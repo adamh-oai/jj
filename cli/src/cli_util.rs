@@ -1068,6 +1068,12 @@ pub struct GitImportExportLock {
     _lock: Option<FileLock>,
 }
 
+#[derive(Clone, Debug)]
+struct GitWorkspace {
+    git_dir: PathBuf,
+    update_git_head: bool,
+}
+
 /// Provides utilities for writing a command that works on a [`Workspace`]
 /// (which most commands do).
 pub struct WorkspaceCommandHelper {
@@ -1078,7 +1084,7 @@ pub struct WorkspaceCommandHelper {
     commit_summary_template_text: String,
     op_summary_template_text: String,
     may_update_working_copy: bool,
-    working_copy_shared_with_git: bool,
+    git_workspace: Option<GitWorkspace>,
 }
 
 enum SnapshotWorkingCopyError {
@@ -1103,6 +1109,12 @@ where
 }
 
 impl WorkspaceCommandHelper {
+    fn syncs_git_refs_automatically(&self) -> bool {
+        self.git_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.update_git_head)
+    }
+
     #[instrument(skip_all)]
     fn new(
         ui: &Ui,
@@ -1116,8 +1128,19 @@ impl WorkspaceCommandHelper {
         let op_summary_template_text = settings.get_string("templates.op_summary")?;
         let may_update_working_copy =
             loaded_at_head && !env.command.global_args().ignore_working_copy;
-        let working_copy_shared_with_git =
-            crate::git_util::is_colocated_git_workspace(&workspace, &repo);
+        let git_workspace = crate::git_util::workspace_git_dir(&workspace, &repo).and_then(|dir| {
+            let Ok(git_backend) = jj_lib::git::get_git_backend(repo.store()) else {
+                return None;
+            };
+            let update_git_head = dunce::canonicalize(git_backend.git_repo_path())
+                .ok()
+                .map(|repo_git_dir| repo_git_dir == dir)
+                .unwrap_or(false);
+            Some(GitWorkspace {
+                git_dir: dir,
+                update_git_head,
+            })
+        });
 
         let helper = Self {
             workspace,
@@ -1126,7 +1149,7 @@ impl WorkspaceCommandHelper {
             commit_summary_template_text,
             op_summary_template_text,
             may_update_working_copy,
-            working_copy_shared_with_git,
+            git_workspace,
         };
         // Parse commit_summary template early to report error before starting
         // mutable operation.
@@ -1159,7 +1182,7 @@ impl WorkspaceCommandHelper {
     /// that need to import from or export to Git. For non-colocated repos,
     /// returns a token with no lock inside.
     fn lock_git_import_export(&self) -> Result<GitImportExportLock, CommandError> {
-        let lock = if self.working_copy_shared_with_git {
+        let lock = if self.syncs_git_refs_automatically() {
             let lock_path = self.workspace.repo_path().join("git_import_export.lock");
             Some(FileLock::lock(lock_path.clone()).map_err(|err| {
                 user_error_with_message("Failed to take lock for Git import/export", err)
@@ -1189,7 +1212,7 @@ impl WorkspaceCommandHelper {
 
         // Reload at current head to avoid creating divergent operations if another
         // process committed an operation while we were waiting for the lock.
-        if self.working_copy_shared_with_git {
+        if self.syncs_git_refs_automatically() {
             let repo = self.repo().clone();
             let op_heads_store = repo.loader().op_heads_store();
             let op_heads = op_heads_store
@@ -1212,7 +1235,11 @@ impl WorkspaceCommandHelper {
         }
 
         #[cfg(feature = "git")]
-        if self.working_copy_shared_with_git {
+        if self
+            .git_workspace
+            .as_ref()
+            .is_some_and(|ws| ws.update_git_head)
+        {
             self.import_git_head(ui, &git_import_export_lock)
                 .map_err(snapshot_command_error)?;
         }
@@ -1224,7 +1251,7 @@ impl WorkspaceCommandHelper {
 
         // import_git_refs() can rebase the working-copy commit.
         #[cfg(feature = "git")]
-        if self.working_copy_shared_with_git {
+        if self.syncs_git_refs_automatically() {
             self.import_git_refs(ui, &git_import_export_lock)
                 .map_err(snapshot_command_error)?;
         }
@@ -1439,7 +1466,7 @@ to the current parents may contain changes from multiple commits.
     }
 
     pub fn working_copy_shared_with_git(&self) -> bool {
-        self.working_copy_shared_with_git
+        self.git_workspace.is_some()
     }
 
     pub fn format_file_path(&self, file: &RepoPath) -> String {
@@ -1948,6 +1975,9 @@ to the current parents may contain changes from multiple commits.
         let options = self
             .snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)
             .map_err(snapshot_command_error)?;
+        let syncs_git_refs_automatically = self.syncs_git_refs_automatically();
+        #[cfg(feature = "git")]
+        let working_copy_shared_with_git = self.working_copy_shared_with_git();
 
         // Compare working-copy tree and operation with repo's, and reload as needed.
         let mut locked_ws = self
@@ -2003,7 +2033,7 @@ to the current parents may contain changes from multiple commits.
             }
 
             #[cfg(feature = "git")]
-            if self.working_copy_shared_with_git {
+            if syncs_git_refs_automatically {
                 let old_tree = wc_commit.tree();
                 let new_tree = commit.tree();
                 export_working_copy_changes_to_git(ui, mut_repo, &old_tree, &new_tree)
@@ -2018,7 +2048,7 @@ to the current parents may contain changes from multiple commits.
         }
 
         #[cfg(feature = "git")]
-        if self.working_copy_shared_with_git
+        if working_copy_shared_with_git
             && let Ok(resolved_tree) = new_tree
                 .trees()
                 .await
@@ -2188,7 +2218,7 @@ to the current parents may contain changes from multiple commits.
             .transpose()?;
 
         #[cfg(feature = "git")]
-        if self.working_copy_shared_with_git {
+        if let Some(git_workspace) = &self.git_workspace {
             use std::error::Error as _;
             if let Some(wc_commit) = &maybe_new_wc_commit {
                 // Export Git HEAD while holding the git-head lock to prevent races:
@@ -2197,7 +2227,12 @@ to the current parents may contain changes from multiple commits.
                 // This can still fail if HEAD was updated concurrently by another JJ process
                 // (overlapping transaction) or a non-JJ process (e.g., git checkout). In that
                 // case, the actual state will be imported on the next snapshot.
-                match jj_lib::git::reset_head(tx.repo_mut(), wc_commit) {
+                match jj_lib::git::reset_head_in_git_dir(
+                    tx.repo_mut(),
+                    wc_commit,
+                    &git_workspace.git_dir,
+                    git_workspace.update_git_head,
+                ) {
                     Ok(()) => {}
                     Err(err @ jj_lib::git::GitResetHeadError::UpdateHeadRef(_)) => {
                         writeln!(ui.warning_default(), "{err}")?;
@@ -2206,8 +2241,10 @@ to the current parents may contain changes from multiple commits.
                     Err(err) => return Err(err.into()),
                 }
             }
-            let stats = jj_lib::git::export_refs(tx.repo_mut())?;
-            crate::git_util::print_git_export_stats(ui, &stats)?;
+            if self.syncs_git_refs_automatically() {
+                let stats = jj_lib::git::export_refs(tx.repo_mut())?;
+                crate::git_util::print_git_export_stats(ui, &stats)?;
+            }
         }
 
         self.user_repo = ReadonlyUserRepo::new(tx.commit(description).block_on()?);

@@ -62,8 +62,9 @@ a comparison with Git, including how workflows are different, see the
 * **Shallow clones: Kind of.** Shallow commits all have the virtual root commit
   as their parent. However, deepening or fully unshallowing a repository is
   currently not yet supported and will cause issues.
-* **git-worktree: No.** However, there's native support for multiple working
-  copies backed by a single repo. See the `jj workspace` family of commands.
+* **git-worktree: Yes.** Use `jj workspace add --git-worktree` to create a new
+  workspace with a linked Git worktree. You can also continue to create
+  workspaces without Git worktrees using the regular `jj workspace` commands.
 * **Sparse checkouts: No.** However, there's native support for sparse
   checkouts. See the `jj sparse` command.
 * **Signed commits: Yes.**

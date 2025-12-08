@@ -79,6 +79,10 @@ You can have multiple working copies backed by a single repo. Use
 directory together is called a "workspace". Each workspace can have a different
 commit checked out.
 
+When using a Git-colocated repo, pass `--git-worktree` to `jj workspace add` to
+create a linked Git worktree alongside the new workspace so Git commands work
+inside it.
+
 Having multiple workspaces can be useful for running long-running tests in a one
 while you continue developing in another, for example. If needed,
 `jj workspace root --name <workspace>` prints the root path of the specified
