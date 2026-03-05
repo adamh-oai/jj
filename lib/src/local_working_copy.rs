@@ -123,6 +123,7 @@ use crate::working_copy::SnapshotError;
 use crate::working_copy::SnapshotOptions;
 use crate::working_copy::SnapshotProgress;
 use crate::working_copy::SnapshotStats;
+use crate::working_copy::SnapshotWarning;
 use crate::working_copy::UntrackedReason;
 use crate::working_copy::WorkingCopy;
 use crate::working_copy::WorkingCopyFactory;
@@ -936,6 +937,7 @@ fn file_state(metadata: &Metadata) -> Result<Option<FileState>, MtimeOutOfRange>
 struct FsmonitorMatcher {
     matcher: Option<Box<dyn Matcher>>,
     watchman_clock: Option<crate::protos::local_working_copy::WatchmanClock>,
+    warning: Option<SnapshotWarning>,
 }
 
 /// Settings specific to the tree state of the [`LocalWorkingCopy`] backend.
@@ -1002,7 +1004,11 @@ pub enum TreeStateError {
     #[error("Persisting tree state to file {path}")]
     PersistTreeState { path: PathBuf, source: io::Error },
     #[error("Filesystem monitor error")]
-    Fsmonitor(#[source] Box<dyn Error + Send + Sync>),
+    Fsmonitor {
+        user_message: String,
+        #[source]
+        err: Box<dyn Error + Send + Sync>,
+    },
 }
 
 impl TreeState {
@@ -1199,13 +1205,17 @@ impl TreeState {
         let previous_clock = self.watchman_clock.clone().map(watchman::Clock::from);
 
         let tokio_fn = async || {
-            let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config)
-                .await
-                .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))?;
-            fsmonitor
-                .query_changed_files(previous_clock)
-                .await
-                .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))
+            let result = async {
+                let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config).await?;
+                fsmonitor.query_changed_files(previous_clock).await
+            }
+            .await;
+            result
+                .inspect_err(|err| tracing::warn!(?err, "Watchman query failed"))
+                .map_err(|err| TreeStateError::Fsmonitor {
+                    user_message: err.detailed_message(),
+                    err: Box::new(err),
+                })
         };
 
         match tokio::runtime::Handle::try_current() {
@@ -1214,7 +1224,10 @@ impl TreeState {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))?;
+                    .map_err(|err| TreeStateError::Fsmonitor {
+                        user_message: err.to_string(),
+                        err: Box::new(err),
+                    })?;
                 runtime.block_on(tokio_fn())
             }
         }
@@ -1227,13 +1240,17 @@ impl TreeState {
         config: &WatchmanConfig,
     ) -> Result<bool, TreeStateError> {
         let tokio_fn = async || {
-            let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config)
-                .await
-                .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))?;
-            fsmonitor
-                .is_trigger_registered()
-                .await
-                .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))
+            let result = async {
+                let fsmonitor = watchman::Fsmonitor::init(&self.working_copy_path, config).await?;
+                fsmonitor.is_trigger_registered().await
+            }
+            .await;
+            result
+                .inspect_err(|err| tracing::warn!(?err, "Watchman trigger query failed"))
+                .map_err(|err| TreeStateError::Fsmonitor {
+                    user_message: err.detailed_message(),
+                    err: Box::new(err),
+                })
         };
 
         match tokio::runtime::Handle::try_current() {
@@ -1242,7 +1259,10 @@ impl TreeState {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))?;
+                    .map_err(|err| TreeStateError::Fsmonitor {
+                        user_message: err.to_string(),
+                        err: Box::new(err),
+                    })?;
                 runtime.block_on(tokio_fn())
             }
         }
@@ -1273,6 +1293,7 @@ impl TreeState {
         let FsmonitorMatcher {
             matcher: fsmonitor_matcher,
             watchman_clock,
+            warning: snapshot_warning,
         } = self
             .make_fsmonitor_matcher(&self.fsmonitor_settings)
             .await?;
@@ -1328,6 +1349,7 @@ impl TreeState {
         })?;
 
         let stats = SnapshotStats {
+            warnings: snapshot_warning.into_iter().collect(),
             untracked_paths: untracked_paths_rx.into_iter().collect(),
         };
         let mut tree_builder = MergedTreeBuilder::new(self.tree.clone());
@@ -1387,16 +1409,22 @@ impl TreeState {
         &self,
         fsmonitor_settings: &FsmonitorSettings,
     ) -> Result<FsmonitorMatcher, SnapshotError> {
-        let (watchman_clock, changed_files) = match fsmonitor_settings {
-            FsmonitorSettings::None => (None, None),
-            FsmonitorSettings::Test { changed_files } => (None, Some(changed_files.clone())),
+        let (watchman_clock, changed_files, warning) = match fsmonitor_settings {
+            FsmonitorSettings::None => (None, None, None),
+            FsmonitorSettings::Test { changed_files } => (None, Some(changed_files.clone()), None),
             #[cfg(feature = "watchman")]
             FsmonitorSettings::Watchman(config) => match self.query_watchman(config).await {
-                Ok((watchman_clock, changed_files)) => (Some(watchman_clock.into()), changed_files),
-                Err(err) => {
-                    tracing::warn!(?err, "Failed to query filesystem monitor");
-                    (None, None)
+                Ok((watchman_clock, changed_files)) => {
+                    (Some(watchman_clock.into()), changed_files, None)
                 }
+                Err(TreeStateError::Fsmonitor { user_message, .. }) => (
+                    None,
+                    None,
+                    Some(SnapshotWarning::FileSystemMonitor {
+                        message: user_message,
+                    }),
+                ),
+                Err(_err) => (None, None, None),
             },
             #[cfg(not(feature = "watchman"))]
             FsmonitorSettings::Watchman(_) => {
@@ -1445,6 +1473,7 @@ impl TreeState {
         Ok(FsmonitorMatcher {
             matcher,
             watchman_clock,
+            warning,
         })
     }
 }

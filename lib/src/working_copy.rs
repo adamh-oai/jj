@@ -235,9 +235,22 @@ pub struct SnapshotOptions<'a> {
 /// A callback for getting progress updates.
 pub type SnapshotProgress<'a> = dyn Fn(&RepoPath) + 'a + Sync;
 
+/// User-visible warnings produced while snapshotting the working copy.
+#[derive(Clone, Debug)]
+pub enum SnapshotWarning {
+    /// The configured filesystem monitor could not be queried and snapshotting
+    /// fell back to a full scan.
+    FileSystemMonitor {
+        /// The user-facing detail from the filesystem monitor failure.
+        message: String,
+    },
+}
+
 /// Stats about a snapshot operation on a working copy.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotStats {
+    /// User-visible warnings produced while snapshotting.
+    pub warnings: Vec<SnapshotWarning>,
     /// List of new (previously untracked) files which are still untracked.
     pub untracked_paths: BTreeMap<RepoPathBuf, UntrackedReason>,
 }

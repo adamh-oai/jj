@@ -133,6 +133,7 @@ use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::working_copy::SnapshotStats;
+use jj_lib::working_copy::SnapshotWarning;
 use jj_lib::working_copy::UntrackedReason;
 use jj_lib::working_copy::WorkingCopy;
 use jj_lib::working_copy::WorkingCopyFactory;
@@ -633,10 +634,15 @@ impl CommandHelper {
                     .map_err(|err| err.into_command_error())?;
                 let merged_stats = {
                     let SnapshotStats {
+                        mut warnings,
                         mut untracked_paths,
                     } = stale_stats;
+                    warnings.extend(fresh_stats.warnings);
                     untracked_paths.extend(fresh_stats.untracked_paths);
-                    SnapshotStats { untracked_paths }
+                    SnapshotStats {
+                        warnings,
+                        untracked_paths,
+                    }
                 };
                 Ok((workspace_command, merged_stats))
             }
@@ -2993,11 +2999,27 @@ pub fn print_untracked_files(
     Ok(())
 }
 
+pub fn print_snapshot_warnings(ui: &Ui, warnings: &[SnapshotWarning]) -> io::Result<()> {
+    for warning in warnings {
+        match warning {
+            SnapshotWarning::FileSystemMonitor { message } => {
+                writeln!(ui.warning_default(), "Failed to query filesystem monitor:")?;
+                let mut formatter = ui.stderr_formatter();
+                for line in message.lines() {
+                    writeln!(formatter, "  {line}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn print_snapshot_stats(
     ui: &Ui,
     stats: &SnapshotStats,
     path_converter: &RepoPathUiConverter,
 ) -> io::Result<()> {
+    print_snapshot_warnings(ui, &stats.warnings)?;
     print_untracked_files(ui, &stats.untracked_paths, path_converter)?;
 
     let large_files_sizes = stats

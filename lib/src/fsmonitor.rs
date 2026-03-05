@@ -165,6 +165,22 @@ pub mod watchman {
         WatchmanTriggerError(#[source] watchman_client::Error),
     }
 
+    impl Error {
+        /// Formats the most actionable user-facing detail from this Watchman
+        /// error.
+        pub fn detailed_message(&self) -> String {
+            match self {
+                Self::WatchmanConnectError(err)
+                | Self::ResolveRootError(err)
+                | Self::WatchmanQueryError(err)
+                | Self::WatchmanTriggerError(err) => err.to_string(),
+                Self::CanonicalizeRootError(err) => {
+                    format!("Could not canonicalize working copy root path: {err}")
+                }
+            }
+        }
+    }
+
     /// Handle to the underlying Watchman instance.
     pub struct Fsmonitor {
         client: watchman_client::Client,

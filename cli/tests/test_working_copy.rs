@@ -18,6 +18,30 @@ use regex::Regex;
 use crate::common::TestEnvironment;
 
 #[test]
+fn test_watchman_query_warning_without_debug_logging() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config(r#"fsmonitor.backend = "watchman""#);
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    let missing_sock = test_env.env_root().join("missing-watchman.sock");
+
+    let output = work_dir
+        .run_jj_with(|cmd| cmd.env("WATCHMAN_SOCK", &missing_sock).arg("status"))
+        .success();
+
+    let stderr = output.stderr.normalized();
+    assert!(
+        stderr.contains("Warning: Failed to query filesystem monitor:"),
+        "{output}"
+    );
+    assert!(
+        stderr.contains("Failed to connect to Watchman: No such file or directory"),
+        "{output}"
+    );
+    assert!(!stderr.contains("jj_lib::local_working_copy"), "{output}");
+}
+
+#[test]
 fn test_snapshot_large_file() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
