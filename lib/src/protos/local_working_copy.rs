@@ -121,6 +121,10 @@ pub struct WorkingCopyState {
     pub pending_sparse_patterns: ::prost::alloc::vec::Vec<
         ::prost::alloc::string::String,
     >,
+    /// Stable opaque AWACS owner for this JJ workspace. It is deliberately not
+    /// the workspace path or mutable @ commit id.
+    #[prost(bytes = "vec", tag = "18")]
+    pub awacs_baseline_owner_id: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AwacsSnapshotBaseline {
@@ -132,7 +136,7 @@ pub struct AwacsSnapshotBaseline {
     /// Authenticated AWACS capability proving continuity from this snapshot.
     #[prost(bytes = "vec", tag = "3")]
     pub continuity_token: ::prost::alloc::vec::Vec<u8>,
-    /// Non-empty only once AWACS exposes a durable client-owned retention pin.
+    /// Opaque owner token for the durable committed/pending baseline pins.
     #[prost(bytes = "vec", tag = "4")]
     pub retention_token: ::prost::alloc::vec::Vec<u8>,
     /// JJ-owned inputs which affect interpretation of the snapshot contents.
