@@ -16,6 +16,124 @@ use crate::common::TestEnvironment;
 use crate::common::to_toml_value;
 
 #[test]
+fn test_log_jq_json_lines_and_slurp() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.run_jj(["describe", "-m", "first\nline"]).success();
+    work_dir.write_file("file", "content\n");
+
+    let output = work_dir.run_jj([
+        "log",
+        "-r",
+        "@",
+        "--jq",
+        "{schema, description, current: jj::current_working_copy}",
+    ]);
+    insta::assert_snapshot!(output, @r#"
+    {"schema":"jj.commit/v1","description":"first\nline\n","current":true}
+    [EOF]
+    "#);
+
+    let output = work_dir.run_jj(["log", "-r", "@ | root()", "--slurp", "--jq", "map(.schema)"]);
+    insta::assert_snapshot!(output, @r#"
+    ["jj.commit/v1","jj.commit/v1"]
+    [EOF]
+    "#);
+
+    let output = work_dir.run_jj([
+        "log",
+        "-r",
+        "@",
+        "--jq",
+        "{keys: keys_unsorted, files: (jj::diff_files | map(.path))}",
+    ]);
+    insta::assert_snapshot!(output, @r#"
+    {"keys":["schema","commit_id","change_id","parent_ids","description","trailers","author","committer","conflict","root"],"files":["file"]}
+    [EOF]
+    "#);
+
+    work_dir
+        .run_jj(["bookmark", "create", "query-test"])
+        .success();
+    let output = work_dir.run_jj([
+        "log",
+        "-r",
+        "@",
+        "--jq",
+        r#"{
+            mine: jj::mine,
+            working_copies: (jj::working_copies | map(.name)),
+            current_working_copy: jj::current_working_copy,
+            bookmarks: (jj::bookmarks | map(.name)),
+            tags: (jj::tags | map(.name)),
+            divergent: jj::divergent,
+            hidden: jj::hidden,
+            change_offset: jj::change_offset,
+            immutable: jj::immutable,
+            empty: jj::empty,
+            signature_present: jj::signature_present,
+            verify_signature: jj::verify_signature,
+            diff_files: (jj::diff_files | map(.path))
+        }"#,
+    ]);
+    insta::assert_snapshot!(output, @r#"
+    {"mine":true,"working_copies":["default"],"current_working_copy":true,"bookmarks":["query-test"],"tags":[],"divergent":false,"hidden":false,"change_offset":0,"immutable":false,"empty":false,"signature_present":false,"verify_signature":null,"diff_files":["file"]}
+    [EOF]
+    "#);
+
+    let output = work_dir.run_jj(["log", "-r", "@", "--jq", "try (1 / 0) catch .kind"]);
+    insta::assert_snapshot!(output, @r#"
+    "non-finite"
+    [EOF]
+    "#);
+}
+
+#[test]
+fn test_log_jq_diff_stats() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("text", "one\ntwo\n");
+    work_dir.run_jj(["describe", "-m", "baseline"]).success();
+    work_dir.run_jj(["new", "-m", "change files"]).success();
+    work_dir.write_file("added", "added\n");
+    work_dir.write_file("binary", "binary\0");
+    work_dir.write_file("text", "one\nthree\nfour\n");
+
+    let output = work_dir.run_jj(["log", "-r", "@", "--jq", "jj::diff_stats"]);
+    insta::assert_snapshot!(output, @r#"
+    {"files":[{"path":"added","status":"added","lines_added":1,"lines_removed":0,"bytes_delta":6},{"path":"binary","status":"added","lines_added":null,"lines_removed":null,"bytes_delta":7},{"path":"text","status":"modified","lines_added":2,"lines_removed":1,"bytes_delta":7}],"total_added":3,"total_removed":1}
+    [EOF]
+    "#);
+
+    let output = work_dir.run_jj(["log", "-r", "@", "--jq", "jj::diff_stats", "text"]);
+    insta::assert_snapshot!(output, @r#"
+    {"files":[{"path":"text","status":"modified","lines_added":2,"lines_removed":1,"bytes_delta":7}],"total_added":2,"total_removed":1}
+    [EOF]
+    "#);
+}
+
+#[test]
+fn test_log_jq_rejects_other_output_modes() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    let output = work_dir.run_jj(["log", "--jq", ".", "--template", "commit_id"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    error: the argument '--jq <FILTER>' cannot be used with '--template <TEMPLATE>'
+
+    Usage: jj log --jq <FILTER> [FILESETS]...
+
+    For more information, try '--help'.
+    [EOF]
+    [exit status: 2]
+    ");
+}
+
+#[test]
 fn test_log_with_empty_revision() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
