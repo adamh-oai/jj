@@ -127,6 +127,17 @@ fn test_workspaces_add_second_and_third_workspace() {
     [EOF]
     "#);
 
+    // Existing non-empty directories are not allowed
+    main_dir.create_dir("../occupied");
+    main_dir.write_file("../occupied/file", "contents");
+    let output = main_dir.run_jj(["workspace", "add", "--name", "occupied", "../occupied"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    ------- stderr -------
+    Error: Destination path exists and is not an empty directory
+    [EOF]
+    [exit status: 1]
+    ");
+
     // Duplicate names are not allowed, directory not created
     let output = main_dir.run_jj(["workspace", "add", "--name", "third", "../tertiary"]);
     insta::assert_snapshot!(output.normalize_backslash(), @"
@@ -207,6 +218,182 @@ fn test_workspaces_add_with_message() {
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
+}
+
+#[test]
+fn test_workspaces_add_colocated_git_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir.create_dir("../secondary");
+    let output = main_dir.run_jj(["workspace", "add", "../secondary"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Created workspace in "../secondary"
+    Working copy  (@) now at: pmmvwywv 058f604d (empty) (no description set)
+    Parent commit (@-)      : qpvuntsm 7b22a8cb initial
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    assert!(secondary_dir.root().join(".git").exists());
+
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(secondary_dir.root().to_str().unwrap()),
+        "worktree list should mention secondary workspace: {stdout}"
+    );
+
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(secondary_dir.root())
+        .output()
+        .unwrap();
+    let git_status = String::from_utf8_lossy(&status_output.stdout);
+    assert!(
+        git_status.is_empty() || git_status.trim() == "?? .jj/",
+        "git status should be clean in the new worktree; got {git_status:?}"
+    );
+}
+
+#[test]
+fn test_workspaces_adopt_existing_colocated_git_worktree() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let worktree_dir = test_env.work_dir("worktree");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let add_output = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(
+        add_output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+    worktree_dir.write_file("file", "changed in worktree\n");
+    worktree_dir.write_file("untracked", "new\n");
+
+    let output = worktree_dir
+        .run_jj(["workspace", "adopt", "--name", "adopted"])
+        .success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Adopted Git worktree as workspace 'adopted'")
+    );
+
+    let output = worktree_dir.run_jj(["status"]).success();
+    assert!(output.stdout.raw().contains("M file"));
+    assert!(output.stdout.raw().contains("A untracked"));
+
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(worktree_dir.root().to_str().unwrap()),
+        "worktree list should mention adopted workspace: {stdout}"
+    );
+
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(worktree_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        status_output.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(output.stdout.raw().contains("adopted:"));
+
+    Ok(())
+}
+
+#[test]
+fn test_workspaces_adopt_rejects_main_git_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    let output = main_dir.run_jj(["workspace", "adopt"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: Cannot adopt the main Git worktree; run this from a linked Git worktree
+    [EOF]
+    [exit status: 1]
+    ");
+}
+
+#[test]
+fn test_workspaces_status_in_linked_git_worktree_does_not_auto_import_git_refs() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    let git_repo = git::open(main_dir.root());
+    let commit_id = main_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "-Tcommit_id",
+            "--no-graph",
+            "-r@",
+        ])
+        .success()
+        .stdout
+        .into_raw();
+    let commit_id = gix::ObjectId::from_hex(commit_id.as_bytes()).unwrap();
+    git_repo
+        .reference(
+            "refs/heads/external",
+            commit_id,
+            gix::refs::transaction::PreviousValue::Any,
+            "",
+        )
+        .unwrap();
+
+    secondary_dir.run_jj(["status"]).success();
+    let output = secondary_dir.run_jj(["--ignore-working-copy", "log", "-rexternal@git"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Error: Revision `external@git` doesn't exist
+    [EOF]
+    [exit status: 1]
+    ");
 }
 
 /// Test how sparse patterns are inherited

@@ -127,6 +127,7 @@ This document contains the help content for the `jj` command-line program.
 * [`jj version`↴](#jj-version)
 * [`jj workspace`↴](#jj-workspace)
 * [`jj workspace add`↴](#jj-workspace-add)
+* [`jj workspace adopt`↴](#jj-workspace-adopt)
 * [`jj workspace forget`↴](#jj-workspace-forget)
 * [`jj workspace list`↴](#jj-workspace-list)
 * [`jj workspace rename`↴](#jj-workspace-rename)
@@ -3769,6 +3770,7 @@ Each workspace also has own sparse patterns.
 ###### **Subcommands:**
 
 * `add` — Add a workspace
+* `adopt` — Adopt the current linked Git worktree as a jj workspace
 * `forget` — Stop tracking a workspace's working-copy commit in the repo
 * `list` — List workspaces
 * `rename` — Renames the current workspace
@@ -3812,6 +3814,22 @@ By default, the new workspace inherits the sparse patterns of the current worksp
   - `empty`:
     Clear all files from the workspace (it will be empty)
 
+
+
+
+## `jj workspace adopt`
+
+Adopt the current linked Git worktree as a jj workspace.
+
+The worktree must belong to the Git repository backing an existing Git-colocated jj workspace. Adoption creates `.jj` metadata in place and preserves the existing Git worktree, files, HEAD, and index.
+
+**Usage:** `jj workspace adopt [OPTIONS]`
+
+###### **Options:**
+
+* `--name <NAME>` — A name for the adopted workspace
+
+   To override the default, which is the basename of the worktree root.
 
 
 
