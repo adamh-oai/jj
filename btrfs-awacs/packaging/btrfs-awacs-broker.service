@@ -1,0 +1,21 @@
+[Unit]
+Description=Privileged Btrfs operation broker for AWACS
+After=local-fs.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/btrfs-awacs/broker.env
+RuntimeDirectory=btrfs-awacs
+RuntimeDirectoryMode=0755
+StateDirectory=btrfs-awacs
+StateDirectoryMode=0700
+ExecStart=/usr/libexec/btrfs-awacs/btrfs-awacs broker-serve /run/btrfs-awacs/broker.sock /var/lib/btrfs-awacs/receipts.sqlite3 ${BTRFS_AWACS_MANAGER_UID} ${BTRFS_AWACS_MANAGER_GID}
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

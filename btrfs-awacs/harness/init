@@ -1,0 +1,61 @@
+#!/bin/busybox sh
+set -eu
+
+/bin/busybox --install -s /bin
+mkdir -p /dev /proc /sys /host /source /tmp /home/test-user
+chmod 1777 /tmp
+printf 'test-user:x:1000:1000:UML test user:/home/test-user:/bin/sh\n' > /etc/passwd
+printf 'test-user:x:1000:\n' > /etc/group
+chown 1000:1000 /home/test-user
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t hostfs hostfs /host
+
+send_mode=default
+for argument in $(cat /proc/cmdline); do
+  case "$argument" in
+    send_runs=*)
+      export RUNS=${argument#send_runs=}
+      ;;
+    send_warmup=*)
+      export WARMUP=${argument#send_warmup=}
+      ;;
+    send_mode=*)
+      send_mode=${argument#send_mode=}
+      export SEND_MODE=$send_mode
+      ;;
+  esac
+done
+
+if [ "$send_mode" = btrfs-ioctl-smoke ]; then
+  mount -t btrfs /dev/ubda /source
+  btrfs subvolume create /source/live
+  btrfs subvolume create /source/recovery-live
+  btrfs subvolume create /source/client-live
+  btrfs subvolume create /source/nested-live
+  echo recovery > /source/recovery-live/file
+  echo before > /source/live/file
+  btrfs subvolume snapshot -r /source/live /source/snapshot-a
+  echo after > /source/live/file
+  btrfs subvolume snapshot -r /source/live /source/snapshot-b
+  mkdir -m 0700 /source/managed
+  mkdir -m 0700 /source/recovery-managed
+  mkdir -m 0700 /source/client-managed
+  mkdir -m 0700 /source/nested-managed
+  mkdir -m 0700 /source/worktrees
+  chown 1000:1000 /source/client-live /source/client-managed
+else
+  mount -t btrfs -o ro /dev/ubda /source
+fi
+
+set -- $(find /source -mindepth 1 -maxdepth 1 -type d \
+  -name 'snapshot-*' -print | sort)
+if [ "$#" -ne 2 ]; then
+  echo "expected exactly two snapshots, found $#" >&2
+  poweroff -f
+fi
+
+/host/guest-run.sh "$1" "$2"
+sync
+poweroff -f

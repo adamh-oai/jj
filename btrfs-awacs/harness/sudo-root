@@ -1,0 +1,8 @@
+#!/bin/busybox sh
+set -eu
+
+if [ "${1:-}" = "--non-interactive" ]; then
+	shift
+fi
+
+exec "$@"

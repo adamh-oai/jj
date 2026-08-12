@@ -1,0 +1,23 @@
+[package]
+name = "btrfs-awacs"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+description = "Btrfs snapshot change index with focused Watchman and Git integrations"
+license = "MIT"
+
+[[bin]]
+name = "btrfs-awacs"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.60", features = ["derive"] }
+getrandom = "0.3.3"
+libc = "0.2.189"
+linux-raw-sys = { version = "0.9.4", features = ["general"] }
+rusqlite = "0.34.0"
+sha2 = "0.10.9"
+uuid = { version = "1.18.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.19.1"

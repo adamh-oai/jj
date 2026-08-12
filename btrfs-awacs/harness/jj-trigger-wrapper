@@ -1,0 +1,9 @@
+#!/bin/busybox sh
+set -eu
+
+set +e
+/usr/bin/jj "$@"
+status=$?
+set -e
+printf 'status=%s command=%s\n' "$status" "$*" >> /tmp/btrfs-awacs-jj-trigger-ran
+exit "$status"

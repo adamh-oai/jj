@@ -1,0 +1,5 @@
+normal --no-data: changed=70074 elapsed=35.519s
+changes-only: changed=70074 elapsed=2.082s
+comparison: changes-only is 94.1% faster (17.06x speedup)
+changed: 70074
+elapsed: 37.603s
