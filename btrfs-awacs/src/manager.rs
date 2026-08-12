@@ -3843,7 +3843,7 @@ impl Store {
                 [watch_id.as_slice()],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-        if boundary_count <= 2 {
+        if boundary_count <= 1 {
             return Ok(0);
         }
         let oldest = oldest.ok_or_else(|| ManagerError::new("replay checkpoint set is empty"))?;
@@ -3896,6 +3896,24 @@ impl Store {
                 break;
             }
             distance = next;
+        }
+        // Direct consumers now own their replay baseline explicitly. Keep the
+        // newest cut plus one boundary for every committed/pending consumer
+        // pin; older generic replay checkpoints are not durable references.
+        retained.clear();
+        retained.insert(newest);
+        {
+            let mut statement = self.connection().prepare(
+                r#"SELECT b.cut_sequence
+                     FROM fsmonitor_boundaries b
+                     JOIN snapshot_pins p ON p.snapshot_id = b.target_snapshot_id
+                    WHERE b.watch_id = ?1
+                      AND p.owner_kind = 'consumer-baseline'"#,
+            )?;
+            let rows = statement
+                .query_map([watch_id.as_slice()], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            retained.extend(rows);
         }
 
         // A retained snapshot also keeps its compact inode/path checkpoint so
@@ -4236,6 +4254,160 @@ impl Store {
             lease_fence: 0,
             expires_ns,
         })
+    }
+
+    /// Reconciles the durable consumer baseline pins with the baseline named
+    /// by the caller's journal after a possible crash. A pending candidate is
+    /// adopted when the journal names it, discarded when the journal still
+    /// names the committed baseline, and otherwise both stale pins are
+    /// released so the caller must establish a fresh full-scan baseline.
+    pub fn reconcile_consumer_baseline(
+        &mut self,
+        watch_id: [u8; 16],
+        authorization_id: [u8; 16],
+        owner_id: [u8; 16],
+        previous_snapshot_id: Option<i64>,
+    ) -> Result<bool, ManagerError> {
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authorized: Option<i64> = transaction
+            .query_row(
+                r#"SELECT 1 FROM watches w JOIN watch_grants g ON g.watch_id = w.id
+                    WHERE w.id = ?1 AND w.state = 'active'
+                      AND g.id = ?2 AND g.state = 'active'
+                      AND (g.permissions & ?3) = ?3"#,
+                params![
+                    watch_id.as_slice(),
+                    authorization_id.as_slice(),
+                    i64::from(PERMISSION_READ | PERMISSION_CUT),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if authorized != Some(1) {
+            return Err(ManagerError::new(
+                "consumer baseline owner is not authorized",
+            ));
+        }
+        let committed: Option<i64> = transaction
+            .query_row(
+                "SELECT snapshot_id FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'committed'",
+                [owner_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let pending: Option<i64> = transaction
+            .query_row(
+                "SELECT snapshot_id FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'pending'",
+                [owner_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let retained = match previous_snapshot_id {
+            Some(previous) if pending == Some(previous) => {
+                transaction.execute(
+                    "DELETE FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'committed'",
+                    [owner_id.as_slice()],
+                )?;
+                transaction.execute(
+                    "UPDATE snapshot_pins SET reason = 'committed' WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'pending'",
+                    [owner_id.as_slice()],
+                )?;
+                true
+            }
+            Some(previous) if committed == Some(previous) => {
+                transaction.execute(
+                    "DELETE FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'pending'",
+                    [owner_id.as_slice()],
+                )?;
+                true
+            }
+            _ => {
+                transaction.execute(
+                    "DELETE FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1",
+                    [owner_id.as_slice()],
+                )?;
+                false
+            }
+        };
+        transaction.commit()?;
+        Ok(retained)
+    }
+
+    /// Pins the scan candidate without releasing the committed baseline.
+    pub fn stage_consumer_baseline(
+        &mut self,
+        watch_id: [u8; 16],
+        authorization_id: [u8; 16],
+        owner_id: [u8; 16],
+        snapshot_id: i64,
+    ) -> Result<(), ManagerError> {
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let valid: Option<i64> = transaction
+            .query_row(
+                r#"SELECT 1 FROM watches w JOIN watch_grants g ON g.watch_id = w.id
+                     JOIN fsmonitor_boundaries b ON b.watch_id = w.id AND b.target_snapshot_id = ?3
+                    WHERE w.id = ?1 AND w.state = 'active'
+                      AND g.id = ?2 AND g.state = 'active'
+                      AND (g.permissions & ?4) = ?4"#,
+                params![
+                    watch_id.as_slice(),
+                    authorization_id.as_slice(),
+                    snapshot_id,
+                    i64::from(PERMISSION_READ | PERMISSION_CUT),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if valid != Some(1) {
+            return Err(ManagerError::new(
+                "consumer baseline candidate is not authorized",
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'pending'",
+            [owner_id.as_slice()],
+        )?;
+        transaction.execute(
+            "INSERT INTO snapshot_pins(snapshot_id, owner_kind, owner_id, reason) VALUES (?1, 'consumer-baseline', ?2, 'pending')",
+            params![snapshot_id, owner_id.as_slice()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Completes the two-phase consumer baseline handoff.
+    pub fn finish_consumer_baseline(
+        &mut self,
+        owner_id: [u8; 16],
+        committed: bool,
+    ) -> Result<(), ManagerError> {
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if committed {
+            transaction.execute(
+                "DELETE FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'committed'",
+                [owner_id.as_slice()],
+            )?;
+            require_one(
+                transaction.execute(
+                    "UPDATE snapshot_pins SET reason = 'committed' WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'pending'",
+                    [owner_id.as_slice()],
+                )?,
+                "commit consumer baseline",
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1 AND reason = 'pending'",
+                [owner_id.as_slice()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn release_retention_lease(&mut self, lease: &RetentionLease) -> Result<(), ManagerError> {
@@ -6950,7 +7122,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_boundaries_keep_parent_cuts_and_active_query_endpoints() {
+    fn retained_boundaries_keep_only_active_query_endpoints_without_consumers() {
         let (_temp, mut store, request) = setup();
         let (_initialize, initialized) = initialize_watch(&mut store, &request);
         for sequence in 1..=5 {
@@ -6996,7 +7168,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(retained, vec![1, 3, 4, 5]);
+        assert_eq!(retained, vec![1, 5]);
         assert!(store.foreign_key_violations().unwrap().is_empty());
 
         store
@@ -7019,7 +7191,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(retained, vec![3, 4, 5]);
+        assert_eq!(retained, vec![5]);
         let query_state: String = store
             .connection()
             .query_row(
@@ -7030,6 +7202,73 @@ mod tests {
             .unwrap();
         assert_eq!(query_state, "released");
         assert!(store.foreign_key_violations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn consumer_baseline_handoff_keeps_only_committed_and_pending() {
+        let (_temp, mut store, request) = setup();
+        let (_initialize, initialized) = initialize_watch(&mut store, &request);
+        for sequence in 1..=3 {
+            append_ready_boundary(&mut store, &initialized, sequence);
+        }
+        let snapshot = |store: &Store, sequence: i64| {
+            store
+                .connection()
+                .query_row(
+                    "SELECT target_snapshot_id FROM fsmonitor_boundaries WHERE watch_id = ?1 AND cut_sequence = ?2",
+                    params![initialized.watch_id.as_slice(), sequence],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        let owner = [77; 16];
+        let a = snapshot(&store, 1);
+        let b = snapshot(&store, 2);
+        let c = snapshot(&store, 3);
+        assert!(!store
+            .reconcile_consumer_baseline(initialized.watch_id, initialized.grant_id, owner, None)
+            .unwrap());
+        store
+            .stage_consumer_baseline(initialized.watch_id, initialized.grant_id, owner, a)
+            .unwrap();
+        store.finish_consumer_baseline(owner, true).unwrap();
+        store
+            .stage_consumer_baseline(initialized.watch_id, initialized.grant_id, owner, b)
+            .unwrap();
+        assert!(
+            store
+                .reconcile_consumer_baseline(
+                    initialized.watch_id,
+                    initialized.grant_id,
+                    owner,
+                    Some(a),
+                )
+                .unwrap()
+        );
+        store
+            .stage_consumer_baseline(initialized.watch_id, initialized.grant_id, owner, c)
+            .unwrap();
+        assert!(
+            store
+                .reconcile_consumer_baseline(
+                    initialized.watch_id,
+                    initialized.grant_id,
+                    owner,
+                    Some(c),
+                )
+                .unwrap()
+        );
+        let pins: Vec<(i64, String)> = store
+            .connection()
+            .prepare(
+                "SELECT snapshot_id, reason FROM snapshot_pins WHERE owner_kind = 'consumer-baseline' AND owner_id = ?1",
+            )
+            .unwrap()
+            .query_map([owner.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(pins, vec![(c, "committed".to_owned())]);
     }
 
     #[test]

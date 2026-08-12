@@ -932,7 +932,14 @@ impl ScanSession for AwacsScanSession {
 
     fn prepare_to_commit(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.stop_renewing();
-        self.check_healthy()
+        self.check_healthy()?;
+        self.lease
+            .lock()
+            .expect("AWACS lease lock should not be poisoned")
+            .as_mut()
+            .expect("AWACS lease should exist while committing")
+            .promote()?;
+        Ok(())
     }
 
     fn finish(
@@ -1066,6 +1073,7 @@ pub struct TreeState {
     pending_sparse_patterns: Option<Vec<RepoPathBuf>>,
     baseline: Option<crate::protos::local_working_copy::AwacsSnapshotBaseline>,
     pending_baseline: Option<crate::protos::local_working_copy::AwacsSnapshotBaseline>,
+    awacs_baseline_owner_id: Vec<u8>,
     transition_id: Vec<u8>,
     no_baseline_reason: String,
     mutation_kind: String,
@@ -1267,6 +1275,11 @@ impl TreeState {
         self.journal_phase = phase;
         self.baseline = proto.baseline;
         self.pending_baseline = proto.pending_baseline;
+        self.awacs_baseline_owner_id = if proto.awacs_baseline_owner_id.len() == 16 {
+            proto.awacs_baseline_owner_id
+        } else {
+            rand::random::<[u8; 16]>().to_vec()
+        };
         self.transition_id = proto.transition_id;
         self.no_baseline_reason = proto.no_baseline_reason;
         self.mutation_kind = proto.mutation_kind;
@@ -1406,6 +1419,7 @@ impl TreeState {
             no_baseline_reason: self.no_baseline_reason.clone(),
             mutation_kind: self.mutation_kind.clone(),
             pending_sparse_patterns,
+            awacs_baseline_owner_id: self.awacs_baseline_owner_id.clone(),
         })
     }
 
@@ -1554,6 +1568,7 @@ impl TreeState {
             pending_sparse_patterns: None,
             baseline: None,
             pending_baseline: None,
+            awacs_baseline_owner_id: rand::random::<[u8; 16]>().to_vec(),
             transition_id: Vec::new(),
             no_baseline_reason: "uninitialized".to_owned(),
             mutation_kind: String::new(),
@@ -2235,6 +2250,11 @@ impl TreeState {
                 let can_use_delta = previous_baseline.is_some();
                 let request = btrfs_awacs::scan::BeginScanRequest {
                     live_root: self.working_copy_path.clone(),
+                    baseline_owner_id: self
+                        .awacs_baseline_owner_id
+                        .as_slice()
+                        .try_into()
+                        .expect("AWACS baseline owner id is always 16 bytes"),
                     previous_baseline,
                 };
                 let mut client = client.lock().map_err(|_| SnapshotError::Other {
@@ -2262,11 +2282,8 @@ impl TreeState {
                 }
                 let scan_root =
                     PathBuf::from(format!("/proc/self/fd/{}", lease.scan_root().as_raw_fd()));
-                // AWACS authenticates the previous baseline and returns
-                // Full whenever that retained boundary was pruned or
-                // cannot be proven. Thus the baseline is a safe
-                // best-effort A binding even though v1 does not offer a
-                // hard client-owned retention pin.
+                // AWACS authenticates the previous baseline and returns Full
+                // whenever its owner pin or lineage cannot be proven.
                 let (changed_files, changed_prefixes) = if !can_use_delta {
                     (None, None)
                 } else {
@@ -2300,9 +2317,8 @@ impl TreeState {
                     filesystem_uuid: lease.next_baseline.identity.filesystem_uuid.to_vec(),
                     subvolume_uuid: lease.next_baseline.identity.subvolume_uuid.to_vec(),
                     continuity_token: lease.next_baseline.continuity_token.clone(),
-                    // AWACS v1 authenticates this lineage token and returns
-                    // Full when A is gone, but it does not expose a durable
-                    // client-owned pin/handoff token yet.
+                    // The retention token is the opaque durable owner
+                    // capability returned by AWACS.
                     retention_token: lease.next_baseline.retention_token.clone(),
                     interpretation_input_fingerprint: awacs_input_fingerprint.to_vec(),
                 };

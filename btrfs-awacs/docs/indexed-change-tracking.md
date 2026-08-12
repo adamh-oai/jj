@@ -1118,7 +1118,7 @@ CREATE TABLE snapshot_pins (
     owner_kind      TEXT NOT NULL CHECK
                     (owner_kind IN ('watch-indexed-head', 'watch-last-cut',
                                     'operation', 'comparison',
-                                    'retention-lease')),
+                                    'retention-lease', 'consumer-baseline')),
     owner_id        BLOB NOT NULL,
     reason          TEXT NOT NULL,
     PRIMARY KEY (snapshot_id, owner_kind, owner_id, reason)

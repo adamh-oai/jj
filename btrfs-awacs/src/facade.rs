@@ -256,6 +256,58 @@ impl FacadeService {
         )
     }
 
+    /// Reconciles one consumer's durable baseline pins with the snapshot
+    /// identity durably named by its local journal.
+    pub fn reconcile_consumer_baseline(
+        &mut self,
+        watch_id: [u8; 16],
+        owner_id: [u8; 16],
+        previous_baseline: Option<&crate::scan::SnapshotBaseline>,
+    ) -> Result<bool, FacadeError> {
+        let authorization_id = self
+            .views
+            .get(&watch_id)
+            .ok_or_else(|| FacadeError::new("scan facade is not active"))?
+            .authorization_id;
+        let previous_snapshot_id = previous_baseline
+            .map(|baseline| self.snapshot_id_for_uuid(baseline.identity.subvolume_uuid))
+            .transpose()?
+            .flatten();
+        self.service
+            .store_mut()
+            .reconcile_consumer_baseline(watch_id, authorization_id, owner_id, previous_snapshot_id)
+            .map_err(|error| FacadeError::context("reconcile consumer baseline", error))
+    }
+
+    /// Pins a candidate B while leaving the committed A pin intact.
+    pub fn stage_consumer_baseline(
+        &mut self,
+        prepared: &PreparedQueryResult,
+        owner_id: [u8; 16],
+    ) -> Result<(), FacadeError> {
+        self.service
+            .store_mut()
+            .stage_consumer_baseline(
+                prepared.activation.watch_id,
+                prepared.activation.authorization_id,
+                owner_id,
+                prepared.snapshot_id,
+            )
+            .map_err(|error| FacadeError::context("stage consumer baseline", error))
+    }
+
+    /// Finalizes or aborts the candidate pin after the local journal commit.
+    pub fn finish_consumer_baseline(
+        &mut self,
+        owner_id: [u8; 16],
+        committed: bool,
+    ) -> Result<(), FacadeError> {
+        self.service
+            .store_mut()
+            .finish_consumer_baseline(owner_id, committed)
+            .map_err(|error| FacadeError::context("finish consumer baseline", error))
+    }
+
     /// Returns the opaque continuity token prepared for the direct scan API.
     pub fn direct_scan_continuity_token(
         &self,
@@ -543,6 +595,19 @@ impl FacadeService {
         bytes
             .try_into()
             .map_err(|_| FacadeError::new("scan snapshot UUID has invalid length"))
+    }
+
+    fn snapshot_id_for_uuid(&self, uuid: [u8; 16]) -> Result<Option<i64>, FacadeError> {
+        self.service
+            .store()
+            .connection()
+            .query_row(
+                "SELECT id FROM snapshots WHERE subvol_uuid = ?1 AND physical_state = 'present'",
+                [uuid.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| FacadeError::context("load baseline snapshot id", error))
     }
 }
 

@@ -32,9 +32,7 @@ pub struct SnapshotBaseline {
     pub identity: SnapshotIdentity,
     /// Authenticated capability used to prove continuity from this snapshot.
     pub continuity_token: Vec<u8>,
-    /// Durable retention capability, once the service supports hard pins.
-    ///
-    /// AWACS v1 leaves this empty and proves the baseline on demand.
+    /// Opaque durable owner capability for the committed/pending pin pair.
     pub retention_token: Vec<u8>,
 }
 
@@ -43,6 +41,9 @@ pub struct SnapshotBaseline {
 pub struct BeginScanRequest {
     /// Absolute live working-copy root whose identity AWACS must validate.
     pub live_root: PathBuf,
+    /// Stable, opaque identity of the consumer workspace which owns exactly
+    /// one committed baseline at a time.
+    pub baseline_owner_id: [u8; 16],
     /// Exact snapshot baseline paired with the consumer's previous tree.
     pub previous_baseline: Option<SnapshotBaseline>,
 }
@@ -145,6 +146,10 @@ pub trait ScanSession: Send {
     /// Extends the active lease while the caller still owns the scan root.
     fn renew(&mut self) -> Result<(), ScanError>;
 
+    /// Durably stages this lease's candidate baseline while preserving the
+    /// previously committed baseline.
+    fn promote(&mut self) -> Result<(), ScanError>;
+
     /// Reports whether state paired with this baseline was durably committed.
     fn finish(&mut self, outcome: ScanOutcome) -> Result<(), ScanError>;
 }
@@ -190,6 +195,12 @@ impl SnapshotLease {
     /// Renews the active lease.
     pub fn renew(&mut self) -> Result<(), ScanError> {
         self.session.renew()
+    }
+
+    /// Stages this candidate as the next durable baseline. The old committed
+    /// baseline remains pinned until finish acknowledges the local journal.
+    pub fn promote(&mut self) -> Result<(), ScanError> {
+        self.session.promote()
     }
 
     /// Returns the conservative client renewal cadence for this lease:
@@ -310,12 +321,14 @@ pub trait ScanRequestHandler: Send {
     fn begin_scan(&mut self, request: BeginScanRequest) -> Result<ServerSnapshotLease, ScanError>;
     /// Renews one still-active private session.
     fn renew_scan(&mut self, session_id: &[u8]) -> Result<(), ScanError>;
+    /// Stages the candidate baseline while retaining the committed baseline.
+    fn promote_scan(&mut self, session_id: &[u8]) -> Result<(), ScanError>;
     /// Finishes one private session with the client's durable outcome.
     fn finish_scan(&mut self, session_id: &[u8], outcome: ScanOutcome) -> Result<(), ScanError>;
 }
 
 const SCAN_MAGIC: &[u8; 4] = b"BAWS";
-const SCAN_VERSION: u16 = 2;
+const SCAN_VERSION: u16 = 3;
 const SCAN_HEADER_SIZE: usize = 16;
 const SCAN_MAX_PAYLOAD: usize = 1024 * 1024;
 const SCAN_MAX_FDS: usize = 1;
@@ -323,6 +336,7 @@ const FLAG_RESPONSE: u16 = 1;
 const OP_BEGIN: u16 = 1;
 const OP_RENEW: u16 = 2;
 const OP_FINISH: u16 = 3;
+const OP_PROMOTE: u16 = 4;
 
 /// Production scan client for an explicit AWACS scan socket.
 ///
@@ -407,6 +421,7 @@ impl ScanClient for SocketScanClient {
     fn begin_scan(&mut self, request: &BeginScanRequest) -> Result<SnapshotLease, ScanError> {
         let mut payload = Encoder::default();
         payload.bytes(path_bytes(&request.live_root))?;
+        payload.bytes.extend_from_slice(&request.baseline_owner_id);
         payload.optional_baseline(request.previous_baseline.as_ref())?;
         let response = request_response(&self.socket, OP_BEGIN, payload.finish())?;
         let mut decoder = Decoder::new(&response.payload);
@@ -422,6 +437,7 @@ impl ScanClient for SocketScanClient {
         }
         let session_id = decoder.bytes()?;
         let continuity_token = decoder.bytes()?;
+        let retention_token = decoder.bytes()?;
         let invalidation = decoder.invalidation()?;
         let expires_boottime_ns = decoder.u64()?;
         let identity = SnapshotIdentity {
@@ -436,7 +452,7 @@ impl ScanClient for SocketScanClient {
             SnapshotBaseline {
                 identity,
                 continuity_token,
-                retention_token: Vec::new(),
+                retention_token,
             },
             invalidation,
             expires_boottime_ns,
@@ -465,6 +481,21 @@ impl ScanSession for SocketScanSession {
             return Err(ScanError::new(
                 ScanErrorKind::MalformedResponse,
                 "AWACS RenewScan response carried descriptors",
+            ));
+        }
+        decoder.finish()
+    }
+
+    fn promote(&mut self) -> Result<(), ScanError> {
+        let mut payload = Encoder::default();
+        payload.bytes(&self.session_id)?;
+        let response = request_response(&self.socket, OP_PROMOTE, payload.finish())?;
+        let mut decoder = Decoder::new(&response.payload);
+        decode_status(&mut decoder)?;
+        if !response.fds.is_empty() {
+            return Err(ScanError::new(
+                ScanErrorKind::MalformedResponse,
+                "AWACS PromoteScan response carried descriptors",
             ));
         }
         decoder.finish()
@@ -548,11 +579,13 @@ impl<H: ScanRequestHandler> SocketScanDispatcher<H> {
             OP_BEGIN => {
                 let mut decoder = Decoder::new(&request.payload);
                 let live_root = decoder.bytes()?;
+                let baseline_owner_id = decoder.array()?;
                 let previous_baseline = decoder.optional_baseline()?;
                 decoder.finish()?;
                 let live_root = PathBuf::from(std::ffi::OsString::from_vec(live_root));
                 match handler.begin_scan(BeginScanRequest {
                     live_root,
+                    baseline_owner_id,
                     previous_baseline,
                 }) {
                     Ok(lease) => {
@@ -560,6 +593,7 @@ impl<H: ScanRequestHandler> SocketScanDispatcher<H> {
                         payload.u8(0);
                         payload.bytes(&lease.session_id)?;
                         payload.bytes(&lease.next_baseline.continuity_token)?;
+                        payload.bytes(&lease.next_baseline.retention_token)?;
                         payload.invalidation(&lease.invalidation)?;
                         payload.u64(lease.expires_boottime_ns);
                         payload
@@ -591,6 +625,15 @@ impl<H: ScanRequestHandler> SocketScanDispatcher<H> {
                 match handler.renew_scan(&session_id) {
                     Ok(()) => socket.send(OP_RENEW, FLAG_RESPONSE, &[0], &[]),
                     Err(err) => send_error(socket, OP_RENEW, &err),
+                }
+            }
+            OP_PROMOTE => {
+                let mut decoder = Decoder::new(&request.payload);
+                let session_id = decoder.bytes()?;
+                decoder.finish()?;
+                match handler.promote_scan(&session_id) {
+                    Ok(()) => socket.send(OP_PROMOTE, FLAG_RESPONSE, &[0], &[]),
+                    Err(err) => send_error(socket, OP_PROMOTE, &err),
                 }
             }
             OP_FINISH => {
@@ -1270,6 +1313,10 @@ mod tests {
             Ok(())
         }
 
+        fn promote(&mut self) -> Result<(), ScanError> {
+            Ok(())
+        }
+
         fn finish(&mut self, outcome: ScanOutcome) -> Result<(), ScanError> {
             self.outcomes.lock().unwrap().push(outcome);
             Ok(())
@@ -1345,6 +1392,7 @@ mod tests {
             assert!(begin.fds.is_empty());
             let mut request = Decoder::new(&begin.payload);
             assert_eq!(request.bytes().unwrap(), b"/tmp/live");
+            assert_eq!(request.array::<16>().unwrap(), [9; 16]);
             assert_eq!(
                 request.optional_baseline().unwrap(),
                 Some(baseline(b"previous"))
@@ -1355,6 +1403,7 @@ mod tests {
             response.u8(0);
             response.bytes(b"session").unwrap();
             response.bytes(b"cursor").unwrap();
+            response.bytes(&[9; 16]).unwrap();
             response.u8(2);
             response.u32(1);
             response.bytes(b"dir").unwrap();
@@ -1380,6 +1429,15 @@ mod tests {
                 .send(OP_RENEW, FLAG_RESPONSE, &[0], &[])
                 .unwrap();
 
+            let promote = server_socket.receive().unwrap();
+            assert_eq!(promote.opcode, OP_PROMOTE);
+            let mut request = Decoder::new(&promote.payload);
+            assert_eq!(request.bytes().unwrap(), b"session");
+            request.finish().unwrap();
+            server_socket
+                .send(OP_PROMOTE, FLAG_RESPONSE, &[0], &[])
+                .unwrap();
+
             let finish = server_socket.receive().unwrap();
             assert_eq!(finish.opcode, OP_FINISH);
             let mut request = Decoder::new(&finish.payload);
@@ -1397,16 +1455,20 @@ mod tests {
         let mut lease = client
             .begin_scan(&BeginScanRequest {
                 live_root: PathBuf::from("/tmp/live"),
+                baseline_owner_id: [9; 16],
                 previous_baseline: Some(baseline(b"previous")),
             })
             .unwrap();
-        assert_eq!(lease.next_baseline, baseline(b"cursor"));
+        let mut expected = baseline(b"cursor");
+        expected.retention_token = vec![9; 16];
+        assert_eq!(lease.next_baseline, expected);
         assert_eq!(
             lease.invalidation,
             Invalidation::Prefixes(vec![b"dir".to_vec()])
         );
         assert!(lease.scan_root().metadata().unwrap().is_dir());
         lease.renew().unwrap();
+        lease.promote().unwrap();
         lease.finish(ScanOutcome::Committed).unwrap();
         server.join().unwrap();
     }
@@ -1430,6 +1492,7 @@ mod tests {
         };
         let error = match client.begin_scan(&BeginScanRequest {
             live_root: PathBuf::from("/tmp/live"),
+            baseline_owner_id: [9; 16],
             previous_baseline: None,
         }) {
             Ok(_) => panic!("error response unexpectedly produced a lease"),
@@ -1453,6 +1516,7 @@ mod tests {
                 request: BeginScanRequest,
             ) -> Result<ServerSnapshotLease, ScanError> {
                 assert_eq!(request.live_root, PathBuf::from("/tmp/live"));
+                assert_eq!(request.baseline_owner_id, [9; 16]);
                 assert_eq!(request.previous_baseline, Some(baseline(b"previous")));
                 Ok(ServerSnapshotLease {
                     session_id: b"session".to_vec(),
@@ -1464,6 +1528,11 @@ mod tests {
             }
 
             fn renew_scan(&mut self, session_id: &[u8]) -> Result<(), ScanError> {
+                assert_eq!(session_id, b"session");
+                Ok(())
+            }
+
+            fn promote_scan(&mut self, session_id: &[u8]) -> Result<(), ScanError> {
                 assert_eq!(session_id, b"session");
                 Ok(())
             }
@@ -1490,6 +1559,7 @@ mod tests {
             dispatcher.serve_one(&server_socket).unwrap();
             dispatcher.serve_one(&server_socket).unwrap();
             dispatcher.serve_one(&server_socket).unwrap();
+            dispatcher.serve_one(&server_socket).unwrap();
         });
         let mut client = SocketScanClient {
             socket: Arc::new(Mutex::new(client_socket)),
@@ -1497,6 +1567,7 @@ mod tests {
         let mut lease = client
             .begin_scan(&BeginScanRequest {
                 live_root: PathBuf::from("/tmp/live"),
+                baseline_owner_id: [9; 16],
                 previous_baseline: Some(baseline(b"previous")),
             })
             .unwrap();
@@ -1505,6 +1576,7 @@ mod tests {
             Invalidation::ExactPaths(vec![b"file".to_vec()])
         );
         lease.renew().unwrap();
+        lease.promote().unwrap();
         lease.finish(ScanOutcome::Committed).unwrap();
         server.join().unwrap();
         assert_eq!(

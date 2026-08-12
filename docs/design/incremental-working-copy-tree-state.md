@@ -332,23 +332,17 @@ but can never leave a clean journal pointing at a pruned snapshot.
 For accepted scan B:
 
 1. Build candidate tree Y from B while A remains retained.
-2. Atomically write
-   `PendingBaselineCommit { prior_clean: (X, A), candidate: (Y, B), transition_id }`.
-3. Ask the backend to durably promote B to a committed baseline using the
-   idempotent transition ID.
-4. After promotion succeeds, atomically write `Clean(Y, B, I)`.
-5. Acknowledge/finish the scan and release A.
+2. Ask AWACS to stage B as a pending owner pin while retaining committed A.
+3. After promotion succeeds, atomically write `Clean(Y, B, I)`.
+4. Acknowledge/finish the scan and atomically replace A with B.
 
 Recovery rules:
 
-- Crash before the pending record: continue from clean A.
-- Crash after pending but before B promotion: abort or expire B, restore/use A,
-  or full-scan if A cannot be proved.
-- Crash after B promotion but before clean publication: query or retry the
-  idempotent transition; publish B if its retention is proved, otherwise keep
-  A and allow B to be reclaimed.
+- Crash before B promotion: continue from clean A.
+- Crash after B promotion but before clean publication: the journal still
+  names A, so the next Begin discards pending B and keeps A.
 - Crash after clean B publication but before A release: use B and release A
-  during cleanup.
+  during the next Begin reconciliation.
 - Lost completion response after clean publication is cleanup only; it cannot
   invalidate the durable B binding.
 
@@ -356,20 +350,13 @@ The backend protocol must therefore support committed-baseline retention or an
 equivalent pin/handoff. A short-lived scan lease that releases B at
 `FinishScan(Committed)` is insufficient.
 
-### Current AWACS v1 compatibility
+### Durable AWACS owner
 
-The first no-row implementation can use a typed AWACS snapshot baseline with
-an authenticated continuity token while the stronger promotion API is added.
-It persists a `CleanBaseline` record only after the local journal is durable
-and sends A's baseline on the next scan. In v1, “clean” means
-“paired with immutable A and safe to reuse only after AWACS proves A,” not
-“hard-pinned”: if AWACS has retained A, it returns a complete A→B delta; if A
-was pruned, expired, or cannot be proved, it returns `Full` and Jujutsu scans
-immutable B. This is correctness-safe because a missing baseline never
-narrows the scan, but it does not guarantee retention or the crash-recoverable
-promotion semantics above. The v1 journal leaves `retention_token` empty;
-`PendingBaselineCommit`, a non-empty retention token, and transition IDs remain
-reserved for the hard-pin protocol.
+The journal stores one random, stable `awacs_baseline_owner_id` for the JJ
+workspace. It is not the root path, workspace name, or mutable `@` commit.
+AWACS uses it to keep one committed baseline pin and, during handoff, one
+pending candidate pin. The exact snapshot UUID in the journal binds that
+physical state to the semantic tree; the owner ID only scopes retention.
 
 ## Working-copy mutations
 

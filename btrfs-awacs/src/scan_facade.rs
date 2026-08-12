@@ -41,6 +41,8 @@ pub struct FacadeScanHandler {
 
 struct ActiveScanSession {
     prepared: PreparedQueryResult,
+    baseline_owner_id: [u8; 16],
+    staged: bool,
     expires_ns: i64,
 }
 
@@ -258,10 +260,22 @@ impl ScanRequestHandler for FacadeScanHandler {
         // remains bound to the caller's exact canonical root.
         let (_requested_root, watch_id) =
             self.ensure_registered_root(&mut facade, &request.live_root, now_ns)?;
+        let previous_baseline = if facade
+            .reconcile_consumer_baseline(
+                watch_id,
+                request.baseline_owner_id,
+                request.previous_baseline.as_ref(),
+            )
+            .map_err(|err| other(format!("reconcile AWACS baseline owner: {err}")))?
+        {
+            request.previous_baseline.as_ref()
+        } else {
+            None
+        };
         let prepared = facade
             .prepare_scan_query(
                 watch_id,
-                request.previous_baseline.as_ref(),
+                previous_baseline,
                 self.requester_uid,
                 self.requester_gid,
                 now_ns,
@@ -324,6 +338,8 @@ impl ScanRequestHandler for FacadeScanHandler {
             session_id.clone(),
             ActiveScanSession {
                 prepared,
+                baseline_owner_id: request.baseline_owner_id,
+                staged: false,
                 expires_ns,
             },
         );
@@ -332,9 +348,9 @@ impl ScanRequestHandler for FacadeScanHandler {
             next_baseline: SnapshotBaseline {
                 identity,
                 continuity_token,
-                // v1 proves retained history on demand but does not yet
-                // expose a durable client-owned retention capability.
-                retention_token: Vec::new(),
+                // This opaque token names the stable consumer owner. It is
+                // not a path or a mutable commit id.
+                retention_token: request.baseline_owner_id.to_vec(),
             },
             invalidation,
             expires_boottime_ns: crate::scan::boottime_now_ns().saturating_add(ttl_ns as u64),
@@ -362,7 +378,26 @@ impl ScanRequestHandler for FacadeScanHandler {
         Ok(())
     }
 
-    fn finish_scan(&mut self, session_id: &[u8], _outcome: ScanOutcome) -> Result<(), ScanError> {
+    fn promote_scan(&mut self, session_id: &[u8]) -> Result<(), ScanError> {
+        let now_ns = unix_time_ns()?;
+        self.expire_sessions(now_ns)?;
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| ScanError::new(ScanErrorKind::LeaseExpired, "unknown AWACS session"))?;
+        if session.staged {
+            return Ok(());
+        }
+        self.facade
+            .lock()
+            .map_err(|_| other("AWACS facade lock poisoned"))?
+            .stage_consumer_baseline(&session.prepared, session.baseline_owner_id)
+            .map_err(|err| other(format!("stage AWACS consumer baseline: {err}")))?;
+        session.staged = true;
+        Ok(())
+    }
+
+    fn finish_scan(&mut self, session_id: &[u8], outcome: ScanOutcome) -> Result<(), ScanError> {
         let now_ns = unix_time_ns()?;
         self.expire_sessions(now_ns)?;
         if self.finished_sessions.contains_key(session_id) {
@@ -372,9 +407,19 @@ impl ScanRequestHandler for FacadeScanHandler {
             .sessions
             .remove(session_id)
             .ok_or_else(|| ScanError::new(ScanErrorKind::LeaseExpired, "unknown AWACS session"))?;
-        self.facade
+        let mut facade = self
+            .facade
             .lock()
-            .map_err(|_| other("AWACS facade lock poisoned"))?
+            .map_err(|_| other("AWACS facade lock poisoned"))?;
+        if session.staged {
+            facade
+                .finish_consumer_baseline(
+                    session.baseline_owner_id,
+                    outcome == ScanOutcome::Committed,
+                )
+                .map_err(|err| other(format!("finish AWACS consumer baseline: {err}")))?;
+        }
+        facade
             .finish_query_response(session.prepared)
             .map(|_| ())
             .map_err(|err| other(format!("finish AWACS scan lease: {err}")))?;

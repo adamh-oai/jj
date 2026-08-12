@@ -127,6 +127,10 @@ impl btrfs_awacs::scan::ScanSession for FakeAwacsSession {
         Ok(())
     }
 
+    fn promote(&mut self) -> Result<(), btrfs_awacs::scan::ScanError> {
+        Ok(())
+    }
+
     fn finish(
         &mut self,
         outcome: btrfs_awacs::scan::ScanOutcome,
@@ -162,7 +166,7 @@ impl btrfs_awacs::scan::ScanClient for FakeAwacsClient {
                     read_only: true,
                 },
                 continuity_token: b"baseline".to_vec(),
-                retention_token: Vec::new(),
+                retention_token: request.baseline_owner_id.to_vec(),
             },
             btrfs_awacs::scan::Invalidation::Prefixes(vec![b"dir".to_vec()]),
             u64::MAX,

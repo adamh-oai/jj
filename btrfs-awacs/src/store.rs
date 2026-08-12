@@ -8,7 +8,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SPEC: &str = include_str!("../docs/indexed-change-tracking.md");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MANAGER_APPLICATION_ID: i64 = 0x4241_5731; // BAW1
 const BROKER_APPLICATION_ID: i64 = 0x4241_5742; // BAWB
 
@@ -307,6 +307,11 @@ fn install_manager_schema(
          VALUES (5, 'remove-watchman-triggers-v5', ?1)",
         [metadata.created_ns],
     )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, name, applied_ns) \
+         VALUES (6, 'consumer-baseline-pins-v6', ?1)",
+        [metadata.created_ns],
+    )?;
     transaction.pragma_update(None, "application_id", MANAGER_APPLICATION_ID)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -336,6 +341,10 @@ fn install_broker_schema(connection: &mut Connection) -> Result<(), StoreError> 
     )?;
     transaction.execute(
         "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (5, 'schema-parity-v5', 0)",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (6, 'schema-parity-v6', 0)",
         [],
     )?;
     transaction.pragma_update(None, "application_id", BROKER_APPLICATION_ID)?;
@@ -454,6 +463,38 @@ fn migrate_manager_schema(connection: &mut Connection) -> Result<(), StoreError>
         )?;
         transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit()?;
+        version = 5;
+    }
+    if version == 5 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            r#"CREATE TABLE snapshot_pins_v6 (
+                   snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+                   owner_kind TEXT NOT NULL CHECK
+                       (owner_kind IN ('watch-indexed-head', 'watch-last-cut',
+                                       'operation', 'comparison',
+                                       'retention-lease', 'consumer-baseline')),
+                   owner_id BLOB NOT NULL,
+                   reason TEXT NOT NULL,
+                   PRIMARY KEY (snapshot_id, owner_kind, owner_id, reason)
+               ) WITHOUT ROWID;
+               INSERT INTO snapshot_pins_v6 SELECT * FROM snapshot_pins;
+               DROP TABLE snapshot_pins;
+               ALTER TABLE snapshot_pins_v6 RENAME TO snapshot_pins;
+               CREATE TRIGGER snapshot_pins_only_present
+               BEFORE INSERT ON snapshot_pins
+               WHEN (SELECT physical_state FROM snapshots WHERE id = NEW.snapshot_id)
+                    IS NOT 'present'
+               BEGIN
+                   SELECT RAISE(ABORT, 'cannot pin a non-present snapshot');
+               END;"#,
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (6, 'consumer-baseline-pins-v6', 0)",
+            [],
+        )?;
+        transaction.pragma_update(None, "user_version", 6)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -525,6 +566,16 @@ fn migrate_broker_schema(connection: &mut Connection) -> Result<(), StoreError> 
             [],
         )?;
         transaction.pragma_update(None, "user_version", 5)?;
+        transaction.commit()?;
+        version = 5;
+    }
+    if version == 5 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (6, 'schema-parity-v6', 0)",
+            [],
+        )?;
+        transaction.pragma_update(None, "user_version", 6)?;
         transaction.commit()?;
     }
     Ok(())
@@ -759,6 +810,10 @@ mod tests {
         store
             .connection()
             .execute("DELETE FROM schema_migrations WHERE version = 5", [])
+            .unwrap();
+        store
+            .connection()
+            .execute("DELETE FROM schema_migrations WHERE version = 6", [])
             .unwrap();
         store
             .connection()

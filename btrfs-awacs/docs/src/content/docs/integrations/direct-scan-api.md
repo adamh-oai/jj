@@ -1,6 +1,6 @@
 ---
 title: "Direct immutable-snapshot API"
-description: "The Begin, Renew, and Finish protocol, typed snapshot baselines, immutable snapshot fds, and daemon sessions."
+description: "The Begin, Renew, Promote, and Finish protocol, typed snapshot baselines, immutable snapshot fds, and daemon sessions."
 sidebar:
   order: 3
 ---
@@ -12,13 +12,14 @@ Jujutsu:
 ```text
 BeginScanRequest {
     live_root: absolute live working-copy path,
+    baseline_owner_id: stable opaque workspace identity,
     previous_baseline: optional SnapshotBaseline,
 }
 
 SnapshotBaseline {
     identity: filesystem UUID + subvolume UUID + read-only flag,
     continuity_token: opaque authenticated proof for that exact snapshot,
-    retention_token: optional durable pin capability,
+    retention_token: opaque durable owner capability,
 }
 
 SnapshotLease {
@@ -26,7 +27,7 @@ SnapshotLease {
     invalidation: Full | ExactPaths(raw-relative-paths) | Prefixes(raw-prefixes),
     expires_boottime_ns: advertised monotonic lease deadline,
     scan_root: open read-only snapshot directory fd,
-    session: private Renew/Finish capability,
+    session: private Renew/Promote/Finish capability,
 }
 
 ScanOutcome = Committed | Aborted
@@ -51,7 +52,8 @@ operations are:
 ```text
 Begin  -> session ID, next baseline token, invalidation, boot-time deadline, identity, one fd
 Renew  -> extend the session's durable query lease
-Finish -> Committed or Aborted; release the pinned prepared response
+Promote -> pin candidate B while retaining committed A
+Finish -> Committed replaces A with B; Aborted drops pending B
 ```
 
 A successful Begin transfers exactly one directory descriptor using
@@ -80,9 +82,16 @@ absolute socket override bypasses the discovery subprocess.
 6. Stores the `PreparedQueryResult` in an active-session map.
 7. Returns a session ID and the open directory fd.
 
-Renew extends the prepared query lease. Finish releases it and records a short
-idempotence tombstone. Invalid/expired baselines currently become safe full scans
-when the selected target snapshot can still be leased.
+Renew extends the prepared query lease. Promote installs a pending
+consumer-baseline pin without removing the old committed pin. Finish
+atomically promotes pending B to committed and removes A, or drops pending B
+on abort, then releases the query lease. A restart reconciles an orphaned
+pending pin against whichever exact baseline the caller's journal names.
+
+The snapshot path is not a workspace identifier. AWACS resolves it internally
+from the snapshot row selected by the watch/cut; Jujutsu associates that
+snapshot with one workspace and semantic tree through its local journal plus
+the opaque baseline owner ID. A mutable at-sign commit is not used as the key.
 
 The handler resolves, authorizes, initializes or adopts, and activates each
 requested canonical root on demand. Multiple repositories and snapshot

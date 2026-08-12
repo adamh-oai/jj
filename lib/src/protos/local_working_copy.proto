@@ -96,6 +96,9 @@ message WorkingCopyState {
   string no_baseline_reason = 15;
   string mutation_kind = 16;
   repeated string pending_sparse_patterns = 17;
+  // Stable opaque AWACS owner for this JJ workspace. It is deliberately not
+  // the workspace path or mutable @ commit id.
+  bytes awacs_baseline_owner_id = 18;
 }
 
 message AwacsSnapshotBaseline {
@@ -104,7 +107,7 @@ message AwacsSnapshotBaseline {
   bytes subvolume_uuid = 2;
   // Authenticated AWACS capability proving continuity from this snapshot.
   bytes continuity_token = 3;
-  // Non-empty only once AWACS exposes a durable client-owned retention pin.
+  // Opaque owner token for the durable committed/pending baseline pins.
   bytes retention_token = 4;
   // JJ-owned inputs which affect interpretation of the snapshot contents.
   bytes interpretation_input_fingerprint = 5;

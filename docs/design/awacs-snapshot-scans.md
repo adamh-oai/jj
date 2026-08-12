@@ -161,6 +161,7 @@ journal publication and keep it retained for the next command.
 ~~~
 BeginScan {
   live_root,
+  baseline_owner_id,
   previous_baseline?,
 }
 
@@ -210,13 +211,13 @@ before any new clean baseline is saved.
 ### Promote baseline
 
 ~~~
-SnapshotLease::promote_baseline(transition_id)
+SnapshotLease::promote()
 ~~~
 
-Promotion durably retains candidate B as a committed baseline while A remains
-retained. It is idempotent by transition ID so Jujutsu can recover after a
-lost response. A crash after promotion but before local journal publication may
-leave an orphan B pin, but must not leave a journal referring to a pruned B.
+Promotion durably retains candidate B as a pending baseline while A remains
+committed. A crash after promotion but before local journal publication may
+leave an orphan B pin, but the next Begin reconciles it against the baseline
+named by the journal and must not leave a journal referring to a pruned B.
 
 ### Finish scan
 
@@ -230,15 +231,10 @@ B because the next command depends on it. Aborted means no clean B binding was
 published; AWACS may reclaim an unpromoted B after a bounded lease timeout.
 Finish is idempotent so a retry after a lost response is safe.
 
-The initial compact-journal implementation also supports AWACS v1 as a safe
-best-effort mode: a `CleanBaseline` local journal persists a typed snapshot
-baseline whose continuity token is authenticated by AWACS, and AWACS must
-return `Full` whenever that prior snapshot is no longer retained or cannot be
-proved. In this mode “clean” means “authoritative if the server can still
-prove the baseline,” not “hard-pinned.” It can deliver incremental scans while
-retention happens to keep A alive, but it is not a substitute for the durable
-promotion/pin protocol above. The stronger `PendingBaselineCommit`
-transition remains the target for guaranteed retention and crash recovery.
+The compact journal persists a stable opaque owner ID beside its typed
+baseline. AWACS retains one committed snapshot per owner plus one pending
+candidate only while a handoff is in flight; old generic replay checkpoints
+are not durable consumer references.
 
 ### Errors
 
