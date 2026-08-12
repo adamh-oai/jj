@@ -25,7 +25,6 @@ struct Registration {
 #[derive(Default)]
 pub struct WatchmanEndpoint {
     roots: RwLock<BTreeMap<Vec<u8>, Registration>>,
-    trigger_runner_enabled: bool,
     precision_marker_directory: Option<PathBuf>,
 }
 
@@ -91,10 +90,6 @@ impl WatchmanEndpoint {
             .map(|bytes| PreparedWatchmanFrame { bytes, query: None })
     }
 
-    pub fn enable_fixed_jj_trigger(&mut self) {
-        self.trigger_runner_enabled = true;
-    }
-
     pub fn enable_precision_guard(&mut self, marker_directory: PathBuf) {
         self.precision_marker_directory = Some(marker_directory);
     }
@@ -126,10 +121,9 @@ impl WatchmanEndpoint {
                 if let Err(error) =
                     facade.activate_precision_guard(watch_id, marker_directory, current_time_ns()?)
                 {
-                    // The recursive journal is only a precision/latency aid.
-                    // Its activation path durably gaps any epoch it began; the
-                    // mandatory snapshot facade remains conservative and must
-                    // not be denied merely because inotify is unavailable.
+                    // The optional journal durably gaps any epoch it began.
+                    // Its absence must not deny snapshot service; conservative
+                    // dirty-witness projection still needs the fix in FIXES.md.
                     eprintln!(
                         "btrfs-awacs: precision guard unavailable for {}: {error}; using snapshot-only invalidation",
                         root.display()
@@ -830,114 +824,6 @@ impl WatchmanEndpoint {
         })
     }
 
-    /* trigger support removed: commands fail explicitly in dispatch.
-    fn trigger_list(
-        &self,
-        facade: &FacadeService,
-        command: &[Value],
-        requester_uid: u32,
-        requester_gid: u32,
-    ) -> Result<Value, WatchmanError> {
-        if command.len() != 2 {
-            return Err(WatchmanError::new("trigger-list requires one root"));
-        }
-        let root = bytes(&command[1], "trigger-list root")?;
-        let registration = self.registration(root, requester_uid, requester_gid)?;
-        let present = facade
-            .service()
-            .store()
-            .has_fixed_jj_trigger(registration.watch_id, registration.authorization_id)
-            .map_err(|error| WatchmanError::context("list jj trigger", error))?;
-        Ok(object([
-            (b"version", Value::Bytes(VERSION.to_vec())),
-            (
-                b"triggers",
-                Value::Array(if present {
-                    vec![fixed_trigger_description()]
-                } else {
-                    Vec::new()
-                }),
-            ),
-        ]))
-    }
-
-    fn trigger_register(
-        &self,
-        facade: &mut FacadeService,
-        command: &[Value],
-        requester_uid: u32,
-        requester_gid: u32,
-    ) -> Result<Value, WatchmanError> {
-        if !self.trigger_runner_enabled {
-            return Err(WatchmanError::new(
-                "jj background trigger runner is not configured",
-            ));
-        }
-        if command.len() != 3 {
-            return Err(WatchmanError::new("trigger requires a root and definition"));
-        }
-        let root = bytes(&command[1], "trigger root")?;
-        let registration = self.registration(root, requester_uid, requester_gid)?;
-        let command_argv = validated_trigger_argv(&command[2])?;
-        let replaced = facade
-            .service_mut()
-            .store_mut()
-            .register_fixed_jj_trigger(
-                registration.watch_id,
-                registration.authorization_id,
-                &command_argv,
-            )
-            .map_err(|error| WatchmanError::context("register jj trigger", error))?;
-        Ok(object([
-            (b"version", Value::Bytes(VERSION.to_vec())),
-            (
-                b"disposition",
-                Value::Bytes(
-                    if replaced {
-                        b"replaced".as_slice()
-                    } else {
-                        b"created".as_slice()
-                    }
-                    .to_vec(),
-                ),
-            ),
-            (
-                b"triggerid",
-                Value::Bytes(b"jj-background-monitor".to_vec()),
-            ),
-        ]))
-    }
-
-    fn trigger_delete(
-        &self,
-        facade: &mut FacadeService,
-        command: &[Value],
-        requester_uid: u32,
-        requester_gid: u32,
-    ) -> Result<Value, WatchmanError> {
-        if command.len() != 3
-            || bytes(command.get(2).unwrap_or(&Value::Null), "trigger name")?
-                != b"jj-background-monitor"
-        {
-            return Err(WatchmanError::new(
-                "trigger-del supports only jj-background-monitor",
-            ));
-        }
-        let root = bytes(&command[1], "trigger-del root")?;
-        let registration = self.registration(root, requester_uid, requester_gid)?;
-        facade
-            .service_mut()
-            .store_mut()
-            .delete_fixed_jj_trigger(registration.watch_id, registration.authorization_id)
-            .map_err(|error| WatchmanError::context("delete jj trigger", error))?;
-        Ok(object([
-            (b"version", Value::Bytes(VERSION.to_vec())),
-            (b"deleted", Value::Bool(true)),
-            (b"trigger", Value::Bytes(b"jj-background-monitor".to_vec())),
-        ]))
-    }
-
-    */
     fn registered(
         &self,
         root: &[u8],
@@ -1113,92 +999,6 @@ fn git_expression() -> Value {
         ]),
     ])
 }
-
-/*
-fn fixed_trigger_definition() -> &'static Value {
-    use std::sync::OnceLock;
-    static DEFINITION: OnceLock<Value> = OnceLock::new();
-    DEFINITION.get_or_init(|| {
-        object([
-            (
-                b"command",
-                Value::Array(
-                    [b"jj".as_slice(), b"--quiet", b"util", b"snapshot"]
-                        .into_iter()
-                        .map(|part| Value::Bytes(part.to_vec()))
-                        .collect(),
-                ),
-            ),
-            (b"expression", jj_expression()),
-            (b"name", Value::Bytes(b"jj-background-monitor".to_vec())),
-            (b"stderr", Value::Bytes(b">/dev/null".to_vec())),
-            (b"stdout", Value::Bytes(b">/dev/null".to_vec())),
-        ])
-    })
-}
-
-fn fixed_trigger_description() -> Value {
-    let Value::Object(definition) = fixed_trigger_definition() else {
-        unreachable!("fixed trigger definition is an object")
-    };
-    object([
-        (
-            b"name",
-            definition
-                .get(b"name".as_slice())
-                .expect("fixed trigger has a name")
-                .clone(),
-        ),
-        (
-            b"command",
-            definition
-                .get(b"command".as_slice())
-                .expect("fixed trigger has a command")
-                .clone(),
-        ),
-    ])
-}
-
-fn validated_trigger_argv(definition: &Value) -> Result<Vec<u8>, WatchmanError> {
-    let Value::Object(definition) = definition else {
-        return Err(WatchmanError::new("trigger definition is not an object"));
-    };
-    for (key, expected) in [
-        (
-            b"name".as_slice(),
-            Value::Bytes(b"jj-background-monitor".to_vec()),
-        ),
-        (b"expression".as_slice(), jj_expression()),
-        (b"stdout".as_slice(), Value::Bytes(b">/dev/null".to_vec())),
-        (b"stderr".as_slice(), Value::Bytes(b">/dev/null".to_vec())),
-    ] {
-        if definition.get(key) != Some(&expected) {
-            return Err(WatchmanError::new(
-                "only the supported filesystem-monitor trigger shape is accepted",
-            ));
-        }
-    }
-    let Value::Array(command) = definition
-        .get(b"command".as_slice())
-        .ok_or_else(|| WatchmanError::new("trigger definition omitted command"))?
-    else {
-        return Err(WatchmanError::new("trigger command is not an array"));
-    };
-    if command.is_empty() {
-        return Err(WatchmanError::new("trigger command is empty"));
-    }
-    let mut encoded = Vec::new();
-    for argument in command {
-        let argument = bytes(argument, "trigger command argument")?;
-        if argument.contains(&0) {
-            return Err(WatchmanError::new("trigger command argument contains NUL"));
-        }
-        encoded.extend_from_slice(argument);
-        encoded.push(0);
-    }
-    Ok(encoded)
-}
-*/
 
 fn array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], WatchmanError> {
     match value {

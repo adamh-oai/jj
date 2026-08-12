@@ -1,4 +1,4 @@
-//! Fenced execution of jj's one supported background snapshot trigger.
+//! Dormant scaffold for future fenced jj background snapshot triggers.
 
 use crate::facade::FacadeService;
 use crate::manager::TriggerRun;

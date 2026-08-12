@@ -9,7 +9,7 @@ use crate::broker::{
     execute_target_object_lookup, ChangedObjectsExecution, ChangedObjectsResult, EffectKind,
     ExpectedManagedDirectory, ExpectedSubvolume, Frame, Opcode, PeerCredentials, ReceiptRequest,
     SeqPacket, SessionGate, SnapshotCreateExecution, SnapshotCreateResult, SnapshotDeleteExecution,
-    SnapshotDeleteResult, StoredBrokerRequest, WorktreeRenameResult,
+    SnapshotDeleteResult, StoredBrokerRequest,
 };
 use crate::btrfs::{filesystem_info, subvolume_info};
 use crate::index::{Index, Object};
@@ -40,7 +40,6 @@ pub struct BrokerDispatcher {
 pub enum ReconciledEffect {
     SnapshotCreated(SnapshotCreateResult),
     SnapshotDeleted(SnapshotDeleteResult),
-    WorktreePublished(WorktreeRenameResult),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -229,12 +228,6 @@ impl BrokerDispatcher {
                 output.array(result.result_hash);
                 Ok(output.finish())
             }
-            Opcode::PublishWorktree => {
-                let _ = (decoder, fds);
-                Err(BrokerError::new(
-                    "AWACS never creates or publishes worktrees; create the Btrfs snapshot externally and let watch-project adopt its parent UUID",
-                ))
-            }
             Opcode::ReconcileReceipt => {
                 if decoder.remaining() == 0 {
                     require_fd_count(fds, 0)?;
@@ -380,12 +373,6 @@ fn reconcile_stored_request(
             output.array(result.deleted_subvolume_uuid);
             output.array(result.result_hash);
             Ok(output.finish())
-        }
-        Opcode::PublishWorktree => {
-            let _ = (gate, journal, decoder, fds, session_id);
-            Err(BrokerError::new(
-                "legacy Worktree publication receipts are unsupported",
-            ))
         }
         _ => Err(BrokerError::new(
             "stored request is not a reconcilable effect opcode",
@@ -598,30 +585,6 @@ impl BrokerClient {
         Ok(result)
     }
 
-    #[cfg(any())]
-    pub fn publish_worktree(
-        &self,
-        execution: &WorktreeRenameExecution,
-        staging_parent: BorrowedFd<'_>,
-        destination_root: BorrowedFd<'_>,
-    ) -> Result<WorktreeRenameResult, BrokerError> {
-        self.verify_execution_session(&execution.receipt)?;
-        let mut encoder = self.auth_encoder();
-        encoder.worktree_rename(execution)?;
-        self.socket.send(
-            &Frame::new(Opcode::PublishWorktree, encoder.finish())?,
-            &[staging_parent, destination_root],
-        )?;
-        let response = receive_response(&self.socket, Opcode::PublishWorktree)?;
-        let mut decoder = Decoder::new(&response);
-        let result = WorktreeRenameResult {
-            worktree_subvolume_uuid: decoder.array()?,
-            result_hash: decoder.array()?,
-        };
-        decoder.finish()?;
-        Ok(result)
-    }
-
     pub fn unresolved_receipt_count(&self) -> Result<u64, BrokerError> {
         self.socket.send(
             &Frame::new(Opcode::ReconcileReceipt, self.auth_payload())?,
@@ -719,29 +682,6 @@ impl BrokerClient {
         let mut decoder = Decoder::new(&response);
         let result = SnapshotDeleteResult {
             deleted_subvolume_uuid: decoder.array()?,
-            result_hash: decoder.array()?,
-        };
-        decoder.finish()?;
-        Ok(result)
-    }
-
-    #[cfg(any())]
-    pub fn reconcile_worktree_publish(
-        &self,
-        operation_id: [u8; 16],
-        operation_fence: i64,
-        staging_parent: BorrowedFd<'_>,
-        destination_root: BorrowedFd<'_>,
-    ) -> Result<WorktreeRenameResult, BrokerError> {
-        let response = self.reconcile_request(
-            Opcode::PublishWorktree,
-            operation_id,
-            operation_fence,
-            &[staging_parent, destination_root],
-        )?;
-        let mut decoder = Decoder::new(&response);
-        let result = WorktreeRenameResult {
-            worktree_subvolume_uuid: decoder.array()?,
             result_hash: decoder.array()?,
         };
         decoder.finish()?;
@@ -1112,7 +1052,6 @@ impl Encoder {
         self.i64(value.operation_fence);
         self.u8(match value.effect_kind {
             EffectKind::SnapshotCreate => 1,
-            EffectKind::WorktreeRename => 2,
             EffectKind::SnapshotDelete => 3,
         });
         self.array(value.filesystem_uuid);
@@ -1120,16 +1059,6 @@ impl Encoder {
         self.array(value.effect_arguments_hash);
         self.array(value.boot_id);
         self.i64(value.started_ns);
-    }
-
-    #[cfg(any())]
-    fn reservation(&mut self, value: &ExpectedReservation) -> Result<(), BrokerError> {
-        self.byte_string(&value.name)?;
-        self.u64(value.device);
-        self.u64(value.inode);
-        self.u32(value.owner_uid);
-        self.array(value.nonce);
-        Ok(())
     }
 
     fn snapshot_create(&mut self, value: &SnapshotCreateExecution) -> Result<(), BrokerError> {
@@ -1146,22 +1075,6 @@ impl Encoder {
         self.expected_subvolume(&value.target);
         self.managed_directory(&value.destination_parent);
         self.byte_string(&value.destination_name)
-    }
-
-    #[cfg(any())]
-    fn worktree_rename(&mut self, value: &WorktreeRenameExecution) -> Result<(), BrokerError> {
-        self.receipt(&value.receipt);
-        self.expected_subvolume(&value.worktree);
-        self.managed_directory(&value.staging_parent);
-        self.byte_string(&value.staging_name)?;
-        self.managed_directory(&value.destination_parent);
-        self.expected_subvolume(&value.destination_root);
-        self.managed_directory(&value.destination_root_directory);
-        self.byte_string(&value.destination_relative_parent)?;
-        self.byte_string(&value.destination_name)?;
-        self.reservation(&value.reservation)?;
-        self.array(value.authorization_hash);
-        Ok(())
     }
 
     fn optional_uuid(&mut self, value: Option<[u8; 16]>) {
@@ -1296,7 +1209,6 @@ impl<'a> Decoder<'a> {
             operation_fence: self.i64()?,
             effect_kind: match self.u8()? {
                 1 => EffectKind::SnapshotCreate,
-                2 => EffectKind::WorktreeRename,
                 3 => EffectKind::SnapshotDelete,
                 _ => return Err(BrokerError::new("invalid broker effect kind tag")),
             },
@@ -1305,17 +1217,6 @@ impl<'a> Decoder<'a> {
             effect_arguments_hash: self.array()?,
             boot_id: self.array()?,
             started_ns: self.i64()?,
-        })
-    }
-
-    #[cfg(any())]
-    fn reservation(&mut self) -> Result<ExpectedReservation, BrokerError> {
-        Ok(ExpectedReservation {
-            name: self.byte_string()?,
-            device: self.u64()?,
-            inode: self.u64()?,
-            owner_uid: self.u32()?,
-            nonce: self.array()?,
         })
     }
 
@@ -1339,23 +1240,6 @@ impl<'a> Decoder<'a> {
             target: self.expected_subvolume()?,
             destination_parent: self.managed_directory()?,
             destination_name: self.byte_string()?,
-        })
-    }
-
-    #[cfg(any())]
-    fn worktree_rename(&mut self) -> Result<WorktreeRenameExecution, BrokerError> {
-        Ok(WorktreeRenameExecution {
-            receipt: self.receipt()?,
-            worktree: self.expected_subvolume()?,
-            staging_parent: self.managed_directory()?,
-            staging_name: self.byte_string()?,
-            destination_parent: self.managed_directory()?,
-            destination_root: self.expected_subvolume()?,
-            destination_root_directory: self.managed_directory()?,
-            destination_relative_parent: self.byte_string()?,
-            destination_name: self.byte_string()?,
-            reservation: self.reservation()?,
-            authorization_hash: self.array()?,
         })
     }
 

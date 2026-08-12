@@ -353,27 +353,7 @@ fn migrate_manager_schema(connection: &mut Connection) -> Result<(), StoreError>
         )));
     }
     if version == 1 {
-        let legacy_policies: i64 =
-            connection.query_row("SELECT count(*) FROM worktree_grant_policies", [], |row| {
-                row.get(0)
-            })?;
-        if legacy_policies != 0 {
-            return Err(StoreError::new(
-                "schema v1 has Worktree policies without durable root locators; remove or explicitly reprovision them before upgrading",
-            ));
-        }
-        let has_root_path: i64 = connection.query_row(
-            "SELECT count(*) FROM pragma_table_info('worktree_grant_policies') \
-             WHERE name = 'destination_root_path'",
-            [],
-            |row| row.get(0),
-        )?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if has_root_path == 0 {
-            transaction.execute_batch(
-                "ALTER TABLE worktree_grant_policies ADD COLUMN destination_root_path BLOB;",
-            )?;
-        }
         transaction.execute(
             "INSERT INTO schema_migrations(version, name, applied_ns) \
              VALUES (2, 'recovery-v2', 0)",
@@ -502,7 +482,7 @@ fn migrate_broker_schema(connection: &mut Connection) -> Result<(), StoreError> 
             manager_store_uuid BLOB NOT NULL CHECK (length(manager_store_uuid) = 16),
             operation_id BLOB NOT NULL CHECK (length(operation_id) = 16),
             operation_fence INTEGER NOT NULL,
-            opcode INTEGER NOT NULL CHECK (opcode IN (3, 5, 6)),
+            opcode INTEGER NOT NULL CHECK (opcode IN (3, 5)),
             payload BLOB NOT NULL,
             payload_hash BLOB NOT NULL CHECK (length(payload_hash) = 32),
             PRIMARY KEY (manager_store_uuid, operation_id, operation_fence)

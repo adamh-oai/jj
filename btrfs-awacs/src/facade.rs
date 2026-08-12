@@ -278,79 +278,6 @@ impl FacadeService {
         Ok(())
     }
 
-    #[cfg(any())]
-    fn legacy_activate_proved_worktree(
-        &mut self,
-        watch_id: [u8; 16],
-        authorization_id: [u8; 16],
-        root: &Path,
-    ) -> Result<String, FacadeError> {
-        if !self
-            .service
-            .ensure_snapshot_facade_is_enabled(watch_id)
-            .map_err(|error| FacadeError::context("verify dirty-witness ABI", error))?
-        {
-            return Err(FacadeError::new(
-                "snapshot facade is disabled until the experimental dirty-witness ABI is verified",
-            ));
-        }
-        let handoff = self
-            .service
-            .take_worktree_view_handoff(watch_id, authorization_id, root)
-            .ok_or_else(|| {
-                FacadeError::new(
-                    "proved Worktree seed requires its live pre-publication monitor handoff",
-                )
-            })?;
-        if let Err(error) = handoff.monitor.check_continuity() {
-            let _ = self
-                .service
-                .store_mut()
-                .invalidate_snapshot_facade(&handoff.activation);
-            return Err(FacadeError::context(
-                "validate Worktree monitor handoff",
-                error,
-            ));
-        }
-        let activation = handoff.activation.clone();
-        let snapshot_uuid = handoff.snapshot_uuid;
-        self.views.insert(
-            watch_id,
-            ActiveView {
-                authorization_id,
-                activation: handoff.activation,
-                monitor: handoff.monitor,
-                precision: None,
-            },
-        );
-        self.check_continuity_or_invalidate(watch_id, "final Worktree seed view check")?;
-        let metadata = self
-            .service
-            .store()
-            .metadata()
-            .map_err(|error| FacadeError::context("load seed clock metadata", error))?;
-        Ok(encode_clock(
-            &ClockClaims {
-                format_version: metadata.clock_format_version,
-                store_uuid: metadata.store_uuid,
-                watch_id,
-                clock_epoch: activation.clock_epoch,
-                cut_sequence: 0,
-                owner_grant_id: authorization_id,
-                monitor_session_id: activation.monitor_session_id,
-                boundary_kind: BoundaryKind::ProvedWorktreeSeed,
-                algorithm_version: ALGORITHM_VERSION,
-                target_snapshot_uuid: snapshot_uuid,
-            },
-            &metadata.clock_hmac_key,
-        ))
-    }
-
-    #[cfg(any())]
-    fn legacy_has_proved_worktree_handoff(&self, watch_id: [u8; 16]) -> bool {
-        self.service.has_worktree_view_handoff(watch_id)
-    }
-
     pub fn query(
         &mut self,
         watch_id: [u8; 16],
@@ -647,9 +574,9 @@ impl FacadeService {
         }
         let old_sequence = i64::try_from(old.cut_sequence)
             .map_err(|_| FacadeError::new("old clock sequence overflow"))?;
-        // The exact old snapshot may have been compacted. A retained older
-        // boundary is still safe: one direct retained-to-head comparison can
-        // only over-report paths, and the response advances the client.
+        // FIXME: Substituting an older retained boundary can omit names present
+        // only in the client's exact baseline. Require the exact sequence and
+        // snapshot UUID or return fresh, as described in FIXES.md.
         let retained: Option<(i64, Vec<u8>)> = self
             .service
             .store()

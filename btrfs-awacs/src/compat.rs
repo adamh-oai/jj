@@ -30,7 +30,6 @@ pub struct ClockClaims {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BoundaryKind {
     Cut,
-    ProvedWorktreeSeed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,20 +68,20 @@ pub fn decode_clock(token: &str, key: &[u8; 32]) -> Result<ClockClaims, CompatEr
     decode_claims(payload)
 }
 
-/// Converts canonical semantic events into the endpoint path changes exposed
-/// through Watchman and the Git hook adapter. Directory dirty witnesses are
-/// retained internally as ordering evidence, but do not affect a VCS query:
-/// once a client's clock names its exact baseline, endpoint-equal transient
-/// namespace activity has no observable VCS effect.
+/// Converts canonical semantic events into endpoint path changes exposed
+/// through Watchman and the Git hook adapter.
+///
+/// FIXME: Dropping directory witnesses is unsafe when a client observed a
+/// transient path after receiving its previous clock. Preserve those witnesses
+/// through consumer-specific projection as described in FIXES.md.
 pub fn project_events(events: &[Event]) -> Projection {
     let mut paths = BTreeSet::new();
     let mut fresh = false;
     for event in events {
         match event.kind {
             EventKind::DirectoryDirtyWitness => {
-                // The endpoint path events already describe any surviving
-                // namespace change. A dirty witness only proves that some
-                // transient mutation happened between cuts.
+                // FIXME: This witness can identify a transient mutation still
+                // present in a client's cached state; see FIXES.md.
             }
             EventKind::SubtreeMoved => {
                 // A directory rename changes descendant paths without
@@ -342,7 +341,6 @@ fn encode_claims(claims: &ClockClaims) -> Vec<u8> {
     output.extend_from_slice(&claims.monitor_session_id);
     output.push(match claims.boundary_kind {
         BoundaryKind::Cut => 0,
-        BoundaryKind::ProvedWorktreeSeed => 1,
     });
     output.extend_from_slice(&claims.algorithm_version.to_be_bytes());
     output.extend_from_slice(&claims.target_snapshot_uuid);
@@ -369,7 +367,6 @@ fn decode_claims(payload: &[u8]) -> Result<ClockClaims, CompatError> {
     let monitor_session_id = take(16).try_into().expect("fixed field");
     let boundary_kind = match take(1)[0] {
         0 => BoundaryKind::Cut,
-        1 => BoundaryKind::ProvedWorktreeSeed,
         _ => return Err(CompatError::new("unknown clock boundary kind")),
     };
     let algorithm_version = u32::from_be_bytes(take(4).try_into().expect("fixed field"));

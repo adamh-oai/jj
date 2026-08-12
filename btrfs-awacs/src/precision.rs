@@ -254,9 +254,9 @@ impl PrecisionGuard {
                         if ignored_client_metadata(&path) {
                             // Git and JJ mutate their metadata while they are
                             // consuming fsmonitor results. Watching those
-                            // paths makes the trigger scheduler wake itself
-                            // and race the foreground query even though both
-                            // client projections exclude them.
+                            // paths would create self-generated precision
+                            // events even though both client projections
+                            // exclude them.
                             offset = end;
                             continue;
                         }

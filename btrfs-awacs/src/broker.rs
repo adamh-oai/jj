@@ -34,7 +34,6 @@ pub enum Opcode {
     CreateSnapshot = 3,
     ChangedObjects = 4,
     DeleteSnapshot = 5,
-    PublishWorktree = 6,
     ReconcileReceipt = 7,
     FullIndex = 8,
     TargetObjectLookup = 9,
@@ -48,7 +47,6 @@ impl Opcode {
             3 => Ok(Self::CreateSnapshot),
             4 => Ok(Self::ChangedObjects),
             5 => Ok(Self::DeleteSnapshot),
-            6 => Ok(Self::PublishWorktree),
             7 => Ok(Self::ReconcileReceipt),
             8 => Ok(Self::FullIndex),
             9 => Ok(Self::TargetObjectLookup),
@@ -244,59 +242,6 @@ pub struct SnapshotDeleteResult {
     pub result_hash: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExpectedReservation {
-    pub name: Vec<u8>,
-    pub device: u64,
-    pub inode: u64,
-    pub owner_uid: u32,
-    pub nonce: [u8; 32],
-}
-
-impl ExpectedReservation {
-    pub fn from_observed(
-        destination_parent: BorrowedFd<'_>,
-        name: &[u8],
-        owner_uid: u32,
-        nonce: [u8; 32],
-    ) -> Result<Self, BrokerError> {
-        let fd = open_file_at(destination_parent, name)?
-            .ok_or_else(|| BrokerError::new("worktree reservation is missing"))?;
-        let metadata = verify_reservation_file(fd.as_fd(), owner_uid, nonce)?;
-        Ok(Self {
-            name: name.to_vec(),
-            device: metadata.st_dev,
-            inode: metadata.st_ino,
-            owner_uid,
-            nonce,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorktreeRenameExecution {
-    pub receipt: ReceiptRequest,
-    pub worktree: ExpectedSubvolume,
-    pub staging_parent: ExpectedManagedDirectory,
-    pub staging_name: Vec<u8>,
-    pub destination_parent: ExpectedManagedDirectory,
-    /// Immutable policy anchor supplied as a separate fd. The broker resolves
-    /// this relative parent itself with openat2(RESOLVE_BENEATH), so a
-    /// compromised manager cannot escape the authorized destination root.
-    pub destination_root: ExpectedSubvolume,
-    pub destination_root_directory: ExpectedManagedDirectory,
-    pub destination_relative_parent: Vec<u8>,
-    pub destination_name: Vec<u8>,
-    pub reservation: ExpectedReservation,
-    pub authorization_hash: [u8; 32],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorktreeRenameResult {
-    pub worktree_subvolume_uuid: [u8; 16],
-    pub result_hash: [u8; 32],
-}
-
 pub fn snapshot_target_locator_hash(directory: &ExpectedManagedDirectory, name: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"btrfs-awacs-snapshot-locator-v1\0");
@@ -335,41 +280,6 @@ pub fn snapshot_delete_effect_hash(execution: &SnapshotDeleteExecution) -> [u8; 
     hash.update((execution.destination_name.len() as u64).to_be_bytes());
     hash.update(&execution.destination_name);
     hash.finalize().into()
-}
-
-#[cfg(any())]
-pub fn worktree_rename_effect_hash(execution: &WorktreeRenameExecution) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"btrfs-awacs-worktree-rename-v1\0");
-    hash_expected_subvolume(&mut hash, &execution.worktree);
-    hash_directory(&mut hash, &execution.staging_parent);
-    hash.update((execution.staging_name.len() as u64).to_be_bytes());
-    hash.update(&execution.staging_name);
-    hash_directory(&mut hash, &execution.destination_parent);
-    hash_expected_subvolume(&mut hash, &execution.destination_root);
-    hash_directory(&mut hash, &execution.destination_root_directory);
-    hash.update((execution.destination_relative_parent.len() as u64).to_be_bytes());
-    hash.update(&execution.destination_relative_parent);
-    hash.update((execution.destination_name.len() as u64).to_be_bytes());
-    hash.update(&execution.destination_name);
-    hash.update((execution.reservation.name.len() as u64).to_be_bytes());
-    hash.update(&execution.reservation.name);
-    hash.update(execution.reservation.device.to_be_bytes());
-    hash.update(execution.reservation.inode.to_be_bytes());
-    hash.update(execution.reservation.owner_uid.to_be_bytes());
-    hash.update(execution.reservation.nonce);
-    hash.update(execution.authorization_hash);
-    hash.finalize().into()
-}
-
-#[cfg(any())]
-fn hash_directory(hash: &mut Sha256, directory: &ExpectedManagedDirectory) {
-    hash.update(directory.filesystem_uuid);
-    hash.update(directory.device.to_be_bytes());
-    hash.update(directory.inode.to_be_bytes());
-    hash.update(directory.owner_uid.to_be_bytes());
-    hash.update(directory.mode.to_be_bytes());
-    hash.update(directory.security_context_hash);
 }
 
 pub fn execute_snapshot_create(
@@ -671,100 +581,6 @@ fn inspect_snapshot_at(
             "open snapshot target beneath manager directory: {error}"
         )))
     }
-}
-
-fn open_file_at(parent: BorrowedFd<'_>, name: &[u8]) -> Result<Option<OwnedFd>, BrokerError> {
-    validate_child_name(name)?;
-    let name = CString::new(name).map_err(|_| BrokerError::new("child name contains NUL"))?;
-    // SAFETY: parent and the NUL-terminated name stay live for openat; a
-    // successful descriptor is transferred exactly once into OwnedFd.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd >= 0 {
-        // SAFETY: openat returned a new owned descriptor.
-        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ENOENT) {
-        Ok(None)
-    } else {
-        Err(BrokerError::new(format!(
-            "open child beneath destination directory: {error}"
-        )))
-    }
-}
-
-fn verify_reservation_file(
-    fd: BorrowedFd<'_>,
-    owner_uid: u32,
-    nonce: [u8; 32],
-) -> Result<libc::stat, BrokerError> {
-    let metadata = fd_metadata(fd)?;
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
-        || metadata.st_mode & 0o7777 != 0o600
-        || metadata.st_nlink != 1
-        || metadata.st_uid != owner_uid
-        || metadata.st_size != nonce.len() as i64
-    {
-        return Err(BrokerError::new(
-            "worktree reservation must be one owner-only regular file containing its nonce",
-        ));
-    }
-    let mut observed = [0_u8; 32];
-    // SAFETY: pread writes exactly at most the live output array length.
-    let read = unsafe {
-        libc::pread(
-            fd.as_raw_fd(),
-            observed.as_mut_ptr().cast(),
-            observed.len(),
-            0,
-        )
-    };
-    if read != observed.len() as isize || observed != nonce {
-        return Err(BrokerError::new(
-            "worktree reservation nonce does not match its operation",
-        ));
-    }
-    Ok(metadata)
-}
-
-#[cfg(any())]
-fn verify_reservation(
-    parent: BorrowedFd<'_>,
-    expected: &ExpectedReservation,
-) -> Result<bool, BrokerError> {
-    let Some(fd) = open_file_at(parent, &expected.name)? else {
-        return Ok(false);
-    };
-    let metadata = verify_reservation_file(fd.as_fd(), expected.owner_uid, expected.nonce)?;
-    if metadata.st_dev != expected.device || metadata.st_ino != expected.inode {
-        return Err(BrokerError::new(
-            "worktree reservation inode no longer matches the admitted capability",
-        ));
-    }
-    Ok(true)
-}
-
-#[cfg(any())]
-fn remove_reservation(
-    parent: BorrowedFd<'_>,
-    expected: &ExpectedReservation,
-) -> Result<(), BrokerError> {
-    if !verify_reservation(parent, expected)? {
-        return Ok(());
-    }
-    let name = CString::new(expected.name.as_slice())
-        .map_err(|_| BrokerError::new("reservation name contains NUL"))?;
-    // SAFETY: parent and name remain live; flags zero removes a non-directory.
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        return Err(BrokerError::io("remove worktree reservation"));
-    }
-    Ok(())
 }
 
 fn validate_child_name(name: &[u8]) -> Result<(), BrokerError> {
@@ -1087,475 +903,6 @@ fn verify_completed_delete_receipt(
     {
         return Err(BrokerError::new(
             "completed deletion receipt does not match the expected result",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any())]
-pub fn execute_worktree_rename(
-    gate: &SessionGate,
-    journal: &mut BrokerJournal,
-    execution: &WorktreeRenameExecution,
-    staging_parent_fd: BorrowedFd<'_>,
-    destination_root_fd: BorrowedFd<'_>,
-) -> Result<WorktreeRenameResult, BrokerError> {
-    gate.authorize(
-        execution.receipt.manager_store_uuid,
-        execution.receipt.manager_session_id,
-    )?;
-    validate_worktree_rename_request(execution)?;
-    verify_managed_directory(staging_parent_fd, &execution.staging_parent)?;
-    verify_subvolume_stable_identity(destination_root_fd, &execution.destination_root)?;
-    if ExpectedManagedDirectory::from_observed(destination_root_fd)?
-        != execution.destination_root_directory
-    {
-        return Err(BrokerError::new(
-            "Worktree destination policy-root security context changed",
-        ));
-    }
-    reject_idmapped_mount(destination_root_fd)?;
-    let destination_parent =
-        open_directory_beneath(destination_root_fd, &execution.destination_relative_parent)?;
-    let destination_parent_fd = destination_parent.as_fd();
-    verify_managed_directory(destination_parent_fd, &execution.destination_parent)?;
-
-    match journal.begin_receipt(&execution.receipt)? {
-        BeginReceipt::Existing(receipt) => match receipt.state {
-            ReceiptState::Completed => {
-                verify_published_worktree(execution, staging_parent_fd, destination_parent_fd)?;
-                if verify_reservation(destination_parent_fd, &execution.reservation)? {
-                    return Err(BrokerError::new(
-                        "completed worktree receipt still has its reservation",
-                    ));
-                }
-                let result = worktree_rename_result(execution);
-                verify_completed_worktree_receipt(&receipt, &result)?;
-                gate.authorize(
-                    execution.receipt.manager_store_uuid,
-                    execution.receipt.manager_session_id,
-                )?;
-                return Ok(result);
-            }
-            ReceiptState::Running => {
-                return Err(BrokerError::new(
-                    "worktree publication for this operation fence is already running",
-                ));
-            }
-            ReceiptState::NeedsReconcile => {
-                return reconcile_worktree_rename(
-                    gate,
-                    journal,
-                    execution,
-                    receipt.id,
-                    staging_parent_fd,
-                    destination_parent_fd,
-                );
-            }
-            ReceiptState::FailedBeforeEffect => {
-                return Err(BrokerError::new(
-                    "worktree publication previously failed before taking effect",
-                ));
-            }
-        },
-        BeginReceipt::Started(_) => {}
-    }
-
-    let preflight = (|| -> Result<(), BrokerError> {
-        match observe_snapshot_at(staging_parent_fd, &execution.staging_name)? {
-            Some(observed) if observed == execution.worktree => {}
-            Some(_) => {
-                return Err(BrokerError::new(
-                    "staged worktree does not match the receipt identity",
-                ));
-            }
-            None => return Err(BrokerError::new("staged worktree is missing")),
-        }
-        if observe_snapshot_at(destination_parent_fd, &execution.destination_name)?.is_some() {
-            return Err(BrokerError::new("worktree destination already exists"));
-        }
-        if !verify_reservation(destination_parent_fd, &execution.reservation)? {
-            return Err(BrokerError::new("worktree reservation is missing"));
-        }
-        Ok(())
-    })();
-    if let Err(error) = preflight {
-        journal.fail_before_effect(
-            execution.receipt.id,
-            execution.receipt.manager_session_id,
-            execution.receipt.request_hash(),
-            current_unix_time_ns()?,
-        )?;
-        return Err(error);
-    }
-
-    let rename_error = rename_noreplace(
-        staging_parent_fd,
-        &execution.staging_name,
-        destination_parent_fd,
-        &execution.destination_name,
-    )
-    .err();
-    let staging = observe_snapshot_at(staging_parent_fd, &execution.staging_name);
-    let destination = observe_snapshot_at(destination_parent_fd, &execution.destination_name);
-    match (staging, destination) {
-        (Ok(None), Ok(Some(observed))) if observed == execution.worktree => {
-            if let Err(error) = remove_reservation(destination_parent_fd, &execution.reservation) {
-                journal.mark_needs_reconcile(
-                    execution.receipt.id,
-                    execution.receipt.manager_session_id,
-                    execution.receipt.request_hash(),
-                )?;
-                return Err(BrokerError::new(format!(
-                    "published worktree reservation requires reconciliation: {error}"
-                )));
-            }
-            sync_filesystem(destination_parent_fd)?;
-            let result = worktree_rename_result(execution);
-            let receipt = journal.complete_receipt(
-                execution.receipt.id,
-                execution.receipt.manager_session_id,
-                execution.receipt.request_hash(),
-                execution.worktree.subvolume_uuid,
-                result.result_hash,
-                current_unix_time_ns()?,
-            )?;
-            verify_completed_worktree_receipt(&receipt, &result)?;
-            gate.authorize(
-                execution.receipt.manager_store_uuid,
-                execution.receipt.manager_session_id,
-            )?;
-            Ok(result)
-        }
-        (Ok(Some(staged)), Ok(None)) if staged == execution.worktree && rename_error.is_some() => {
-            journal.fail_before_effect(
-                execution.receipt.id,
-                execution.receipt.manager_session_id,
-                execution.receipt.request_hash(),
-                current_unix_time_ns()?,
-            )?;
-            Err(BrokerError::new(format!(
-                "worktree rename failed before taking effect: {}",
-                rename_error.expect("matched error")
-            )))
-        }
-        (staging, destination) => {
-            journal.mark_needs_reconcile(
-                execution.receipt.id,
-                execution.receipt.manager_session_id,
-                execution.receipt.request_hash(),
-            )?;
-            Err(BrokerError::new(format!(
-                "worktree rename requires reconciliation: staging={staging:?}, destination={destination:?}"
-            )))
-        }
-    }
-}
-
-#[cfg(any())]
-fn reconcile_worktree_rename(
-    gate: &SessionGate,
-    journal: &mut BrokerJournal,
-    execution: &WorktreeRenameExecution,
-    receipt_id: [u8; 16],
-    staging_parent_fd: BorrowedFd<'_>,
-    destination_parent_fd: BorrowedFd<'_>,
-) -> Result<WorktreeRenameResult, BrokerError> {
-    let staging = observe_snapshot_at(staging_parent_fd, &execution.staging_name)?;
-    let destination = observe_snapshot_at(destination_parent_fd, &execution.destination_name)?;
-    match (staging, destination) {
-        (None, Some(observed)) if observed == execution.worktree => {
-            remove_reservation(destination_parent_fd, &execution.reservation)?;
-            sync_filesystem(destination_parent_fd)?;
-            let result = worktree_rename_result(execution);
-            let receipt = journal.reconcile_completed(
-                receipt_id,
-                execution.receipt.request_hash(),
-                execution.worktree.subvolume_uuid,
-                result.result_hash,
-                current_unix_time_ns()?,
-            )?;
-            verify_completed_worktree_receipt(&receipt, &result)?;
-            gate.authorize(
-                execution.receipt.manager_store_uuid,
-                execution.receipt.manager_session_id,
-            )?;
-            Ok(result)
-        }
-        (Some(staged), None) if staged == execution.worktree => {
-            journal.reconcile_failed_before_effect(
-                receipt_id,
-                execution.receipt.request_hash(),
-                current_unix_time_ns()?,
-            )?;
-            Err(BrokerError::new(
-                "reconciled worktree publication did not take effect",
-            ))
-        }
-        _ => Err(BrokerError::new(
-            "worktree publication state is ambiguous and cannot be reconciled",
-        )),
-    }
-}
-
-#[cfg(any())]
-fn validate_worktree_rename_request(
-    execution: &WorktreeRenameExecution,
-) -> Result<(), BrokerError> {
-    validate_child_name(&execution.staging_name)?;
-    validate_child_name(&execution.destination_name)?;
-    validate_child_name(&execution.reservation.name)?;
-    if execution.destination_name == execution.reservation.name {
-        return Err(BrokerError::new(
-            "worktree destination and reservation names must differ",
-        ));
-    }
-    if execution.receipt.effect_kind != EffectKind::WorktreeRename {
-        return Err(BrokerError::new(
-            "worktree executor received the wrong receipt kind",
-        ));
-    }
-    if execution.worktree.readonly {
-        return Err(BrokerError::new(
-            "published worktree snapshot must be writable",
-        ));
-    }
-    if execution.worktree.filesystem_uuid != execution.staging_parent.filesystem_uuid
-        || execution.worktree.filesystem_uuid != execution.destination_parent.filesystem_uuid
-        || execution.worktree.filesystem_uuid != execution.destination_root.filesystem_uuid
-        || execution.receipt.filesystem_uuid != execution.worktree.filesystem_uuid
-    {
-        return Err(BrokerError::new(
-            "worktree, staging, destination, and receipt must name one filesystem",
-        ));
-    }
-    if execution.destination_relative_parent.len() > libc::PATH_MAX as usize {
-        return Err(BrokerError::new(
-            "Worktree relative destination path exceeds PATH_MAX",
-        ));
-    }
-    let locator =
-        snapshot_target_locator_hash(&execution.destination_parent, &execution.destination_name);
-    if execution.receipt.target_locator_hash != locator
-        || execution.receipt.effect_arguments_hash != worktree_rename_effect_hash(execution)
-    {
-        return Err(BrokerError::new(
-            "worktree receipt hashes do not bind the supplied effect arguments",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any())]
-fn verify_published_worktree(
-    execution: &WorktreeRenameExecution,
-    staging_parent_fd: BorrowedFd<'_>,
-    destination_parent_fd: BorrowedFd<'_>,
-) -> Result<(), BrokerError> {
-    if observe_snapshot_at(staging_parent_fd, &execution.staging_name)?.is_some() {
-        return Err(BrokerError::new(
-            "completed worktree remains at its staging path",
-        ));
-    }
-    if observe_snapshot_at(destination_parent_fd, &execution.destination_name)?
-        != Some(execution.worktree.clone())
-    {
-        return Err(BrokerError::new(
-            "published worktree does not match its destination identity",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any())]
-fn rename_noreplace(
-    source_parent: BorrowedFd<'_>,
-    source_name: &[u8],
-    destination_parent: BorrowedFd<'_>,
-    destination_name: &[u8],
-) -> Result<(), BrokerError> {
-    let source = CString::new(source_name)
-        .map_err(|_| BrokerError::new("worktree staging name contains NUL"))?;
-    let destination = CString::new(destination_name)
-        .map_err(|_| BrokerError::new("worktree destination name contains NUL"))?;
-    // SAFETY: both directory fds and NUL-terminated names remain live for the
-    // syscall; RENAME_NOREPLACE makes destination publication atomic.
-    if unsafe {
-        libc::renameat2(
-            source_parent.as_raw_fd(),
-            source.as_ptr(),
-            destination_parent.as_raw_fd(),
-            destination.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    } != 0
-    {
-        return Err(BrokerError::io("publish worktree with renameat2"));
-    }
-    Ok(())
-}
-
-#[repr(C)]
-#[cfg(any())]
-struct OpenHow {
-    flags: u64,
-    mode: u64,
-    resolve: u64,
-}
-
-#[repr(C)]
-#[cfg(any())]
-struct MountIdRequest {
-    size: u32,
-    spare: u32,
-    mount_id: u64,
-    parameters: u64,
-}
-
-#[repr(C)]
-#[cfg(any())]
-struct StatMountBasic {
-    size: u32,
-    spare: u32,
-    mask: u64,
-    sb_dev_major: u32,
-    sb_dev_minor: u32,
-    sb_magic: u64,
-    sb_flags: u32,
-    fs_type: u32,
-    mount_id: u64,
-    parent_mount_id: u64,
-    old_mount_id: u32,
-    old_parent_mount_id: u32,
-    mount_attributes: u64,
-    mount_propagation: u64,
-    mount_peer_group: u64,
-    mount_master: u64,
-    propagate_from: u64,
-    mount_root: u32,
-    mount_point: u32,
-}
-
-#[cfg(any())]
-fn reject_idmapped_mount(fd: BorrowedFd<'_>) -> Result<(), BrokerError> {
-    // Request the non-recycled mount ID needed by statmount(2).
-    // SAFETY: statx is zeroed and all pointer/size arguments are valid.
-    let mut statx: libc::statx = unsafe { zeroed() };
-    let empty = c"";
-    let status = unsafe {
-        libc::statx(
-            fd.as_raw_fd(),
-            empty.as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_STATX_SYNC_AS_STAT,
-            0x4000, // STATX_MNT_ID_UNIQUE
-            &mut statx,
-        )
-    };
-    if status != 0 || statx.stx_mask & 0x4000 == 0 {
-        return Err(BrokerError::new(
-            "kernel cannot prove the Worktree policy root mount identity",
-        ));
-    }
-    let request = MountIdRequest {
-        size: size_of::<MountIdRequest>() as u32,
-        spare: 0,
-        mount_id: statx.stx_mnt_id,
-        parameters: 0x0000_0002, // STATMOUNT_MNT_BASIC
-    };
-    // The fixed prefix through mount_attributes is sufficient for this check.
-    // SAFETY: output is writable and both sizes match the C ABI definitions.
-    let mut output: StatMountBasic = unsafe { zeroed() };
-    let result = unsafe {
-        libc::syscall(
-            i64::from(linux_raw_sys::general::__NR_statmount),
-            &request,
-            &mut output,
-            size_of::<StatMountBasic>(),
-            0,
-        )
-    };
-    if result != 0 || output.mask & 0x0000_0002 == 0 {
-        return Err(BrokerError::io("inspect Worktree mount attributes"));
-    }
-    if output.mount_attributes & 0x0010_0000 != 0 {
-        return Err(BrokerError::new(
-            "idmapped Worktree destinations are not supported by v1 policy",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any())]
-fn open_directory_beneath(root: BorrowedFd<'_>, relative: &[u8]) -> Result<OwnedFd, BrokerError> {
-    if relative.is_empty() {
-        // SAFETY: fcntl duplicates the live descriptor and returns new ownership.
-        let fd = unsafe { libc::fcntl(root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
-        if fd < 0 {
-            return Err(BrokerError::io("duplicate Worktree policy root"));
-        }
-        // SAFETY: fd is the new descriptor returned above.
-        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
-    }
-    if relative.starts_with(b"/")
-        || relative
-            .split(|byte| *byte == b'/')
-            .any(|component| component.is_empty() || component == b"." || component == b"..")
-    {
-        return Err(BrokerError::new(
-            "Worktree destination relative path is not normalized",
-        ));
-    }
-    let path = CString::new(relative)
-        .map_err(|_| BrokerError::new("Worktree relative path contains NUL"))?;
-    let how = OpenHow {
-        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
-        mode: 0,
-        // RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS |
-        // RESOLVE_BENEATH. Destination policies do not cross mounts or links.
-        resolve: 0x01 | 0x02 | 0x04 | 0x08,
-    };
-    // SAFETY: root, path, and open_how remain valid for this syscall.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            path.as_ptr(),
-            &how,
-            size_of::<OpenHow>(),
-        ) as i32
-    };
-    if fd < 0 {
-        return Err(BrokerError::io(
-            "resolve Worktree destination beneath policy root",
-        ));
-    }
-    // SAFETY: fd is the new descriptor returned by openat2.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-#[cfg(any())]
-fn worktree_rename_result(execution: &WorktreeRenameExecution) -> WorktreeRenameResult {
-    let mut hash = Sha256::new();
-    hash.update(b"btrfs-awacs-worktree-published-v1\0");
-    hash.update(execution.receipt.target_locator_hash);
-    hash.update(execution.worktree.subvolume_uuid);
-    WorktreeRenameResult {
-        worktree_subvolume_uuid: execution.worktree.subvolume_uuid,
-        result_hash: hash.finalize().into(),
-    }
-}
-
-#[cfg(any())]
-fn verify_completed_worktree_receipt(
-    receipt: &Receipt,
-    result: &WorktreeRenameResult,
-) -> Result<(), BrokerError> {
-    if receipt.state != ReceiptState::Completed
-        || receipt.target_subvol_uuid != Some(result.worktree_subvolume_uuid)
-        || receipt.result_hash != Some(result.result_hash)
-    {
-        return Err(BrokerError::new(
-            "completed worktree receipt does not match the published result",
         ));
     }
     Ok(())
@@ -2196,7 +1543,6 @@ fn decode_header(header: &[u8]) -> Result<(Opcode, usize, usize), BrokerError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EffectKind {
     SnapshotCreate,
-    WorktreeRename,
     SnapshotDelete,
 }
 
@@ -2204,7 +1550,6 @@ impl EffectKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::SnapshotCreate => "snapshot-create",
-            Self::WorktreeRename => "worktree-rename",
             Self::SnapshotDelete => "snapshot-delete",
         }
     }
@@ -2212,7 +1557,6 @@ impl EffectKind {
     fn parse(value: &str) -> Result<Self, BrokerError> {
         match value {
             "snapshot-create" => Ok(Self::SnapshotCreate),
-            "worktree-rename" => Ok(Self::WorktreeRename),
             "snapshot-delete" => Ok(Self::SnapshotDelete),
             _ => Err(BrokerError::new(format!(
                 "unknown broker effect kind {value:?}"
@@ -2330,10 +1674,8 @@ impl BrokerJournal {
         opcode: Opcode,
         payload: &[u8],
     ) -> Result<(), BrokerError> {
-        if !matches!(
-            opcode,
-            Opcode::CreateSnapshot | Opcode::DeleteSnapshot | Opcode::PublishWorktree
-        ) || payload.len() > MAX_FRAME_PAYLOAD
+        if !matches!(opcode, Opcode::CreateSnapshot | Opcode::DeleteSnapshot)
+            || payload.len() > MAX_FRAME_PAYLOAD
         {
             return Err(BrokerError::new("invalid effect request payload"));
         }
@@ -3074,52 +2416,6 @@ mod tests {
         execution
     }
 
-    #[cfg(any())]
-    fn worktree_execution(session_id: [u8; 16]) -> WorktreeRenameExecution {
-        let created = snapshot_execution(session_id);
-        let receipt = ReceiptRequest {
-            id: [31; 16],
-            manager_store_uuid: created.receipt.manager_store_uuid,
-            manager_session_id: session_id,
-            operation_id: [32; 16],
-            operation_fence: 6,
-            effect_kind: EffectKind::WorktreeRename,
-            filesystem_uuid: created.receipt.filesystem_uuid,
-            target_locator_hash: [0; 32],
-            effect_arguments_hash: [0; 32],
-            boot_id: [33; 16],
-            started_ns: 700,
-        };
-        let mut execution = WorktreeRenameExecution {
-            receipt,
-            worktree: created.source.clone(),
-            staging_parent: created.destination_parent.clone(),
-            staging_name: b"staged-worktree".to_vec(),
-            destination_parent: ExpectedManagedDirectory {
-                inode: 30,
-                ..created.destination_parent.clone()
-            },
-            destination_root: created.source,
-            destination_root_directory: created.destination_parent.clone(),
-            destination_relative_parent: Vec::new(),
-            destination_name: b"published-worktree".to_vec(),
-            reservation: ExpectedReservation {
-                name: b"reservation".to_vec(),
-                device: 20,
-                inode: 31,
-                owner_uid: unsafe { libc::geteuid() },
-                nonce: [34; 32],
-            },
-            authorization_hash: [35; 32],
-        };
-        execution.receipt.target_locator_hash = snapshot_target_locator_hash(
-            &execution.destination_parent,
-            &execution.destination_name,
-        );
-        execution.receipt.effect_arguments_hash = worktree_rename_effect_hash(&execution);
-        execution
-    }
-
     #[test]
     fn seqpacket_round_trips_one_bounded_frame_and_rights() {
         let (left, right) = SeqPacket::pair().unwrap();
@@ -3318,60 +2614,6 @@ mod tests {
         assert!(journal.unresolved_receipts(store).unwrap().is_empty());
     }
 
-    #[cfg(any())]
-    #[test]
-    fn reservation_observation_requires_exact_private_inode_and_nonce() {
-        let temp = tempdir().unwrap();
-        let directory = File::open(temp.path()).unwrap();
-        let path = temp.path().join("reservation");
-        let nonce = [7_u8; 32];
-        fs::write(&path, nonce).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let expected = ExpectedReservation::from_observed(
-            directory.as_fd(),
-            b"reservation",
-            unsafe { libc::geteuid() },
-            nonce,
-        )
-        .unwrap();
-        assert!(verify_reservation(directory.as_fd(), &expected).unwrap());
-
-        fs::write(&path, [8_u8; 32]).unwrap();
-        assert!(verify_reservation(directory.as_fd(), &expected).is_err());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn worktree_receipt_binds_both_directories_names_and_reservation() {
-        let execution = worktree_execution([1; 16]);
-        let original = execution.receipt.effect_arguments_hash;
-        let mut renamed = execution.clone();
-        renamed.destination_name = b"other".to_vec();
-        assert_ne!(worktree_rename_effect_hash(&renamed), original);
-
-        let mut another_nonce = execution;
-        another_nonce.reservation.nonce = [99; 32];
-        assert_ne!(worktree_rename_effect_hash(&another_nonce), original);
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn worktree_executor_rejects_unbound_arguments_before_receipt() {
-        let gate = SessionGate::default();
-        let store = [12; 16];
-        let session = gate.handshake(store);
-        let mut execution = worktree_execution(session);
-        execution.destination_name = b"tampered".to_vec();
-        let (_temp, mut journal) = journal();
-        let null = File::open("/dev/null").unwrap();
-
-        let error =
-            execute_worktree_rename(&gate, &mut journal, &execution, null.as_fd(), null.as_fd())
-                .unwrap_err();
-        assert!(error.to_string().contains("do not bind"));
-        assert!(journal.unresolved_receipts(store).unwrap().is_empty());
-    }
-
     #[test]
     fn receipt_is_durable_before_effect_and_idempotent() {
         let (_temp, mut journal) = journal();
@@ -3512,21 +2754,5 @@ mod tests {
         worker.join().unwrap();
         assert!(gate.authorize(store, first).is_err());
         gate.authorize(store, second).unwrap();
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn worktree_parent_resolution_is_beneath_and_symlink_free() {
-        let temp = tempdir().unwrap();
-        fs::create_dir(temp.path().join("allowed")).unwrap();
-        std::os::unix::fs::symlink("/", temp.path().join("escape")).unwrap();
-        let root = File::open(temp.path()).unwrap();
-        let allowed = open_directory_beneath(root.as_fd(), b"allowed").unwrap();
-        assert_eq!(
-            fd_metadata(allowed.as_fd()).unwrap().st_ino,
-            fs::metadata(temp.path().join("allowed")).unwrap().ino()
-        );
-        assert!(open_directory_beneath(root.as_fd(), b"../").is_err());
-        assert!(open_directory_beneath(root.as_fd(), b"escape/tmp").is_err());
     }
 }

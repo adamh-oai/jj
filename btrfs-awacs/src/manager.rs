@@ -19,11 +19,10 @@ use uuid::Uuid;
 
 pub const PERMISSION_READ: u8 = 0x01;
 pub const PERMISSION_CUT: u8 = 0x02;
-pub const PERMISSION_WORKTREE: u8 = 0x04;
 pub const PERMISSION_TRIGGER: u8 = 0x08;
 pub const PERMISSION_RETAIN: u8 = 0x10;
 pub const PERMISSION_ADMIN: u8 = 0x20;
-pub const PERMISSION_MASK: u8 = 0x3f;
+pub const PERMISSION_MASK: u8 = 0x3b;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Permissions(u8);
@@ -247,65 +246,6 @@ pub struct SnapshotDeleteReservation {
     pub identity: SnapshotIdentity,
 }
 
-#[cfg(any())]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorktreePolicy {
-    pub policy_id: [u8; 16],
-    pub destination_fs_uuid: [u8; 16],
-    pub destination_root_subvol_uuid: [u8; 16],
-    pub destination_root_path: Vec<u8>,
-    pub destination_root_generation: u64,
-    pub metadata_policy: String,
-    pub allow_idmapped: bool,
-    pub policy_hash: [u8; 32],
-}
-
-#[cfg(any())]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorktreeRequest {
-    pub watch_id: [u8; 16],
-    pub authorization_id: [u8; 16],
-    pub policy: WorktreePolicy,
-    pub staged_path: Vec<u8>,
-    pub final_path: Vec<u8>,
-    pub destination_parent_subvol_uuid: [u8; 16],
-    pub destination_parent_ino: u64,
-    pub destination_parent_generation: u64,
-    pub destination_name: Vec<u8>,
-    pub reservation_name: Vec<u8>,
-    pub reservation_ino: u64,
-    pub reservation_generation: u64,
-    pub reservation_nonce: [u8; 32],
-    pub requester_uid: u32,
-    pub requester_gid: u32,
-    pub lease_owner: [u8; 16],
-    pub now_ns: i64,
-    pub lease_expires_ns: i64,
-}
-
-#[cfg(any())]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorktreeReservation {
-    pub operation_id: [u8; 16],
-    pub worktree_id: [u8; 16],
-    pub filesystem_id: i64,
-    pub seed_snapshot_id: i64,
-    pub seed_revision_id: i64,
-    pub seed_subvol_uuid: [u8; 16],
-    pub operation_fence: i64,
-    pub policy_hash: [u8; 32],
-}
-
-#[cfg(any())]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TrackedWorktree {
-    pub worktree_id: [u8; 16],
-    pub watch_id: [u8; 16],
-    pub grant_id: [u8; 16],
-    pub seed_revision_id: i64,
-    pub seed_snapshot_id: i64,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FacadeActivation {
     pub watch_id: [u8; 16],
@@ -330,13 +270,6 @@ pub enum MutationHint {
         generation: u64,
     },
     FullInvalidation,
-}
-
-#[cfg(any())]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProvedWorktreeSeed {
-    pub worktree_id: [u8; 16],
-    pub snapshot_uuid: [u8; 16],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,18 +308,6 @@ pub struct RecoveryReport {
     pub boot_changed: bool,
 }
 
-#[cfg(any())]
-struct WorktreeHead {
-    filesystem_id: i64,
-    revision_id: i64,
-    snapshot_id: i64,
-    indexed_seq: i64,
-    last_cut_seq: i64,
-    single_owner_uid: Option<Vec<u8>>,
-    privileged_metadata_count: i64,
-    subvol_uuid: Vec<u8>,
-}
-
 struct RevisionMetadata {
     summary_version: i64,
     owner_cardinality: i64,
@@ -408,22 +329,6 @@ struct PlannedCutAdmissionRow {
     operation_fence: i64,
     operation_id: Vec<u8>,
     cut_fence: i64,
-}
-
-#[cfg(any())]
-pub fn worktree_policy_hash(policy: &WorktreePolicy) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"btrfs-awacs-worktree-policy-v1\0");
-    hash.update(policy.policy_id);
-    hash.update(policy.destination_fs_uuid);
-    hash.update(policy.destination_root_subvol_uuid);
-    hash.update((policy.destination_root_path.len() as u64).to_be_bytes());
-    hash.update(&policy.destination_root_path);
-    hash.update(policy.destination_root_generation.to_be_bytes());
-    hash.update((policy.metadata_policy.len() as u64).to_be_bytes());
-    hash.update(policy.metadata_policy.as_bytes());
-    hash.update([u8::from(policy.allow_idmapped)]);
-    hash.finalize().into()
 }
 
 #[derive(Debug)]
@@ -510,7 +415,7 @@ impl Store {
         now_ns: i64,
     ) -> Result<Option<InitializedWatch>, ManagerError> {
         let adoption_started = std::time::Instant::now();
-        if !path_is_absolute(live_path) || permissions.contains(PERMISSION_WORKTREE) {
+        if !path_is_absolute(live_path) {
             return Err(ManagerError::new("invalid descendant adoption request"));
         }
         let watch_id = random_id();
@@ -659,13 +564,7 @@ impl Store {
             [],
         )?;
         transaction.execute(
-            "DELETE FROM worktrees WHERE operation_id IN (\
-                 SELECT id FROM operations WHERE kind = 'worktree' AND state = 'planned'\
-             ) AND state = 'creating'",
-            [],
-        )?;
-        transaction.execute(
-            "DELETE FROM operations WHERE kind IN ('cut', 'worktree') AND state = 'planned'",
+            "DELETE FROM operations WHERE kind = 'cut' AND state = 'planned'",
             [],
         )?;
         transaction.execute(
@@ -737,7 +636,7 @@ impl Store {
                 WHERE EXISTS (
                     SELECT 1 FROM operations o
                      WHERE o.filesystem_id = topology_leases.filesystem_id
-                       AND o.kind IN ('initialize', 'worktree')
+                       AND o.kind = 'initialize'
                        AND o.state NOT IN ('planned', 'done', 'failed')
                        AND o.lease_owner = topology_leases.lease_owner
                 )"#,
@@ -1308,16 +1207,8 @@ impl Store {
             params![watch_id.as_slice(), authorization_id.as_slice()],
         )?;
         transaction.execute(
-            r#"DELETE FROM worktrees WHERE operation_id IN (
-                    SELECT id FROM operations
-                     WHERE watch_id = ?1 AND authorization_id = ?2
-                       AND kind = 'worktree' AND state = 'planned')
-                  AND state = 'creating'"#,
-            params![watch_id.as_slice(), authorization_id.as_slice()],
-        )?;
-        transaction.execute(
             "DELETE FROM operations WHERE watch_id = ?1 AND authorization_id = ?2 \
-             AND kind IN ('cut', 'worktree') AND state = 'planned'",
+             AND kind = 'cut' AND state = 'planned'",
             params![watch_id.as_slice(), authorization_id.as_slice()],
         )?;
         let active_effects: i64 = transaction.query_row(
@@ -1758,9 +1649,9 @@ impl Store {
         transaction.execute(
             r#"INSERT INTO fsmonitor_boundaries(
                    watch_id, cut_sequence, target_snapshot_id, boundary_kind,
-                   cut_operation_id, seed_worktree_id, clock_epoch,
+                   cut_operation_id, clock_epoch,
                    guard_epoch, guard_sequence, guard_complete
-               ) VALUES (?1, ?2, ?3, 'cut', ?4, NULL, ?5, ?6, ?7, ?8)"#,
+               ) VALUES (?1, ?2, ?3, 'cut', ?4, ?5, ?6, ?7, ?8)"#,
             params![
                 activation.watch_id.as_slice(),
                 sequence,
@@ -1774,79 +1665,6 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
-    }
-
-    #[cfg(any())]
-    pub fn finalize_proved_worktree_seed(
-        &mut self,
-        activation: &FacadeActivation,
-        binding: &ViewBinding,
-    ) -> Result<ProvedWorktreeSeed, ManagerError> {
-        if activation.monitor_session_id != binding.monitor_session_id {
-            return Err(ManagerError::new(
-                "proved Worktree monitor session is stale",
-            ));
-        }
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(Vec<u8>, i64, Vec<u8>)> = transaction
-            .query_row(
-                r#"SELECT wt.id, r.snapshot_id, s.subvol_uuid
-                     FROM watches w
-                     JOIN watch_grants g ON g.watch_id = w.id
-                     JOIN worktrees wt ON wt.watch_id = w.id
-                     JOIN revisions r ON r.id = w.indexed_revision_id
-                     JOIN snapshots s ON s.id = r.snapshot_id
-                    WHERE w.id = ?1 AND w.state = 'active'
-                      AND w.indexed_seq = 0 AND w.last_cut_seq = 0
-                      AND w.last_cut_snapshot_id = r.snapshot_id
-                      AND w.fsmonitor_owner_grant_id = ?2
-                      AND w.clock_epoch = ?3
-                      AND w.view_monitor_session_id = ?4
-                      AND w.fsmonitor_root = ?5
-                      AND w.mount_ns_dev = ?6 AND w.mount_ns_ino = ?7
-                      AND w.view_root_dev = ?8 AND w.view_root_ino = ?9
-                      AND w.view_root_mnt_id = ?10
-                      AND g.id = ?2 AND g.state = 'active'
-                      AND wt.state = 'present' AND wt.seed_revision_id = r.id"#,
-                params![
-                    activation.watch_id.as_slice(),
-                    activation.authorization_id.as_slice(),
-                    activation.clock_epoch.as_slice(),
-                    activation.monitor_session_id.as_slice(),
-                    binding.root_path,
-                    encode_u64(binding.mount_ns_dev).as_slice(),
-                    encode_u64(binding.mount_ns_ino).as_slice(),
-                    encode_u64(binding.process_root_dev).as_slice(),
-                    encode_u64(binding.process_root_ino).as_slice(),
-                    encode_u64(binding.process_root_mnt_id).as_slice(),
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let (worktree_id, snapshot_id, snapshot_uuid) = row.ok_or_else(|| {
-            ManagerError::new("proved Worktree seed binding or authorization is stale")
-        })?;
-        transaction.execute(
-            r#"INSERT INTO fsmonitor_boundaries(
-                   watch_id, cut_sequence, target_snapshot_id, boundary_kind,
-                   cut_operation_id, seed_worktree_id, clock_epoch,
-                   guard_epoch, guard_sequence, guard_complete
-               ) VALUES (?1, 0, ?2, 'proved_worktree_seed', NULL, ?3, ?4,
-                         NULL, NULL, 0)"#,
-            params![
-                activation.watch_id.as_slice(),
-                snapshot_id,
-                worktree_id,
-                activation.clock_epoch.as_slice(),
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(ProvedWorktreeSeed {
-            worktree_id: fixed_manager_blob(&worktree_id, "Worktree ID")?,
-            snapshot_uuid: fixed_manager_blob(&snapshot_uuid, "seed snapshot UUID")?,
-        })
     }
 
     pub fn begin_query_lease(
@@ -2074,12 +1892,6 @@ impl Store {
                 "initialize lease must expire after admission",
             ));
         }
-        if request.permissions.contains(PERMISSION_WORKTREE) {
-            return Err(ManagerError::new(
-                "a WORKTREE grant requires an immutable destination policy",
-            ));
-        }
-
         let watch_id = random_id();
         let grant_id = random_id();
         let operation_id = random_id();
@@ -3906,9 +3718,6 @@ impl Store {
                               SELECT 1 FROM watches w
                                WHERE w.indexed_revision_id = r.id)
                           AND NOT EXISTS (
-                              SELECT 1 FROM worktrees wt
-                               WHERE wt.seed_revision_id = r.id)
-                          AND NOT EXISTS (
                               SELECT 1 FROM revisions child
                                WHERE child.storage_base_revision_id = r.id)
                           AND NOT EXISTS (
@@ -4011,11 +3820,11 @@ impl Store {
         Ok(reclaimed)
     }
 
-    /// Drops intermediate physical replay checkpoints while preserving enough
-    /// exponentially-spaced boundaries to answer every clock issued since the
-    /// oldest retained boundary. The adjacent watch-cut comparisons stay
-    /// intact: a client whose exact checkpoint was discarded is replayed from
-    /// the newest retained older boundary, which can only over-report paths.
+    /// Attempts to retain exponentially spaced physical replay checkpoints.
+    ///
+    /// FIXME: The cleanup currently conflicts with retained boundary foreign
+    /// keys, and an older checkpoint cannot safely replace a client's exact
+    /// baseline. Both retention issues are described in FIXES.md.
     pub fn retain_exponential_replay_checkpoints(
         &mut self,
         watch_id: [u8; 16],
@@ -4143,9 +3952,6 @@ impl Store {
                               SELECT 1 FROM watches w
                                WHERE w.indexed_revision_id = r.id)
                           AND NOT EXISTS (
-                              SELECT 1 FROM worktrees wt
-                               WHERE wt.seed_revision_id = r.id)
-                          AND NOT EXISTS (
                               SELECT 1 FROM revisions child
                                WHERE child.storage_base_revision_id = r.id)
                           AND NOT EXISTS (
@@ -4241,522 +4047,6 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
-    }
-
-    /// Trusted provisioning step which anchors a WORKTREE grant to one
-    /// immutable destination-root policy generation.
-    #[cfg(any())]
-    pub fn provision_worktree_policy(
-        &mut self,
-        watch_id: [u8; 16],
-        grant_id: [u8; 16],
-        policy: &WorktreePolicy,
-        now_ns: i64,
-    ) -> Result<(), ManagerError> {
-        if !matches!(
-            policy.metadata_policy.as_str(),
-            "sanitized-private-user-tree" | "admin-trusted-preserve"
-        ) || policy.allow_idmapped
-            || worktree_policy_hash(policy) != policy.policy_hash
-        {
-            return Err(ManagerError::new("invalid Worktree policy"));
-        }
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let filesystem_id: i64 = transaction
-            .query_row(
-                r#"SELECT w.filesystem_id
-                     FROM watches w JOIN watch_grants g ON g.watch_id = w.id
-                    WHERE w.id = ?1 AND w.state = 'active' AND g.id = ?2
-                      AND g.state = 'active'"#,
-                params![watch_id.as_slice(), grant_id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| ManagerError::new("Worktree grant is absent or revoked"))?;
-        if filesystem_uuid(&transaction, filesystem_id)? != policy.destination_fs_uuid {
-            return Err(ManagerError::new(
-                "Worktree destination must be on the watched Btrfs filesystem",
-            ));
-        }
-        require_one(
-            transaction.execute(
-                "UPDATE watch_grants SET permissions = permissions | ?3 \
-                 WHERE id = ?1 AND watch_id = ?2 AND state = 'active'",
-                params![
-                    grant_id.as_slice(),
-                    watch_id.as_slice(),
-                    PERMISSION_WORKTREE
-                ],
-            )?,
-            "add WORKTREE permission",
-        )?;
-        transaction.execute(
-            r#"INSERT INTO worktree_grant_policies(
-                   id, grant_id, destination_filesystem_id,
-                   destination_root_subvol_uuid, destination_root_path, destination_root_ino,
-                   destination_root_generation, metadata_policy, allow_idmapped,
-                   policy_hash, created_ns
-               ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"#,
-            params![
-                policy.policy_id.as_slice(),
-                grant_id.as_slice(),
-                filesystem_id,
-                policy.destination_root_subvol_uuid.as_slice(),
-                policy.destination_root_path,
-                encode_u64(crate::index::ROOT_INO).as_slice(),
-                encode_u64(policy.destination_root_generation).as_slice(),
-                policy.metadata_policy,
-                i64::from(policy.allow_idmapped),
-                policy.policy_hash.as_slice(),
-                now_ns,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    #[cfg(any())]
-    pub fn reserve_worktree(
-        &mut self,
-        request: &WorktreeRequest,
-    ) -> Result<WorktreeReservation, ManagerError> {
-        if request.lease_expires_ns <= request.now_ns
-            || !path_is_absolute(&request.staged_path)
-            || !path_is_absolute(&request.final_path)
-            || request.destination_name.is_empty()
-            || request.reservation_name.is_empty()
-            || worktree_policy_hash(&request.policy) != request.policy.policy_hash
-        {
-            return Err(ManagerError::new("invalid Worktree reservation request"));
-        }
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let policy_valid: Option<i64> = transaction
-            .query_row(
-                r#"SELECT 1
-                     FROM worktree_grant_policies p
-                     JOIN watch_grants g ON g.id = p.grant_id
-                     JOIN filesystems f ON f.id = p.destination_filesystem_id
-                    WHERE p.id = ?1 AND p.grant_id = ?2 AND g.watch_id = ?3
-                      AND g.state = 'active'
-                      AND (g.permissions & ?4) = ?4
-                      AND f.fs_uuid = ?5
-                      AND p.destination_root_subvol_uuid = ?6
-                      AND p.destination_root_path = ?7
-                      AND p.destination_root_generation = ?8
-                      AND p.metadata_policy = ?9 AND p.allow_idmapped = ?10
-                      AND p.policy_hash = ?11"#,
-                params![
-                    request.policy.policy_id.as_slice(),
-                    request.authorization_id.as_slice(),
-                    request.watch_id.as_slice(),
-                    i64::from(PERMISSION_READ | PERMISSION_CUT | PERMISSION_WORKTREE),
-                    request.policy.destination_fs_uuid.as_slice(),
-                    request.policy.destination_root_subvol_uuid.as_slice(),
-                    request.policy.destination_root_path,
-                    encode_u64(request.policy.destination_root_generation).as_slice(),
-                    request.policy.metadata_policy,
-                    i64::from(request.policy.allow_idmapped),
-                    request.policy.policy_hash.as_slice(),
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if policy_valid != Some(1) {
-            return Err(ManagerError::new(
-                "Worktree policy or authorization is stale",
-            ));
-        }
-        let head: WorktreeHead = transaction.query_row(
-            r#"SELECT w.filesystem_id, w.indexed_revision_id,
-                          w.last_cut_snapshot_id, w.indexed_seq, w.last_cut_seq,
-                          r.single_owner_uid, r.privileged_metadata_count,
-                          s.subvol_uuid
-                     FROM watches w
-                     JOIN revisions r ON r.id = w.indexed_revision_id
-                     JOIN snapshots s ON s.id = w.last_cut_snapshot_id
-                    WHERE w.id = ?1 AND w.state = 'active'
-                      AND r.state = 'ready' AND s.physical_state = 'present'"#,
-            [request.watch_id.as_slice()],
-            |row| {
-                Ok(WorktreeHead {
-                    filesystem_id: row.get(0)?,
-                    revision_id: row.get(1)?,
-                    snapshot_id: row.get(2)?,
-                    indexed_seq: row.get(3)?,
-                    last_cut_seq: row.get(4)?,
-                    single_owner_uid: row.get(5)?,
-                    privileged_metadata_count: row.get(6)?,
-                    subvol_uuid: row.get(7)?,
-                })
-            },
-        )?;
-        if head.indexed_seq != head.last_cut_seq {
-            return Err(ManagerError::new(
-                "Worktree requires the indexed and physical heads to match",
-            ));
-        }
-        if request.policy.metadata_policy == "sanitized-private-user-tree" {
-            let owner = head
-                .single_owner_uid
-                .as_deref()
-                .map(decode_u64)
-                .transpose()?
-                .ok_or_else(|| ManagerError::new("Worktree seed has mixed ownership"))?;
-            if owner != u64::from(request.requester_uid) || head.privileged_metadata_count != 0 {
-                return Err(ManagerError::new(
-                    "Worktree seed is not a sanitized caller-owned tree",
-                ));
-            }
-        }
-        transaction.execute(
-            "INSERT INTO topology_leases( \
-                 filesystem_id, lease_owner, lease_fence, lease_expires_ns \
-             ) VALUES (?1, NULL, 0, NULL) \
-             ON CONFLICT(filesystem_id) DO NOTHING",
-            [head.filesystem_id],
-        )?;
-        let topology_fence = claim_topology_lease(
-            &transaction,
-            head.filesystem_id,
-            request.lease_owner,
-            request.now_ns,
-            request.lease_expires_ns,
-        )?;
-        reject_destination_below_watch(&transaction, head.filesystem_id, &request.final_path)?;
-        let seed_subvol_uuid = fixed_manager_blob::<16>(&head.subvol_uuid, "seed subvolume UUID")?;
-        let operation_id = random_id();
-        let worktree_id = random_id();
-        transaction.execute(
-            r#"INSERT INTO operations(
-                   id, kind, state, filesystem_id, watch_id, sequence,
-                   source_subvol_uuid, base_snapshot_id, expected_parent_uuid,
-                   requested_readonly, requester_uid, requester_gid,
-                   authorization_id, worktree_policy_id, reserved_path, final_path,
-                   destination_parent_subvol_uuid, destination_parent_ino,
-                   destination_parent_generation, destination_name,
-                   destination_reservation_name, destination_reservation_ino,
-                   destination_reservation_generation, destination_reservation_nonce,
-                   lease_owner, lease_fence, lease_expires_ns, updated_ns
-               ) VALUES (
-                   ?1, 'worktree', 'planned', ?2, ?3, NULL, ?4, ?5, ?4, 0,
-                   ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                   ?17, ?18, ?19, ?20, 1, ?21, ?22
-               )"#,
-            params![
-                operation_id.as_slice(),
-                head.filesystem_id,
-                request.watch_id.as_slice(),
-                seed_subvol_uuid.as_slice(),
-                head.snapshot_id,
-                request.requester_uid,
-                request.requester_gid,
-                request.authorization_id.as_slice(),
-                request.policy.policy_id.as_slice(),
-                request.staged_path,
-                request.final_path,
-                request.destination_parent_subvol_uuid.as_slice(),
-                encode_u64(request.destination_parent_ino).as_slice(),
-                encode_u64(request.destination_parent_generation).as_slice(),
-                request.destination_name,
-                request.reservation_name,
-                encode_u64(request.reservation_ino).as_slice(),
-                encode_u64(request.reservation_generation).as_slice(),
-                request.reservation_nonce.as_slice(),
-                request.lease_owner.as_slice(),
-                request.lease_expires_ns,
-                request.now_ns,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO worktrees(id, filesystem_id, subvol_uuid, path, \
-             seed_revision_id, watch_id, operation_id, state) \
-             VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, 'creating')",
-            params![
-                worktree_id.as_slice(),
-                head.filesystem_id,
-                request.final_path,
-                head.revision_id,
-                operation_id.as_slice(),
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO snapshot_pins(snapshot_id, owner_kind, owner_id, reason) \
-             VALUES (?1, 'operation', ?2, 'worktree-seed')",
-            params![head.snapshot_id, operation_id.as_slice()],
-        )?;
-        release_topology_lease(
-            &transaction,
-            head.filesystem_id,
-            request.lease_owner,
-            topology_fence,
-        )?;
-        transaction.commit()?;
-        Ok(WorktreeReservation {
-            operation_id,
-            worktree_id,
-            filesystem_id: head.filesystem_id,
-            seed_snapshot_id: head.snapshot_id,
-            seed_revision_id: head.revision_id,
-            seed_subvol_uuid,
-            operation_fence: 1,
-            policy_hash: request.policy.policy_hash,
-        })
-    }
-
-    #[cfg(any())]
-    pub fn start_worktree_effect(
-        &mut self,
-        reservation: &WorktreeReservation,
-        lease_owner: [u8; 16],
-        now_ns: i64,
-    ) -> Result<(), ManagerError> {
-        require_one(
-            self.connection_mut().execute(
-                "UPDATE operations SET state = 'fs_started', updated_ns = ?4 \
-                 WHERE id = ?1 AND state = 'planned' AND lease_owner = ?2 \
-                   AND lease_fence = ?3",
-                params![
-                    reservation.operation_id.as_slice(),
-                    lease_owner.as_slice(),
-                    reservation.operation_fence,
-                    now_ns
-                ],
-            )?,
-            "start Worktree effect",
-        )
-    }
-
-    #[cfg(any())]
-    pub fn record_created_worktree(
-        &mut self,
-        reservation: &WorktreeReservation,
-        lease_owner: [u8; 16],
-        subvol_uuid: [u8; 16],
-        parent_uuid: Option<[u8; 16]>,
-        now_ns: i64,
-    ) -> Result<(), ManagerError> {
-        if parent_uuid != Some(reservation.seed_subvol_uuid) {
-            return Err(ManagerError::new(
-                "writable clone has the wrong parent UUID",
-            ));
-        }
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_one(transaction.execute(
-            "UPDATE worktrees SET subvol_uuid = ?2 WHERE id = ?1 AND state = 'creating' AND subvol_uuid IS NULL",
-            params![reservation.worktree_id.as_slice(), subvol_uuid.as_slice()],
-        )?, "record Worktree UUID")?;
-        require_one(transaction.execute(
-            "UPDATE operations SET state = 'awaiting_destination', discovered_uuid = ?4, updated_ns = ?5 \
-             WHERE id = ?1 AND state = 'fs_started' AND lease_owner = ?2 AND lease_fence = ?3",
-            params![reservation.operation_id.as_slice(), lease_owner.as_slice(), reservation.operation_fence, subvol_uuid.as_slice(), now_ns],
-        )?, "record created Worktree")?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// Reacquires the filesystem topology exclusion and rechecks the final
-    /// locator immediately before the broker is allowed to publish it. The
-    /// caller keeps this lease until `publish_worktree` commits.
-    #[cfg(any())]
-    pub fn prepare_worktree_publication(
-        &mut self,
-        reservation: &WorktreeReservation,
-        lease_owner: [u8; 16],
-        resolved_final_path: &[u8],
-        now_ns: i64,
-        lease_expires_ns: i64,
-    ) -> Result<i64, ManagerError> {
-        if lease_expires_ns <= now_ns || !path_is_absolute(resolved_final_path) {
-            return Err(ManagerError::new(
-                "invalid Worktree topology publication request",
-            ));
-        }
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let authorized: Option<i64> = transaction
-            .query_row(
-                r#"SELECT 1
-                     FROM operations o
-                     JOIN watch_grants g
-                       ON g.id = o.authorization_id AND g.watch_id = o.watch_id
-                     JOIN worktree_grant_policies p ON p.id = o.worktree_policy_id
-                    WHERE o.id = ?1 AND o.kind = 'worktree'
-                      AND o.state = 'awaiting_destination'
-                      AND o.filesystem_id = ?2 AND o.lease_owner = ?3
-                      AND o.lease_fence = ?4 AND g.state = 'active'
-                      AND (g.permissions & ?5) = ?5 AND p.policy_hash = ?6"#,
-                params![
-                    reservation.operation_id.as_slice(),
-                    reservation.filesystem_id,
-                    lease_owner.as_slice(),
-                    reservation.operation_fence,
-                    i64::from(PERMISSION_READ | PERMISSION_CUT | PERMISSION_WORKTREE),
-                    reservation.policy_hash.as_slice(),
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if authorized != Some(1) {
-            return Err(ManagerError::new("Worktree publication authority is stale"));
-        }
-        let topology_fence = claim_topology_lease(
-            &transaction,
-            reservation.filesystem_id,
-            lease_owner,
-            now_ns,
-            lease_expires_ns,
-        )?;
-        reject_destination_below_watch(
-            &transaction,
-            reservation.filesystem_id,
-            resolved_final_path,
-        )?;
-        transaction.commit()?;
-        Ok(topology_fence)
-    }
-
-    #[cfg(any())]
-    pub fn publish_worktree(
-        &mut self,
-        reservation: &WorktreeReservation,
-        lease_owner: [u8; 16],
-        topology_fence: i64,
-        subvol_uuid: [u8; 16],
-        now_ns: i64,
-    ) -> Result<TrackedWorktree, ManagerError> {
-        let child_watch_id = random_id();
-        let child_grant_id = random_id();
-        let child_clock_epoch = random_id();
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let topology_valid: Option<i64> = transaction
-            .query_row(
-                "SELECT 1 FROM topology_leases \
-                 WHERE filesystem_id = ?1 AND lease_owner = ?2 AND lease_fence = ?3",
-                params![
-                    reservation.filesystem_id,
-                    lease_owner.as_slice(),
-                    topology_fence,
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if topology_valid != Some(1) {
-            return Err(ManagerError::new(
-                "lost filesystem topology lease before Worktree publication",
-            ));
-        }
-        let (final_path, principal_kind, principal_id, permissions): (
-            Vec<u8>,
-            String,
-            Vec<u8>,
-            i64,
-        ) = transaction.query_row(
-            r#"SELECT o.final_path, g.principal_kind, g.principal_id, g.permissions
-                 FROM operations o JOIN watch_grants g
-                   ON g.id = o.authorization_id AND g.watch_id = o.watch_id
-                WHERE o.id = ?1 AND o.state = 'awaiting_destination'
-                  AND o.lease_owner = ?2 AND o.lease_fence = ?3
-                  AND o.discovered_uuid = ?4 AND g.state = 'active'"#,
-            params![
-                reservation.operation_id.as_slice(),
-                lease_owner.as_slice(),
-                reservation.operation_fence,
-                subvol_uuid.as_slice(),
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        transaction.execute(
-            r#"INSERT INTO watches(
-                   id, filesystem_id, live_subvol_uuid, live_path,
-                   indexed_revision_id, indexed_seq, last_cut_snapshot_id,
-                   last_cut_seq, cut_owner, cut_fence, cut_expires_ns,
-                   clock_epoch, replay_floor_seq, fsmonitor_state, state
-               ) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, NULL, 0, NULL,
-                         ?7, 0, 'disabled', 'active')"#,
-            params![
-                child_watch_id.as_slice(),
-                reservation.filesystem_id,
-                subvol_uuid.as_slice(),
-                final_path,
-                reservation.seed_revision_id,
-                reservation.seed_snapshot_id,
-                child_clock_epoch.as_slice(),
-            ],
-        )?;
-        transaction.execute(
-            r#"INSERT INTO watch_grants(
-                   id, watch_id, principal_kind, principal_id, permissions,
-                   state, created_ns, revoked_ns
-               ) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, NULL)"#,
-            params![
-                child_grant_id.as_slice(),
-                child_watch_id.as_slice(),
-                principal_kind,
-                principal_id,
-                permissions,
-                now_ns,
-            ],
-        )?;
-        require_one(
-            transaction.execute(
-                "UPDATE worktrees SET state = 'present', watch_id = ?3 \
-             WHERE id = ?1 AND state = 'creating' AND subvol_uuid = ?2",
-                params![
-                    reservation.worktree_id.as_slice(),
-                    subvol_uuid.as_slice(),
-                    child_watch_id.as_slice()
-                ],
-            )?,
-            "publish Worktree row",
-        )?;
-        require_one(transaction.execute(
-            "UPDATE operations SET state = 'done', lease_owner = NULL, lease_expires_ns = NULL, updated_ns = ?5 \
-             WHERE id = ?1 AND state = 'awaiting_destination' AND lease_owner = ?2 \
-               AND lease_fence = ?3 AND discovered_uuid = ?4",
-            params![reservation.operation_id.as_slice(), lease_owner.as_slice(), reservation.operation_fence, subvol_uuid.as_slice(), now_ns],
-        )?, "finish Worktree operation")?;
-        transaction.execute(
-            "DELETE FROM snapshot_pins WHERE snapshot_id = ?1 AND owner_kind = 'operation' AND owner_id = ?2 AND reason = 'worktree-seed'",
-            params![reservation.seed_snapshot_id, reservation.operation_id.as_slice()],
-        )?;
-        for (kind, reason) in [
-            ("watch-indexed-head", "worktree-seed-index"),
-            ("watch-last-cut", "worktree-seed-cut"),
-        ] {
-            transaction.execute(
-                "INSERT INTO snapshot_pins(snapshot_id, owner_kind, owner_id, reason) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    reservation.seed_snapshot_id,
-                    kind,
-                    child_watch_id.as_slice(),
-                    reason,
-                ],
-            )?;
-        }
-        release_topology_lease(
-            &transaction,
-            reservation.filesystem_id,
-            lease_owner,
-            topology_fence,
-        )?;
-        transaction.commit()?;
-        Ok(TrackedWorktree {
-            worktree_id: reservation.worktree_id,
-            watch_id: child_watch_id,
-            grant_id: child_grant_id,
-            seed_revision_id: reservation.seed_revision_id,
-            seed_snapshot_id: reservation.seed_snapshot_id,
-        })
     }
 
     pub fn create_retention_lease(
@@ -6927,110 +6217,6 @@ fn filesystem_uuid_from_connection(
         .map_err(|_| ManagerError::new("stored filesystem UUID has invalid length"))
 }
 
-#[cfg(any())]
-fn claim_topology_lease(
-    transaction: &Transaction<'_>,
-    filesystem_id: i64,
-    lease_owner: [u8; 16],
-    now_ns: i64,
-    lease_expires_ns: i64,
-) -> Result<i64, ManagerError> {
-    let claimed = transaction.execute(
-        "UPDATE topology_leases \
-            SET lease_owner = ?2, lease_fence = lease_fence + 1, lease_expires_ns = ?3 \
-          WHERE filesystem_id = ?1 \
-            AND (lease_owner IS NULL OR lease_expires_ns <= ?4 OR lease_owner = ?2)",
-        params![
-            filesystem_id,
-            lease_owner.as_slice(),
-            lease_expires_ns,
-            now_ns,
-        ],
-    )?;
-    if claimed != 1 {
-        return Err(ManagerError::new("filesystem topology lease is busy"));
-    }
-    transaction
-        .query_row(
-            "SELECT lease_fence FROM topology_leases WHERE filesystem_id = ?1",
-            [filesystem_id],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-}
-
-#[cfg(any())]
-fn release_topology_lease(
-    transaction: &Transaction<'_>,
-    filesystem_id: i64,
-    lease_owner: [u8; 16],
-    topology_fence: i64,
-) -> Result<(), ManagerError> {
-    require_one(
-        transaction.execute(
-            "UPDATE topology_leases SET lease_owner = NULL, lease_expires_ns = NULL \
-             WHERE filesystem_id = ?1 AND lease_owner = ?2 AND lease_fence = ?3",
-            params![filesystem_id, lease_owner.as_slice(), topology_fence,],
-        )?,
-        "release filesystem topology lease",
-    )
-}
-
-#[cfg(any())]
-fn reject_source_containing_worktree(
-    transaction: &Transaction<'_>,
-    filesystem_id: i64,
-    source_path: &[u8],
-) -> Result<(), ManagerError> {
-    let mut statement = transaction.prepare(
-        "SELECT path FROM worktrees \
-         WHERE filesystem_id = ?1 AND state IN ('creating', 'present', 'deleting')",
-    )?;
-    let paths = statement
-        .query_map([filesystem_id], |row| row.get::<_, Vec<u8>>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if paths
-        .iter()
-        .any(|path| path_is_same_or_descendant(path, source_path))
-    {
-        return Err(ManagerError::new(
-            "initialize source contains a non-deleted Worktree reservation",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any())]
-fn reject_destination_below_watch(
-    transaction: &Transaction<'_>,
-    filesystem_id: i64,
-    destination_path: &[u8],
-) -> Result<(), ManagerError> {
-    let mut statement = transaction.prepare(
-        "SELECT live_path FROM watches \
-         WHERE filesystem_id = ?1 AND state IN ('initializing', 'active', 'blocked')",
-    )?;
-    let paths = statement
-        .query_map([filesystem_id], |row| row.get::<_, Vec<u8>>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if paths
-        .iter()
-        .any(|path| path_is_same_or_descendant(destination_path, path))
-    {
-        return Err(ManagerError::new(
-            "Worktree destination is below a non-deleted watched root",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any())]
-fn path_is_same_or_descendant(candidate: &[u8], ancestor: &[u8]) -> bool {
-    let candidate = Path::new(std::ffi::OsStr::from_bytes(candidate));
-    let ancestor = Path::new(std::ffi::OsStr::from_bytes(ancestor));
-    candidate.is_absolute() && ancestor.is_absolute() && candidate.starts_with(ancestor)
-}
-
 fn path_is_absolute(path: &[u8]) -> bool {
     Path::new(std::ffi::OsStr::from_bytes(path)).is_absolute()
 }
@@ -7227,6 +6413,13 @@ mod tests {
             )
             .unwrap();
         (reservation, initialized)
+    }
+
+    #[test]
+    fn permissions_reject_retired_permission_bit() {
+        assert!(Permissions::new(0x04).is_err());
+        assert!(Permissions::new(PERMISSION_READ | PERMISSION_CUT | 0x04).is_err());
+        assert!(Permissions::new(PERMISSION_READ | PERMISSION_CUT).is_ok());
     }
 
     #[test]
@@ -7903,90 +7096,6 @@ mod tests {
             (snapshot_state.as_str(), operation_state.as_str()),
             ("deleted", "done")
         );
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn refuses_worktree_permission_without_policy() {
-        let (_temp, mut store, mut request) = setup();
-        request.permissions =
-            Permissions::new(PERMISSION_READ | PERMISSION_CUT | PERMISSION_WORKTREE).unwrap();
-        assert!(store.reserve_initialize(&request).is_err());
-    }
-
-    #[cfg(any())]
-    #[test]
-    fn topology_path_exclusion_is_component_aware_and_symmetric() {
-        assert!(path_is_same_or_descendant(b"/watch/child", b"/watch"));
-        assert!(path_is_same_or_descendant(b"/watch", b"/watch"));
-        assert!(!path_is_same_or_descendant(b"/watch-two", b"/watch"));
-        assert!(!path_is_same_or_descendant(b"relative/child", b"relative"));
-
-        let (_temp, mut store, request) = setup();
-        let (initialize, initialized) = initialize_watch(&mut store, &request);
-        let transaction = store
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
-        assert!(reject_destination_below_watch(
-            &transaction,
-            initialize.filesystem_id,
-            b"/source/worktree"
-        )
-        .is_err());
-        reject_destination_below_watch(
-            &transaction,
-            initialize.filesystem_id,
-            b"/source-two/worktree",
-        )
-        .unwrap();
-
-        let operation_id = [91_u8; 16];
-        transaction
-            .execute(
-                r#"INSERT INTO operations(
-                       id, kind, state, filesystem_id, watch_id, sequence,
-                       source_subvol_uuid, base_snapshot_id, expected_parent_uuid,
-                       requested_readonly, requester_uid, requester_gid,
-                       authorization_id, reserved_path, lease_owner, lease_fence,
-                       lease_expires_ns, updated_ns
-                   ) VALUES (?1, 'cut', 'planned', ?2, ?3, 100, ?4, ?5,
-                             ?4, 1, 1000, 1000, ?6, ?7, ?8, 1, 1000, 400)"#,
-                params![
-                    operation_id.as_slice(),
-                    initialize.filesystem_id,
-                    initialized.watch_id.as_slice(),
-                    request.source_subvol_uuid.as_slice(),
-                    initialized.snapshot_id,
-                    initialized.grant_id.as_slice(),
-                    b"/staging/worktree".as_slice(),
-                    request.lease_owner.as_slice(),
-                ],
-            )
-            .unwrap();
-        transaction
-            .execute(
-                "INSERT INTO worktrees(id, filesystem_id, subvol_uuid, path, \
-                 seed_revision_id, watch_id, operation_id, state) \
-                 VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, 'creating')",
-                params![
-                    [92_u8; 16].as_slice(),
-                    initialize.filesystem_id,
-                    b"/future/worktree".as_slice(),
-                    initialized.revision_id,
-                    operation_id.as_slice(),
-                ],
-            )
-            .unwrap();
-        assert!(reject_source_containing_worktree(
-            &transaction,
-            initialize.filesystem_id,
-            b"/future"
-        )
-        .is_err());
-        reject_source_containing_worktree(&transaction, initialize.filesystem_id, b"/future-two")
-            .unwrap();
-        transaction.rollback().unwrap();
     }
 
     #[test]
