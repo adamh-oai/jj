@@ -1834,6 +1834,15 @@ async fn reset_head_impl(
     git_repo: gix::Repository,
     should_update_git_head: bool,
 ) -> Result<(), GitResetHeadError> {
+    // Reserve the index before changing HEAD. Keep the lock until the index
+    // is committed so a failed permission/concurrency preflight cannot leave
+    // HEAD partially updated.
+    let index_lock = gix::lock::File::acquire_to_update_resource(
+        git_repo.index_path(),
+        gix::lock::acquire::Fail::Immediately,
+        None,
+    )
+    .map_err(GitResetHeadError::from_git)?;
     let first_parent_id = &wc_commit.parent_ids()[0];
     let new_head_target = if first_parent_id != mut_repo.store().root_commit_id() {
         RefTarget::normal(first_parent_id.clone())
@@ -1882,7 +1891,7 @@ async fn reset_head_impl(
         clear_operation_state(&git_repo)?;
     }
 
-    reset_index(mut_repo, &git_repo, wc_commit).await
+    reset_index(mut_repo, &git_repo, wc_commit, index_lock).await
 }
 
 /// Sets Git HEAD to the parent of the given working-copy commit and resets
@@ -1957,6 +1966,7 @@ async fn reset_index(
     repo: &dyn Repo,
     git_repo: &gix::Repository,
     wc_commit: &Commit,
+    mut index_lock: gix::lock::File,
 ) -> Result<(), GitResetHeadError> {
     let parent_tree = wc_commit.parent_tree(repo).await?;
     // Use the merged parent tree as the Git index, allowing `git diff` to show the
@@ -2003,8 +2013,10 @@ async fn reset_index(
     debug_assert!(index.verify_entries().is_ok());
 
     index
-        .write(gix::index::write::Options::default())
-        .map_err(GitResetHeadError::from_git)
+        .write_to(&mut index_lock, gix::index::write::Options::default())
+        .map_err(GitResetHeadError::from_git)?;
+    index_lock.commit().map_err(GitResetHeadError::from_git)?;
+    Ok(())
 }
 
 fn build_index_from_merged_tree(

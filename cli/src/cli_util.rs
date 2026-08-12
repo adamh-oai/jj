@@ -2292,23 +2292,6 @@ to the current parents may contain changes from multiple commits.
         Ok(stats)
     }
 
-    async fn update_working_copy(
-        &mut self,
-        ui: &Ui,
-        maybe_old_commit: Option<&Commit>,
-        new_commit: &Commit,
-    ) -> Result<(), CommandError> {
-        assert!(self.may_update_working_copy);
-        let stats = update_working_copy(
-            &self.user_repo.repo,
-            &mut self.workspace,
-            maybe_old_commit,
-            new_commit,
-        )
-        .await?;
-        self.print_updated_working_copy_stats(ui, maybe_old_commit, new_commit, &stats)
-    }
-
     fn print_updated_working_copy_stats(
         &self,
         ui: &Ui,
@@ -2407,15 +2390,65 @@ to the current parents may contain changes from multiple commits.
             maybe_new_wc_commit
         };
 
+        let should_commit_transaction = self.env.command.should_commit_transaction();
+        #[cfg(feature = "git")]
+        let git_checkout_needs_update = maybe_new_wc_commit.as_ref().is_some_and(|new_commit| {
+            git_checkout_projection_changed(maybe_old_wc_commit.as_ref(), new_commit)
+        });
+        #[cfg(feature = "git")]
+        let workspace_name = self.workspace_name().to_owned();
+
+        // Hold the working-copy lock across Git mutation, operation
+        // publication, and checkout. Persist pending_checkout before the first
+        // Git mutation so a failed finalization cannot look clean later.
+        let mut locked_ws = if self.may_update_working_copy {
+            if let Some(new_commit) = &maybe_new_wc_commit {
+                let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+                if let Some(old_commit) = &maybe_old_wc_commit
+                    && old_commit.tree().tree_ids_and_labels()
+                        != locked_ws.locked_wc().old_tree().tree_ids_and_labels()
+                {
+                    return Err(user_error("Concurrent working copy operation. Try again."));
+                }
+                let tree_changed = maybe_old_wc_commit.as_ref().is_none_or(|old_commit| {
+                    old_commit.tree().tree_ids_and_labels()
+                        != new_commit.tree().tree_ids_and_labels()
+                });
+                #[cfg(feature = "git")]
+                let needs_pending_checkout = tree_changed || git_checkout_needs_update;
+                #[cfg(not(feature = "git"))]
+                let needs_pending_checkout = tree_changed;
+                if needs_pending_checkout {
+                    locked_ws
+                        .locked_wc()
+                        .prepare_checkout(new_commit)
+                        .map_err(|err| {
+                            internal_error_with_message(
+                                format!(
+                                    "Failed to prepare checkout of commit {}",
+                                    new_commit.id().hex()
+                                ),
+                                err,
+                            )
+                        })?;
+                }
+                Some(locked_ws)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         #[cfg(feature = "git")]
         if let Some(git_workspace) = &self.env.git_workspace
-            && self.env.command.should_commit_transaction()
+            && should_commit_transaction
         {
-            if let Some(wc_commit) = &maybe_new_wc_commit {
+            if git_checkout_needs_update && let Some(wc_commit) = &maybe_new_wc_commit {
                 try_reset_git_head(
                     ui,
                     tx.repo_mut(),
-                    self.workspace_name(),
+                    &workspace_name,
                     wc_commit,
                     git_workspace,
                     git_import_export_lock,
@@ -2428,24 +2461,51 @@ to the current parents may contain changes from multiple commits.
             }
         }
 
-        self.user_repo = ReadonlyUserRepo::new(
-            self.env
-                .command
-                .maybe_commit_transaction(tx, description)
-                .await?,
-        );
+        let new_repo = self
+            .env
+            .command
+            .maybe_commit_transaction(tx, description)
+            .await?;
 
-        // Update working copy before reporting repo changes, so that
-        // potential errors while reporting changes (broken pipe, etc)
-        // don't leave the working copy in a stale state.
-        if self.may_update_working_copy {
+        #[cfg(feature = "test-fakes")]
+        if env::var_os("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH").is_some() {
+            return Err(internal_error_with_message(
+                "Injected failure after operation publication",
+                io::Error::other("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH"),
+            ));
+        }
+
+        let maybe_checkout_stats = if let Some(mut locked_ws) = locked_ws.take() {
             if let Some(new_commit) = &maybe_new_wc_commit {
-                self.update_working_copy(ui, maybe_old_wc_commit.as_ref(), new_commit)
-                    .await?;
+                let stats = locked_ws
+                    .locked_wc()
+                    .check_out(new_commit)
+                    .await
+                    .map_err(|err| {
+                        internal_error_with_message(
+                            format!("Failed to check out commit {}", new_commit.id().hex()),
+                            err,
+                        )
+                    })?;
+                locked_ws.finish(new_repo.op_id().clone()).await?;
+                Some(stats)
             } else {
-                // It seems the workspace was deleted, so we shouldn't try to
-                // update it.
+                None
             }
+        } else {
+            None
+        };
+        self.user_repo = ReadonlyUserRepo::new(new_repo);
+
+        if let Some(stats) = maybe_checkout_stats
+            && let Some(new_commit) = &maybe_new_wc_commit
+        {
+            self.print_updated_working_copy_stats(
+                ui,
+                maybe_old_wc_commit.as_ref(),
+                new_commit,
+                &stats,
+            )?;
         }
 
         self.report_repo_changes(ui, &old_repo).await?;
@@ -2741,6 +2801,18 @@ pub async fn export_working_copy_changes_to_git(
     _new_tree: &MergedTree,
 ) -> Result<(), CommandError> {
     Ok(())
+}
+
+#[cfg(feature = "git")]
+fn git_checkout_projection_changed(old_commit: Option<&Commit>, new_commit: &Commit) -> bool {
+    let Some(old_commit) = old_commit else {
+        return true;
+    };
+    // Git HEAD is the first parent of the working-copy commit. The index is
+    // that parent's tree plus intent-to-add entries derived from the
+    // working-copy tree.
+    old_commit.parent_ids().first() != new_commit.parent_ids().first()
+        || old_commit.tree().tree_ids_and_labels() != new_commit.tree().tree_ids_and_labels()
 }
 
 #[cfg(feature = "git")]

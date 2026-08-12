@@ -123,6 +123,10 @@ pub trait LockedWorkingCopy: Any + Send {
     /// Check out the specified commit in the working copy.
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError>;
 
+    /// Durably records the intended checkout before callers mutate any
+    /// colocated Git state.
+    fn prepare_checkout(&mut self, commit: &Commit) -> Result<(), WorkingCopyStateError>;
+
     /// Update the workspace name.
     fn rename_workspace(&mut self, new_workspace_name: WorkspaceNameBuf);
 
