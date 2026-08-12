@@ -1,0 +1,17 @@
+---
+title: "Indexed change-tracking design"
+description: "The complete normative Btrfs change-tracking architecture, kernel contract, transaction protocols, and embedded SQLite schema."
+sidebar:
+  order: 2
+---
+
+import { Content as IndexedChangeTrackingDesign } from '../../../../indexed-change-tracking.md';
+
+:::note[Normative source]
+This page renders the existing `docs/indexed-change-tracking.md` directly.
+The Rust implementation also embeds that exact file with `include_str!` when
+initializing its SQLite stores, so the document must remain at its original
+repository path.
+:::
+
+<IndexedChangeTrackingDesign />

@@ -1,703 +1,625 @@
-# AWACS correctness, compatibility, and performance fixes
-
-This document records issues identified by inspecting the implementation. The
-project and its tests were not executed on the review machine. References name
-the implementation boundary rather than unstable source line numbers.
-
-AWACS is a focused Btrfs-backed filesystem monitor. Its intended compatibility
-target is the subset of the Watchman BSER protocol used by a pinned jj client
-and Git's fsmonitor hook protocol version 2. It is not a general Watchman
-server, Git's built-in fsmonitor daemon, or a filesystem-independent watcher.
-Repository roots must satisfy the supported Btrfs-subvolume, custom-kernel,
-mount-namespace, and authorization constraints.
-
-Adoption of an already-created Btrfs snapshot descendant is supported. Watchman
-trigger registration, listing, and background execution are not supported;
-their future implementation is tracked in [TODO.md](TODO.md).
-
-## Correctness and client-visible compatibility
-
-### P0: A discarded directory witness can produce a falsely clean status
-
-`src/index.rs` emits `DirectoryDirtyWitness` when an ancestor changed without a
-surviving named endpoint change. `src/compat.rs::project_events` unconditionally
-discards that witness. The comment assumes the client's cached tree exactly
-matches its authenticated snapshot clock, but neither jj nor Git proves that
-the filesystem stops changing while it crawls or refreshes its cached state.
-
-One failing sequence is:
-
-1. AWACS creates snapshot B and returns its clock.
-2. A temporary file appears after B and the client observes it during its
-   crawl or stat pass.
-3. The file disappears before snapshot C.
-4. B and C have the same endpoint names; the surviving parent-directory witness
-   is discarded.
-5. AWACS returns an empty non-fresh response although the client still caches
-   the removed file.
-
-jj can immediately persist C's clock when the matcher is empty. Git can retain
-stale tracked, untracked-cache, or fsmonitor-valid state. The same class
-includes a temporary directory subtree, an overwritten name, a hardlink alias,
-and changes observed during post-response client work.
-
-**Fix:** Keep every directory witness until consumer-specific projection. For
-Git, invalidate the affected directory prefix or return `/` when the prefix
-cannot be represented safely. For jj, expand the affected subtree against the
-relevant immutable index, use a proven-complete exact-name journal interval,
-or return `is_fresh_instance = true`. Establish an explicit client-baseline
-contract; do not infer that equal snapshot endpoints imply equal client state.
-
-**Tests:** Pause a real jj or Git client after it receives clock B but before it
-finishes crawling. Create and remove a file, a nested subtree, and a hardlink
-before cut C. Compare the monitored result with an independent full scan and
-verify that no falsely clean result advances the client clock.
-
-### P0: The optional precision guard records a journal that queries ignore
-
-The **precision guard** in `src/precision.rs` is an optional recursive Linux
-inotify watcher, separate from the mandatory root-path/mount-namespace
-continuity monitor. It watches each reachable directory, writes exact mutation
-hints into the durable SQLite `mutation_events` table, and associates those
-hints with a guard epoch and monotonically increasing cursor. A private marker
-and explicit drain establish that a cursor covers a complete interval; lost
-watches, overflow, or marker failure mark the epoch gapped. It is enabled only
-when `BTRFS_AWACS_PRECISION_GUARD=1` and complete directory traversal is
-possible. It is not a replacement for snapshot comparison: mechanisms such as
-writable `mmap` are outside a complete inotify-only content contract.
-
-`src/manager.rs` persists and pins complete guard intervals, and
-`src/compat.rs::project_ready_cut_range_with_lease` already knows how to merge
-their exact names with immutable snapshot events. The actual client path in
-`src/facade.rs::prepare_query_after_cut` instead performs a direct historical
-comparison and calls `project_events`. Consequently the recorded journal is
-orphaned from jj/Git responses and cannot repair the directory-witness race.
-
-**Fix:** Route query projection through the lease-pinned range projector when
-both boundaries share a complete guard epoch and all guard records are
-contiguous. Merge exact names with authoritative snapshot object/reference
-changes. If the guard is absent, gapped, incomplete, over budget, or lacks
-coverage, apply the conservative directory-witness behavior above. Keep
-mandatory namespace continuity independent of recursive guard availability.
-
-**Tests:** Exercise complete, gapped, overflowed, restarted, and reclaimed
-guard epochs; marker creation/deletion; directory moves; metadata exclusions;
-and transient names observed by a client between snapshot and crawl. Verify
-the same correctness guarantees with the guard disabled.
-
-### P0: A compacted clock can be resolved to the wrong baseline
-
-`src/facade.rs::replay_boundary_for_clock` accepts a retained boundary with
-`cut_sequence <= old.cut_sequence`. Its claim that comparing an older retained
-snapshot with the current head can only over-report paths is incorrect.
-
-For example, an older retained snapshot contains `a`, the client's actual
-snapshot contains `b` after `a -> b`, and the current snapshot again contains
-`a` after `b -> a`. Comparing the retained endpoint with the current endpoint
-cannot reveal that the client's cached `b` must be removed. The same false
-negative occurs when a name exists only in a reclaimed intermediate baseline.
-
-**Fix:** Resolve exactly the authenticated token's watch, epoch, owner grant,
-monitor session, boundary kind, cut sequence, and target snapshot UUID. If the
-exact baseline remains available, replay a complete pinned adjacent event
-range or compare that exact snapshot with the target. If it is unavailable,
-return a fresh/full invalidation. Never substitute an older retained boundary.
-Coordinate reclamation and query pinning transactionally.
-
-**Tests:** Force compaction of the client's exact baseline while keeping an
-older boundary. Cover `a -> b -> a`, create/delete, same-name replacement,
-hardlink alias deletion, directory moves, copied/foreign tokens, future tokens,
-restart, and concurrent GC. Require all necessary paths or an explicit fresh
-response; an empty incremental result is never acceptable.
-
-### P0: Compaction contradicts retained-boundary foreign keys and lookup
-
-`src/manager.rs::retain_exponential_replay_checkpoints` keeps a sparse set of
-`fsmonitor_boundaries`, but its final
-`reclaim_unreferenced_cut_comparisons` step attempts to delete every
-`watch_cuts` row older than the newest cut. Each retained boundary has a
-composite foreign key to its exact `watch_cuts` row. With the configured
-`PRAGMA foreign_keys = ON`, deleting those parent rows therefore fails with a
-foreign-key violation instead of completing maintenance. Earlier boundary and
-revision reclamation occurs in separately committed transactions, so this
-failure can leave a partially compacted history.
-
-There is a second coupling: `src/manager.rs::historical_snapshot_sequence`
-determines watch membership and sequence using `watch_cuts` and, in a limited
-case, the current watch head. It never consults a retained boundary. If a
-future schema change or legacy state permits boundary retention after its cut
-row disappears, exact historical queries fail with "source snapshot is not
-retained on this watch" even when the boundary and snapshot still exist.
-
-Repairing either foreign keys or membership lookup alone would expose the
-preceding older-baseline false negative unless exact clock resolution is fixed
-at the same time.
-
-**Fix:** Preserve every `watch_cuts` row referenced by a retained boundary, or
-redesign boundaries to own independent durable snapshot/sequence membership
-without a foreign key to reclaimable cut rows. Make the chosen membership
-source authoritative for historical lookup and retain every adjacent event
-required by an exact client clock; when that exact history is unavailable,
-return fresh. Validate the complete `(watch, clock epoch, cut sequence,
-snapshot UUID, boundary kind)` tuple and physical snapshot state. Perform
-retention, floor changes, boundary removal, event reclamation, and query pin
-checks in one atomic transaction or a fenced recoverable maintenance plan.
-
-**Tests:** Compact a watch with several retained older checkpoints and verify
-foreign-key integrity, successful maintenance, exact-baseline lookup, and no
-partial committed cleanup. Then prune each exact boundary, snapshot, history
-segment, or epoch separately and verify a fresh response. Repeat under
-concurrent query pinning, injected transaction failure, and daemon restart.
-
-### P0: An invalid immutable cut advances the physical head too early
-
-`src/manager.rs::publish_validated_physical_cut` requires the caller to reject
-nested-subvolume boundaries and unsupported fscrypt metadata before publication.
-`src/service.rs::finish_cut` publishes the physical snapshot head first and only
-later parses boundary records or materializes target objects. A nested
-subvolume or fscrypt inode can therefore leave the physical head ahead of the
-indexed head while its operation remains in `manifest_ready`.
-
-`src/manager.rs::fail_cut_comparison` is the existing terminal-failure
-transition. It atomically marks the `watch_cuts` row and operation failed,
-records the error, releases operation-owned snapshot pins, and abandons waiting
-cut admissions. Production never calls it; only a manager test does. Thus a
-validation failure currently returns an error without performing that durable
-cleanup. Calling the helper alone is insufficient because it does not rewind or
-replace the already-advanced physical head, and the rejected immutable snapshot
-cannot become valid during restart.
-
-**Fix:** Prefer validating the immutable target and all required endpoint
-metadata before `publish_validated_physical_cut`, so rejected snapshots never
-become the physical head. If publication must precede validation, atomically
-terminally fail the operation, release pins/admissions, establish a recoverable
-physical/indexed-head invariant, quarantine or delete the rejected snapshot,
-and permit the next valid cut or full-fresh recovery to advance. Recovery must
-not retry the same permanently invalid snapshot forever.
-
-**Tests:** Introduce a nested subvolume or fscrypt object after initialization.
-Inspect both watch heads, operation state, `watch_cuts`, admissions, pins,
-snapshot lifecycle, daemon restart, and the next valid cut. Inject failure at
-every stage before and after physical publication and validate recovery.
-
-### P1: Full-fresh fallback is not propagated through the client response
-
-`src/manager.rs::publish_full_fresh_checkpoint` records
-`watch_cuts.fresh_instance = 1`, but `PublishedCut` does not carry that flag.
-`src/facade.rs` still attempts a historical comparison for a supplied old clock.
-On a legacy kernel without the required dirty-witness capability, that second
-comparison fails for the same reason that caused full-fresh fallback, so the
-client receives an error rather than a valid `/` invalidation.
-
-**Fix:** Carry freshness explicitly through `PublishedCut`, admission polling,
-facade completion, Watchman encoding, and Git hook encoding. When the newly
-committed cut is full-fresh, skip historical comparison and return its new
-clock with a full invalidation. Do not lose or reinterpret the committed
-freshness state during shared-cut admission or recovery.
-
-**Tests:** Use legacy-only and malformed/incomplete v2 stream fixtures, then
-issue initial and incremental jj/Git queries. Verify successful fresh
-responses, committed clocks, follower responses, restart behavior, and the
-next successful incremental cut.
-
-### P1: Client-side baseline resets can invalidate otherwise genuine clocks
-
-An authenticated clock proves which snapshot AWACS compared; it does not prove
-that jj's expected tree or Git's index still corresponds to that snapshot.
-jj resets/imports or colocated Git operations can replace its expected tree
-while excluded `.git`/`.jj` metadata hides the cause from the monitor. Git can
-likewise replace its index or fsmonitor-valid bitmap independently.
-
-**Fix:** Audit the pinned jj `TreeState::reset`, recovery, checkout, import, and
-colocated Git integration paths and clear the saved clock whenever the expected
-tree changes. Verify Git invalidates its fsmonitor bitmap on index replacement,
-configuration changes, and repository transitions. Server-side token binding
-is necessary but cannot repair an unrelated stale client baseline.
-
-**Tests:** Reset or replace client state without changing monitored user files,
-then compare monitored jj/Git status with fsmonitor-disabled full scans.
-Include interrupted checkouts, colocated repositories, sparse-index transitions,
-and copied state databases.
-
-### P1: Trigger commands are intentionally unsupported and deletion is not truthful
-
-The pinned jj client calls `trigger-del` even when
-`fsmonitor.watchman.register-snapshot-trigger = false`; when enabled, it calls
-`trigger-list` and registers `jj-background-monitor`. AWACS currently returns a
-synthetic `deleted: false` for `trigger-del`, rejects `trigger-list` and
-`trigger`, and does not execute a background scheduler. Some jj diagnostic
-paths call `trigger-list` even when automatic registration is disabled.
-
-**Fix:** Until trigger support exists, document trigger-disabled operation
-accurately, return truthful errors for unsupported registration/listing, and
-make the minimal deletion lifecycle safe and accurately scoped. Implement the
-complete future protocol, authorization, scheduling, persistence, and security
-requirements before claiming trigger support; see [TODO.md](TODO.md).
-
-**Tests:** Run real pinned jj initialization, repeated initialization, status,
-and trigger diagnostics with trigger registration disabled. Separately verify
-the unsupported enabled configuration fails clearly without partially
-registering or executing a command.
-
-## Authorization, time, and kernel trust boundaries
-
-### P1: Connected peer identity is reused for a different frame sender
-
-`src/watchman_transport.rs` authenticates a Unix-stream connector once using
-`SO_PEERCRED` and `SO_PEERPIDFD`. `recv_authenticated` then reads bytes with
-plain `recv` and clones the original connector's identity for every frame.
-A connected descriptor inherited or passed to a same-UID process in another
-mount namespace or chroot can be used to send a request that is checked against
-the connector's namespace rather than the actual sending process.
-
-**Fix:** Enable `SO_PASSCRED`, receive request data with `recvmsg`, and bind
-each complete frame to kernel-supplied `SCM_CREDENTIALS` plus a verified
-`SCM_PIDFD` or equivalent live process handle when the supported Linux
-transport can prove those credentials describe the actual sender. Reject
-missing credentials, mixed-identity byte spans, and frame boundaries that
-cannot be tied to one sender. If the Watchman-compatible Unix-stream transport
-cannot provide that guarantee, redesign requests around an authenticated
-per-request namespace/root handle or another provably nondelegable authority.
-Reject process exit, identity changes, unsafe descriptor delegation, and
-namespace/root mismatches before invoking privileged operations or writing a
-successful response. Merely rereading `SO_PEERCRED` does not solve descriptor
-passing.
-
-**Tests:** Pass a connected descriptor with `SCM_RIGHTS`, inherit it across
-fork/exec, switch mount namespaces and chroots, exit the original process,
-attempt PID reuse, and inject missing or mixed `SCM_CREDENTIALS`/`SCM_PIDFD`
-spans. Verify each individual frame is authorized against its actual sender
-and that no partial successful response escapes on rejection.
-
-### P1: Correctness-critical leases use adjustable wall-clock time
-
-`src/main.rs`, `src/service.rs`, and `src/watchman.rs` derive timestamps from
-`SystemTime`/`UNIX_EPOCH`. Those values feed cut admissions, operation leases,
-query pins, historical comparisons, retention, and dormant trigger leases.
-Wall-clock jumps backward can retain abandoned leases indefinitely; jumps
-forward can expire active ownership and permit unsafe takeover or reclamation.
-
-**Fix:** Introduce an explicit boot-scoped monotonic time domain using
-`CLOCK_BOOTTIME` for every correctness deadline and duration. Store or verify
-the boot ID alongside persisted deadlines; invalidate or recover old-boot
-leases before comparing them. Keep Unix timestamps solely for logs,
-human-facing diagnostics, and retention policies deliberately defined in civil
-time. Avoid mixing the two domains in arithmetic or SQL predicates.
-
-**Tests:** Inject forward/backward wall-clock jumps, suspend/resume, lease
-renewal races, process restart, boot-ID changes, expired admissions, concurrent
-GC, and active historical jobs. Confirm active owners remain fenced and stale
-owners are eventually reclaimed.
-
-### P1: Parsed kernel stream identities and completion counts are discarded
-
-`src/manifest.rs` parses the v2 filesystem UUID, source/target UUIDs,
-source/target root IDs, source/target transaction IDs, record count, and
-completion checksum. `src/service.rs::parse_kernel_changed_objects` retains
-capability and object data but does not compare the parsed endpoint identities
-with the actual authenticated snapshot descriptors. `src/broker.rs` checks
-the ioctl-reported byte count only against a maximum, derives the final byte
-count independently from file metadata, and never verifies `output_records`.
-
-This requires malformed or inconsistent kernel output, a corrupted staged
-manifest, or another violated kernel contract; the broker already separately
-checks the opened snapshot descriptors. It is still a missing defense at the
-privileged kernel-to-SQLite boundary.
-
-**Fix:** Carry the v2 header through normal and recovered comparisons. Require
-exact filesystem, source/target UUID, root-ID, and transaction-ID matches with
-the verified source and target descriptors. Require ioctl `output_bytes` to
-match actual file length and the stream's completion framing; require
-`output_records` to match the parsed/footer count, accounting explicitly for
-whether the completion record is included. Reject every mismatch before
-index publication or staged-manifest reuse.
-
-**Tests:** Independently mutate each identity, root ID, transaction ID, CRC,
-capability bit, ioctl byte count, footer byte count, ioctl record count,
-footer record count, and output limit. Recompute valid checksums where needed
-so identity/count validation cannot pass accidentally due to generic corruption
-detection.
-
-### P1: Malformed Watchman expressions can leak durable query leases
-
-`src/watchman.rs::validate_expression` evaluates an expression against the
-empty path instead of fully validating its syntax tree. A name array such as
-`["name", ["", 123]]` can short-circuit successfully for the empty candidate
-but fail later on a real changed pathname. By then facade finalization has
-created a durable query lease and response pin; expression filtering can
-return early without releasing them.
-
-**Fix:** Implement a complete structural validator that visits every operator,
-operand, string, array element, scope, and depth before admitting a cut. Use an
-RAII-style response/lease guard or an explicit single cleanup path so every
-post-allocation failure releases the lease, including filtering, frame
-encoding, response-size fallback, sender revalidation, and socket write errors.
-
-**Tests:** Generate malformed expressions whose invalid branch is hidden by
-`anyof`, `allof`, `name` arrays, nesting, or path-dependent evaluation. Assert
-no cut is admitted for invalid syntax and verify query leases, revision pins,
-comparison pins, and response gates are empty after every injected failure.
-
-## Performance and resource lifetime
-
-### P0: Each query can flush unrelated writes across the entire filesystem
-
-Every jj/Git clock or query creates a new read-only snapshot.
-`src/broker.rs::sync_filesystem` calls `syncfs` after snapshot creation,
-deletion, and selected reconciliation paths. `syncfs` flushes the whole Btrfs
-filesystem, so an otherwise clean status can wait for unrelated builds,
-downloads, image writes, or other repositories. Changed-object spool files also
-receive multiple durability barriers across broker and manager stages.
-
-**Fix:** Define the minimum Btrfs transaction durability needed for snapshot
-receipt recovery. Replace filesystem-wide synchronization with an applicable
-transaction-specific `START_SYNC`/`WAIT_SYNC` barrier, an appropriately scoped
-fsync, or a safely batched commit. Batch deletion barriers and eliminate
-redundant spool syncs only after proving crash-recovery equivalence.
-
-**Tests:** Measure clean and one-file jj/Git status with idle storage and
-concurrent unrelated buffered writes on the same Btrfs filesystem. Count
-`syncfs`, `fsync`, transaction waits, ioctl calls, and p50/p95/p99 latency;
-inject crashes before and after every retained durability boundary.
-
-### P1: Incremental queries repeat the already-completed kernel comparison
-
-Publishing a cut computes and stores its adjacent changed-object events.
-`src/facade.rs::prepare_query_after_cut` then invokes
-`Service::historical_changes` for the old token, repeating the kernel
-comparison, manifest spool, hashing, parsing, target-object lookup, and
-temporary SQLite writes. Finalization runs while the daemon-wide facade mutex
-is held, serializing this expensive second comparison across clients.
-
-**Fix:** For an exact immediately preceding baseline, project the newly
-published and pinned `PublishedCut.events`. For longer complete retained
-ranges, use `project_ready_cut_range_with_lease`; apply the correct witness and
-guard semantics before returning. Reserve direct historical comparison for a
-proved exact-baseline case that actually needs it. Keep long kernel operations
-and path expansion outside the global facade lock while preserving namespace,
-grant, and response fencing.
-
-**Tests:** Assert one changed-object ioctl for an adjacent incremental request,
-correct projection for multi-cut and fresh ranges, and no global serialization
-of independent watches. Capture concurrent status latency, spool writes,
-SQLite transactions, and lock hold times.
-
-### P1: Missing snapshot lineage silently becomes a full repository initialization
-
-`src/service.rs::adopt_snapshot_descendant` and
-`src/manager.rs::adopt_snapshot_descendant` currently return `None` both when a
-root is not an adoptable descendant and when its parent lineage exists but the
-expected retained snapshot revision is unavailable. `src/watchman.rs` treats
-both cases identically and falls back to `initialize`, which creates another
-snapshot and performs an `O(namespace size)` full index/tree search.
-
-This hides a retention or lifecycle error on a path that is supposed to reuse
-its known parent revision. Large externally created snapshot descendants can
-therefore unexpectedly cause expensive privileged repository crawls.
-
-**Fix:** Replace `Option<InitializedWatch>` with explicit outcomes such as
-`Adopted`, `NotDescendant`, and `KnownLineageMissingSeed`. Detect known parent
-UUIDs independently from the presence of a ready/present seed revision. Allow
-full initialization only when missing lineage is expected for a genuinely new
-root; fail or safely retry known-lineage requests whose retained seed was
-deleted, reclaimed, not yet committed, or raced by maintenance. Coordinate
-parent lookup, seed snapshot/revision pinning, retention, and descendant
-publication transactionally.
-
-**Tests:** Register a genuine non-descendant, a descendant with a present seed,
-a descendant whose known parent's seed is missing/deleted/not ready, and a
-descendant racing parent publication or retention. Verify the known-lineage
-failure/retry path never calls full-index creation, privileged tree search, or
-fallback initialization; confirm successful adoption shares the exact parent
-revision.
-
-### P0: Production does not reclaim snapshots or enforce configured retention
-
-`src/service.rs::garbage_collect` and `maintain_history` exist but no active
-daemon lifecycle or public maintenance command invokes them. Each client query
-therefore retains another read-only Btrfs snapshot, revision, and change
-history. `replay_window_cuts` and `replay_window_ns` are configured but not
-consumed, and `maintain_history` ignores its timestamp.
-
-**Fix:** First repair exact-clock and retained-boundary correctness. Then add a
-bounded production maintenance loop or explicit operational command that
-enforces count-, age-, and storage-based retention while respecting grants,
-active query pins, physical/indexed heads, failed operations, and broker
-fences. Expose snapshot count, retained bytes, SQLite/WAL size, oldest lease,
-history floor, failed operations, deletion backlog, and maintenance latency.
-
-**Tests:** Issue thousands of actual jj/Git queries, advance monotonic and
-retention clocks, hold/release pins, restart during deletion, and inject broker
-failures. Verify bounded snapshots and database growth, preserved exact active
-baselines, explicit fresh fallback after reclamation, and successful recovery.
-
-### P1: Concurrent queries cannot join the expensive in-flight cut
-
-`src/manager.rs::admit_planned_cut` joins only `operations.state = 'planned'`.
-The leader quickly transitions to `fs_started`, before the expensive snapshot,
-filesystem synchronization, delta comparison, and index publication. A second
-client arriving during that long interval cannot safely join the existing cut
-and may fail, spin, or create additional physical snapshots.
-
-**Fix:** Maintain a per-watch joinable in-flight batch through the snapshot and
-indexing phases, or explicitly admit followers to authorized `fs_started` and
-`manifest_ready` operations. Preserve sender/root checks, grant generation,
-session and epoch fences, cut ordering, waiter expiry, disconnect handling,
-shared result publication, and next-cut admission. Do not return a stale
-pre-request snapshot merely to improve batching.
-
-**Tests:** Admit clients at `planned`, `fs_started`, snapshot barrier, manifest
-parse, SQLite publication, boundary finalization, revocation, and response
-encoding. Verify one appropriate cut, correct shared results, independent
-waiter cancellation, authorization isolation, and bounded contention.
-
-### P1: Directory moves force unnecessary full crawls and metadata self-churn
-
-`src/compat.rs::project_events` converts every `SubtreeMoved` event into a
-fresh `/` result before `.git`/`.jj` filtering. Even a rename wholly inside
-excluded client metadata can trigger a complete repository crawl. Git can
-represent directory-prefix invalidations directly, while jj needs expanded
-descendant names or a bounded fresh fallback. Metadata writes are filtered only
-after snapshotting, kernel comparison, and indexing, so client-owned clock and
-index updates can generate avoidable monitoring work.
-
-**Fix:** Apply exact component-aware consumer exclusions before escalating a
-directory move. Emit old/new directory prefixes for Git; expand old/new jj
-subtrees from immutable indexes up to a clear size budget, otherwise return
-fresh. Investigate safe earlier exclusion of `.git` and `.jj` churn without
-weakening client-baseline reset detection, nested-subvolume validation, or
-other authorization invariants.
-
-**Tests:** Rename small and large trees, move trees into/out of excluded
-metadata, change only `.git`/`.jj`, replace parents, and exercise raw byte
-names. Compare monitored status with full scans and measure crawl count,
-snapshot/delta work, subtree expansion time, and self-triggering loops.
-
-### P1: History maintenance repeatedly crawls already-ready checkpoints
-
-`src/manager.rs::retain_exponential_replay_checkpoints` attempts to compact
-each retained boundary. `compact_revision` loads, hashes, and summarizes the
-whole namespace before determining that an existing ready checkpoint already
-satisfies the request. Once production maintenance exists, one pass can cost
-`O(repository size * retained checkpoint count)` even when nothing changed.
-
-**Fix:** Inspect compacted/checkpoint metadata before loading the inode graph.
-Only compact newly selected or actually deep overlay revisions, limit work per
-maintenance cycle, and preserve all pinned revision/snapshot relationships.
-
-**Tests:** Build large repositories with many already-ready checkpoints, rerun
-maintenance without changes, and count SQL reads, namespace allocations,
-hashing, bytes read, wall time, and retained snapshot correctness.
-
-### P1: Full-fresh recovery materializes an unnecessary complete event list
-
-`src/manager.rs::full_fresh_events` expands every indexed pathname even though
-jj/Git need only the newly committed baseline and a full `/` invalidation.
-`publish_full_fresh_checkpoint` also duplicates objects, references, and events
-into comparison staging before writing the full checkpoint. Recovery for a
-large repository therefore expands every path and writes much of the namespace
-more than once.
-
-**Fix:** Represent a full-fresh comparison as a compact durable sentinel and
-persist the required checkpoint without constructing per-path events. Generate
-a full inventory lazily only for an explicitly supported API that needs one.
-Keep replay, admissions, leases, and client freshness semantics unambiguous.
-
-**Tests:** Force full-fresh fallback on large and high-hardlink repositories;
-compare memory, SQLite writes, WAL growth, runtime, resulting clock, and
-subsequent incremental correctness.
-
-### P1: Daemon connection, frame, and protocol costs are unbounded
-
-`src/main.rs` starts an operating-system thread for every incoming connection;
-the server lacks an equivalent deadline for an indefinitely partial request
-frame. Git's hook connects for every invocation and sends both `watch-project`
-and a generic Watchman `query`, despite exposing a supposedly focused Git hook
-interface. jj creates monitor clients repeatedly and may execute discovery when
-`WATCHMAN_SOCK` is unset. The nonconcurrent daemon path can also decode the same
-BSER frame three times: initial `decode_and_authorize`, another authorization
-inside `prepare_authenticated_frame`, and final endpoint dispatch. Each repeat
-also revisits root/grant checks and facade-lock acquisition.
-
-**Fix:** Bound active connections, worker threads, frame read time, outstanding
-cuts, queue depth, and per-client resources. Use a dedicated authenticated
-single-request Git protocol or cached root registration where compatible.
-Carry one decoded, authorized request through dispatch, reuse socket discovery
-safely, and avoid redundant root authorization without weakening the required
-final sender/grant revalidation. Preserve response-size limits, sender
-identity, root binding, and grant revocation.
-
-**Tests:** Open many idle/partial sockets, flood connections, create slow
-readers/writers, repeatedly invoke the Git hook, and run parallel jj clients.
-Assert bounded threads, file descriptors, memory, broker work, latency, and
-fairness; verify real-client compatibility after reducing round trips.
-
-### P2: Recursive precision watching has unbounded directory-scale overhead
-
-When enabled, `src/precision.rs` recursively enumerates directories and adds an
-inotify watch for each one. Large trees can hit kernel watch limits, consume
-substantial memory, or add expensive re-arming work after directory creation and
-rename. The marker itself must not create a perpetual wakeup loop.
-
-**Fix:** Set explicit watch-count, traversal-time, memory, and event-queue
-budgets. Surface degraded/gapped state and continue with conservative snapshot
-projection. Consider a kernel-native bounded mutation journal only if it
-preserves exact transient-name completeness and overflow generation.
-
-**Tests:** Exercise very deep/wide trees, watch exhaustion, denied traversal,
-rename storms, overflow, marker churn, daemon restart, and fallback correctness
-with the guard disabled.
-
-## Deployment and actual client boundaries
-
-### P1: A clean default installation does not create its spool directory
-
-`src/main.rs::automatic_watchman_paths` creates the state and managed snapshot
-directories but returns `state_dir/spool` without creating it.
-`src/service.rs` immediately requires the spool directory to exist, have the
-expected owner, and be private. Automatic jj/Git daemon startup therefore
-fails on a clean installation unless an operator created or overrode the
-directory separately.
-
-**Fix:** Create the default spool directory with the correct principal and mode
-before constructing the service, validate existing directories without
-following symlinks, and apply the same checks to explicit overrides.
-
-**Tests:** Start from empty state/runtime directories; vary umask, owner, mode,
-symlink attacks, missing parents, explicit spool overrides, and broker
-availability. Verify automatic discovery and the first real jj/Git query.
-
-### P1: Installers do not provide a consistent discoverable command set
-
-`install.sh` creates `watchman` and `git-fsmonitor-hook` aliases but omits the
-documented `btrfs-awacs-watchman` alias. Both install scripts place the
-discovery executable under `libexec`, which is not normally on `PATH`. A jj
-client without `WATCHMAN_SOCK` may therefore fail to discover AWACS even
-though installation succeeded.
-
-**Fix:** Make both installers produce the same documented multicall aliases and
-install a discoverable wrapper/symlink on an intended `PATH`, or explicitly
-configure and test `WATCHMAN_SOCK`/client discovery. Validate broker service
-paths, permissions, package prefixes, `DESTDIR`, and fresh-install behavior.
-
-**Tests:** Exercise both installation methods in a clean Linux image, with and
-without `WATCHMAN_SOCK`, normal `PATH`, alternate prefixes, absent runtime
-directories, and real Git/jj invocations.
-
-### P1: One namespace daemon cannot serve roots on different Btrfs filesystems
-
-The automatic daemon socket is scoped to the mount namespace, but its manager
-database and managed snapshot directory are selected from the first repository.
-A second root on another Btrfs filesystem reaches the same daemon even though
-its snapshot cannot be created in the first filesystem's managed directory.
-
-**Fix:** Partition managers, broker configuration, snapshot directories, and
-durable state by filesystem UUID inside the namespace daemon, or expose one
-daemon/socket per `(mount namespace, filesystem UUID)`. If multi-filesystem
-support is deliberately excluded, reject subsequent roots early with a clear
-diagnostic and document the limitation.
-
-**Tests:** Register two roots on the same filesystem, two distinct Btrfs
-filesystems, bind mounts, changed mount namespaces, and an explicitly
-configured manager directory. Verify correct routing, authorization, snapshot
-placement, and independent retention.
-
-### P1: The advertised end-to-end runner has no declared executable target
-
-`run_e2e.sh` invokes `cargo build --bin btrfs-awacs-e2e`, but `Cargo.toml` has
-`autobins = false` and declares only `btrfs-awacs`. There is no checked-in
-matching integration binary. Several formerly advertised realistic acceptance
-paths were excluded rather than wired into runnable Linux/Btrfs coverage.
-
-**Fix:** Add a declared, maintained Linux/Btrfs/UML integration-test target or
-replace the script with the actual supported test command. Provide a custom
-kernel image, a disposable Btrfs filesystem, broker setup, real pinned jj/Git
-clients, fixture capture, and deterministic race/failure hooks. Fail CI if any
-documented acceptance target is missing.
-
-**Tests:** In the supported remote Linux environment, build the documented
-target from a clean checkout, provision the filesystem/broker, and run the
-complete correctness, recovery, compatibility, and performance suites below.
-
-### P1: Claimed replacement compatibility exceeds the tested support envelope
-
-AWACS does not implement arbitrary Watchman commands, subscriptions, saved
-state, SCM-aware clocks, general trigger programs, Git's built-in daemon, or
-ordinary filesystem roots unrelated to eligible Btrfs subvolumes. Git's stock
-Watchman sample hook and arbitrary client/library versions are not established
-compatibility boundaries. Raw non-UTF-8 paths must also be traced through the
-actual pinned Watchman client and jj pathname representation; preserving bytes
-inside AWACS alone is not proof that the client accepts them.
-
-**Fix:** Publish an explicit support matrix naming the exact custom kernel ABI,
-Btrfs root shape, filesystem/mount constraints, jj revision,
-`watchman_client` version, Git versions, supported expressions/fields/token
-forms, metadata exclusions, Git hook protocol, and raw-path behavior. Reject
-unsupported configurations clearly instead of implying general drop-in
-compatibility.
-
-**Tests:** Capture byte-exact BSER fixtures from the pinned jj client, then run
-real-client differential tests across each claimed jj/Git version and support
-matrix entry. Treat unsupported features as explicit negative tests.
-
-## Required validation before making a compatibility claim
-
-All of the following tests require a suitable remote Linux environment with the
-modified Btrfs kernel and a disposable filesystem; none were run during this
-inspection.
-
-1. **Independent inode/reference oracle:** Generate random valid trees and
-   mutation sequences; prove that applying `delta(A, B)` to an independent
-   full index of A matches an independent full index of B. Include hardlinks,
-   multiple aliases, inode reuse, overwrite, directory moves, symlinks, chmod,
-   chown, executable bits, xattrs, reflinks, arbitrary non-NUL path bytes,
-   nested directories, and packed-reference cancellation.
-2. **Kernel mutation coverage:** Exercise ordinary writes, truncate, fallocate,
-   modify/restore, writable `mmap`, fsync, inode metadata, security/trusted
-   xattrs, fscrypt, verity, dedupe against managed read-only snapshots, nested
-   subvolumes, root replacement, ancestor rename, mount-over, and mutation
-   witnesses across consecutive snapshot barriers.
-3. **Client-observation races:** Pause actual jj/Git clients after a clock is
-   issued and during crawls/re-stats. Create/remove transient files and complete
-   subtrees, rename names away and back, replace parents, and change hardlinks.
-   Compare every monitored state and advanced clock against a full scan.
-4. **Retention and clock soundness:** Reclaim exact and intermediate boundaries,
-   prune `watch_cuts`, race GC with queries, restart the daemon, copy tokens
-   across watches/users/stores, alter epoch/session/UUID/sequence claims, and
-   assert either a complete incremental result or an explicit fresh response.
-5. **Malformed kernel output and crash recovery:** Independently alter every
-   endpoint identity, count, checksum, capability, boundary, xattr reset, and
-   generation. Crash around snapshot creation, manifest staging, head
-   publication, index publication, query fencing, and snapshot deletion;
-   inspect persistent heads, operations, leases, pins, receipts, and retries.
-6. **Real Watchman protocol fixtures:** Record pinned `watchman_client` 0.9.0
-   discovery, `watch-project`, `clock`, initial/incremental queries, integer and
-   string clocks, exact jj expressions, trigger-disabled deletion, diagnostics,
-   unsupported trigger registration/listing, semantic errors, framing limits,
-   and the actual raw-path support boundary.
-7. **Real Git/jj differential behavior:** Compare fsmonitor-enabled and disabled
-   results for tracked/untracked paths, `.gitignore`, sparse checkout, sparse
-   index, untracked cache, directory moves, hardlinks, externally linked Git
-   working directories, Btrfs snapshot-descendant adoption, colocated `.jj`/`.git`,
-   client-side expected-tree/index resets, and supported version upgrades.
-8. **Authorization and namespaces:** Pass and inherit connected sockets, switch
-   mount namespaces/chroots, revoke grants, expire/renew leases, restart
-   monitors, lose root-component watches, overflow inotify, replace watched
-   roots, inject partial frames, and validate every response against its actual
-   sender without leaking pins.
-9. **Deployment and lifecycle:** Test both installers, executable aliases,
-   `PATH` and `WATCHMAN_SOCK` discovery, fresh spool creation, broker service
-   permissions, absent `XDG_RUNTIME_DIR`, unsupported root shapes, independent
-   Btrfs filesystems, retained database upgrades, daemon restart, and bounded
-   production GC.
-10. **Performance acceptance:** Measure cold/warm unchanged status, one-file
-    changes, small/large directory moves, high hardlink fanout, 100k/1M-path
-    initialization, concurrent clients, unrelated filesystem writeback,
-    snapshots and retained bytes, SQLite/WAL growth, `syncfs`/`fsync`, kernel
-    comparison counts, inotify watches, open descriptors, thread counts,
-    per-watch fairness, and p50/p95/p99 latency.
-
-The strongest defensible compatibility claim is conditional: the explicitly
-tested jj Watchman subset and Git hook-v2 protocol behave conservatively for
-the documented Btrfs/kernel/client support matrix. General Watchman, Git's
-built-in fsmonitor daemon and Watchman triggers remain outside that claim.
+# AWACS and Jujutsu remediation tracker
+
+This is the current, prioritized remediation plan for `btrfs-awacs` and its
+companion checkout at `../jj`. The authoritative architecture, complete
+finding inventory, source ownership, and review-time evidence are in
+[SPEC.md](SPEC.md), especially [Section 21: verified implementation gaps and
+review findings](SPEC.md#21-verified-implementation-gaps-and-review-findings).
+The [documentation site](docs/) organizes the same implementation and lifecycle
+by component. The older [indexed change-tracking design](docs/indexed-change-tracking.md)
+describes intended contracts; a schema table, dormant helper, or design proposal
+does not establish that the corresponding production behavior exists.
+
+`C-NN` and `P-NN` below refer to the correctness and performance findings in
+`SPEC.md`. Related items are grouped here to keep this document actionable.
+Source-backed legacy concerns without a dedicated specification finding are
+identified explicitly. Previously reported substitution of an older retained
+clock boundary and failure to create the automatic spool directory are fixed;
+neither is an outstanding remediation item.
+
+## Scope and noninterchangeable client contracts
+
+AWACS exposes three materially different integration boundaries:
+
+- **Focused Watchman compatibility:** Jujutsu receives changed names and an
+  authenticated clock, then crawls the **mutable live checkout**.
+- **Git fsmonitor hook v2:** Git receives a token and NUL-delimited names or
+  `/`, then refreshes its index and untracked state against the **mutable live
+  checkout**. The current helper internally uses the focused Watchman endpoint;
+  it is not Git's built-in fsmonitor daemon.
+- **Direct Jujutsu scans:** Jujutsu receives an authenticated cursor, path
+  invalidation, revocable lease, and read-only snapshot directory descriptor;
+  it crawls exactly that **immutable snapshot** via `/proc/self/fd/N` and must
+  commit its cursor only with the tree derived from the same snapshot.
+
+The transient live-crawl/directory-witness race is a **Watchman/Git** problem;
+it does not automatically transfer to the direct immutable scan. Conversely,
+descriptor validation, session renewal, external-input fingerprints, and
+transactional scan completion are **direct-scan** requirements that ordinary
+Watchman does not provide. Findings and acceptance tests must preserve that
+distinction.
+
+## P0: release blockers and silent data loss
+
+### C-01: Removing the primary workspace can destroy every workspace
+
+[`../jj/cli/src/commands/workspace/remove.rs`](../jj/cli/src/commands/workspace/remove.rs)
+rejects only the *currently selected workspace name*. From a secondary
+workspace, `jj workspace remove default` can recursively delete the primary
+workspace containing the shared `.jj/repo` and possibly the colocated Git
+object database. Secondary workspaces reference that same repository rather
+than owning independent history.
+
+**Remediate:** Resolve and verify the target's workspace identity and every
+shared operation/object/Git store before any transaction or deletion. Refuse a
+target containing storage required by any surviving workspace; protect against
+path ancestry, aliases, replaced symlinks, and concurrent workspace changes.
+
+**Accept when:** Removing `default` from secondary colocated and
+non-colocated workspaces fails without changing registrations, history,
+operations, filesystem contents, or Git objects.
+
+### C-02: Optional snapshot fallback fabricates a populated baseline
+
+[`../jj/cli/src/commands/workspace/add.rs`](../jj/cli/src/commands/workspace/add.rs)
+captures the source commit before attempting an optional Btrfs snapshot. If
+snapshot creation falls back to an ordinary empty directory, it retains that
+snapshot-only source baseline. `TreeState::reset` records the source tree
+without writing its files; the next scan can record every inherited tracked
+file as deleted or attach a Watchman baseline to nonexistent contents.
+
+**Remediate:** Associate the inherited baseline strictly with a successfully
+created, verified physical snapshot. On ordinary fallback, use stock Jujutsu
+workspace initialization and materialize the desired checkout before recording
+any filesystem-monitor cursor.
+
+**Accept when:** A nonempty source tree survives automatic fallback on a
+non-Btrfs root, absent optional tooling, an existing empty directory, and an
+unsupported/cross-filesystem destination; the initial monitored and
+unmonitored status matches stock Jujutsu.
+
+### C-03: The companion checkout cannot resolve its workspace dependencies
+
+[`../jj/Cargo.toml`](../jj/Cargo.toml) points `btrfs-awacs` at nonexistent
+`../bsend-watch`; the actual sibling is `../btrfs-awacs`. Cargo resolves that
+workspace path dependency before any build or test, even with the optional
+AWACS feature disabled.
+
+**Remediate:** Correct the dependency path or use a deliberate independently
+resolvable integration strategy. Preserve normal feature-disabled and
+non-Linux builds.
+
+**Accept when:** Jujutsu Cargo metadata, ordinary feature-disabled builds, and
+supported Linux `--features awacs` builds all resolve from a clean checkout.
+
+### C-04: Watchman and Git can report a falsely clean live checkout
+
+[`src/compat.rs`](src/compat.rs) discards `DirectoryDirtyWitness`. A live
+client can observe a temporary file after receiving clock B; that name can
+disappear before cut C, leaving identical immutable endpoints and an empty
+incremental result. The client then persists C while retaining incorrect
+tracked, untracked, or cached state.
+
+**Remediate:** Keep directory witnesses through consumer-specific projection.
+Git must receive a safe affected directory prefix or `/`; Watchman/Jujutsu
+must receive complete exact names from a proven contiguous journal interval,
+complete immutable subtree expansion, or `is_fresh_instance = true`. Do not
+claim endpoint equality proves what a live client observed.
+
+**Scope:** This race affects live Watchman and Git scans. A direct Jujutsu
+client reading the exact leased immutable snapshot cannot observe that
+particular transient file from the live checkout.
+
+**Accept when:** Paused real Jujutsu Watchman and Git clients survive transient
+file/subtree creation, deletion, rename-away/back, overwrite, and hardlink
+changes without advancing a falsely clean clock.
+
+### C-05: Invalid immutable targets can permanently wedge a watch
+
+[`src/service.rs`](src/service.rs) advances the physical snapshot head before
+all nested-subvolume, fscrypt, manifest, and target-object checks complete.
+A permanently invalid target can leave the physical and indexed heads
+inconsistent and the operation in `manifest_ready`. Production does not call
+the existing durable `fail_cut_comparison` transition, so restart can retry the
+same invalid snapshot indefinitely.
+
+**Remediate:** Perform all rejection-sensitive validation before publishing
+the physical head, or define one atomic terminal-failure/quarantine/recovery
+transition that restores a usable head, fails admissions, releases pins, and
+allows the next valid cut.
+
+**Accept when:** Injected nested-subvolume/fscrypt and staged-manifest errors
+leave no stuck heads, operations, admissions, pins, or permanently unserviceable
+Watchman, Git, or direct-scan clients across restart.
+
+### P-01: Production has no snapshot or history garbage collection
+
+[`src/service.rs`](src/service.rs) implements `garbage_collect` and
+`maintain_history`, but daemon startup, request processing, and background
+workers never invoke them. Every status creates another managed snapshot;
+configured replay windows do not bound snapshots, revisions, SQLite/WAL
+storage, event history, or copy-on-write extents.
+
+**Remediate:** First repair retained-boundary foreign keys and exact-baseline
+history ownership. Then run bounded, observable production maintenance with
+explicit snapshot-count, age, and storage policies; honor live scan/query
+leases, grants, physical/indexed heads, broker fences, failed operations, and
+retryable delete intents.
+
+**Accept when:** Thousands of real requests with concurrent active leases,
+restart, and injected deletion failures keep snapshot count, retained bytes,
+SQLite/WAL growth, and deletion backlog bounded while returning fresh whenever
+an exact historical baseline has genuinely expired.
+
+### P-02: Every status can flush unrelated filesystem-wide writes
+
+[`src/broker.rs`](src/broker.rs) invokes `syncfs` after Btrfs snapshot creation,
+deletion, and selected recovery operations. This waits for writeback on the
+entire filesystem, including unrelated builds, image writes, downloads, and
+other checkouts. Even an unchanged status can therefore inherit arbitrary
+tail latency.
+
+**Remediate:** Establish the exact durability/recovery contract, then replace
+whole-filesystem flushes with a valid Btrfs transaction-specific barrier,
+scoped durability operation, or safely batched commits. Preserve broker receipt
+crash consistency.
+
+**Accept when:** Idle and heavily contended clean/one-file status benchmarks
+report snapshot/ioctl, `syncfs`/`fsync`, and p50/p95/p99 counts, and
+crash-injection tests validate every remaining durability boundary.
+
+## P1: substantial correctness and compatibility defects
+
+### C-06: History compaction violates its retained-boundary foreign keys
+
+[`src/manager.rs`](src/manager.rs) retains selected `fsmonitor_boundaries`
+while `reclaim_unreferenced_cut_comparisons` deletes every older `watch_cuts`
+parent. SQLite foreign keys reject that deletion after earlier retention and
+revision changes have already committed. Historical membership lookup also
+relies on the cut rows that maintenance attempts to remove.
+
+**Remediate:** Retain every parent row needed by a surviving exact boundary,
+or redesign durable boundary ownership and lookup together. Make boundary,
+cut, revision, snapshot pin, replay floor, and admission reclamation atomic
+or explicitly fenced and recoverable; never revive older-boundary substitution.
+
+**Accept when:** Repeated maintenance passes succeed with retained old clocks,
+active scans, concurrent queries, injected transaction failures, restart, and
+`PRAGMA foreign_key_check`; a missing exact baseline yields fresh.
+
+### C-07–C-09: External ignore handling changes or poisons Jujutsu state
+
+**Tracked findings:** C-07, C-08, and C-09.
+
+[`../jj/cli/src/cli_util.rs`](../jj/cli/src/cli_util.rs) reads external ignore
+files once for `base_ignores`, then rereads them for the direct-scan input
+fingerprint. A mutation between those reads can persist a cursor claiming the
+new fingerprint for a tree produced from old ignore contents. It additionally
+removes relative `core.excludesFile` from the shared base matcher: `jj run`
+and external diff-edit paths never restore it, while the ordinary snapshot path
+restores it after `info/exclude`, reversing Git's required precedence.
+These latter regressions affect `none`, Watchman, and AWACS alike.
+
+**Remediate:** Construct one immutable external-input bundle and derive both
+the effective matcher and fingerprint from its exact bytes/configuration.
+Preserve stock global-versus-repository ignore precedence and ensure every
+snapshot entry point receives the same relative ignore semantics. Read
+worktree-relative inputs from the leased immutable root when using AWACS.
+
+**Accept when:** Real `none`, Watchman, AWACS, `jj run`, and external diff-edit
+comparisons agree with stock Jujutsu and Git for absolute/relative global
+ignores, contradictory `info/exclude` rules, and edits injected between
+fingerprinting and traversal.
+
+### C-17–C-22, C-28–C-30: Workspace lifecycle violates stock safety
+
+**Tracked findings:** C-17, C-18, C-19, C-20, C-21, C-22, C-28, C-29, and
+C-30.
+
+[`../jj/cli/src/commands/workspace/add.rs`](../jj/cli/src/commands/workspace/add.rs)
+and [`remove.rs`](../jj/cli/src/commands/workspace/remove.rs) introduce several
+independent lifecycle hazards:
+
+- A sparse-source snapshot widened to a full destination can record missing
+  inherited files as deletions instead of materializing them.
+- Removal deletes an unsnapshotted sibling without checking dirty tracked or
+  untracked files and follows a replaced target symlink to unrelated storage.
+- Removal commits the forgotten registration before learning that a normal
+  Btrfs directory cannot be deleted as a subvolume or that optional Btrfs
+  tooling is absent; colocated removal also leaves linked Git-worktree state.
+- Optional snapshot creation rejects stock-supported existing empty
+  destinations, fails instead of falling back across filesystems or missing
+  tooling, and can create a nested subvolume inside a monitored parent.
+
+**Remediate:** Lock and verify target workspace identity without following
+replacement symlinks; inspect/snapshot target state and require an explicit
+safe policy before destructive deletion; validate target/deletion capability
+before committing removal; clean linked Git administration; materialize sparse
+differences; and make every `auto` optimization observationally equivalent to
+stock Jujutsu. Reject nested monitored destinations before snapshot creation.
+
+**Accept when:** Differential lifecycle tests cover primary/secondary/sparse
+workspaces, dirty siblings, path replacement, missing tools, regular Btrfs
+directories, linked worktrees, nested destinations, existing empty directories,
+cross-filesystem fallback, rollback/recovery, and every Btrfs mode.
+
+### C-10: Direct scans bind a namespace daemon to its first root
+
+[`src/main.rs`](src/main.rs) constructs one `FacadeScanHandler` with the first
+canonical root and watch ID. [`src/scan_facade.rs`](src/scan_facade.rs)
+unconditionally rejects subsequent roots even though daemon discovery is
+mount-namespace-scoped and Watchman registration supports additional watches.
+A second repository or sibling Btrfs workspace cannot use direct AWACS.
+
+**Remediate:** Resolve and authorize each Begin request against its actual
+canonical root, grant, watch, filesystem, and namespace; safely create/adopt
+new watches; bind every session and fd to that exact identity.
+
+**Additional still-live concern:** The namespace daemon also chooses its
+manager database and managed-snapshot directory from the first filesystem.
+Roots on a second Btrfs filesystem cannot use snapshots stored on the first;
+partition services by filesystem UUID or explicitly scope discovery by
+`(mount namespace, filesystem UUID)`.
+
+**Accept when:** Independent roots, snapshot-descendant workspaces, bind
+mounts, multiple Btrfs filesystems, and unauthorized namespace/root changes
+route to the correct isolated service and lease.
+
+### P-03 and C-26: Direct invalidation paths defeat incremental scans
+
+[`src/index.rs`](src/index.rs) and [`src/compat.rs`](src/compat.rs) produce
+repository-relative bytes such as `src/file.rs`.
+[`src/scan_facade.rs`](src/scan_facade.rs) incorrectly requires `/src/file.rs`,
+so every normal nonempty response degrades to `Invalidation::Full`. At the
+client boundary,
+[`../jj/lib/src/local_working_copy.rs`](../jj/lib/src/local_working_copy.rs)
+uses `filter_map` and silently discards malformed paths; an empty resulting
+matcher can still commit the new cursor.
+
+**Remediate:** Specify one byte-exact repository-relative representation,
+validate components and encoding at both boundaries, preserve exact/prefix
+semantics, and fail closed or force `Full` on any unrepresentable path.
+
+**Accept when:** Actual end-to-end adjacent one-file changes remain
+incremental; non-UTF-8 supported paths, malformed entries, parent traversal,
+absolute paths, `.gitignore`, sparse prefixes, and empty invalidation sets
+cannot silently advance an incorrect cursor.
+
+### C-11, C-16, C-25: Lease clocks, locking, and failure cleanup disagree
+
+[`src/scan_facade.rs`](src/scan_facade.rs) captures wall-clock time before the
+expensive cut, computes durable session expiry from that stale timestamp, and
+advertises a fresh boot-time deadline after the cut.
+[`src/scan.rs`](src/scan.rs) holds the global handler mutex across Begin and
+response transmission; Begin also holds the shared facade lock while creating
+and comparing snapshots. Renew/Finish requests for unrelated sessions cannot
+advance. A failed Begin response leaves an already-inserted session pinned,
+and expiry cleanup runs only when another request arrives. Correctness-critical
+manager, admission, query, and retention leases elsewhere also use adjustable
+Unix wall-clock values.
+
+**Remediate:** Use one boot-scoped monotonic correctness clock with persisted
+boot identity; establish lease expiry after the cut and communicate the same
+actual deadline to both peers. Decouple expensive cuts and socket writes from
+global session/renewal locks, add bounded read/write deadlines and independent
+maintenance, and abort an allocated session immediately on response-send
+failure or disconnect.
+
+**Accept when:** Slow Begin, parallel Renew/Finish, wall-clock jumps,
+suspend/resume, failed fd delivery, idle abandoned sessions, daemon restart,
+and injected renewal failures neither invalidate an actively traversed
+snapshot nor retain pins or working-copy locks indefinitely.
+
+### C-12: Socket connector identity is reused after descriptor delegation
+
+[`src/watchman_transport.rs`](src/watchman_transport.rs) authenticates the
+original Unix-stream connector, not each later sending process; direct socket
+handling in [`src/main.rs`](src/main.rs) inherits the same authority model.
+A same-UID process using an inherited or passed connected descriptor can send
+from a different mount namespace or chroot. The direct endpoint can additionally
+transfer a private managed-snapshot directory fd.
+
+**Remediate:** Prove per-request sender and namespace/root authority with a
+supported nondelegable transport or kernel credentials/process handles. Reject
+mixed frame identity, missing or unverifiable credentials, stale processes,
+namespace changes, and unauthorized descriptor reuse before privileged work or
+fd delivery. Rechecking `SO_PEERCRED` alone does not establish the actual
+sender after descriptor passing.
+
+**Accept when:** Passed/inherited descriptors, fork/exec, mount namespace and
+chroot changes, process exit, PID reuse, revocation, and malformed ancillary
+data never authorize an unintended sender or leak a snapshot fd.
+
+### C-13–C-14: Freshness and optional precision never reach live clients
+
+[`src/manager.rs`](src/manager.rs) records full-fresh publication, but
+`PublishedCut` does not carry that state through the Watchman/Git facade.
+[`src/facade.rs`](src/facade.rs) can retry the historical comparison that
+already required fallback and return an error instead of a fresh `/` result.
+The direct immutable client separately degrades safely to `Full`.
+
+The optional recursive inotify precision guard persists certified exact-name
+intervals, but the live query path performs `historical_changes` plus
+`project_events` rather than the available lease-pinned range projector.
+Consequently its overhead does not repair the Watchman/Git transient-witness
+race.
+
+**Remediate:** Propagate committed freshness explicitly through publication,
+admissions, recovery, facade responses, Watchman encoding, and Git hooks.
+For live clients, use only complete, contiguous, epoch-matched precision
+intervals to refine directory witnesses; otherwise expand safely or return
+fresh. Keep mandatory namespace continuity separate from optional precision.
+
+**Accept when:** Legacy/incomplete kernel streams return successful fresh
+responses; complete, gapped, overflowed, restarted, and disabled precision
+guards never permit a falsely clean live-client response.
+
+### C-15 and C-23: Protocol and kernel trust boundaries are incomplete
+
+[`src/watchman.rs`](src/watchman.rs) validates expressions by evaluating an
+empty path. Short-circuiting can hide malformed operands until a real result
+has already allocated a durable response lease; late failure leaks pins.
+[`src/service.rs`](src/service.rs), [`src/manifest.rs`](src/manifest.rs), and
+[`src/broker.rs`](src/broker.rs) also fail to reconcile every parsed kernel
+filesystem/source/target identity, transaction/root ID, ioctl record count,
+completion count, and actual output-byte count before publication.
+
+**Remediate:** Validate the entire Watchman expression syntax tree before
+admitting a cut; guard every allocated response with unconditional cleanup.
+Carry authenticated endpoint expectations through normal and recovered
+manifest parsing and reject independently inconsistent identities, counters,
+framing, and checksums before indexing.
+
+**Accept when:** Hidden malformed expression branches leave no cuts/pins, and
+independent mutations of each kernel header/footer/ioctl identity or count
+are rejected before any indexed head advances.
+
+### Live-client baseline resets require explicit invalidation
+
+**Still-live legacy concern:** An authenticated Watchman clock proves an AWACS
+snapshot identity, not that Jujutsu's expected tree or Git's index still
+corresponds to it. Reset, interrupted checkout, import, recovery, colocated Git
+operations, index replacement, and excluded `.jj`/`.git` metadata can replace
+client-side baseline state without a matching monitored user-file event.
+
+**Remediate:** Audit all Jujutsu tree reset/import/checkout/recovery paths and
+clear incompatible saved Watchman clocks whenever the expected tree changes;
+verify Git invalidates its fsmonitor-valid/index state on equivalent
+transitions. The direct backend must continue committing its cursor only with
+the exact tree produced from its leased immutable snapshot.
+
+**Accept when:** Watchman/Git/direct enabled results match independent full
+scans after baseline replacement, interrupted transactions, copied working
+copy/index state, colocated imports, and sparse-index transitions.
+
+### Snapshot-descendant lineage loss silently triggers a full initialization
+
+**Still-live legacy concern:**
+[`src/service.rs`](src/service.rs) and [`src/manager.rs`](src/manager.rs)
+return `None` both for a genuinely unrelated root and for a descendant whose
+known parent lacks its expected ready/present seed revision.
+[`src/watchman.rs`](src/watchman.rs) treats both identically and invokes full
+initialization. A retention, publication, or lifecycle defect can therefore
+silently become a privileged `O(repository size)` crawl instead of preserving
+or safely retrying known snapshot lineage.
+
+**Remediate:** Return distinct `Adopted`, `NotDescendant`, and
+`KnownLineageMissingSeed` outcomes. Detect known parent identity independently
+of seed readiness; pin/adopt transactionally and permit full initialization
+only for genuinely new roots.
+
+**Accept when:** Missing/deleted/not-ready parent seeds and races with
+publication or maintenance never call full-index initialization, while real
+new roots and valid descendants retain their intended behavior.
+
+### C-24: Watchman trigger compatibility is intentionally incomplete
+
+[`src/watchman.rs`](src/watchman.rs) returns synthetic `deleted: false` for
+`trigger-del` and rejects `trigger-list` and `trigger`. Dormant manager tables
+and helper methods are not a production scheduler or trigger implementation.
+Certain Jujutsu diagnostics and enabled background-monitor registration thus
+remain unsupported.
+
+**Remediate:** Keep `fsmonitor.watchman.register-snapshot-trigger = false`,
+return truthful errors, and document the exact supported command subset. Do
+not claim trigger support until authorization, persistence, scheduling,
+execution, deletion, and real-client compatibility are implemented.
+
+**Accept when:** Real pinned Jujutsu initialization/status succeeds with
+registration disabled, enabled registration fails clearly without side
+effects, and unsupported diagnostics are accurately documented.
+
+## P1/P2: scaling, deployment, and compatibility follow-up
+
+### P-04–P-05: Adjacent deltas are recomputed and cuts fail to coalesce
+
+Publishing a cut already persists its adjacent changed-object events, but
+[`src/facade.rs`](src/facade.rs) repeats the privileged historical kernel
+comparison, spool/hash, target lookup, and SQLite work. Meanwhile
+[`src/manager.rs`](src/manager.rs) permits followers only while a cut remains
+`planned`; requests arriving during expensive `fs_started`/`manifest_ready`
+snapshot, flush, or indexing phases cannot join the useful in-flight work.
+
+**Remediate:** Use the already pinned published adjacent delta or a complete
+lease-pinned retained range, while preserving live directory-witness
+semantics. Keep an authorized per-watch batch joinable through the expensive
+cut and release global locks around unrelated expensive work.
+
+**Accept when:** Adjacent status performs one changed-object comparison;
+concurrent callers at every snapshot/publication stage share one valid target
+cut without crossing grants, roots, namespaces, or epochs.
+
+### P-06 and P-12: Connections, sessions, and cleanup have no hard bounds
+
+[`src/main.rs`](src/main.rs) spawns an operating-system thread per accepted
+connection. [`src/scan.rs`](src/scan.rs) allocates an approximately 1 MiB
+receive buffer before blocking on each idle direct connection, and direct
+transport lacks read/write deadlines.
+[`src/scan_facade.rs`](src/scan_facade.rs) scans every live session and
+five-minute completion tombstone on every Begin/Renew/Finish, approaching
+quadratic cleanup work under sustained traffic.
+
+**Remediate:** Bound clients, workers, packet buffers, queue depth,
+in-flight cuts, and per-connection deadlines; use indexed expiry or a
+background maintenance heap; never hold a global dispatch lock across a
+potentially blocked socket write.
+
+**Accept when:** Idle/partial/nonreading clients, high command rates, renewal
+storms, and disconnects produce bounded descriptors, threads, memory,
+tombstones, latency, and snapshot pins.
+
+### P-07: Full freshness, ready checkpoints, and directory moves over-crawl
+
+[`src/manager.rs`](src/manager.rs) enumerates every path for full freshness
+even though clients need only a new clock plus `/`, and hydrates/hashes whole
+revisions before discovering that existing checkpoints are already ready.
+[`src/compat.rs`](src/compat.rs) escalates subtree moves before applying
+`.git`/`.jj` exclusions, so irrelevant metadata movement can force a full live
+client crawl. Git supports compact directory-prefix invalidation, while
+Watchman/Jujutsu requires safe descendant expansion or a bounded fresh result.
+
+**Remediate:** Represent full freshness as a durable sentinel; inspect
+checkpoint state before hydration; filter component-aware excluded metadata
+before escalation; use Git prefixes and bounded immutable-subtree expansion
+for Watchman. Ensure excluded metadata churn cannot invalidate required
+namespace/security or client-baseline invariants.
+
+**Accept when:** Large repositories, repeated maintenance, `.git`/`.jj`-only
+moves, real source-tree moves, hardlink fanout, and full-fallback recovery
+avoid unnecessary namespace-sized allocations/crawls while preserving correct
+client state.
+
+### P-09: Snapshot workspace creation destroys the metadata-sharing benefit
+
+[`../jj/cli/src/commands/workspace/add.rs`](../jj/cli/src/commands/workspace/add.rs)
+snapshots the complete source checkout, then recursively removes copied `.jj`
+and `.git` metadata before constructing the destination workspace. On a large
+colocated repository this walks and copy-on-write-modifies potentially
+hundreds of thousands of metadata entries.
+
+**Remediate:** Separate repository metadata from the snapshotted source tree,
+use safe subvolume/layout boundaries, or construct the destination without
+recursively rewriting shared repository/object metadata.
+
+**Accept when:** Large colocated repositories show bounded workspace-add
+metadata traversal and copy-on-write amplification while preserving correct
+Git worktree ownership and AWACS nested-subvolume invariants.
+
+### P-10–P-11: Each direct command repeats external work
+
+[`../jj/cli/src/cli_util.rs`](../jj/cli/src/cli_util.rs) repeatedly parses Git
+sparse state, reads ignore files, and probes executable-bit policy.
+[`src/scan.rs`](src/scan.rs) launches `btrfs-awacs scan-sockname` for default
+discovery, and
+[`../jj/lib/src/local_working_copy.rs`](../jj/lib/src/local_working_copy.rs)
+opens a new connection and creates/joins a renewal thread even for short clean
+scans.
+
+**Remediate:** Reuse the same validated immutable input bundle, parsed sparse
+state, resolved executable-bit policy, safe namespace-scoped discovery, and
+appropriately bounded renewal infrastructure without sharing stale authority
+or cursors.
+
+**Accept when:** Clean and one-file scans show fewer subprocesses, sparse/index
+reads, temporary permission probes, thread creations, and socket round trips
+without weakening fingerprint or lease correctness.
+
+### Recursive precision watching has directory-scale overhead
+
+**Still-live legacy concern:** When enabled,
+[`src/precision.rs`](src/precision.rs) recursively walks reachable directories
+and installs one Linux inotify watch per directory. Large/wide trees, rename
+storms, unreadable paths, watch exhaustion, queue overflow, and private-marker
+churn can consume unbounded time or kernel watch resources.
+
+**Remediate:** Set explicit watch-count, traversal, queue, memory, and
+re-arming budgets; surface degraded/gapped state and conservatively project
+snapshot witnesses when exact coverage is unavailable.
+
+**Accept when:** Deep/wide trees, denied traversal, exhaustion, directory
+moves, overflow, restart, and disabled guard remain bounded and preserve the
+same live-client correctness guarantee.
+
+### P-08 and P-13: The advertised validation and install paths do not work
+
+[`run_e2e.sh`](run_e2e.sh) requests nonexistent
+`--bin btrfs-awacs-e2e`; [`Cargo.toml`](Cargo.toml) sets `autobins = false`
+and declares only `btrfs-awacs`.
+[`install.sh`](install.sh) omits the `btrfs-awacs-watchman` alias that
+[`packaging/install.sh`](packaging/install.sh) creates, and both place commands
+under `libexec` rather than an ordinary default `PATH`.
+
+**Remediate:** Declare and maintain the actual Linux/Btrfs end-to-end target
+or replace the script with a real supported command. Make both installers
+produce the same documented entry points and a deliberate discoverable `PATH`,
+`WATCHMAN_SOCK`, or `BTRFS_AWACS_COMMAND` configuration.
+
+**Accept when:** Clean installation and documented acceptance commands work
+with the supported custom kernel, disposable Btrfs filesystem, broker,
+namespace-scoped daemon discovery, real pinned Jujutsu/Git versions, and direct
+AWACS feature-enabled Jujutsu.
+
+### C-27: Cursor migration is not backward compatible with stock Jujutsu
+
+[`../jj/lib/src/local_working_copy.rs`](../jj/lib/src/local_working_copy.rs)
+persists the new backend-tagged cursor without mirroring the legacy Watchman
+protobuf field. Older/stock Jujutsu ignores the new field and loses the
+existing baseline when binaries alternate.
+
+**Remediate:** Define a safe dual-write/read migration or an explicitly
+versioned interoperability policy; never reinterpret a direct AWACS cursor as
+a Watchman clock.
+
+**Accept when:** Alternating supported stock, Watchman-enabled, and direct
+AWACS binaries preserves a compatible Watchman baseline or deliberately
+performs a safe fresh crawl without mixing backend identities.
+
+## Required acceptance and support boundaries
+
+Run kernel-dependent tests on Linux with the supported modified Btrfs kernel,
+privileged broker, disposable eligible Btrfs subvolumes, and real pinned
+Jujutsu/Git clients. Ordinary unit tests, macOS execution, schema inspection,
+and environment-skipped integration tests cannot establish this boundary.
+
+1. **Build and deployment:** Resolve both checkouts with AWACS enabled and
+   disabled; run the documented end-to-end target, both installers, broker
+   activation, normal discovery, aliases, permissions, and clean startup.
+2. **Stock Jujutsu parity:** Compare `none`, Watchman, and AWACS for workspace
+   add/remove, optional Btrfs fallback, sparsity, global/repository ignores,
+   `jj run`, external diff editing, colocated Git, and cursor migration.
+3. **Immutable index oracle:** Differentially compare snapshots and indexed
+   events against an independently generated full inode/reference graph;
+   include hardlinks, inode reuse, directory moves, metadata, xattrs, reflinks,
+   supported raw path bytes, nested subvolumes, and custom kernel witnesses.
+4. **Live-client observation:** Pause real Watchman/Git clients between clock
+   receipt and live crawl; exercise transient files/subtrees, rename reversal,
+   overwrite, hardlink aliases, excluded metadata, precision gaps, and fresh
+   fallback. Verify every advanced clock against a full live scan.
+5. **Direct immutable transaction:** Mutate the live checkout during leased
+   traversal; verify descriptor identity, immutable contents, exact/prefix
+   invalidation, external-input fingerprints, renewal, failed Begin delivery,
+   Finish/abort, restart, and cursor/tree atomicity.
+6. **Recovery and retention:** Crash around snapshot receipts, physical/indexed
+   publication, manifest staging, compaction, foreign keys, retention, exact
+   baseline removal, query/session pinning, broker deletion, and clock-domain
+   changes; require either complete continuity or an explicit fresh result.
+7. **Workspace destruction safety:** Reject removal of shared storage, active
+   or dirty sibling data, symlink-replaced targets, and unrecoverable deletion
+   failures; preserve registrations/history and clean linked Git metadata.
+8. **Authority and isolation:** Exercise descriptor passing/inheritance,
+   process replacement, mount namespaces, chroot, multiple roots/filesystems,
+   grants, revocation, stale epochs, malformed frames/expressions, kernel
+   identity/count corruption, and response fd leakage.
+9. **Resource and latency budgets:** Measure clean/dirty p50/p95/p99, unrelated
+   filesystem writeback, `syncfs`/`fsync`, changed-object ioctl counts,
+   concurrent cut coalescing, metadata traversal, full-crawl count,
+   inotify watches, subprocesses, threads, buffers, tombstones, SQLite/WAL
+   growth, retained snapshot bytes, and active/expired pins.
+
+Until these gates pass, the defensible support claim is limited to the exact
+reviewed custom-kernel ABI, eligible Btrfs root and mount topology, authorized
+broker, pinned client versions, focused Watchman command/expression subset,
+Git hook-v2 framing, direct AWACS feature/build combination, supported path
+representation, and documented trigger-disabled configuration. AWACS is not a
+general Watchman server, Git's built-in fsmonitor daemon, an arbitrary
+filesystem watcher, or a verified drop-in replacement outside that envelope.

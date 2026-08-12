@@ -1,0 +1,74 @@
+---
+title: Btrfs AWACS
+description: Immutable Btrfs filesystem monitoring, Jujutsu integration, and the complete implementation review.
+template: splash
+hero:
+  title: Btrfs AWACS
+  tagline: Authenticated filesystem cuts, immutable repository scans, and an honest account of their current implementation.
+  actions:
+    - text: Explore the architecture
+      link: /architecture/system-overview/
+      icon: right-arrow
+    - text: Read the 43 review findings
+      link: /review/overview/
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+AWACS builds a persistent change index from immutable Btrfs snapshots. Git and
+Watchman-compatible clients consume authenticated path invalidations; Jujutsu
+can also lease the actual immutable snapshot and derive its working-copy tree
+without racing the live checkout.
+
+<CardGrid>
+  <LinkCard
+    title="Understand the architecture"
+    description="Process boundaries, Btrfs identity, durable state, and privileged broker ownership."
+    href="/architecture/system-overview/"
+  />
+  <LinkCard
+    title="Follow a filesystem cut"
+    description="Watch initialization, snapshot publication, crash recovery, and lease lifetime."
+    href="/lifecycle/watch-initialization/"
+  />
+  <LinkCard
+    title="Trace the integrations"
+    description="Watchman, Git fsmonitor, Jujutsu direct scans, fingerprints, and Btrfs workspaces."
+    href="/integrations/direct-scan-api/"
+  />
+  <LinkCard
+    title="Inspect the implementation review"
+    description="30 correctness findings and 13 performance findings, ordered by severity."
+    href="/review/overview/"
+  />
+</CardGrid>
+
+## Three client contracts
+
+<CardGrid>
+  <Card title="Focused Watchman">
+    Changed names and authenticated clocks narrow a crawl of the **live**,
+    mutable checkout. Transient directory changes must remain visible.
+  </Card>
+  <Card title="Native Git fsmonitor">
+    Hook-v2 tokens and NUL-delimited invalidations conservatively refresh Git's
+    tracked, untracked, and index state.
+  </Card>
+  <Card title="Direct Jujutsu scans">
+    A leased read-only snapshot descriptor, authenticated cursor, and external
+    input fingerprint bind a tree state to one **immutable** filesystem cut.
+  </Card>
+</CardGrid>
+
+## Implementation status
+
+This documentation describes the code that currently exists, including
+verified regressions and missing production wiring. It does not equate a
+planned schema, unused helper, environment-gated test, or architectural
+proposal with a functioning production path.
+
+Start with the [system overview](/architecture/system-overview/), then follow
+the [cut-publication lifecycle](/lifecycle/cut-publication/), the
+[Jujutsu snapshot transaction](/integrations/jujutsu-transaction/), and the
+[review findings](/review/overview/).

@@ -1,0 +1,213 @@
+---
+title: "P1 · Correctness and compatibility"
+description: "P1 correctness review findings, affected components, failure mechanisms, and observed impact."
+sidebar:
+  order: 4
+---
+This page contains **20 P1 correctness findings**. Identifiers correspond to the reviewed source specification.
+
+**C-06 — History maintenance violates its own retained-boundary foreign keys.**
+`src/manager.rs` deliberately retains the oldest and newest
+filesystem-monitor boundaries, then deletes every older `watch_cuts` parent.
+The retained boundaries reference those cut rows. SQLite rejects maintenance
+after earlier compaction/boundary changes have already committed, leaving
+partially applied retention work.
+
+---
+
+**C-07 — External ignore fingerprinting can permanently poison a direct-scan
+baseline.** `../jj/cli/src/cli_util.rs` first reads
+Git ignore files into `base_ignores`, then rereads the same files for the AWACS
+fingerprint. A change between those reads pairs a tree derived from the old
+ignore contents with a cursor fingerprint representing the new contents. The
+next command sees the same new fingerprint and no worktree event, so a newly
+unignored file can remain missing or newly ignored private content can be
+tracked.
+
+---
+
+**C-08 — Relative `core.excludesFile` regresses ordinary Jujutsu behavior.**
+`../jj/cli/src/cli_util.rs` removes worktree-relative
+global excludes from `base_ignores()` for every backend. The normal snapshot
+path reapplies them through `scan_root_ignores`, but
+`../jj/cli/src/commands/run.rs` and
+`../jj/cli/src/merge_tools/diff_working_copies.rs`
+explicitly provide an empty list. `jj run` and external diff-edit snapshots can
+therefore include previously ignored generated or sensitive files even when
+AWACS is disabled.
+
+---
+
+**C-09 — Relative global-ignore precedence is reversed for every backend.**
+`../jj/cli/src/cli_util.rs` now chains repository
+`info/exclude` into `base_ignores` before deferring a relative global
+`core.excludesFile`.
+`../jj/lib/src/local_working_copy.rs`
+later appends that relative global file on top. Since Jujutsu's ignore matcher
+uses the newest applicable rule, the lower-priority global ignore incorrectly
+overrides the higher-priority repository exclude. This changes tracking or
+silently includes/excludes private files under `none`, Watchman, and AWACS. A
+live `fsmonitor.backend = "none"` comparison showed that Git and the installed
+Jujutsu both reported an unignored candidate, while the current implementation
+incorrectly reported a clean working copy.
+
+---
+
+**C-10 — Direct AWACS works only for the daemon's first workspace root.**
+`src/main.rs` discovers one daemon/socket per mount namespace,
+but constructs a `FacadeScanHandler` permanently bound to the first root and
+watch. `src/scan_facade.rs` rejects every other requested
+root. A second independent repository or a sibling `jj workspace add` Btrfs
+workspace cannot snapshot through the existing daemon, despite the Watchman
+endpoint supporting dynamic root registration.
+
+---
+
+**C-11 — Server lease expiry and advertised client deadline disagree.**
+`src/scan_facade.rs` records wall-clock `now` before the
+expensive snapshot cut, derives the durable/server expiry from that old time,
+and advertises a fresh boot-time deadline only after the cut. A slow cut,
+wall-clock adjustment, or suspend can expire the real server lease long before
+Jujutsu's advertised renewal deadline.
+
+---
+
+**C-12 — A connected descriptor can carry the wrong namespace authority.**
+`src/watchman_transport.rs` and
+`src/main.rs` authenticate the original socket connector rather
+than each later sending process. An inherited or transferred connected
+descriptor can therefore be reused by a same-UID process with a different mount
+namespace or chroot. The direct endpoint can additionally transfer a private
+managed snapshot fd under the original connector's authority.
+
+---
+
+**C-13 — Fresh fallback is lost for Watchman and Git.**
+`src/manager.rs` records a full-fresh cut in SQLite, but
+`PublishedCut` does not propagate its freshness. The facade retries a
+historical comparison that can fail for exactly the kernel capability that
+required the fresh checkpoint, returning an error instead of `/`. The direct
+backend has a separate safe `Full` fallback for this case.
+
+---
+
+**C-14 — The optional precision journal is recorded but not used by clients.**
+`src/facade.rs` certifies and pins guard cursors, but projects
+direct `historical_changes` using `project_events` rather than the existing
+lease-aware precision-range projector in `src/compat.rs`.
+Consequently the recursive inotify overhead does not repair the live-client
+directory-witness false negative.
+
+---
+
+**C-15 — Invalid Watchman expressions can leak durable response pins.**
+`src/watchman.rs` validates expressions against an empty
+path, but short-circuiting can hide a malformed name operand until a nonempty
+changed path is evaluated after a prepared response has been allocated. The
+error path returns without releasing that response's query lease/pins.
+
+---
+
+**C-16 — One slow direct Begin can expire unrelated active scans.**
+`src/scan.rs` holds the global dispatcher mutex while
+`src/scan_facade.rs` holds the shared facade mutex across
+snapshot creation and historical comparison. Renew and Finish requests cannot
+proceed until the entire cut completes. Once the blocked renewal finally runs,
+session cleanup may already have removed the expired lease. The packet
+transport has no read deadline, and Jujutsu joins the blocked renewal thread
+while finishing or dropping its working-copy transaction; a stalled daemon can
+therefore hang the command indefinitely while retaining its working-copy lock.
+
+---
+
+**C-17 — Widening a sparse snapshot workspace can commit missing files as
+deletions.**
+`../jj/cli/src/commands/workspace/add.rs`
+records a full source-commit baseline before applying destination sparsity. A
+Btrfs snapshot of a sparse source physically lacks its excluded tracked files,
+but `--sparse-patterns=full` selects no later sparsity update, and
+`../jj/lib/src/local_working_copy.rs`
+only invents file-state entries during reset. Files unchanged between source
+and destination are never materialized; a subsequent scan records them as
+deletions, contrary to stock full-workspace behavior.
+
+---
+
+**C-18 — Workspace removal silently destroys unsnapshotted sibling edits.**
+`../jj/cli/src/commands/workspace/remove.rs`
+snapshots only the invoking workspace. It does not open, lock, snapshot,
+inspect, or request confirmation for the target workspace before removing its
+working-copy commit and recursively deleting its files. Tracked modifications
+and untracked files created since the target's last Jujutsu command can be
+irretrievably lost. A disposable-workspace reproduction confirmed that an
+unsnapshotted file disappeared without any warning or confirmation.
+
+---
+
+**C-19 — Workspace removal follows replaced symlinks to unrelated directories.**
+`../jj/cli/src/commands/workspace/remove.rs`
+canonicalizes the stored target path and follows symlinks, but never reloads or
+verifies the target workspace identity. A replaced workspace directory can
+therefore cause recursive deletion of the active checkout or another unrelated
+directory under the caller's permissions. A disposable-workspace reproduction
+replaced the registered path with a symlink; removal reported success and
+deleted an unrelated directory while leaving the actual workspace elsewhere.
+
+---
+
+**C-20 — Auto removal cannot remove ordinary directories on Btrfs.**
+`../jj/cli/src/commands/workspace/remove.rs`
+forgets the workspace before trying subvolume deletion for every target.
+`../jj/cli/src/commands/btrfs.rs` classifies
+an ordinary directory *on* Btrfs as an operation error instead of the
+`Ok(false)` fallback case. The command leaves the directory behind after
+deleting its durable workspace registration.
+
+---
+
+**C-21 — Optional Btrfs mode fails hard when the Btrfs executable is absent.**
+`../jj/cli/src/commands/btrfs.rs` and
+`../jj/cli/src/commands/workspace/add.rs`
+convert a missing `btrfs` executable into an unconditional error. Consequently
+`btrfs.enabled = "auto"` does not preserve ordinary add/clone/remove behavior on
+systems without the tool; removal has already forgotten the workspace before
+discovering the error.
+
+---
+
+**C-22 — Snapshot workspaces can violate the monitored parent's Btrfs
+boundary invariant.**
+`../jj/cli/src/commands/workspace/add.rs`
+permits a destination underneath the current workspace. With snapshot mode,
+that creates a nested Btrfs subvolume under the AWACS-monitored parent.
+`src/service.rs` rejects nested-subvolume transitions on a
+subsequent parent cut, so creating a child can break monitoring of the source
+workspace as well as failing direct registration of the new child.
+
+---
+
+**C-23 — Parsed kernel stream identities and completion counters are not fully
+enforced.** `src/service.rs` parses v2 endpoint metadata but
+does not compare all advertised filesystem/source/target identities and
+transaction fields with the actual descriptors.
+`src/broker.rs` also fails to reconcile all ioctl-reported
+record/byte totals with the persisted stream. A malformed or mismatched custom
+kernel stream can cross the trust boundary without the intended proof.
+
+---
+
+**C-24 — Trigger compatibility does not match ordinary Watchman features.**
+`src/watchman.rs` always returns a synthetic
+`deleted: false` for `trigger-del` and explicitly rejects `trigger-list` and
+`trigger`. Jujutsu trigger registration and certain diagnostics are unsupported;
+configuration must keep `register-snapshot-trigger = false`.
+
+---
+
+**C-25 — A failed Begin response can leave a snapshot pinned indefinitely.**
+`src/scan_facade.rs` inserts an active session and retains
+its prepared query before `src/scan.rs` sends the Begin response
+and descriptor. A failed response disconnects without aborting that inserted
+session. Expired sessions are reclaimed only while servicing a later
+Begin/Renew/Finish, and the daemon has no independent maintenance scheduler;
+an idle daemon can therefore retain the abandoned snapshot pin indefinitely.
