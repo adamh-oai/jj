@@ -122,8 +122,8 @@ struct RunWorkspace {
 }
 
 impl RunWorkspace {
-    /// Persist the post-snapshot tree state to disk so the next slot
-    /// acquisition can diff against it and only touch changed files.
+    /// Persist the post-snapshot working-copy journal so the next slot
+    /// acquisition can reuse the semantic tree and baseline safely.
     fn persist(&mut self) -> Result<(), RunError> {
         self.tree_state.save()?;
         Ok(())
@@ -208,36 +208,36 @@ impl WorkspacePool {
         let slot_path = self.slot_path(slot_index);
         let working_copy_dir = slot_path.join("working_copy");
         let state_dir = slot_path.join("state");
-        let tree_state_path = state_dir.join("tree_state");
+        let state_marker_path = state_dir.join("tree_state");
 
-        let is_reused_workspace = tree_state_path.exists();
+        let is_reused_workspace = state_marker_path.exists();
         let settings = default_tree_state_settings();
         let mut tree_state = if !self.clean && is_reused_workspace {
-            // Load the persisted tree state so `check_out` below can diff
-            // against it, only touching files that changed and removing files
-            // no longer present in the new tree.
+            // Load the persisted working-copy journal so `check_out` below
+            // can diff against its semantic tree and remove files no longer
+            // present in the new tree.
             //
-            // Delete `tree_state` from disk before checkout to act as a dirty
-            // marker. If we crash between here and the save at the end of the
-            // job, the next acquisition will see the file absent and wipe the
-            // slot rather than trusting inconsistent state.
+            // Delete the journal before checkout to act as a dirty marker. If
+            // we crash between here and the save at the end of the job, the
+            // next acquisition will see the file absent and wipe the slot
+            // rather than trusting inconsistent state.
             let ts = TreeState::load(
                 commit.store().clone(),
                 working_copy_dir.clone(),
                 state_dir.clone(),
                 &settings,
             )?;
-            fs::remove_file(&tree_state_path)?;
+            fs::remove_file(&state_marker_path)?;
             ts
         } else {
             // This is the first use of the workspace, the previous job crashed,
             // or --clean was passed. Wipe any leftover working copy so we start
-            // from a clean slate, then use an in-memory empty tree state.
-            // `tree_state` stays absent on disk until a successful job writes
-            // it via `persist()`.
-            fs::remove_file(&tree_state_path).or_else(|e| match e {
+            // from a clean slate, then use an in-memory empty tree state. The
+            // journal stays absent on disk until a successful job writes it
+            // via `persist()`.
+            fs::remove_file(&state_marker_path).or_else(|e| match e {
                 e if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                e => Err(RunError::PathDeletionFailure(tree_state_path.clone(), e)),
+                e => Err(RunError::PathDeletionFailure(state_marker_path.clone(), e)),
             })?;
             fs::remove_dir_all(&working_copy_dir).or_else(|e| match e {
                 e if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -318,11 +318,14 @@ impl WorkspacePool {
     fn snapshot_options(&self, base_ignores: Arc<GitIgnoreFile>) -> SnapshotOptions<'_> {
         SnapshotOptions {
             base_ignores,
+            scan_root_ignores: vec![],
             start_tracking_matcher: self.auto_tracking_matcher.as_ref(),
             progress: None,
             // TODO: read from current wc/settings
             max_new_file_size: 64_000_u64, // 64 MB for now
             force_tracking_matcher: &NothingMatcher,
+            awacs_input_fingerprint: None,
+            awacs_compatible_input_fingerprints: vec![],
         }
     }
 
@@ -452,8 +455,8 @@ async fn rewrite_commit(
                 commit = old_id.hex(),
                 "subdirectory does not exist in commit; skipping"
             );
-            // Persist the post-checkout state so the next pool acquisition
-            // can diff from this tree even though no command ran.
+            // Persist the post-checkout journal so the next pool acquisition
+            // can reuse this semantic tree even though no command ran.
             workspace.persist()?;
             return Ok(RunJob {
                 old_id,
@@ -534,9 +537,9 @@ async fn rewrite_commit(
         }
     }
 
-    // Persist the post-snapshot tree state so the next pool acquisition can
-    // diff against it and only touch files that changed. Done unconditionally
-    // so the slot is reusable even when the command failed.
+    // Persist the post-snapshot journal so the next pool acquisition can reuse
+    // the semantic tree and baseline. Done unconditionally so the slot is
+    // reusable even when the command failed.
     workspace.persist()?;
 
     let new_tree = if output.status.success() {

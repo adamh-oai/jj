@@ -146,7 +146,7 @@ jj-cli = { path = ".", features = ["test-fakes"], default-features = false }
 [features]
 default = ["watchman", "git", "awacs"]
 bench = ["dep:criterion"]
-awacs = ["dep:btrfs-awacs"]
+awacs = ["jj-lib/awacs", "dep:btrfs-awacs"]
 git = ["jj-lib/git", "dep:gix"]
 test-fakes = ["jj-lib/testing"]
 watchman = ["jj-lib/watchman"]

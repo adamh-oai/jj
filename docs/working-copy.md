@@ -89,12 +89,29 @@ registers a distinct working-copy commit at the worktree's existing Git HEAD,
 and then snapshots any local changes without rewriting the worktree files,
 Git HEAD, or index.
 
-Run `jj util subvolume enable` in the main Git-colocated workspace to enable
-the persistent snapshot-backed working-copy mode. The command verifies that
-the checkout is on Btrfs, converts the repository root into a subvolume when
-needed, creates a nested subvolume for `.git`, and records the mode in local
-working-copy state. It also resets the local working-copy baseline so the next
-snapshot establishes state for the new topology.
+Run `jj util subvolume init <new-path>` in the main Git-colocated workspace
+to build a snapshot-backed replacement checkout. The command leaves the source
+checkout untouched, creates a Btrfs subvolume at the new path, copies the
+repository into it, creates a nested subvolume for `.git`, and establishes
+the initial AWACS baseline there. After it succeeds, rename the old and new
+directories to put the initialized checkout at the desired path. If the source
+root or `.git` is already a subvolume, initialization snapshots that boundary
+instead of copying it.
+
+`jj util subvolume enable` uses that same initializer with a unique sibling
+path. It does not rename the source while copying, building, or establishing
+the initial baseline. Only after initialization succeeds does it rename the
+original checkout aside and activate the initialized checkout at the original
+path. It keeps the displaced original as a visible sibling and prints both the
+command to enter the activated checkout and a command to delete the original
+after it has been verified. By default it removes partial staged checkouts
+after a failed initialization; pass `--keep` to retain a failed staging
+checkout for inspection. If initialization fails or is interrupted, the
+original path is untouched.
+Passing `--compress=true` or `--compress=false` sets the corresponding
+Btrfs compression property on the newly created root and `.git` subvolumes
+and copies file data instead of reflinking it, so existing extents are
+rewritten under the requested policy.
 
 While that mode is enabled, `jj workspace add` creates a Btrfs snapshot of the
 current checkout automatically. This preserves already-materialized files such as

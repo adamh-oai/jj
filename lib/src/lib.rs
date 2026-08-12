@@ -72,6 +72,7 @@ pub mod hex_util;
 pub mod id_prefix;
 pub mod index;
 pub mod iter_util;
+mod legacy_local_working_copy;
 pub mod local_working_copy;
 pub mod lock;
 pub mod matchers;

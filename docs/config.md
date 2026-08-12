@@ -882,7 +882,7 @@ show-cryptographic-signatures = true
 ## Pager
 
 By default, jj will paginate output that would scroll off the screen. It does
-this by passing output through `less -FRXK` on most platforms (on Windows it uses
+this by passing output through `less -FRX` on most platforms (on Windows it uses
 [the pager](#builtin-pager) that is built-in to jj).
 
 Which pager to use can be customized by setting `ui.pager`. When choosing a
@@ -896,14 +896,14 @@ tool-specific environments that should not affect other programs. The generic
 Examples:
 
 ```shell
-# Pipe output through `less -FRXK` (default on non-Windows platforms)
-$ jj config set --user ui.pager "less -FRXK"
+# Pipe output through `less -FRX` (default on non-Windows platforms)
+$ jj config set --user ui.pager "less -FRX"
 
 # Use the built-in pager (default on Windows)
 $ jj config set --user ui.pager :builtin
 
 # Use `$PAGER` environment variable if set (on non-Windows platforms)
-$ jj config set --user ui.pager '["sh", "-c", "exec ${PAGER:-less -FRXK}"]'
+$ jj config set --user ui.pager '["sh", "-c", "exec ${PAGER:-less -FRX}"]'
 ```
 
 Additionally, paging behavior can be toggled via `ui.paginate` like so:
@@ -2239,27 +2239,21 @@ with the `JJ_CONFIG` environment variable. If the environment variable is set
 the default locations. It can be a path to a TOML file or a directory of TOML
 files, which will be loaded in lexicographic order and merged. Multiple paths
 can be specified by separating them with a platform-specific path separator (`:`
-on Unix-like systems, `;` on Windows). Note that this variable only affects
-user-level and system-level config files; repo and workspace configs are
-unaffected and will continue to be loaded from their respective locations.
-(There is no environment variable to disable repo or workspace configs.)
+on Unix-like systems, `;` on Windows).
 
-For example, the following could be used to run `jj` without loading any user or
-system configs:
+For example, the following could be used to run `jj` without loading any user
+configs:
 
 ```bash
-# Ignores any settings specified in `{PLATFORM,/etc}/jj/{config.toml,conf.d/*.toml}`,
-# but still loads repo and workspace configs.
-JJ_CONFIG= jj log
+JJ_CONFIG= jj log       # Ignores any settings specified in any config files.
 ```
 
 There are also the `--config-file <PATH>` and `--config <NAME=VALUE>`
-[global options](#specifying-config-on-the-command-line) which work with any
-`jj` command.
+[global options](./cli-reference.md#options) which work with any `jj` command.
 
 ### System config files
 
-On Unix-like platforms, system-wide `jj` configurations are by default loaded in
+On unix-like platforms, system-wide `jj` configurations are by default loaded in
 the following precedence order (with later configs overriding earlier ones).
 
 - `/etc/jj/config.toml`
@@ -2314,12 +2308,12 @@ config files or environment variables. For example,
 jj --config ui.color=always --config ui.diff-editor=meld split
 ```
 
-The config value should be specified as a TOML expression. If it is a string
-value and isn't enclosed by any TOML constructs (such as array notation), quotes
-can be omitted. Here is an example with more advanced TOML constructs:
+Config value should be specified as a TOML expression. If string value isn't
+enclosed by any TOML constructs (such as array notation), quotes can be omitted.
+Here is an example with more advanced TOML constructs:
 
 ```shell
-# Single quotes and the '\' are interpreted by the shell (assuming a POSIX shell)
+# Single quotes and the '\' are interpreted by the shell and assume a Unix shell
 # Double quotes are passed to jj and are parsed as TOML syntax
 jj log --config \
   'template-aliases."format_timestamp(timestamp)"="""timestamp.format("%Y-%m-%d %H:%M %:::z")"""'

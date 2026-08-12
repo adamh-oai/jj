@@ -443,7 +443,10 @@ fn test_conflict_marker_length_stored_in_working_copy() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_output), @r#"
     Current operation: OperationId("ee791f2181026a056ad383d14dbc749ba44e24fedfd39418954871b83d754929147b951bde1fbcca6a8460932e53a6d7ea739bf054ec0bf03607b9370173d6e5")
     Current tree: MergedTree { tree_ids: Conflicted([TreeId("381273b50cf73f8c81b3f1502ee89e9bbd6c1518"), TreeId("771f3d31c4588ea40a8864b2a981749888e596c2"), TreeId("f56b8223da0dab22b03b8323ced4946329aeb4e0")]), labels: Labeled(["rlvkpnrz ccf9527c \"side-a\"", "qpvuntsm 2205b3ac \"base\"", "zsuskuln d7acaf48 \"side-b\""]), .. }
-    Normal { exec_bit: ExecBit(false) }           313 <timestamp> Some(MaterializedConflictData { conflict_marker_len: 11 }) "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
 
@@ -506,7 +509,10 @@ fn test_conflict_marker_length_stored_in_working_copy() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_output), @r#"
     Current operation: OperationId("b196f038bbd8cf84508417da8e974874b52202bc98abca08725e946a7a9ea9e011aeddda805c565f49a1e07e43524161caa56fa438de662aba8a6349b5a44be1")
     Current tree: MergedTree { tree_ids: Conflicted([TreeId("381273b50cf73f8c81b3f1502ee89e9bbd6c1518"), TreeId("771f3d31c4588ea40a8864b2a981749888e596c2"), TreeId("3329c18c95f7b7a55c278c2259e9c4ce711fae59")]), labels: Labeled(["rlvkpnrz ccf9527c \"side-a\"", "qpvuntsm 2205b3ac \"base\"", "zsuskuln d7acaf48 \"side-b\""]), .. }
-    Normal { exec_bit: ExecBit(false) }           274 <timestamp> Some(MaterializedConflictData { conflict_marker_len: 11 }) "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
 
@@ -541,7 +547,10 @@ fn test_conflict_marker_length_stored_in_working_copy() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_output), @r#"
     Current operation: OperationId("65b561ae4667b8b9db3f3d6cb2f6bccd087f17b008ba87b976266e641efdab4f12193407e4f6f8bd76b02eff767a6c173ef53e2c0217be389b05779170a257b6")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("6120567b3cb2472d549753ed3e4b84183d52a650")), labels: Unlabeled, .. }
-    Normal { exec_bit: ExecBit(false) }           130 <timestamp> None "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
     Ok(())

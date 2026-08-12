@@ -889,6 +889,27 @@
                 }
             }
         },
+        "btrfs": {
+            "type": "object",
+            "description": "Settings controlling Btrfs integration",
+            "properties": {
+                "enabled": {
+                    "description": "Whether to enable Btrfs integration. `jj git clone` creates new checkouts as Btrfs subvolumes and `jj workspace add` creates Btrfs snapshots. `auto` uses Btrfs only when the relevant filesystem or source workspace supports it. For `jj workspace remove`, `true` and `auto` use Btrfs deletion for subvolume targets. Workspace snapshots are overridden by `--btrfs-snapshot`.",
+                    "oneOf": [
+                        {
+                            "type": "boolean"
+                        },
+                        {
+                            "type": "string",
+                            "enum": [
+                                "auto"
+                            ]
+                        }
+                    ],
+                    "default": false
+                }
+            }
+        },
         "experimental-advance-branches": {
             "type": "object",
             "description": "Settings controlling the 'advance-branches' feature which moves bookmarks forward when new commits are created.",

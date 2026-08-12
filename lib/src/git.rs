@@ -16,6 +16,7 @@
 
 use std::borrow::Borrow;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::default::Default;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 
 use bstr::BStr;
 use bstr::BString;
+use bstr::ByteSlice as _;
 use futures::StreamExt as _;
 use futures::TryStreamExt as _;
 use futures::stream;
@@ -73,6 +75,7 @@ use crate::ref_name::WorkspaceName;
 use crate::repo::MutableRepo;
 use crate::repo::Repo;
 use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::revset::ResolvedRevsetExpression;
 use crate::revset::RevsetEvaluationError;
 use crate::revset::RevsetExpression;
@@ -1825,6 +1828,68 @@ fn open_git_repo_with_dir(
     gix::ThreadSafeRepository::open_opts(git_dir, opts)
         .map(|repo| repo.to_thread_local())
         .map_err(|err| GitResetHeadError::Git(Box::new(err)))
+}
+
+fn git_sparse_patterns_from_index(
+    git_repo: &gix::Repository,
+    index: &gix::index::File,
+) -> Result<Option<Vec<RepoPathBuf>>, GitResetHeadError> {
+    if git_repo.config_snapshot().boolean("core.sparseCheckout") != Some(true) {
+        return Ok(None);
+    }
+
+    let mut included_paths = Vec::new();
+    let mut excluded_ancestors = HashSet::new();
+    for entry in index.entries() {
+        let path = entry
+            .path(index)
+            .to_str()
+            .map_err(GitResetHeadError::from_git)?;
+        let path = RepoPathBuf::from_internal_string(path.trim_end_matches('/'))
+            .map_err(GitResetHeadError::from_git)?;
+        if entry
+            .flags
+            .contains(gix::index::entry::Flags::SKIP_WORKTREE)
+        {
+            excluded_ancestors.extend(path.ancestors().map(RepoPath::to_owned));
+        } else {
+            included_paths.push(path);
+        }
+    }
+
+    // A directory is safe to use as a native jj sparse prefix only when no
+    // Git-skipped entry lives beneath it. This keeps included directories open
+    // to new files without turning an excluded sibling into a jj deletion.
+    let mut patterns = BTreeSet::new();
+    for path in included_paths {
+        let pattern = path
+            .ancestors()
+            .take_while(|ancestor| !excluded_ancestors.contains(*ancestor))
+            .last()
+            .unwrap_or(path.as_ref());
+        patterns.insert(pattern.to_owned());
+    }
+
+    Ok(Some(patterns.into_iter().collect()))
+}
+
+/// Returns native jj sparse prefixes matching a colocated Git worktree index.
+///
+/// A Git sparse index can represent an excluded directory as one skipped tree
+/// entry. Deriving prefixes from index entries supports both that compressed
+/// representation and full indexes carrying per-file skip-worktree flags.
+pub fn sparse_patterns_in_git_dir(
+    settings: &UserSettings,
+    git_dir: &Path,
+) -> Result<Option<Vec<RepoPathBuf>>, GitResetHeadError> {
+    let git_repo = open_git_repo_with_dir(settings, git_dir)?;
+    if git_repo.config_snapshot().boolean("core.sparseCheckout") != Some(true) {
+        return Ok(None);
+    }
+    let Some(index) = git_repo.try_index().map_err(GitResetHeadError::from_git)? else {
+        return Ok(Some(vec![RepoPathBuf::root()]));
+    };
+    git_sparse_patterns_from_index(&git_repo, &index)
 }
 
 async fn reset_head_impl(

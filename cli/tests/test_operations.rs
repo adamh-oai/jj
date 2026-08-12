@@ -752,6 +752,10 @@ fn test_op_abandon_ancestors() {
     insta::assert_snapshot!(work_dir.run_jj(["debug", "local-working-copy", "--ignore-working-copy"]), @r#"
     Current operation: OperationId("16e498947b26cdd5e09fd250167d03254f6a9d8ce555e3838bbf432e2c5d7b90d5d80414f11aa67df1ecb8074eadf3fd79336feeb2c5e564c9dc711de5d38d96")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("4b825dc642cb6eb9a060e54bf8d69288fbee4904")), labels: Unlabeled, .. }
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
     insta::assert_snapshot!(work_dir.run_jj(["op", "log"]), @"
@@ -813,6 +817,10 @@ fn test_op_abandon_ancestors() {
     insta::assert_snapshot!(work_dir.run_jj(["debug", "local-working-copy", "--ignore-working-copy"]), @r#"
     Current operation: OperationId("76472b5d1bf3739c027318ab349ce8531cfedc3738f87abf78dd9e5482fdb165aa34a4edba3a281bab884d9df551a731512702fc43096a59c3569568fa9b0dba")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("4b825dc642cb6eb9a060e54bf8d69288fbee4904")), labels: Unlabeled, .. }
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
     insta::assert_snapshot!(work_dir.run_jj(["op", "log"]), @"
@@ -861,6 +869,10 @@ fn test_op_abandon_without_updating_working_copy() {
     insta::assert_snapshot!(work_dir.run_jj(["debug", "local-working-copy", "--ignore-working-copy"]), @r#"
     Current operation: OperationId("62f41230e57ec67e2181e49cbc7c2e43c42aaddd5ea7f10c401ba6e0e92c20c22815994ff9993e0e0625561c7f9e0d9b2e9817cdcedb3d19dce5609be43a0859")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("4b825dc642cb6eb9a060e54bf8d69288fbee4904")), labels: Unlabeled, .. }
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
     insta::assert_snapshot!(work_dir.run_jj(["op", "log", "-n1", "--ignore-working-copy"]), @"
@@ -883,6 +895,10 @@ fn test_op_abandon_without_updating_working_copy() {
     insta::assert_snapshot!(work_dir.run_jj(["debug", "local-working-copy", "--ignore-working-copy"]), @r#"
     Current operation: OperationId("62f41230e57ec67e2181e49cbc7c2e43c42aaddd5ea7f10c401ba6e0e92c20c22815994ff9993e0e0625561c7f9e0d9b2e9817cdcedb3d19dce5609be43a0859")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("4b825dc642cb6eb9a060e54bf8d69288fbee4904")), labels: Unlabeled, .. }
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
     insta::assert_snapshot!(work_dir.run_jj(["op", "log", "-n1", "--ignore-working-copy"]), @"

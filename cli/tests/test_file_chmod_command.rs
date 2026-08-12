@@ -325,7 +325,10 @@ fn test_chmod_exec_bit_settings() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_timestamp), @r#"
     Current operation: OperationId("1e4ba9c8f03df16a2771f856a721cf86d3cc39db7be7f39e2bf1684925d22ce74ea1b18a0a6a3441a2e7e6e395cd3a58967cc8cfe98e6613996c822ed1073cd0")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("6d5f482d15035cdd7733b1b551d1fead28d22592")), labels: Unlabeled, .. }
-    Normal { exec_bit: ExecBit(false) }             5 <timestamp> None "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#); // in-repo: false, on-disk: false (1/4)
 
@@ -338,7 +341,10 @@ fn test_chmod_exec_bit_settings() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_timestamp), @r#"
     Current operation: OperationId("fa0db599588bfd6e4763aafc55f72ed562d8ff94a7b902f194743267e9163efc53b9e17b7eead28023e1d002582f0f810f4295f80ccfab629bd5fba7744cd29b")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("5201dbafb66dc1b28b029a262e1b206f6f93df1e")), labels: Unlabeled, .. }
-    Normal { exec_bit: ExecBit(true) }             5 <timestamp> None "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#); // in-repo: true, on-disk: true (2/4)
 
@@ -360,7 +366,10 @@ fn test_chmod_exec_bit_settings() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_timestamp), @r#"
     Current operation: OperationId("ed819afb0927ba7df0ffe210d95c1cf16396ec753631a88e49e5e241b3ce06f3fd6caead28c3f8ed31dc8de0cb23725f544d61ca6c1f7d2c90924970a66586be")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("6d5f482d15035cdd7733b1b551d1fead28d22592")), labels: Unlabeled, .. }
-    Normal { exec_bit: ExecBit(true) }             5 <timestamp> None "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#); // in-repo: false, on-disk: true (3/4)
 
@@ -371,7 +380,10 @@ fn test_chmod_exec_bit_settings() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_timestamp), @r#"
     Current operation: OperationId("cbe47baa102289146cae20f704e5b76ed684d89a6d5ddef7a0765aee0e33acfe78b4213efd4777266d264cdbb41cc927eba6d45a9c3478be19cd72f6c2bc3fdc")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("5201dbafb66dc1b28b029a262e1b206f6f93df1e")), labels: Unlabeled, .. }
-    Normal { exec_bit: ExecBit(false) }             5 <timestamp> None "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#); // in-repo: true, on-disk: false (4/4) Yay! We've observed all possible states!
 
@@ -404,7 +416,10 @@ fn test_chmod_exec_bit_settings() -> TestResult {
     insta::assert_snapshot!(output.normalize_stdout_with(redact_timestamp), @r#"
     Current operation: OperationId("29ccfbc7d485c0638720d1343290b5f51463433f1d6dc775403ffb1f8c9bca8bd603d43e4eb10eb62996f5d2fd2592835584b7670775e636e4108b996126f017")
     Current tree: MergedTree { tree_ids: Resolved(TreeId("5201dbafb66dc1b28b029a262e1b206f6f93df1e")), labels: Unlabeled, .. }
-    Normal { exec_bit: ExecBit(true) }             5 <timestamp> None "file"
+    Journal phase: NoBaseline
+    Journal generation: 0
+    Journal baseline: none
+    Journal fallback: subvolume mode disabled
     [EOF]
     "#);
     Ok(())
