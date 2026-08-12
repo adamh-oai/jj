@@ -5,14 +5,14 @@ use crate::manager::TriggerRun;
 use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug)]
 pub struct TriggerCommandConfig {
-    pub jj_executable: PathBuf,
     pub daemon_socket: PathBuf,
     pub home: PathBuf,
+    pub path: Option<OsString>,
     pub requester_uid: u32,
     pub requester_gid: u32,
     pub run_owner: [u8; 16],
@@ -93,7 +93,7 @@ pub fn execute_claimed(
     config: &TriggerCommandConfig,
     claimed: &ClaimedTrigger,
 ) -> Result<std::process::ExitStatus, TriggerError> {
-    execute_jj(config, &claimed.root)
+    execute_command(config, claimed)
 }
 
 pub fn finish_claimed(
@@ -151,28 +151,43 @@ fn validate_process_identity(config: &TriggerCommandConfig) -> Result<(), Trigge
             "trigger runner process credentials differ from its configured principal",
         ));
     }
-    if !config.jj_executable.is_absolute()
-        || !config.daemon_socket.is_absolute()
-        || !config.home.is_absolute()
-        || config.lease_ns <= 0
-    {
+    if !config.daemon_socket.is_absolute() || !config.home.is_absolute() || config.lease_ns <= 0 {
         return Err(TriggerError::new(
-            "trigger executable, socket, and home must be absolute and its lease positive",
+            "trigger socket and home must be absolute and its lease positive",
         ));
     }
     Ok(())
 }
 
-fn execute_jj(
+fn execute_command(
     config: &TriggerCommandConfig,
-    root: &Path,
+    claimed: &ClaimedTrigger,
 ) -> Result<std::process::ExitStatus, TriggerError> {
+    let root = &claimed.root;
+    let mut arguments = claimed
+        .run
+        .command_argv
+        .split(|byte| *byte == 0)
+        .map(|argument| OsString::from_vec(argument.to_vec()))
+        .collect::<Vec<_>>();
+    if arguments.last().is_some_and(|argument| argument.is_empty()) {
+        arguments.pop();
+    }
+    let executable = arguments
+        .first()
+        .cloned()
+        .ok_or_else(|| TriggerError::new("durable trigger command is empty"))?;
     let trigger = OsString::from_vec(b"jj-background-monitor".to_vec());
-    Command::new(&config.jj_executable)
-        .args(["--quiet", "util", "snapshot"])
+    let mut command = Command::new(executable);
+    command.args(arguments.into_iter().skip(1));
+    command
         .current_dir(root)
         .env_clear()
-        .env("HOME", &config.home)
+        .env("HOME", &config.home);
+    if let Some(path) = &config.path {
+        command.env("PATH", path);
+    }
+    command
         .env("WATCHMAN_SOCK", &config.daemon_socket)
         .env("WATCHMAN_ROOT", root)
         .env("WATCHMAN_TRIGGER", trigger)
@@ -180,7 +195,7 @@ fn execute_jj(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|error| TriggerError::context("execute jj snapshot trigger", error))
+        .map_err(|error| TriggerError::context("execute Watchman trigger", error))
 }
 
 #[derive(Debug)]
@@ -215,9 +230,9 @@ mod tests {
     #[test]
     fn trigger_runner_refuses_root_and_relative_executables_before_claiming() {
         let config = TriggerCommandConfig {
-            jj_executable: PathBuf::from("jj"),
             daemon_socket: PathBuf::from("socket"),
             home: PathBuf::from("home"),
+            path: None,
             requester_uid: 0,
             requester_gid: 0,
             run_owner: [1; 16],
@@ -238,9 +253,9 @@ mod tests {
         let gid = unsafe { libc::getegid() };
         let temp = tempfile::tempdir().unwrap();
         let config = TriggerCommandConfig {
-            jj_executable: PathBuf::from("/bin/true"),
             daemon_socket: temp.path().join("watchman.sock"),
             home: temp.path().to_path_buf(),
+            path: Some(OsString::from("/bin")),
             requester_uid: uid,
             requester_gid: gid,
             run_owner: [7; 16],
@@ -253,6 +268,7 @@ mod tests {
                 through_sequence: 3,
                 run_owner: [7; 16],
                 run_fence: 4,
+                command_argv: b"true\0".to_vec(),
             },
             root: temp.path().to_path_buf(),
         };

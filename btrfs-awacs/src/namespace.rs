@@ -12,8 +12,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
-const IN_BINDING_MASK: u32 = libc::IN_ATTRIB
-    | libc::IN_CREATE
+const IN_BINDING_MASK: u32 = libc::IN_CREATE
     | libc::IN_DELETE
     | libc::IN_MOVED_FROM
     | libc::IN_MOVED_TO
@@ -22,8 +21,7 @@ const IN_BINDING_MASK: u32 = libc::IN_ATTRIB
     | libc::IN_UNMOUNT
     | libc::IN_IGNORED
     | libc::IN_Q_OVERFLOW;
-const IN_SELF_MASK: u32 = libc::IN_ATTRIB
-    | libc::IN_DELETE_SELF
+const IN_SELF_MASK: u32 = libc::IN_DELETE_SELF
     | libc::IN_MOVE_SELF
     | libc::IN_UNMOUNT
     | libc::IN_IGNORED
@@ -273,18 +271,16 @@ impl PendingNamespaceMonitor {
                             | libc::IN_IGNORED
                             | libc::IN_Q_OVERFLOW)
                         != 0;
-                    let watched_object_attributes = name.is_empty() && mask & libc::IN_ATTRIB != 0;
                     if self_event
-                        || watched_object_attributes
                         || expected.is_some_and(|expected| {
                             expected
                                 .as_deref()
                                 .is_none_or(|expected_name| expected_name == name)
                         })
                     {
-                        return Err(NamespaceError::new(
-                            "pending root-path monitor observed an unexpected event",
-                        ));
+                        return Err(NamespaceError::new(format!(
+                            "pending root-path monitor observed an unexpected event (wd={wd}, mask={mask:#x}, name={name:?}, expected={expected:?})"
+                        )));
                     }
                 }
                 offset = end;
@@ -436,16 +432,14 @@ impl NamespaceMonitor {
                         | libc::IN_IGNORED
                         | libc::IN_Q_OVERFLOW)
                     != 0;
-                let watched_object_attributes = name.is_empty() && mask & libc::IN_ATTRIB != 0;
                 if self_event
-                    || watched_object_attributes
                     || expected.is_some_and(|expected| {
                         expected.as_deref().is_none_or(|expected| expected == name)
                     })
                 {
-                    return Err(NamespaceError::new(
-                        "root-path binding monitor observed a relevant event",
-                    ));
+                    return Err(NamespaceError::new(format!(
+                        "root-path binding monitor observed a relevant event (wd={wd}, mask={mask:#x}, name={name:?}, expected={expected:?})"
+                    )));
                 }
                 offset = end;
             }

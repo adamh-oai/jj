@@ -13,6 +13,5 @@ pub mod precision;
 pub mod service;
 pub mod store;
 pub mod tree_index;
-pub mod trigger;
 pub mod watchman;
 pub mod watchman_transport;

@@ -1,8 +1,8 @@
-//! Credential-bound Unix-stream framing for the per-user Watchman endpoint.
+//! Connection-bound Unix-stream framing for the per-user Watchman endpoint.
 //!
-//! Linux attaches credentials and a pidfd to each received byte span. A frame
-//! is accepted only when every `recvmsg` span has both control messages and
-//! names one unchanged sender.
+//! The connected peer is authenticated once with `SO_PEERCRED` and
+//! `SO_PEERPIDFD`. Every byte on that Unix stream is then bound to that same
+//! kernel-identified peer.
 
 use crate::bser::{decode_frame, Limits};
 use crate::facade::FacadeService;
@@ -23,7 +23,7 @@ const BSER_INT8: u8 = 0x03;
 const BSER_INT16: u8 = 0x04;
 const BSER_INT32: u8 = 0x05;
 const BSER_INT64: u8 = 0x06;
-const SCM_PIDFD: libc::c_int = 0x04;
+const SO_PEERPIDFD: libc::c_int = 77;
 const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -81,16 +81,19 @@ pub struct AuthenticatedFrame {
 
 pub struct CredentialedStream {
     stream: UnixStream,
+    peer_identity: FrameIdentity,
 }
 
 impl CredentialedStream {
     pub fn new(stream: UnixStream) -> Result<Self, TransportError> {
-        set_bool_socket_option(stream.as_raw_fd(), libc::SO_PASSCRED)?;
-        set_bool_socket_option(stream.as_raw_fd(), libc::SO_PASSPIDFD)?;
+        let peer_identity = connected_peer_identity(stream.as_raw_fd())?;
         stream
             .set_write_timeout(Some(RESPONSE_WRITE_TIMEOUT))
             .map_err(|error| TransportError::context("set response write timeout", error))?;
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            peer_identity,
+        })
     }
 
     pub fn receive_frame(&self, limits: Limits) -> Result<AuthenticatedFrame, TransportError> {
@@ -225,6 +228,7 @@ impl CredentialedStream {
             let (received, span_identity) = recv_authenticated(
                 self.stream.as_raw_fd(),
                 &mut output[old_length..old_length + remaining],
+                &self.peer_identity,
             )?;
             if received == 0 {
                 output.truncate(old_length);
@@ -267,113 +271,78 @@ fn combine_write_and_release(
     }
 }
 
-fn set_bool_socket_option(fd: RawFd, option: libc::c_int) -> Result<(), TransportError> {
-    let enabled: libc::c_int = 1;
-    // SAFETY: `enabled` is a correctly sized immutable integer and `fd` is a
-    // live Unix socket for the duration of this call.
-    let result = unsafe {
-        libc::setsockopt(
+fn connected_peer_identity(fd: RawFd) -> Result<FrameIdentity, TransportError> {
+    let mut credentials: libc::ucred = unsafe { zeroed() };
+    let mut credentials_length = size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the output buffer and length are initialized and live for the syscall.
+    let credentials_result = unsafe {
+        libc::getsockopt(
             fd,
             libc::SOL_SOCKET,
-            option,
-            (&raw const enabled).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
+            libc::SO_PEERCRED,
+            (&raw mut credentials).cast(),
+            &raw mut credentials_length,
         )
     };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(TransportError::context(
-            format!("enable socket option {option}"),
+    if credentials_result != 0 || credentials_length as usize != size_of::<libc::ucred>() {
+        return Err(TransportError::context(
+            "read connected peer credentials",
             io::Error::last_os_error(),
-        ))
+        ));
     }
+
+    let mut raw_pidfd: libc::c_int = -1;
+    let mut pidfd_length = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: the output buffer and length are initialized and live for the syscall.
+    let pidfd_result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_PEERPIDFD,
+            (&raw mut raw_pidfd).cast(),
+            &raw mut pidfd_length,
+        )
+    };
+    if pidfd_result != 0 || pidfd_length as usize != size_of::<libc::c_int>() || raw_pidfd < 0 {
+        return Err(TransportError::context(
+            "read connected peer pidfd",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: a successful SO_PEERPIDFD getsockopt returned a new owned fd.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+    Ok(FrameIdentity {
+        pid: credentials.pid,
+        uid: credentials.uid,
+        gid: credentials.gid,
+        pidfd,
+    })
 }
 
 fn recv_authenticated(
     fd: RawFd,
     destination: &mut [u8],
+    peer_identity: &FrameIdentity,
 ) -> Result<(usize, FrameIdentity), TransportError> {
-    // SAFETY: CMSG_SPACE is a pure size calculation for the two payload types.
-    let control_length = unsafe {
-        libc::CMSG_SPACE(size_of::<libc::ucred>() as libc::c_uint)
-            + libc::CMSG_SPACE(size_of::<libc::c_int>() as libc::c_uint)
-    } as usize;
-    let mut control = vec![0u8; control_length];
-    let mut iovec = libc::iovec {
-        iov_base: destination.as_mut_ptr().cast(),
-        iov_len: destination.len(),
-    };
-    // SAFETY: Zero is a valid initial state for msghdr; all non-null pointers
-    // below refer to live writable allocations for this syscall.
-    let mut message: libc::msghdr = unsafe { zeroed() };
-    message.msg_iov = &raw mut iovec;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
-    // SAFETY: `message` describes the valid buffers above and remains alive
-    // for the whole syscall.
-    let received = unsafe { libc::recvmsg(fd, &raw mut message, libc::MSG_CMSG_CLOEXEC) };
+    // SAFETY: `destination` is a live writable byte slice and `fd` is the
+    // connected Unix stream authenticated when `CredentialedStream` was made.
+    let received = unsafe { libc::recv(fd, destination.as_mut_ptr().cast(), destination.len(), 0) };
     if received < 0 {
         return Err(TransportError::context(
-            "receive credentialed frame span",
+            "receive connected peer frame span",
             io::Error::last_os_error(),
         ));
     }
-    if message.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(TransportError::new(
-            "credential control messages were truncated",
-        ));
-    }
-
-    let mut credentials = None;
-    let mut pidfd = None;
-    // SAFETY: The kernel initialized the control buffer and cmsg traversal
-    // macros stay within `message.msg_controllen`.
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(&raw const message);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET {
-                match (*cmsg).cmsg_type {
-                    libc::SCM_CREDENTIALS => {
-                        if (*cmsg).cmsg_len
-                            < libc::CMSG_LEN(size_of::<libc::ucred>() as libc::c_uint) as usize
-                            || credentials.is_some()
-                        {
-                            return Err(TransportError::new(
-                                "invalid or duplicate SCM_CREDENTIALS",
-                            ));
-                        }
-                        credentials = Some(*(libc::CMSG_DATA(cmsg).cast::<libc::ucred>()));
-                    }
-                    SCM_PIDFD => {
-                        if (*cmsg).cmsg_len
-                            < libc::CMSG_LEN(size_of::<libc::c_int>() as libc::c_uint) as usize
-                            || pidfd.is_some()
-                        {
-                            return Err(TransportError::new("invalid or duplicate SCM_PIDFD"));
-                        }
-                        let raw = *(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
-                        if raw < 0 {
-                            return Err(TransportError::new("SCM_PIDFD contained an invalid fd"));
-                        }
-                        pidfd = Some(OwnedFd::from_raw_fd(raw));
-                    }
-                    _ => {}
-                }
-            }
-            cmsg = libc::CMSG_NXTHDR(&raw const message, cmsg);
-        }
-    }
-    let credentials =
-        credentials.ok_or_else(|| TransportError::new("frame span lacks SCM_CREDENTIALS"))?;
-    let pidfd = pidfd.ok_or_else(|| TransportError::new("frame span lacks SCM_PIDFD"))?;
+    let pidfd = peer_identity
+        .pidfd
+        .try_clone()
+        .map_err(|error| TransportError::context("clone connected peer pidfd", error))?;
     Ok((
         received as usize,
         FrameIdentity {
-            pid: credentials.pid,
-            uid: credentials.uid,
-            gid: credentials.gid,
+            pid: peer_identity.pid,
+            uid: peer_identity.uid,
+            gid: peer_identity.gid,
             pidfd,
         },
     ))
@@ -470,6 +439,24 @@ mod tests {
         // SAFETY: These libc accessors have no preconditions.
         assert_eq!(received.identity.uid, unsafe { libc::geteuid() });
         assert_eq!(received.identity.gid, unsafe { libc::getegid() });
+    }
+
+    #[test]
+    fn accepts_a_frame_queued_before_the_receiver_is_created() {
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let expected = Value::Array(vec![Value::Bytes(b"clock".to_vec())]);
+        let bytes = encode_frame(&expected, Limits::default()).unwrap();
+        sender.write_all(&bytes).unwrap();
+        let receiver = match CredentialedStream::new(receiver) {
+            Ok(receiver) => receiver,
+            Err(error) if error.to_string().contains("Operation not permitted") => return,
+            Err(error) => panic!("authenticate connected stream: {error}"),
+        };
+        let received = receiver.receive_frame(Limits::default()).unwrap();
+        assert_eq!(
+            decode_frame(&received.bytes, Limits::default()).unwrap(),
+            expected
+        );
     }
 
     #[test]

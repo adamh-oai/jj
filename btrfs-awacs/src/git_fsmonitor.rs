@@ -1,7 +1,6 @@
 //! Direct Git fsmonitor hook-v2 protocol over the synchronized facade.
 
 use crate::bser::{decode_frame, encode_frame, Limits, Value};
-use crate::compat::ClientFlavor;
 use crate::facade::FacadeService;
 use crate::watchman_transport::CredentialedStream;
 use std::collections::BTreeMap;
@@ -32,16 +31,22 @@ pub fn run_hook_v2(
         std::str::from_utf8(&argv[1]).ok()
     };
     let result = facade
-        .query(
-            watch_id,
-            old_clock,
-            ClientFlavor::Git,
-            requester_uid,
-            requester_gid,
-            now_ns,
-        )
+        .query(watch_id, old_clock, requester_uid, requester_gid, now_ns)
         .map_err(|error| GitFsmonitorError::context("run Git fsmonitor query", error))?;
-    encode_response(&result.clock, &result.projection.paths)
+    let paths = result
+        .projection
+        .paths
+        .into_iter()
+        .filter(|path| !component_prefix(path, b".git"))
+        .collect::<Vec<_>>();
+    encode_response(&result.clock, &paths)
+}
+
+fn component_prefix(path: &[u8], component: &[u8]) -> bool {
+    path == component
+        || path
+            .strip_prefix(component)
+            .is_some_and(|rest| rest.starts_with(b"/"))
 }
 
 pub fn run_hook_over_socket(
@@ -64,6 +69,43 @@ pub fn run_hook_over_socket(
         .map_err(|error| GitFsmonitorError::context("authenticate daemon transport", error))?;
     let canonical_root = std::fs::canonicalize(root)
         .map_err(|error| GitFsmonitorError::context("canonicalize Git worktree", error))?;
+    let canonical_root_bytes = canonical_root.as_os_str().as_bytes().to_vec();
+    let limits = Limits::default();
+    // Git invokes the hook while creating a new worktree, before any other
+    // Watchman client has had a chance to register that path.  Bootstrap the
+    // standard Watchman lifecycle here so a Btrfs snapshot descendant can be
+    // adopted instead of making the first query fail and forcing Git's full
+    // filesystem fallback.
+    let watch_project = Value::Array(vec![
+        Value::Bytes(b"watch-project".to_vec()),
+        Value::Bytes(canonical_root_bytes.clone()),
+    ]);
+    let frame = encode_frame(&watch_project, limits)
+        .map_err(|error| GitFsmonitorError::context("encode watch-project", error))?;
+    stream
+        .send_frame(&frame, limits)
+        .map_err(|error| GitFsmonitorError::context("send watch-project", error))?;
+    let response = stream
+        .receive_frame(limits)
+        .map_err(|error| GitFsmonitorError::context("receive watch-project", error))?;
+    let response = decode_frame(&response.bytes, limits)
+        .map_err(|error| GitFsmonitorError::context("decode watch-project", error))?;
+    let Value::Object(response) = response else {
+        return Err(GitFsmonitorError::new(
+            "watch-project response is not an object",
+        ));
+    };
+    if let Some(Value::Bytes(error)) = response.get(b"error".as_slice()) {
+        return Err(GitFsmonitorError::new(format!(
+            "watch-project failed: {}",
+            String::from_utf8_lossy(error)
+        )));
+    }
+    if response.get(b"watch".as_slice()) != Some(&Value::Bytes(canonical_root_bytes.clone())) {
+        return Err(GitFsmonitorError::new(
+            "watch-project response did not preserve the Git worktree root",
+        ));
+    }
     let mut options = BTreeMap::from([
         (b"expression".to_vec(), git_expression()),
         (
@@ -77,10 +119,9 @@ pub fn run_hook_over_socket(
     }
     let request = Value::Array(vec![
         Value::Bytes(b"query".to_vec()),
-        Value::Bytes(canonical_root.as_os_str().as_bytes().to_vec()),
+        Value::Bytes(canonical_root_bytes),
         Value::Object(options),
     ]);
-    let limits = Limits::default();
     let frame = encode_frame(&request, limits)
         .map_err(|error| GitFsmonitorError::context("encode daemon query", error))?;
     stream

@@ -1,30 +1,23 @@
 use btrfs_awacs::broker::{
     execute_changed_objects, execute_full_index, execute_snapshot_create, execute_snapshot_delete,
-    execute_target_object_lookup, execute_worktree_rename, snapshot_create_effect_hash,
-    snapshot_delete_effect_hash, snapshot_target_locator_hash, worktree_rename_effect_hash,
-    ChangedObjectsExecution, EffectKind, ExpectedManagedDirectory, ExpectedReservation,
+    execute_target_object_lookup, snapshot_create_effect_hash, snapshot_delete_effect_hash,
+    snapshot_target_locator_hash, ChangedObjectsExecution, EffectKind, ExpectedManagedDirectory,
     ExpectedSubvolume, ReceiptRequest, SeqPacketListener, SessionGate, SnapshotCreateExecution,
-    SnapshotDeleteExecution, WorktreeRenameExecution,
+    SnapshotDeleteExecution,
 };
 use btrfs_awacs::broker_protocol::BrokerDispatcher;
-use btrfs_awacs::bser::{decode_frame, encode_frame, Limits as BserLimits, Value as BserValue};
+use btrfs_awacs::bser::{encode_frame, Limits as BserLimits, Value as BserValue};
 use btrfs_awacs::btrfs::{send_changed_objects, OpenedSubvolume};
-use btrfs_awacs::compat::ClientFlavor;
 use btrfs_awacs::facade::FacadeService;
-use btrfs_awacs::git_fsmonitor::{run_hook_over_socket, run_hook_v2};
+use btrfs_awacs::git_fsmonitor::run_hook_over_socket;
 use btrfs_awacs::manager::{
-    Permissions, Principal, PERMISSION_CUT, PERMISSION_READ, PERMISSION_RETAIN, PERMISSION_TRIGGER,
+    Permissions, Principal, PERMISSION_CUT, PERMISSION_READ, PERMISSION_TRIGGER,
 };
 use btrfs_awacs::manifest::{
     parse_changed_objects, parse_changed_objects_v2, CHANGED_OBJECTS_V2_MAGIC,
 };
-use btrfs_awacs::service::{
-    ChangesOptions, InitializeOptions, Service, ServiceConfig, WorktreeOptions,
-};
+use btrfs_awacs::service::{ChangesOptions, InitializeOptions, Service, ServiceConfig};
 use btrfs_awacs::store::{BrokerJournal, ServiceMetadata, Store};
-use btrfs_awacs::trigger::{
-    claim_one_pending, execute_claimed, finish_claimed, TriggerCommandConfig,
-};
 use btrfs_awacs::watchman::WatchmanEndpoint;
 use btrfs_awacs::watchman_transport::CredentialedStream;
 use clap::{Parser, Subcommand as ClapSubcommand, ValueEnum};
@@ -33,15 +26,17 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
+use tracing::{debug, info, info_span, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
 
 const SNAPSHOT_DIR: &str = ".btrfs-awacs";
 const SNAPSHOT_PREFIX: &str = "snapshot-";
@@ -119,37 +114,9 @@ enum CliCommand {
         target_name: OsString,
         journal: PathBuf,
     },
-    /// Diagnostic: publish a staged writable Worktree through the broker.
-    #[command(name = "__broker-publish-worktree")]
-    BrokerPublishWorktree {
-        staged_worktree: PathBuf,
-        staging_dir: PathBuf,
-        staging_name: OsString,
-        destination_dir: PathBuf,
-        destination_name: OsString,
-        reservation_name: OsString,
-        journal: PathBuf,
-    },
     /// Diagnostic: request a complete inode/reference index through the broker.
     #[command(name = "__broker-full-index")]
     BrokerFullIndex { snapshot: PathBuf },
-    /// Acceptance helper: exercise the complete service workflow.
-    #[command(name = "__service-smoke")]
-    ServiceSmoke {
-        source: PathBuf,
-        managed_dir: PathBuf,
-        spool_dir: PathBuf,
-        manager_db: PathBuf,
-        broker_journal: PathBuf,
-    },
-    /// Acceptance helper: exercise crash recovery boundaries.
-    #[command(name = "__service-recovery-smoke")]
-    ServiceRecoverySmoke {
-        source: PathBuf,
-        managed_dir: PathBuf,
-        spool_dir: PathBuf,
-        manager_db: PathBuf,
-    },
     /// Acceptance helper: prove nested-subvolume rejection.
     #[command(name = "__nested-boundary-smoke")]
     NestedBoundarySmoke {
@@ -209,7 +176,17 @@ fn main() {
         .as_deref()
         .and_then(|name| Path::new(name).file_name())
         .map(OsStr::to_owned);
+    let explicit_command = env::args_os().nth(1);
     let invoked_as_git_hook = invoked_name.as_deref() == Some(OsStr::new(GIT_FSMONITOR_PROGRAM));
+    let component = match invoked_name.as_deref() {
+        Some(name) if name == OsStr::new(GIT_FSMONITOR_PROGRAM) => "git-fsmonitor-hook",
+        Some(name) if name == OsStr::new("watchman") => "watchman-discovery",
+        Some(name) if name == OsStr::new(WATCHMAN_SERVER_PROGRAM) => "watchman-serve",
+        _ if explicit_command.as_deref() == Some(OsStr::new(WATCHMAN_SERVER)) => "watchman-serve",
+        _ if explicit_command.as_deref() == Some(OsStr::new("broker-serve")) => "broker-serve",
+        _ => "btrfs-awacs",
+    };
+    let _tracing_guard = init_tracing(component);
     if invoked_as_git_hook {
         if let Err(error) = run_git_fsmonitor_program() {
             eprintln!("error: {error}");
@@ -231,6 +208,81 @@ fn main() {
         return;
     }
     run_cli(Cli::parse());
+}
+
+fn init_tracing(component: &'static str) -> Option<WorkerGuard> {
+    let path = match awacs_log_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("btrfs-awacs logging disabled: {error}");
+            return None;
+        }
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| "log path has no parent".to_owned())
+        .ok()?;
+    if let Err(error) = fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+    {
+        eprintln!(
+            "btrfs-awacs logging disabled: create {}: {error}",
+            parent.display()
+        );
+        return None;
+    }
+    let filename = path
+        .file_name()
+        .ok_or_else(|| "log path has no filename".to_owned())
+        .ok()?;
+    let appender = tracing_appender::rolling::never(parent, filename);
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let filter = EnvFilter::try_from_env("BTRFS_AWACS_LOG_FILTER")
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .finish();
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        eprintln!("btrfs-awacs logging disabled: subscriber already initialized");
+        return None;
+    }
+    info!(
+        component,
+        pid = std::process::id(),
+        ppid = unsafe { libc::getppid() },
+        log_path = %path.display(),
+        "process started"
+    );
+    Some(guard)
+}
+
+fn awacs_log_path() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os("BTRFS_AWACS_LOG") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err("BTRFS_AWACS_LOG must be an absolute path".to_owned());
+        }
+        return Ok(path);
+    }
+    let state_home =
+        match env::var_os("XDG_STATE_HOME") {
+            Some(path) => PathBuf::from(path),
+            None => PathBuf::from(env::var_os("HOME").ok_or_else(|| {
+                "HOME or XDG_STATE_HOME is required for default log path".to_owned()
+            })?)
+            .join(".local/state"),
+        };
+    Ok(state_home.join("btrfs-awacs/watchman.log"))
 }
 
 fn run_cli(cli: Cli) {
@@ -287,48 +339,7 @@ fn run_cli(cli: Cli) {
             &target_name,
             &journal,
         )),
-        CliCommand::BrokerPublishWorktree {
-            staged_worktree,
-            staging_dir,
-            staging_name,
-            destination_dir,
-            destination_name,
-            reservation_name,
-            journal,
-        } => finish(run_broker_publish_worktree_helper(
-            &staged_worktree,
-            &staging_dir,
-            &staging_name,
-            &destination_dir,
-            &destination_name,
-            &reservation_name,
-            &journal,
-        )),
         CliCommand::BrokerFullIndex { snapshot } => finish(run_broker_full_index_helper(&snapshot)),
-        CliCommand::ServiceSmoke {
-            source,
-            managed_dir,
-            spool_dir,
-            manager_db,
-            broker_journal,
-        } => finish(run_service_smoke_helper(
-            source,
-            managed_dir,
-            spool_dir,
-            manager_db,
-            broker_journal,
-        )),
-        CliCommand::ServiceRecoverySmoke {
-            source,
-            managed_dir,
-            spool_dir,
-            manager_db,
-        } => finish(run_service_recovery_smoke_helper(
-            source,
-            managed_dir,
-            spool_dir,
-            manager_db,
-        )),
         CliCommand::NestedBoundarySmoke {
             source,
             managed_dir,
@@ -373,18 +384,48 @@ fn finish_send_helper(result: Result<(), SendHelperError>) {
 }
 
 fn run_git_fsmonitor_program() -> Result<(), String> {
+    let started = Instant::now();
+    let caller_directory =
+        env::current_dir().map_err(|error| format!("read Git worktree directory: {error}"))?;
+    let root = automatic_watch_root(&caller_directory)?;
     let socket = match env::var_os("BTRFS_AWACS_SOCKET") {
         Some(socket) => PathBuf::from(socket),
-        None => ensure_watchman_daemon()?,
+        None => ensure_watchman_daemon(&root)?,
     };
-    let root =
-        env::current_dir().map_err(|error| format!("read Git worktree directory: {error}"))?;
     let argv = env::args_os()
         .skip(1)
         .map(|value| value.as_bytes().to_vec())
         .collect::<Vec<_>>();
-    let response =
-        run_hook_over_socket(&socket, &root, &argv).map_err(|error| error.to_string())?;
+    let token_kind = argv
+        .get(1)
+        .map(|token| {
+            if token.is_empty() || token.iter().all(u8::is_ascii_digit) {
+                "fresh"
+            } else {
+                "incremental"
+            }
+        })
+        .unwrap_or("invalid");
+    let span = info_span!(
+        "git_fsmonitor_hook",
+        root = %root.display(),
+        socket = %socket.display(),
+        token_kind,
+    );
+    let _entered = span.enter();
+    let response = run_hook_over_socket(&socket, &root, &argv).map_err(|error| {
+        warn!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %error,
+            "git fsmonitor hook failed"
+        );
+        error.to_string()
+    })?;
+    info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        response_bytes = response.len(),
+        "git fsmonitor hook completed"
+    );
     io::stdout()
         .write_all(&response)
         .and_then(|()| io::stdout().flush())
@@ -392,6 +433,7 @@ fn run_git_fsmonitor_program() -> Result<(), String> {
 }
 
 fn run_watchman_discovery_shim() -> Result<(), String> {
+    let started = Instant::now();
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.as_slice()
         != [
@@ -409,7 +451,9 @@ fn run_watchman_discovery_shim() -> Result<(), String> {
             "focused watchman shim supports only --output-encoding bser-v2 get-sockname".to_owned(),
         );
     }
-    let socket = ensure_watchman_daemon()?;
+    let root =
+        env::current_dir().map_err(|error| format!("read Watchman caller directory: {error}"))?;
+    let socket = ensure_watchman_daemon(&root)?;
     let response = BserValue::Object(BTreeMap::from([
         (
             b"version".to_vec(),
@@ -422,16 +466,29 @@ fn run_watchman_discovery_shim() -> Result<(), String> {
     ]));
     let frame = encode_frame(&response, BserLimits::default())
         .map_err(|error| format!("encode Watchman discovery response: {error}"))?;
-    io::stdout()
+    let result = io::stdout()
         .write_all(&frame)
         .and_then(|()| io::stdout().flush())
-        .map_err(|error| format!("write Watchman discovery response: {error}"))
+        .map_err(|error| format!("write Watchman discovery response: {error}"));
+    match &result {
+        Ok(()) => info!(
+            socket = %socket.display(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "watchman discovery completed"
+        ),
+        Err(error) => warn!(
+            socket = %socket.display(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %error,
+            "watchman discovery failed"
+        ),
+    }
+    result
 }
 
-fn ensure_watchman_daemon() -> Result<PathBuf, String> {
+fn ensure_watchman_daemon(caller_directory: &Path) -> Result<PathBuf, String> {
     let socket = namespace_watchman_socket()?;
-    if socket.exists() {
-        validate_user_socket(&socket)?;
+    if socket.exists() && existing_watchman_socket_is_live(&socket)? {
         return Ok(socket);
     }
     let namespace_directory = socket
@@ -453,31 +510,36 @@ fn ensure_watchman_daemon() -> Result<PathBuf, String> {
             io::Error::last_os_error()
         ));
     }
-    if socket.exists() {
-        validate_user_socket(&socket)?;
+    if socket.exists() && existing_watchman_socket_is_live(&socket)? {
         return Ok(socket);
     }
-    let required = |name: &str| {
-        env::var_os(name)
-            .ok_or_else(|| format!("{name} is required to activate the focused Watchman daemon"))
-    };
+    let root = automatic_watch_root(caller_directory)?;
+    let paths = automatic_watchman_paths(&root)?;
     let executable = env::current_exe().map_err(|error| format!("locate btrfs-awacs: {error}"))?;
+    let daemon_stderr = automatic_daemon_stderr()?;
     let mut child = Command::new(executable)
         .arg(WATCHMAN_SERVER)
         .arg(&socket)
-        .arg(required("BTRFS_AWACS_ROOT")?)
-        .arg(required("BTRFS_AWACS_MANAGED_DIR")?)
-        .arg(required("BTRFS_AWACS_SPOOL_DIR")?)
-        .arg(required("BTRFS_AWACS_MANAGER_DB")?)
-        .arg(required("BTRFS_AWACS_BROKER_SOCKET")?)
+        .arg(&root)
+        .arg(&paths.managed_dir)
+        .arg(&paths.spool_dir)
+        .arg(&paths.manager_db)
+        .arg(&paths.broker_socket)
         .arg(env::var_os("BTRFS_AWACS_WATCH_ID").unwrap_or_else(|| OsString::from("auto")))
         .arg(env::var_os("BTRFS_AWACS_GRANT_ID").unwrap_or_else(|| OsString::from("auto")))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        // The discovery shim is invoked with stderr captured by callers such as jj.
+        // A long-lived daemon must not inherit that pipe, or the caller waits
+        // forever for EOF after the shim itself exits.
+        .stderr(daemon_stderr)
         .spawn()
         .map_err(|error| format!("start focused Watchman daemon: {error}"))?;
-    for _ in 0..100 {
+    // The first root can require a complete index build before the daemon can
+    // publish its socket. Keep the activation lock until that finishes so
+    // concurrent shims cannot spawn competing daemons and replace each
+    // other's public socket.
+    for _ in 0..12_000 {
         if socket.exists() {
             validate_user_socket(&socket)?;
             return Ok(socket);
@@ -491,6 +553,91 @@ fn ensure_watchman_daemon() -> Result<PathBuf, String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Err("timed out waiting for focused Watchman daemon socket".to_owned())
+}
+
+#[derive(Debug)]
+struct AutomaticWatchmanPaths {
+    managed_dir: PathBuf,
+    spool_dir: PathBuf,
+    manager_db: PathBuf,
+    broker_socket: PathBuf,
+}
+
+fn automatic_watch_root(caller_directory: &Path) -> Result<PathBuf, String> {
+    let canonical = fs::canonicalize(caller_directory)
+        .map_err(|error| format!("canonicalize Watchman caller directory: {error}"))?;
+    // Watchman clients normally invoke discovery from somewhere inside the
+    // working copy. Prefer the nearest repository root so snapshots cover the
+    // whole tree rather than only the caller's current subdirectory.
+    for candidate in canonical.ancestors() {
+        if candidate.join(".jj").exists() || candidate.join(".git").exists() {
+            return Ok(candidate.to_path_buf());
+        }
+    }
+    Ok(canonical)
+}
+
+fn automatic_watchman_paths(root: &Path) -> Result<AutomaticWatchmanPaths, String> {
+    let state_home = match env::var_os("XDG_STATE_HOME") {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(
+            env::var_os("HOME")
+                .ok_or_else(|| "HOME is required when XDG_STATE_HOME is unset".to_owned())?,
+        )
+        .join(".local/state"),
+    };
+    let state_dir = state_home.join("btrfs-awacs");
+    fs::create_dir_all(&state_dir).map_err(|error| {
+        format!(
+            "create AWACS state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let root_parent = root
+        .parent()
+        .ok_or_else(|| format!("Watchman root {} has no parent", root.display()))?;
+    let managed_dir = env::var_os("BTRFS_AWACS_MANAGED_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root_parent.join(".btrfs-awacs-managed"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&managed_dir)
+        .map_err(|error| {
+            format!(
+                "create AWACS managed directory {}: {error}",
+                managed_dir.display()
+            )
+        })?;
+    Ok(AutomaticWatchmanPaths {
+        // Snapshot clones must stay on the watched root's Btrfs filesystem.
+        managed_dir,
+        spool_dir: env::var_os("BTRFS_AWACS_SPOOL_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("spool")),
+        manager_db: env::var_os("BTRFS_AWACS_MANAGER_DB")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| state_dir.join("watchman.sqlite3")),
+        broker_socket: env::var_os("BTRFS_AWACS_BROKER_SOCKET")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/run/btrfs-awacs/broker.sock")),
+    })
+}
+
+fn automatic_daemon_stderr() -> Result<Stdio, String> {
+    let path = awacs_log_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "AWACS log path has no parent".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create AWACS log directory {}: {error}", parent.display()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("open AWACS daemon error log {}: {error}", path.display()))?;
+    Ok(Stdio::from(file))
 }
 
 fn namespace_watchman_socket() -> Result<PathBuf, String> {
@@ -548,6 +695,35 @@ fn validate_user_socket(path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn existing_watchman_socket_is_live(path: &Path) -> Result<bool, String> {
+    validate_user_socket(path)?;
+    match UnixStream::connect(path) {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "remove stale Watchman socket {}: {error}",
+                        path.display()
+                    ));
+                }
+            }
+            Ok(false)
+        }
+        Err(error) => Err(format!(
+            "connect to existing Watchman socket {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 fn run_btrfs_inspect_helper(path: &Path) -> Result<(), String> {
@@ -760,133 +936,6 @@ fn run_broker_delete_snapshot_helper(
     Ok(())
 }
 
-fn run_broker_publish_worktree_helper(
-    staged_path: &Path,
-    staging_parent_path: &Path,
-    staging_name: &OsStr,
-    destination_parent_path: &Path,
-    destination_name: &OsStr,
-    reservation_name: &OsStr,
-    journal_path: &Path,
-) -> Result<(), String> {
-    let staged = OpenedSubvolume::open(staged_path).map_err(|error| error.to_string())?;
-    let staging_parent = File::open(staging_parent_path).map_err(|error| {
-        format!(
-            "open staging parent {}: {error}",
-            staging_parent_path.display()
-        )
-    })?;
-    let destination_parent = File::open(destination_parent_path).map_err(|error| {
-        format!(
-            "open destination parent {}: {error}",
-            destination_parent_path.display()
-        )
-    })?;
-    let canonical_destination = fs::canonicalize(destination_parent_path)
-        .map_err(|error| format!("canonicalize destination parent: {error}"))?;
-    let mut destination_root_path = canonical_destination.clone();
-    let destination_root = loop {
-        if let Ok(opened) = OpenedSubvolume::open(&destination_root_path) {
-            break opened;
-        }
-        if !destination_root_path.pop() {
-            return Err("destination parent has no enclosing Btrfs subvolume root".to_owned());
-        }
-    };
-    let destination_relative_parent = canonical_destination
-        .strip_prefix(&destination_root_path)
-        .map_err(|_| "destination parent escaped its discovered policy root".to_owned())?
-        .as_os_str()
-        .as_bytes()
-        .to_vec();
-    let reservation_path = destination_parent_path.join(reservation_name);
-    let reservation_bytes = fs::read(&reservation_path)
-        .map_err(|error| format!("read {}: {error}", reservation_path.display()))?;
-    let nonce: [u8; 32] = reservation_bytes.try_into().map_err(|bytes: Vec<u8>| {
-        format!(
-            "reservation {} has {} bytes, expected 32",
-            reservation_path.display(),
-            bytes.len()
-        )
-    })?;
-    let destination_identity = ExpectedManagedDirectory::from_observed(destination_parent.as_fd())
-        .map_err(|error| error.to_string())?;
-    let reservation = ExpectedReservation::from_observed(
-        destination_parent.as_fd(),
-        reservation_name.as_bytes(),
-        unsafe { libc::geteuid() },
-        nonce,
-    )
-    .map_err(|error| error.to_string())?;
-    let gate = SessionGate::default();
-    let manager_store_uuid = [0x51; 16];
-    let manager_session_id = gate.handshake(manager_store_uuid);
-    let receipt = ReceiptRequest {
-        id: [0x52; 16],
-        manager_store_uuid,
-        manager_session_id,
-        operation_id: [0x53; 16],
-        operation_fence: 1,
-        effect_kind: EffectKind::WorktreeRename,
-        filesystem_uuid: staged.filesystem.fs_uuid,
-        target_locator_hash: [0; 32],
-        effect_arguments_hash: [0; 32],
-        boot_id: [0x54; 16],
-        started_ns: 1,
-    };
-    let mut execution = WorktreeRenameExecution {
-        receipt,
-        worktree: ExpectedSubvolume::from_observed(&staged.filesystem, &staged.subvolume),
-        staging_parent: ExpectedManagedDirectory::from_observed(staging_parent.as_fd())
-            .map_err(|error| error.to_string())?,
-        staging_name: staging_name.as_bytes().to_vec(),
-        destination_parent: destination_identity,
-        destination_root: ExpectedSubvolume::from_observed(
-            &destination_root.filesystem,
-            &destination_root.subvolume,
-        ),
-        destination_root_directory: ExpectedManagedDirectory::from_observed(
-            destination_root.as_fd(),
-        )
-        .map_err(|error| error.to_string())?,
-        destination_relative_parent,
-        destination_name: destination_name.as_bytes().to_vec(),
-        reservation,
-        authorization_hash: [0x55; 32],
-    };
-    execution.receipt.target_locator_hash =
-        snapshot_target_locator_hash(&execution.destination_parent, &execution.destination_name);
-    execution.receipt.effect_arguments_hash = worktree_rename_effect_hash(&execution);
-    let mut journal = BrokerJournal::create(journal_path)
-        .map_err(|error| format!("create broker journal: {error}"))?;
-
-    let first = execute_worktree_rename(
-        &gate,
-        &mut journal,
-        &execution,
-        staging_parent.as_fd(),
-        destination_root.as_fd(),
-    )
-    .map_err(|error| error.to_string())?;
-    let repeated = execute_worktree_rename(
-        &gate,
-        &mut journal,
-        &execution,
-        staging_parent.as_fd(),
-        destination_root.as_fd(),
-    )
-    .map_err(|error| format!("idempotent replay failed: {error}"))?;
-    if repeated != first {
-        return Err("idempotent worktree replay returned a different result".to_owned());
-    }
-    println!(
-        "worktree_subvol_uuid={} result_sha256={} idempotent=true",
-        hex_bytes(&first.worktree_subvolume_uuid),
-        hex_bytes(&first.result_hash),
-    );
-    Ok(())
-}
-
 fn run_broker_full_index_helper(snapshot_path: &Path) -> Result<(), String> {
     let snapshot = OpenedSubvolume::open(snapshot_path).map_err(|error| error.to_string())?;
     let expected = ExpectedSubvolume::from_observed(&snapshot.filesystem, &snapshot.subvolume);
@@ -913,6 +962,7 @@ fn run_broker_full_index_helper(snapshot_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any())]
 fn run_service_smoke_helper(
     source_path: PathBuf,
     managed_path: PathBuf,
@@ -933,7 +983,6 @@ fn run_service_smoke_helper(
         Permissions::new(PERMISSION_READ | PERMISSION_CUT | PERMISSION_TRIGGER | PERMISSION_RETAIN)
             .map_err(|error| error.to_string())?;
     let base_config = ServiceConfig::new(managed_path.clone(), spool_path.clone(), [0x71; 16])
-        .allow_experimental_dirty_witness()
         .with_incremental_comparison_failpoint();
     let mut service = if let Some(socket) = env::var_os("BTRFS_AWACS_BROKER_SOCKET") {
         Service::new_external(store, base_config.with_broker_socket(socket.into()))
@@ -1106,7 +1155,6 @@ fn run_service_smoke_helper(
         let store = Store::open(&store_path)
             .map_err(|error| format!("reopen manager store for facade ABI probe: {error}"))?;
         let config = ServiceConfig::new(managed_path.clone(), spool_path.clone(), [0x71; 16])
-            .allow_experimental_dirty_witness()
             .with_broker_socket(socket.into());
         service = Service::new_external(store, config)
             .map_err(|error| format!("restart service for facade ABI probe: {error}"))?;
@@ -1173,7 +1221,6 @@ fn run_service_smoke_helper(
         .query(
             worktree.watch_id,
             Some(&worktree_seed_clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
@@ -1186,7 +1233,6 @@ fn run_service_smoke_helper(
         .query(
             worktree.watch_id,
             Some(&worktree_baseline.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
@@ -1208,23 +1254,15 @@ fn run_service_smoke_helper(
         .activate(initialized.watch_id, initialized.grant_id, &source_path)
         .map_err(|error| error.to_string())?;
     let fresh = facade
-        .query(
-            initialized.watch_id,
-            None,
-            ClientFlavor::Jj,
-            0,
-            0,
-            current_time_ns()?,
-        )
+        .query(initialized.watch_id, None, 0, 0, current_time_ns()?)
         .map_err(|error| error.to_string())?;
     if !fresh.projection.fresh_instance || fresh.projection.paths != [b"/".to_vec()] {
         return Err("first facade query was not a fresh baseline".to_owned());
     }
 
-    // The required correctness backstop is the snapshot delta, not inotify.
-    // Exercise namespace mutations before the optional precision guard exists;
-    // each endpoint-equal case must retain a directory dirty witness and force
-    // jj to crawl rather than return an empty incremental result.
+    // Exercise endpoint-equal namespace mutations before the optional
+    // precision guard exists. VCS clients care about the final tree, so the
+    // internal directory dirty witness must not force a fresh crawl.
     let transient = source_path.join("snapshot-only-transient");
     fs::write(&transient, b"observably transient\n")
         .map_err(|error| format!("create snapshot-only transient: {error}"))?;
@@ -1234,17 +1272,16 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&fresh.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
         )
         .map_err(|error| error.to_string())?;
-    if !snapshot_file_witness.projection.fresh_instance
-        || snapshot_file_witness.projection.paths != [b"/".to_vec()]
+    if snapshot_file_witness.projection.fresh_instance
+        || !snapshot_file_witness.projection.paths.is_empty()
     {
         return Err(format!(
-            "snapshot-only transient file lost its directory witness: {:?}",
+            "snapshot-only transient file leaked into endpoint projection: {:?}",
             snapshot_file_witness.projection
         ));
     }
@@ -1260,17 +1297,16 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&snapshot_file_witness.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
         )
         .map_err(|error| error.to_string())?;
-    if !snapshot_tree_witness.projection.fresh_instance
-        || snapshot_tree_witness.projection.paths != [b"/".to_vec()]
+    if snapshot_tree_witness.projection.fresh_instance
+        || !snapshot_tree_witness.projection.paths.is_empty()
     {
         return Err(format!(
-            "snapshot-only transient subtree lost its ancestor witness: {:?}",
+            "snapshot-only transient subtree leaked into endpoint projection: {:?}",
             snapshot_tree_witness.projection
         ));
     }
@@ -1286,17 +1322,16 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&snapshot_tree_witness.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
         )
         .map_err(|error| error.to_string())?;
-    if !snapshot_mixed_witness.projection.fresh_instance
-        || snapshot_mixed_witness.projection.paths != [b"/".to_vec()]
+    if snapshot_mixed_witness.projection.fresh_instance
+        || snapshot_mixed_witness.projection.paths != [b"service-dir/mixed-persistent".to_vec()]
     {
         return Err(format!(
-            "known nested create erased its directory dirty witness: {:?}",
+            "mixed endpoint projection did not retain only the persistent create: {:?}",
             snapshot_mixed_witness.projection
         ));
     }
@@ -1311,7 +1346,6 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&snapshot_mixed_witness.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
@@ -1334,7 +1368,6 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&snapshot_data_witness.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
@@ -1396,7 +1429,6 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&snapshot_metadata_witness.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
@@ -1408,14 +1440,7 @@ fn run_service_smoke_helper(
         .activate_precision_guard(initialized.watch_id, &spool_path, current_time_ns()?)
         .map_err(|error| format!("activate precision guard: {error}"))?;
     let precision_fresh = facade
-        .query(
-            initialized.watch_id,
-            None,
-            ClientFlavor::Jj,
-            0,
-            0,
-            current_time_ns()?,
-        )
+        .query(initialized.watch_id, None, 0, 0, current_time_ns()?)
         .map_err(|error| error.to_string())?;
     if !precision_fresh.projection.fresh_instance
         || precision_fresh.projection.paths != [b"/".to_vec()]
@@ -1428,7 +1453,6 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&precision_fresh.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
@@ -1455,7 +1479,6 @@ fn run_service_smoke_helper(
         .query(
             initialized.watch_id,
             Some(&incremental.clock),
-            ClientFlavor::Jj,
             0,
             0,
             current_time_ns()?,
@@ -1773,7 +1796,7 @@ fn run_service_smoke_helper(
         ));
     }
     println!(
-        "watch={} sequence={} events={} objects={} refs={} worktree={} gc_deleted={} worktree_seed_fresh={} worktree_incremental={} facade_sequence={} facade_aliases={} facade_restart_activation=true snapshot_only_dirty_witness=true precision_transient=true watchman_fresh=true dynamic_worktree_watch=true git_aliases={} response_fence_released=true incremental_equals_full=true",
+        "watch={} sequence={} events={} objects={} refs={} worktree={} gc_deleted={} worktree_seed_fresh={} worktree_incremental={} facade_sequence={} facade_aliases={} facade_restart_activation=true endpoint_transients_clean=true precision_transient=true watchman_fresh=true dynamic_worktree_watch=true git_aliases={} response_fence_released=true incremental_equals_full=true",
         hex_bytes(&initialized.watch_id),
         published.sequence,
         published.events.len(),
@@ -1790,6 +1813,7 @@ fn run_service_smoke_helper(
     Ok(())
 }
 
+#[cfg(any())]
 fn require_hardlink_projection(
     result: &btrfs_awacs::facade::QueryResult,
     operation: &str,
@@ -1888,6 +1912,7 @@ fn run_nested_boundary_smoke_helper(
     Ok(())
 }
 
+#[cfg(any())]
 fn run_service_recovery_smoke_helper(
     source_path: PathBuf,
     managed_path: PathBuf,
@@ -2371,34 +2396,19 @@ fn validate_root_broker_directory(path: &Path, private: bool) -> Result<(), Stri
     Ok(())
 }
 
-#[derive(Clone)]
-struct DaemonTriggerConfig {
-    command: TriggerCommandConfig,
-    interval: Duration,
-}
-
+/* trigger scheduler removed: Watchman trigger commands fail explicitly */
+/*
 fn configured_trigger_runner(
     socket_path: &Path,
     uid: u32,
     gid: u32,
 ) -> Result<Option<DaemonTriggerConfig>, String> {
-    let Some(jj) = env::var_os("BTRFS_AWACS_JJ") else {
-        return Ok(None);
-    };
     if uid == 0 {
-        return Err("BTRFS_AWACS_JJ cannot enable a trigger runner in a root daemon".to_owned());
-    }
-    let jj = fs::canonicalize(PathBuf::from(jj))
-        .map_err(|error| format!("canonicalize BTRFS_AWACS_JJ: {error}"))?;
-    let jj_metadata = fs::metadata(&jj)
-        .map_err(|error| format!("stat configured jj executable {}: {error}", jj.display()))?;
-    if !jj.is_absolute() || !jj_metadata.is_file() || jj_metadata.permissions().mode() & 0o111 == 0
-    {
-        return Err("BTRFS_AWACS_JJ must resolve to an executable regular file".to_owned());
+        return Ok(None);
     }
     let home = PathBuf::from(
         env::var_os("HOME")
-            .ok_or_else(|| "HOME is required when BTRFS_AWACS_JJ is configured".to_owned())?,
+            .ok_or_else(|| "HOME is required for the jj trigger runner".to_owned())?,
     );
     if !home.is_absolute() || !socket_path.is_absolute() {
         return Err("trigger HOME and daemon socket paths must be absolute".to_owned());
@@ -2417,9 +2427,9 @@ fn configured_trigger_runner(
     }
     Ok(Some(DaemonTriggerConfig {
         command: TriggerCommandConfig {
-            jj_executable: jj,
             daemon_socket: socket_path.to_path_buf(),
             home,
+            path: env::var_os("PATH"),
             requester_uid: uid,
             requester_gid: gid,
             run_owner: *Uuid::new_v4().as_bytes(),
@@ -2435,33 +2445,86 @@ fn spawn_trigger_scheduler(
 ) -> Result<(), String> {
     std::thread::Builder::new()
         .name("btrfs-awacs-jj-trigger".to_owned())
-        .spawn(move || loop {
-            let (watch_ids, readiness_fds) = match facade.lock() {
-                Ok(facade) => match facade
-                    .service()
-                    .store()
-                    .active_fixed_jj_trigger_watches(config.command.requester_uid)
-                {
-                    Ok(watches) => match facade.precision_readiness_fds(&watches) {
-                        Ok(fds) => (watches, fds),
+        .spawn(move || {
+            let mut next_iteration = Instant::now();
+            loop {
+                let now = Instant::now();
+                if now < next_iteration {
+                    std::thread::sleep(next_iteration - now);
+                }
+                next_iteration = Instant::now() + config.interval;
+                let (watch_ids, readiness_fds) = match facade.lock() {
+                    Ok(facade) => match facade
+                        .service()
+                        .store()
+                        .active_fixed_jj_trigger_watches(config.command.requester_uid)
+                    {
+                        Ok(watches) => match facade.precision_readiness_fds(&watches) {
+                            Ok(fds) => (watches, fds),
+                            Err(error) => {
+                                eprintln!("btrfs-awacs trigger scheduler: precision poll: {error}");
+                                (watches, Vec::new())
+                            }
+                        },
                         Err(error) => {
-                            eprintln!("btrfs-awacs trigger scheduler: precision poll: {error}");
-                            (watches, Vec::new())
+                            eprintln!("btrfs-awacs trigger scheduler: list watches: {error}");
+                            std::thread::sleep(config.interval);
+                            continue;
                         }
                     },
-                    Err(error) => {
-                        eprintln!("btrfs-awacs trigger scheduler: list watches: {error}");
-                        std::thread::sleep(config.interval);
-                        continue;
+                    Err(_) => return,
+                };
+                if let Err(error) = wait_for_precision_or_interval(&readiness_fds, config.interval)
+                {
+                    eprintln!("btrfs-awacs trigger scheduler: wait: {error}");
+                    std::thread::sleep(config.interval);
+                }
+                for watch_id in watch_ids {
+                    let now_ns = match current_time_ns() {
+                        Ok(now_ns) => now_ns,
+                        Err(error) => {
+                            eprintln!("btrfs-awacs trigger scheduler: {error}");
+                            continue;
+                        }
+                    };
+                    let pending = match facade.lock() {
+                        Ok(mut facade) => facade.begin_concurrent_query(
+                            watch_id,
+                            None,
+                            config.command.requester_uid,
+                            config.command.requester_gid,
+                            now_ns,
+                        ),
+                        Err(_) => return,
+                    };
+                    let pending = match pending {
+                        Ok(pending) => pending,
+                        Err(error) => {
+                            eprintln!("btrfs-awacs trigger scheduler: admit periodic cut: {error}");
+                            continue;
+                        }
+                    };
+                    let completed = match pending.execute() {
+                        Ok(completed) => completed,
+                        Err(error) => {
+                            eprintln!("btrfs-awacs trigger scheduler: run periodic cut: {error}");
+                            continue;
+                        }
+                    };
+                    let result = match facade.lock() {
+                        Ok(mut facade) => facade
+                            .finish_concurrent_query(completed)
+                            .and_then(|prepared| facade.finish_query_response(prepared)),
+                        Err(_) => return,
+                    };
+                    if let Err(error) = result {
+                        eprintln!("btrfs-awacs trigger scheduler: finalize periodic cut: {error}");
                     }
-                },
-                Err(_) => return,
-            };
-            if let Err(error) = wait_for_precision_or_interval(&readiness_fds, config.interval) {
-                eprintln!("btrfs-awacs trigger scheduler: wait: {error}");
-                std::thread::sleep(config.interval);
-            }
-            for watch_id in watch_ids {
+                }
+
+                // Claim under the facade lock, execute without it, then finish
+                // under the original durable run fence. This avoids deadlocking
+                // when `jj util snapshot` connects back to this daemon.
                 let now_ns = match current_time_ns() {
                     Ok(now_ns) => now_ns,
                     Err(error) => {
@@ -2469,76 +2532,31 @@ fn spawn_trigger_scheduler(
                         continue;
                     }
                 };
-                let pending = match facade.lock() {
-                    Ok(mut facade) => facade.begin_concurrent_query(
-                        watch_id,
-                        None,
-                        ClientFlavor::Jj,
-                        config.command.requester_uid,
-                        config.command.requester_gid,
-                        now_ns,
+                let claimed = match facade.lock() {
+                    Ok(mut facade) => claim_one_pending(&mut facade, &config.command, now_ns),
+                    Err(_) => return,
+                };
+                let claimed = match claimed {
+                    Ok(Some(claimed)) => claimed,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        eprintln!("btrfs-awacs trigger scheduler: claim: {error}");
+                        continue;
+                    }
+                };
+                let execution = execute_claimed(&config.command, &claimed);
+                let outcome = match facade.lock() {
+                    Ok(mut facade) => finish_claimed(&mut facade, claimed, execution),
+                    Err(_) => return,
+                };
+                match outcome {
+                    Ok(outcome) if !outcome.succeeded => eprintln!(
+                        "btrfs-awacs trigger scheduler: jj exited {:?}",
+                        outcome.exit_code
                     ),
-                    Err(_) => return,
-                };
-                let pending = match pending {
-                    Ok(pending) => pending,
-                    Err(error) => {
-                        eprintln!("btrfs-awacs trigger scheduler: admit periodic cut: {error}");
-                        continue;
-                    }
-                };
-                let completed = match pending.execute() {
-                    Ok(completed) => completed,
-                    Err(error) => {
-                        eprintln!("btrfs-awacs trigger scheduler: run periodic cut: {error}");
-                        continue;
-                    }
-                };
-                let result = match facade.lock() {
-                    Ok(mut facade) => facade
-                        .finish_concurrent_query(completed)
-                        .and_then(|prepared| facade.finish_query_response(prepared)),
-                    Err(_) => return,
-                };
-                if let Err(error) = result {
-                    eprintln!("btrfs-awacs trigger scheduler: finalize periodic cut: {error}");
+                    Ok(_) => {}
+                    Err(error) => eprintln!("btrfs-awacs trigger scheduler: finish: {error}"),
                 }
-            }
-
-            // Claim under the facade lock, execute without it, then finish
-            // under the original durable run fence. This avoids deadlocking
-            // when `jj util snapshot` connects back to this daemon.
-            let now_ns = match current_time_ns() {
-                Ok(now_ns) => now_ns,
-                Err(error) => {
-                    eprintln!("btrfs-awacs trigger scheduler: {error}");
-                    continue;
-                }
-            };
-            let claimed = match facade.lock() {
-                Ok(mut facade) => claim_one_pending(&mut facade, &config.command, now_ns),
-                Err(_) => return,
-            };
-            let claimed = match claimed {
-                Ok(Some(claimed)) => claimed,
-                Ok(None) => continue,
-                Err(error) => {
-                    eprintln!("btrfs-awacs trigger scheduler: claim: {error}");
-                    continue;
-                }
-            };
-            let execution = execute_claimed(&config.command, &claimed);
-            let outcome = match facade.lock() {
-                Ok(mut facade) => finish_claimed(&mut facade, claimed, execution),
-                Err(_) => return,
-            };
-            match outcome {
-                Ok(outcome) if !outcome.succeeded => eprintln!(
-                    "btrfs-awacs trigger scheduler: jj exited {:?}",
-                    outcome.exit_code
-                ),
-                Ok(_) => {}
-                Err(error) => eprintln!("btrfs-awacs trigger scheduler: finish: {error}"),
             }
         })
         .map(|_| ())
@@ -2577,6 +2595,7 @@ fn wait_for_precision_or_interval(fds: &[OwnedFd], interval: Duration) -> Result
     }
     Ok(())
 }
+*/
 
 fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
     let WatchmanServeArgs {
@@ -2620,10 +2639,8 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
         Store::create(&store_path, &metadata)
             .map_err(|error| format!("create manager store: {error}"))?
     };
-    let mut config = ServiceConfig::new(managed, spool, boot_id).with_broker_socket(broker_socket);
-    if env::var_os("BTRFS_AWACS_EXPERIMENTAL_DIRTY_WITNESS").as_deref() == Some(OsStr::new("1")) {
-        config = config.allow_experimental_dirty_witness();
-    }
+    let config = ServiceConfig::new(managed, spool, boot_id).with_broker_socket(broker_socket);
+    let reconnect_config = config.clone();
     let mut service = Service::new_external(store, config).map_err(|error| error.to_string())?;
     let automatic = watch_argument == OsStr::new("auto") && grant_argument == OsStr::new("auto");
     if (watch_argument == OsStr::new("auto")) != (grant_argument == OsStr::new("auto")) {
@@ -2671,44 +2688,68 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
     };
     let mut facade = FacadeService::new(service);
     let mut endpoint = WatchmanEndpoint::default();
-    let trigger_config = configured_trigger_runner(&socket_path, uid, gid)?;
-    if trigger_config.is_some() {
-        endpoint.enable_fixed_jj_trigger();
-    }
     if env::var_os("BTRFS_AWACS_PRECISION_GUARD").as_deref() == Some(OsStr::new("1")) {
         endpoint.enable_precision_guard(runtime.to_path_buf());
     }
     endpoint
         .register(&mut facade, &root, watch_id, grant_id, uid, gid)
         .map_err(|error| error.to_string())?;
-    let listener = UnixListener::bind(&socket_path)
-        .map_err(|error| format!("bind Watchman socket {}: {error}", socket_path.display()))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("set Watchman socket mode: {error}"))?;
+    // Publish the socket only after it is ready to authenticate clients. A
+    // client can write immediately after connect(), so binding the public path
+    // before arming credential delivery races the first BSER frame.
+    let staged_socket_path = runtime.join(format!(".watchman.sock.{}.staging", std::process::id()));
+    if staged_socket_path.exists() {
+        return Err(format!(
+            "refusing to replace staged Watchman socket {}",
+            staged_socket_path.display()
+        ));
+    }
+    let listener = UnixListener::bind(&staged_socket_path).map_err(|error| {
+        format!(
+            "bind staged Watchman socket {}: {error}",
+            staged_socket_path.display()
+        )
+    })?;
+    fs::set_permissions(&staged_socket_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("set staged Watchman socket mode: {error}"))?;
+    fs::rename(&staged_socket_path, &socket_path)
+        .map_err(|error| format!("publish Watchman socket {}: {error}", socket_path.display()))?;
     let endpoint = std::sync::Arc::new(endpoint);
     let facade = std::sync::Arc::new(std::sync::Mutex::new(facade));
-    if let Some(trigger_config) = trigger_config {
-        spawn_trigger_scheduler(std::sync::Arc::clone(&facade), trigger_config)?;
-    }
+    let reconnect_config = std::sync::Arc::new(reconnect_config);
+    let reconnect_store_path = std::sync::Arc::new(store_path);
+    let refresh_generation = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
     loop {
         let (stream, _) = listener
             .accept()
             .map_err(|error| format!("accept Watchman connection: {error}"))?;
         let endpoint = std::sync::Arc::clone(&endpoint);
         let facade = std::sync::Arc::clone(&facade);
+        let reconnect_config = std::sync::Arc::clone(&reconnect_config);
+        let reconnect_store_path = std::sync::Arc::clone(&reconnect_store_path);
+        let refresh_generation = std::sync::Arc::clone(&refresh_generation);
         std::thread::Builder::new()
             .name("btrfs-awacs-watchman-client".to_owned())
             .spawn(move || {
-                let Ok(mut transport) = CredentialedStream::new(stream) else {
-                    return;
+                let mut transport = match CredentialedStream::new(stream) {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        warn!(error = %error, "watchman client setup failed");
+                        return;
+                    }
                 };
                 loop {
-                    let Ok(frame) = transport.receive_frame(BserLimits::default()) else {
-                        return;
+                    let frame = match transport.receive_frame(BserLimits::default()) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            debug!(error = %error, "watchman client disconnected");
+                            return;
+                        }
                     };
                     let Ok(now_ns) = current_time_ns() else {
                         return;
                     };
+                    let request_started = Instant::now();
                     let request = match facade.lock() {
                         Ok(facade) => match transport.decode_and_authorize(
                             &endpoint,
@@ -2718,13 +2759,27 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
                         ) {
                             Ok(request) => request,
                             Err(error) => {
-                                eprintln!("btrfs-awacs Watchman transport failed: {error}");
+                                warn!(error = %error, "watchman transport failed");
                                 return;
                             }
                         },
                         Err(_) => return,
                     };
-                    let concurrent = match facade.lock() {
+                    let (command, root) = watchman_request_summary(&request);
+                    let observed_refresh_generation = match refresh_generation.lock() {
+                        Ok(generation) => *generation,
+                        Err(_) => return,
+                    };
+                    let span = info_span!(
+                        "watchman_request",
+                        command = %command,
+                        root = %root,
+                        uid = frame.identity.uid,
+                        gid = frame.identity.gid,
+                    );
+                    let _entered = span.enter();
+                    debug!("watchman request received");
+                    let mut concurrent = match facade.lock() {
                         Ok(mut facade) => endpoint.begin_concurrent_frame(
                             &mut facade,
                             &request,
@@ -2735,17 +2790,115 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
                         ),
                         Err(_) => return,
                     };
+                    if let Err(error) = &concurrent {
+                        if broker_session_was_fenced(&error.to_string()) {
+                            warn!(
+                                error = %error,
+                                "watchman broker session fenced during request preparation; reconnecting"
+                            );
+                            if let Err(refresh_error) = refresh_watchman_facade(
+                                &endpoint,
+                                &facade,
+                                &refresh_generation,
+                                observed_refresh_generation,
+                                &reconnect_store_path,
+                                &reconnect_config,
+                            ) {
+                                warn!(
+                                    error = %refresh_error,
+                                    "watchman broker reconnect failed"
+                                );
+                                return;
+                            }
+                            concurrent = match facade.lock() {
+                                Ok(mut facade) => endpoint.begin_concurrent_frame(
+                                    &mut facade,
+                                    &request,
+                                    frame.identity.uid,
+                                    frame.identity.gid,
+                                    now_ns,
+                                    BserLimits::default(),
+                                ),
+                                Err(_) => return,
+                            };
+                        }
+                    }
                     let prepared = match concurrent {
                         Ok(Some(pending)) => {
+                            let cut_started = Instant::now();
                             let completed = match pending.execute() {
                                 Ok(completed) => completed,
+                                Err(error) if broker_session_was_fenced(&error.to_string()) => {
+                                    warn!(
+                                        elapsed_ms = cut_started.elapsed().as_millis() as u64,
+                                        error = %error,
+                                        "watchman broker session fenced; reconnecting"
+                                    );
+                                    if let Err(refresh_error) = refresh_watchman_facade(
+                                        &endpoint,
+                                        &facade,
+                                        &refresh_generation,
+                                        observed_refresh_generation,
+                                        &reconnect_store_path,
+                                        &reconnect_config,
+                                    ) {
+                                        warn!(
+                                            error = %refresh_error,
+                                            "watchman broker reconnect failed"
+                                        );
+                                        return;
+                                    }
+                                    let retry = match facade.lock() {
+                                        Ok(mut facade) => endpoint.begin_concurrent_frame(
+                                            &mut facade,
+                                            &request,
+                                            frame.identity.uid,
+                                            frame.identity.gid,
+                                            now_ns,
+                                            BserLimits::default(),
+                                        ),
+                                        Err(_) => return,
+                                    };
+                                    let retry = match retry {
+                                        Ok(Some(retry)) => retry,
+                                        Ok(None) => {
+                                            warn!(
+                                                "watchman reconnect retry lost concurrent request"
+                                            );
+                                            return;
+                                        }
+                                        Err(retry_error) => {
+                                            warn!(
+                                                error = %retry_error,
+                                                "watchman reconnect retry preparation failed"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    match retry.execute() {
+                                        Ok(completed) => completed,
+                                        Err(retry_error) => {
+                                            warn!(
+                                                error = %retry_error,
+                                                "watchman reconnect retry cut failed"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
                                 Err(error) => {
-                                    eprintln!(
-                                        "btrfs-awacs Watchman concurrent cut failed: {error}"
+                                    warn!(
+                                        elapsed_ms = cut_started.elapsed().as_millis() as u64,
+                                        error = %error,
+                                        "watchman concurrent cut failed"
                                     );
                                     return;
                                 }
                             };
+                            info!(
+                                elapsed_ms = cut_started.elapsed().as_millis() as u64,
+                                "watchman synchronized cut completed"
+                            );
                             match facade.lock() {
                                 Ok(mut facade) => endpoint
                                     .finish_concurrent_frame(&mut facade, completed)
@@ -2772,10 +2925,11 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
                     let prepared = match prepared {
                         Ok(prepared) => prepared,
                         Err(error) => {
-                            eprintln!("btrfs-awacs Watchman client frame failed: {error}");
+                            warn!(error = %error, "watchman request preparation failed");
                             return;
                         }
                     };
+                    let response_bytes = prepared.encoded_len();
                     let write = transport.send_prepared_frame(&prepared, BserLimits::default());
                     let release = match facade.lock() {
                         Ok(mut facade) => {
@@ -2784,13 +2938,75 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
                         Err(_) => return,
                     };
                     if let Err(error) = combine_daemon_response(write, release) {
-                        eprintln!("btrfs-awacs Watchman client frame failed: {error}");
+                        warn!(error = %error, "watchman response failed");
                         return;
                     }
+                    info!(
+                        elapsed_ms = request_started.elapsed().as_millis() as u64,
+                        response_bytes, "watchman request completed"
+                    );
                 }
             })
             .map_err(|error| format!("start Watchman client worker: {error}"))?;
     }
+}
+
+fn broker_session_was_fenced(error: &str) -> bool {
+    error.contains("manager session has been fenced")
+}
+
+fn refresh_watchman_facade(
+    endpoint: &WatchmanEndpoint,
+    facade: &std::sync::Mutex<FacadeService>,
+    generation: &std::sync::Mutex<u64>,
+    observed_generation: u64,
+    store_path: &Path,
+    config: &ServiceConfig,
+) -> Result<(), String> {
+    let mut generation = generation
+        .lock()
+        .map_err(|_| "watchman refresh generation lock is poisoned".to_owned())?;
+    if *generation != observed_generation {
+        return Ok(());
+    }
+    let store = Store::open(store_path)
+        .map_err(|error| format!("reopen manager store after broker restart: {error}"))?;
+    let service =
+        Service::new_external(store, config.clone()).map_err(|error| error.to_string())?;
+    let rebuilt = endpoint
+        .rebuild_facade(service)
+        .map_err(|error| format!("rebuild Watchman facade after broker restart: {error}"))?;
+    let mut facade = facade
+        .lock()
+        .map_err(|_| "watchman facade lock is poisoned".to_owned())?;
+    *facade = rebuilt;
+    *generation = generation.saturating_add(1);
+    info!(
+        refresh_generation = *generation,
+        "watchman broker session reconnected"
+    );
+    Ok(())
+}
+
+fn watchman_request_summary(request: &BserValue) -> (String, String) {
+    let BserValue::Array(command) = request else {
+        return ("<non-array>".to_owned(), "<none>".to_owned());
+    };
+    let name = command
+        .first()
+        .and_then(|value| match value {
+            BserValue::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let root = command
+        .get(1)
+        .and_then(|value| match value {
+            BserValue::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "<none>".to_owned());
+    (name, root)
 }
 
 fn combine_daemon_response(
@@ -3344,10 +3560,7 @@ mod tests {
             "__broker-changed-objects",
             "__broker-create-snapshot",
             "__broker-delete-snapshot",
-            "__broker-publish-worktree",
             "__broker-full-index",
-            "__service-smoke",
-            "__service-recovery-smoke",
             "__nested-boundary-smoke",
             "git-fsmonitor-hook",
             "btrfs-awacs-watchman",

@@ -33,12 +33,6 @@ pub enum BoundaryKind {
     ProvedWorktreeSeed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClientFlavor {
-    Jj,
-    Git,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Projection {
     pub fresh_instance: bool,
@@ -75,51 +69,31 @@ pub fn decode_clock(token: &str, key: &[u8; 32]) -> Result<ClockClaims, CompatEr
     decode_claims(payload)
 }
 
-/// Converts canonical semantic events into the conservative re-stat set used
-/// by both clients. Snapshot-only directory witnesses deliberately become a
-/// fresh jj result because jj treats returned names as exact paths.
-pub fn project_events(events: &[Event], flavor: ClientFlavor) -> Projection {
+/// Converts canonical semantic events into the endpoint path changes exposed
+/// through Watchman and the Git hook adapter. Directory dirty witnesses are
+/// retained internally as ordering evidence, but do not affect a VCS query:
+/// once a client's clock names its exact baseline, endpoint-equal transient
+/// namespace activity has no observable VCS effect.
+pub fn project_events(events: &[Event]) -> Projection {
     let mut paths = BTreeSet::new();
     let mut fresh = false;
     for event in events {
         match event.kind {
             EventKind::DirectoryDirtyWitness => {
-                for path in event.old_path.iter().chain(&event.new_path) {
-                    if excluded(path, flavor) {
-                        continue;
-                    }
-                    match flavor {
-                        ClientFlavor::Jj => fresh = true,
-                        ClientFlavor::Git => {
-                            paths.insert(directory_prefix(path));
-                        }
-                    }
-                }
+                // The endpoint path events already describe any surviving
+                // namespace change. A dirty witness only proves that some
+                // transient mutation happened between cuts.
             }
             EventKind::SubtreeMoved => {
-                let relevant = event
-                    .old_path
-                    .iter()
-                    .chain(&event.new_path)
-                    .filter(|path| !excluded(path, flavor))
-                    .collect::<Vec<_>>();
-                match flavor {
-                    // Descendant expansion belongs to the query engine. Until
-                    // it is supplied, jj must crawl instead of treating a
-                    // relevant directory name as recursive. A move wholly
-                    // beneath .git or .jj is a proven nonmatch.
-                    ClientFlavor::Jj if !relevant.is_empty() => fresh = true,
-                    ClientFlavor::Jj => {}
-                    ClientFlavor::Git => {
-                        for path in relevant {
-                            paths.insert(directory_prefix(path));
-                        }
-                    }
-                }
+                // A directory rename changes descendant paths without
+                // emitting one endpoint event per descendant. Until the
+                // query engine can expand those descendants, a generic
+                // Watchman response must conservatively ask for a crawl.
+                fresh = event.old_path.is_some() || event.new_path.is_some();
             }
             EventKind::PathAdded | EventKind::PathRemoved | EventKind::PathChanged => {
                 for path in event.old_path.iter().chain(&event.new_path) {
-                    if !path.is_empty() && !excluded(path, flavor) {
+                    if !path.is_empty() {
                         paths.insert(path.clone());
                     }
                 }
@@ -148,15 +122,8 @@ impl Store {
         watch_id: [u8; 16],
         from_sequence: Option<i64>,
         target_sequence: i64,
-        flavor: ClientFlavor,
     ) -> Result<Projection, CompatError> {
-        self.project_ready_cut_range_with_lease(
-            watch_id,
-            from_sequence,
-            target_sequence,
-            flavor,
-            None,
-        )
+        self.project_ready_cut_range_with_lease(watch_id, from_sequence, target_sequence, None)
     }
 
     pub fn project_ready_cut_range_with_lease(
@@ -164,7 +131,6 @@ impl Store {
         watch_id: [u8; 16],
         from_sequence: Option<i64>,
         target_sequence: i64,
-        flavor: ClientFlavor,
         lease: Option<&QueryLeaseReservation>,
     ) -> Result<Projection, CompatError> {
         let head: Option<(i64, i64)> = self
@@ -270,7 +236,7 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| CompatError::context("decode cut-range events", error))?;
         let Some((guard_epoch, from_guard, to_guard)) = lease.and_then(|lease| lease.guard) else {
-            return Ok(project_events(&events, flavor));
+            return Ok(project_events(&events));
         };
         if lease.is_some_and(|lease| {
             lease.watch_id != watch_id
@@ -286,7 +252,7 @@ impl Store {
         // witnesses. Immutable object/ref events remain authoritative and are
         // still unioned below.
         events.retain(|event| event.kind != EventKind::DirectoryDirtyWitness);
-        let mut projection = project_events(&events, flavor);
+        let mut projection = project_events(&events);
         let mut statement = self
             .connection()
             .prepare(
@@ -325,17 +291,11 @@ impl Store {
                 return Ok(fresh_projection());
             }
             match (kind.as_str(), path) {
-                ("path" | "object", Some(path)) if !excluded(&path, flavor) => {
+                ("path" | "object", Some(path)) => {
                     paths.insert(path);
                 }
-                ("directory-prefix", Some(path)) if !excluded(&path, flavor) => match flavor {
-                    ClientFlavor::Jj => projection.fresh_instance = true,
-                    ClientFlavor::Git => {
-                        paths.insert(directory_prefix(&path));
-                    }
-                },
+                ("directory-prefix", Some(_)) => projection.fresh_instance = true,
                 ("full-invalidation", None) => projection.fresh_instance = true,
-                ("path" | "object" | "directory-prefix", Some(_)) => {}
                 _ => return Ok(fresh_projection()),
             }
         }
@@ -369,29 +329,6 @@ fn decode_event_kind(value: &str) -> Result<EventKind, CompatError> {
         "directory-dirty-witness" => Ok(EventKind::DirectoryDirtyWitness),
         _ => Err(CompatError::new(format!("unknown event kind {value:?}"))),
     }
-}
-
-fn excluded(path: &[u8], flavor: ClientFlavor) -> bool {
-    component_prefix(path, b".git")
-        || (flavor == ClientFlavor::Jj && component_prefix(path, b".jj"))
-}
-
-fn component_prefix(path: &[u8], component: &[u8]) -> bool {
-    path == component
-        || path
-            .strip_prefix(component)
-            .is_some_and(|rest| rest.starts_with(b"/"))
-}
-
-fn directory_prefix(path: &[u8]) -> Vec<u8> {
-    if path.is_empty() {
-        return b"/".to_vec();
-    }
-    let mut result = path.to_vec();
-    if !result.ends_with(b"/") {
-        result.push(b'/');
-    }
-    result
 }
 
 fn encode_claims(claims: &ClockClaims) -> Vec<u8> {
@@ -608,43 +545,29 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_only_directory_witness_is_fresh_for_jj_and_prefix_for_git() {
+    fn directory_witness_does_not_change_endpoint_projection() {
         let events = vec![
             event(EventKind::PathChanged, b"hardlink"),
             event(EventKind::DirectoryDirtyWitness, b"dir"),
             event(EventKind::PathChanged, b".git/index"),
         ];
         assert_eq!(
-            project_events(&events, ClientFlavor::Jj),
-            Projection {
-                fresh_instance: true,
-                paths: vec![b"/".to_vec()]
-            }
-        );
-        assert_eq!(
-            project_events(&events, ClientFlavor::Git),
+            project_events(&events),
             Projection {
                 fresh_instance: false,
-                paths: vec![b"dir/".to_vec(), b"hardlink".to_vec()]
+                paths: vec![b".git/index".to_vec(), b"hardlink".to_vec()]
             }
         );
     }
 
     #[test]
-    fn jj_ignores_a_subtree_move_wholly_inside_its_metadata_directories() {
+    fn subtree_move_requires_a_generic_fresh_projection() {
         let events = vec![event(EventKind::SubtreeMoved, b".jj/repo/op_store")];
         assert_eq!(
-            project_events(&events, ClientFlavor::Jj),
+            project_events(&events),
             Projection {
-                fresh_instance: false,
-                paths: Vec::new(),
-            }
-        );
-        assert_eq!(
-            project_events(&events, ClientFlavor::Git),
-            Projection {
-                fresh_instance: false,
-                paths: vec![b".jj/repo/op_store/".to_vec()],
+                fresh_instance: true,
+                paths: vec![b"/".to_vec()],
             }
         );
     }

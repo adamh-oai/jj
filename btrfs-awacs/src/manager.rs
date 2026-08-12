@@ -1,8 +1,9 @@
 use crate::btrfs::SubvolumeInfo;
-use crate::compat::{project_events, ClientFlavor};
+use crate::compat::project_events;
 use crate::index::{
-    apply_manifest, object_security_digest, object_state_digest, reference_state_digest,
-    xor_digest, Event, EventKind, Index, Object, ROOT_INO,
+    apply_manifest, apply_manifest_to_trusted_checkpoint, object_security_digest,
+    object_state_digest, reference_state_digest, xor_digest, Event, EventKind, Index, Object,
+    ROOT_INO,
 };
 use crate::manifest::{
     ChangedObjectsManifest, Reference, CHANGE_CREATED, CHANGE_INODE, CHANGE_REF,
@@ -10,7 +11,6 @@ use crate::manifest::{
 use crate::namespace::ViewBinding;
 use crate::store::{decode_u64, encode_u64, Store, StoreError};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::os::unix::ffi::OsStrExt;
@@ -247,6 +247,7 @@ pub struct SnapshotDeleteReservation {
     pub identity: SnapshotIdentity,
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreePolicy {
     pub policy_id: [u8; 16],
@@ -259,6 +260,7 @@ pub struct WorktreePolicy {
     pub policy_hash: [u8; 32],
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeRequest {
     pub watch_id: [u8; 16],
@@ -281,6 +283,7 @@ pub struct WorktreeRequest {
     pub lease_expires_ns: i64,
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorktreeReservation {
     pub operation_id: [u8; 16],
@@ -293,6 +296,7 @@ pub struct WorktreeReservation {
     pub policy_hash: [u8; 32],
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackedWorktree {
     pub worktree_id: [u8; 16],
@@ -328,6 +332,7 @@ pub enum MutationHint {
     FullInvalidation,
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProvedWorktreeSeed {
     pub worktree_id: [u8; 16],
@@ -354,6 +359,7 @@ pub struct TriggerRun {
     pub through_sequence: i64,
     pub run_owner: [u8; 16],
     pub run_fence: i64,
+    pub command_argv: Vec<u8>,
 }
 
 type WatchGrantIds = ([u8; 16], [u8; 16]);
@@ -369,6 +375,7 @@ pub struct RecoveryReport {
     pub boot_changed: bool,
 }
 
+#[cfg(any())]
 struct WorktreeHead {
     filesystem_id: i64,
     revision_id: i64,
@@ -403,6 +410,7 @@ struct PlannedCutAdmissionRow {
     cut_fence: i64,
 }
 
+#[cfg(any())]
 pub fn worktree_policy_hash(policy: &WorktreePolicy) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"btrfs-awacs-worktree-policy-v1\0");
@@ -489,6 +497,120 @@ impl Store {
             ))
         })
         .transpose()
+    }
+
+    pub fn adopt_snapshot_descendant(
+        &mut self,
+        fs_uuid: [u8; 16],
+        live_subvol_uuid: [u8; 16],
+        parent_uuid: [u8; 16],
+        live_path: &[u8],
+        principal: &Principal,
+        permissions: Permissions,
+        now_ns: i64,
+    ) -> Result<Option<InitializedWatch>, ManagerError> {
+        let adoption_started = std::time::Instant::now();
+        if !path_is_absolute(live_path) || permissions.contains(PERMISSION_WORKTREE) {
+            return Err(ManagerError::new("invalid descendant adoption request"));
+        }
+        let watch_id = random_id();
+        let grant_id = random_id();
+        let clock_epoch = random_id();
+        let (principal_kind, principal_id) = principal.kind_and_id();
+        let transaction_started = std::time::Instant::now();
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tracing::info!(
+            elapsed_ms = transaction_started.elapsed().as_millis() as u64,
+            "descendant adoption acquired SQLite transaction"
+        );
+        let seed_started = std::time::Instant::now();
+        let seed: Option<(i64, i64, i64)> = transaction
+            .query_row(
+                r#"SELECT filesystem_id, revision_id, snapshot_id
+                     FROM (
+                           SELECT s.filesystem_id AS filesystem_id,
+                                  r.id AS revision_id,
+                                  s.id AS snapshot_id
+                             FROM snapshots s
+                             JOIN revisions r ON r.snapshot_id = s.id
+                             JOIN filesystems f ON f.id = s.filesystem_id
+                            WHERE f.fs_uuid = ?1 AND s.subvol_uuid = ?2
+                              AND s.physical_state = 'present' AND r.state = 'ready'
+                           UNION ALL
+                           SELECT w.filesystem_id AS filesystem_id,
+                                  r.id AS revision_id,
+                                  s.id AS snapshot_id
+                             FROM watches w
+                             JOIN revisions r ON r.id = w.indexed_revision_id
+                             JOIN snapshots s ON s.id = r.snapshot_id
+                             JOIN filesystems f ON f.id = w.filesystem_id
+                            WHERE f.fs_uuid = ?1 AND w.live_subvol_uuid = ?2
+                              AND w.state = 'active' AND r.state = 'ready'
+                              AND s.physical_state = 'present'
+                          )
+                 ORDER BY revision_id DESC LIMIT 1"#,
+                params![fs_uuid.as_slice(), parent_uuid.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        tracing::info!(
+            elapsed_ms = seed_started.elapsed().as_millis() as u64,
+            found = seed.is_some(),
+            "descendant adoption looked up seed revision"
+        );
+        let Some((filesystem_id, revision_id, snapshot_id)) = seed else {
+            let commit_started = std::time::Instant::now();
+            transaction.commit()?;
+            tracing::info!(
+                elapsed_ms = commit_started.elapsed().as_millis() as u64,
+                total_elapsed_ms = adoption_started.elapsed().as_millis() as u64,
+                "descendant adoption committed missing seed"
+            );
+            return Ok(None);
+        };
+        transaction.execute(
+            r#"INSERT INTO watches(id, filesystem_id, live_subvol_uuid, live_path,
+                   indexed_revision_id, indexed_seq, last_cut_snapshot_id, last_cut_seq,
+                   cut_owner, cut_fence, cut_expires_ns, clock_epoch, replay_floor_seq,
+                   fsmonitor_state, state)
+               VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0, NULL, 0, NULL, ?7, 0, 'disabled', 'active')"#,
+            params![
+                watch_id.as_slice(),
+                filesystem_id,
+                live_subvol_uuid.as_slice(),
+                live_path,
+                revision_id,
+                snapshot_id,
+                clock_epoch.as_slice()
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO watch_grants(id, watch_id, principal_kind, principal_id, permissions, state, created_ns, revoked_ns) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, NULL)",
+            params![grant_id.as_slice(), watch_id.as_slice(), principal_kind, principal_id, permissions.bits(), now_ns],
+        )?;
+        for (kind, reason) in [
+            ("watch-indexed-head", "lineage-seed-index"),
+            ("watch-last-cut", "lineage-seed-cut"),
+        ] {
+            transaction.execute("INSERT INTO snapshot_pins(snapshot_id, owner_kind, owner_id, reason) VALUES (?1, ?2, ?3, ?4)", params![snapshot_id, kind, watch_id.as_slice(), reason])?;
+        }
+        let commit_started = std::time::Instant::now();
+        transaction.commit()?;
+        tracing::info!(
+            elapsed_ms = commit_started.elapsed().as_millis() as u64,
+            total_elapsed_ms = adoption_started.elapsed().as_millis() as u64,
+            "descendant adoption committed seeded watch"
+        );
+        Ok(Some(InitializedWatch {
+            watch_id,
+            grant_id,
+            revision_id,
+            snapshot_id,
+            sequence: 0,
+            fresh_instance: false,
+        }))
     }
 
     /// Abandons intents which never crossed the durable pre-effect boundary.
@@ -749,6 +871,7 @@ impl Store {
         &mut self,
         watch_id: [u8; 16],
         authorization_id: [u8; 16],
+        command_argv: &[u8],
     ) -> Result<bool, ManagerError> {
         let transaction = self
             .connection_mut()
@@ -781,13 +904,14 @@ impl Store {
             .optional()?;
         transaction.execute(
             r#"INSERT INTO watchman_triggers(
-                   watch_id, name, owner_grant_id, command_kind,
+                   watch_id, name, owner_grant_id, command_kind, command_argv,
                    expression_kind, state, last_evaluated_seq,
                    pending_through_seq, run_owner, run_fence, run_expires_ns
-               ) VALUES (?1, 'jj-background-monitor', ?2, 'jj-snapshot-v1',
+               ) VALUES (?1, 'jj-background-monitor', ?2, 'argv-v1', ?4,
                          'exclude-git-jj-v1', 'active', NULL, ?3, NULL, 0, NULL)
                ON CONFLICT(watch_id, owner_grant_id, name) DO UPDATE SET
                    command_kind = excluded.command_kind,
+                   command_argv = excluded.command_argv,
                    expression_kind = excluded.expression_kind,
                    state = 'active',
                    pending_through_seq = MAX(
@@ -797,6 +921,7 @@ impl Store {
                 watch_id.as_slice(),
                 authorization_id.as_slice(),
                 indexed_sequence,
+                command_argv,
             ],
         )?;
         transaction.commit()?;
@@ -896,10 +1021,10 @@ impl Store {
         let transaction = self
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let candidate: Option<(Vec<u8>, Vec<u8>, i64, i64)> = transaction
+        let candidate: Option<(Vec<u8>, Vec<u8>, i64, i64, Vec<u8>)> = transaction
             .query_row(
                 r#"SELECT t.watch_id, t.owner_grant_id, t.pending_through_seq,
-                          t.run_fence
+                          t.run_fence, t.command_argv
                      FROM watchman_triggers t
                      JOIN watches w ON w.id = t.watch_id
                      JOIN watch_grants g
@@ -913,10 +1038,20 @@ impl Store {
                     ORDER BY t.run_fence, COALESCE(t.run_expires_ns, 0), t.watch_id
                     LIMIT 1"#,
                 [now_ns],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((watch_id, authorization_id, through_sequence, old_fence)) = candidate else {
+        let Some((watch_id, authorization_id, through_sequence, old_fence, command_argv)) =
+            candidate
+        else {
             transaction.commit()?;
             return Ok(None);
         };
@@ -956,6 +1091,7 @@ impl Store {
             through_sequence,
             run_owner,
             run_fence,
+            command_argv,
         }))
     }
 
@@ -1640,6 +1776,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(any())]
     pub fn finalize_proved_worktree_seed(
         &mut self,
         activation: &FacadeActivation,
@@ -1993,7 +2130,6 @@ impl Store {
             [filesystem_id],
             |row| row.get(0),
         )?;
-        reject_source_containing_worktree(&transaction, filesystem_id, &request.source_path)?;
 
         transaction.execute(
             "INSERT INTO watches( \
@@ -3043,7 +3179,7 @@ impl Store {
                 reservation.watch_id.as_slice(),
             ],
         )?;
-        let trigger_projection = project_events(&applied.events, ClientFlavor::Jj);
+        let trigger_projection = project_events(&applied.events);
         if trigger_projection.fresh_instance || !trigger_projection.paths.is_empty() {
             transaction.execute(
                 r#"UPDATE watchman_triggers
@@ -3532,12 +3668,17 @@ impl Store {
                     replace_checkpoint_owner_counts(&transaction, revision_id, &owner_counts)?;
                     update_revision_summary(&transaction, revision_id, &summary)?;
                 }
+                transaction.execute(
+                    "UPDATE revisions SET provenance_comparison_id = NULL WHERE id = ?1",
+                    [revision_id],
+                )?;
                 transaction.commit()?;
                 return Ok(summary_version != 2);
             }
             require_one(
                 transaction.execute(
-                    "UPDATE revisions SET storage_base_revision_id = NULL, delta_depth = 0 \
+                    "UPDATE revisions SET storage_base_revision_id = NULL, \
+                            provenance_comparison_id = NULL, delta_depth = 0 \
                      WHERE id = ?1 AND state = 'ready'",
                     [revision_id],
                 )?,
@@ -3575,7 +3716,8 @@ impl Store {
             require_one(
                 transaction.execute(
                     r#"UPDATE revisions
-                          SET storage_base_revision_id = NULL, delta_depth = 0,
+                          SET storage_base_revision_id = NULL,
+                              provenance_comparison_id = NULL, delta_depth = 0,
                               state_hash = ?2
                         WHERE id = ?1 AND state = 'ready'"#,
                     params![revision_id, state_hash.as_slice()],
@@ -3869,8 +4011,241 @@ impl Store {
         Ok(reclaimed)
     }
 
+    /// Drops intermediate physical replay checkpoints while preserving enough
+    /// exponentially-spaced boundaries to answer every clock issued since the
+    /// oldest retained boundary. The adjacent watch-cut comparisons stay
+    /// intact: a client whose exact checkpoint was discarded is replayed from
+    /// the newest retained older boundary, which can only over-report paths.
+    pub fn retain_exponential_replay_checkpoints(
+        &mut self,
+        watch_id: [u8; 16],
+        compactor_owner: [u8; 16],
+    ) -> Result<usize, ManagerError> {
+        let boundaries: Vec<(i64, i64)> = {
+            let mut statement = self.connection().prepare(
+                r#"SELECT b.cut_sequence, r.id
+                     FROM fsmonitor_boundaries b
+                     JOIN revisions r ON r.snapshot_id = b.target_snapshot_id
+                    WHERE b.watch_id = ?1 AND r.state = 'ready'
+                    ORDER BY b.cut_sequence"#,
+            )?;
+            let rows = statement
+                .query_map([watch_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        if boundaries.len() <= 2 {
+            return Ok(0);
+        }
+
+        let sequences = boundaries
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<BTreeSet<_>>();
+        let oldest = *sequences
+            .first()
+            .ok_or_else(|| ManagerError::new("replay checkpoint set is empty"))?;
+        let newest = *sequences
+            .last()
+            .ok_or_else(|| ManagerError::new("replay checkpoint set is empty"))?;
+        let mut retained = BTreeSet::from([oldest, newest]);
+        let mut distance = 1_i64;
+        while newest.saturating_sub(distance) > oldest {
+            let wanted = newest.saturating_sub(distance);
+            if let Some(sequence) = sequences.range(..=wanted).next_back() {
+                retained.insert(*sequence);
+            }
+            let next = distance.saturating_mul(2);
+            if next == distance {
+                break;
+            }
+            distance = next;
+        }
+
+        // An in-flight response pins its exact source and target boundaries.
+        let mut statement = self.connection().prepare(
+            r#"SELECT from_cut_sequence, to_cut_sequence
+                 FROM query_leases
+                WHERE watch_id = ?1 AND state = 'active'"#,
+        )?;
+        let active = statement
+            .query_map([watch_id.as_slice()], |row| {
+                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for (from, to) in active {
+            if let Some(from) = from {
+                retained.insert(from);
+            }
+            retained.insert(to);
+        }
+
+        // A retained snapshot also keeps its compact inode/path checkpoint so
+        // a direct retained-to-head comparison can resolve raw changed-object
+        // identities without replaying intermediate cuts.
+        for (_, revision_id) in boundaries
+            .iter()
+            .filter(|(sequence, _)| retained.contains(sequence))
+        {
+            self.compact_revision(*revision_id, compactor_owner)?;
+        }
+
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM snapshot_pins WHERE owner_kind = 'replay-boundary' AND owner_id = ?1",
+            [watch_id.as_slice()],
+        )?;
+        for sequence in &retained {
+            transaction.execute(
+                r#"INSERT OR IGNORE INTO snapshot_pins(
+                       snapshot_id, owner_kind, owner_id, reason
+                   )
+                   SELECT target_snapshot_id, 'replay-boundary', ?1,
+                          'exponential-replay-checkpoint'
+                     FROM fsmonitor_boundaries
+                    WHERE watch_id = ?1 AND cut_sequence = ?2"#,
+                params![watch_id.as_slice(), sequence],
+            )?;
+        }
+        let mut removed = 0_usize;
+        for (sequence, _) in boundaries
+            .iter()
+            .filter(|(sequence, _)| !retained.contains(sequence))
+        {
+            removed += transaction.execute(
+                "DELETE FROM fsmonitor_boundaries WHERE watch_id = ?1 AND cut_sequence = ?2",
+                params![watch_id.as_slice(), sequence],
+            )?;
+        }
+        transaction.commit()?;
+
+        // Once intermediate boundaries no longer pin their snapshots, reclaim
+        // their indexes before dropping the now-useless adjacent cut events.
+        let reclaimed = self.reclaim_unreferenced_revisions()?;
+        self.reclaim_unreferenced_cut_comparisons(watch_id, newest)?;
+        Ok(removed + reclaimed)
+    }
+
+    fn reclaim_unreferenced_revisions(&mut self) -> Result<usize, ManagerError> {
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut reclaimed = 0_usize;
+        loop {
+            let candidate: Option<i64> = transaction
+                .query_row(
+                    r#"SELECT r.id FROM revisions r
+                        WHERE r.state = 'ready'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM watches w
+                               WHERE w.indexed_revision_id = r.id)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM worktrees wt
+                               WHERE wt.seed_revision_id = r.id)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM revisions child
+                               WHERE child.storage_base_revision_id = r.id)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM query_revision_pins p
+                               WHERE p.revision_id = r.id)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM snapshot_pins p
+                               WHERE p.snapshot_id = r.snapshot_id)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM fsmonitor_boundaries b
+                               WHERE b.target_snapshot_id = r.snapshot_id)
+                        ORDER BY r.id LIMIT 1"#,
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(revision_id) = candidate else {
+                break;
+            };
+            for table in [
+                "checkpoint_objects",
+                "checkpoint_refs",
+                "checkpoint_owner_counts",
+                "revision_checkpoints",
+                "object_overrides",
+                "ref_overrides",
+                "owner_count_overrides",
+            ] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE revision_id = ?1"),
+                    [revision_id],
+                )?;
+            }
+            require_one(
+                transaction.execute("DELETE FROM revisions WHERE id = ?1", [revision_id])?,
+                "reclaim logical revision",
+            )?;
+            reclaimed += 1;
+        }
+        transaction.commit()?;
+        Ok(reclaimed)
+    }
+
+    fn reclaim_unreferenced_cut_comparisons(
+        &mut self,
+        watch_id: [u8; 16],
+        newest_sequence: i64,
+    ) -> Result<(), ManagerError> {
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM cut_admissions WHERE operation_id IN (\
+                 SELECT operation_id FROM watch_cuts \
+                  WHERE watch_id = ?1 AND sequence < ?2\
+             )",
+            params![watch_id.as_slice(), newest_sequence],
+        )?;
+        transaction.execute(
+            "DELETE FROM watch_cuts WHERE watch_id = ?1 AND sequence < ?2",
+            params![watch_id.as_slice(), newest_sequence],
+        )?;
+        transaction.execute(
+            "DELETE FROM operations WHERE watch_id = ?1 AND kind = 'cut' \
+             AND state = 'done' AND sequence < ?2",
+            params![watch_id.as_slice(), newest_sequence],
+        )?;
+        for table in ["change_events", "comparison_refs", "comparison_objects"] {
+            transaction.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE comparison_id IN (\
+                         SELECT c.id FROM comparisons c \
+                          WHERE NOT EXISTS (SELECT 1 FROM revisions r \
+                                             WHERE r.provenance_comparison_id = c.id) \
+                            AND NOT EXISTS (SELECT 1 FROM watch_cuts wc \
+                                             WHERE wc.comparison_id = c.id) \
+                            AND NOT EXISTS (SELECT 1 FROM query_comparison_pins p \
+                                             WHERE p.comparison_id = c.id)\
+                     )"
+                ),
+                [],
+            )?;
+        }
+        transaction.execute(
+            r#"DELETE FROM comparisons
+                WHERE NOT EXISTS (SELECT 1 FROM revisions r
+                                   WHERE r.provenance_comparison_id = comparisons.id)
+                  AND NOT EXISTS (SELECT 1 FROM watch_cuts wc
+                                   WHERE wc.comparison_id = comparisons.id)
+                  AND NOT EXISTS (SELECT 1 FROM query_comparison_pins p
+                                   WHERE p.comparison_id = comparisons.id)"#,
+            [],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Trusted provisioning step which anchors a WORKTREE grant to one
     /// immutable destination-root policy generation.
+    #[cfg(any())]
     pub fn provision_worktree_policy(
         &mut self,
         watch_id: [u8; 16],
@@ -3942,6 +4317,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(any())]
     pub fn reserve_worktree(
         &mut self,
         request: &WorktreeRequest,
@@ -4131,6 +4507,7 @@ impl Store {
         })
     }
 
+    #[cfg(any())]
     pub fn start_worktree_effect(
         &mut self,
         reservation: &WorktreeReservation,
@@ -4153,6 +4530,7 @@ impl Store {
         )
     }
 
+    #[cfg(any())]
     pub fn record_created_worktree(
         &mut self,
         reservation: &WorktreeReservation,
@@ -4185,6 +4563,7 @@ impl Store {
     /// Reacquires the filesystem topology exclusion and rechecks the final
     /// locator immediately before the broker is allowed to publish it. The
     /// caller keeps this lease until `publish_worktree` commits.
+    #[cfg(any())]
     pub fn prepare_worktree_publication(
         &mut self,
         reservation: &WorktreeReservation,
@@ -4243,6 +4622,7 @@ impl Store {
         Ok(topology_fence)
     }
 
+    #[cfg(any())]
     pub fn publish_worktree(
         &mut self,
         reservation: &WorktreeReservation,
@@ -4883,7 +5263,7 @@ impl Store {
                    from_snapshot_id, to_snapshot_id, comparison_kind,
                    algorithm_version, state, lease_owner, lease_fence,
                    lease_expires_ns, manifest_hash, raw_ref_adds, raw_ref_deletes)
-               VALUES (?1, ?2, 'incremental', 2, 'claimed', ?3, 1, ?4,
+               VALUES (?1, ?2, 'incremental', 3, 'claimed', ?3, 1, ?4,
                        NULL, NULL, NULL)
                ON CONFLICT(from_snapshot_id, to_snapshot_id,
                            comparison_kind, algorithm_version) DO NOTHING"#,
@@ -4898,7 +5278,7 @@ impl Store {
             r#"SELECT id, state, lease_owner, lease_fence, lease_expires_ns
                  FROM comparisons
                 WHERE from_snapshot_id = ?1 AND to_snapshot_id = ?2
-                  AND comparison_kind = 'incremental' AND algorithm_version = 2"#,
+                  AND comparison_kind = 'incremental' AND algorithm_version = 3"#,
             params![from_snapshot_id, to_snapshot_id],
             |row| {
                 Ok((
@@ -4912,17 +5292,18 @@ impl Store {
         )?;
         let (comparison_id, state, current_owner, old_fence, old_expiry) = row;
         if state == "index_ready" {
-            let events = load_comparison_events(&transaction, comparison_id)?;
+            for table in ["change_events", "comparison_refs", "comparison_objects"] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE comparison_id = ?1"),
+                    [comparison_id],
+                )?;
+            }
+            transaction.execute(
+                "DELETE FROM comparisons WHERE id = ?1 AND comparison_kind = 'incremental' AND algorithm_version = 3",
+                [comparison_id],
+            )?;
             transaction.commit()?;
-            return Ok(HistoricalComparisonAdmission::Ready(HistoricalChanges {
-                watch_id,
-                from_snapshot_uuid,
-                to_snapshot_uuid,
-                from_sequence,
-                to_sequence,
-                fresh_instance: false,
-                events,
-            }));
+            return self.claim_historical_comparison(request);
         }
         let already_owned = current_owner.as_deref() == Some(lease_owner.as_slice());
         if !already_owned && old_expiry.is_some_and(|expiry| expiry > now_ns) {
@@ -4999,9 +5380,15 @@ impl Store {
         target_objects: &BTreeMap<u64, Object>,
         now_ns: i64,
     ) -> Result<HistoricalChanges, ManagerError> {
-        let base = self.load_revision(claim.from_revision_id)?;
-        let expected_target = self.load_revision(claim.to_revision_id)?;
-        let applied = apply_manifest(&base, manifest, target_objects)
+        // A historical query can span retained checkpoints whose complete
+        // indexes are O(repo size).  The kernel manifest is the boundary of
+        // what can affect the answer, so resolve only those objects, aliases,
+        // and ancestors from each endpoint's SQLite revision chain.  Loading
+        // either complete revision here would turn every incremental query
+        // back into O(all indexed paths).
+        let base = self.load_revision_delta_subset(claim.from_revision_id, manifest)?;
+        let expected_target = self.load_revision_delta_subset(claim.to_revision_id, manifest)?;
+        let applied = apply_manifest_to_trusted_checkpoint(&base, manifest, target_objects)
             .map_err(|error| ManagerError::new(format!("apply historical manifest: {error}")))?;
         if applied.index != expected_target {
             return Err(ManagerError::new(
@@ -5029,7 +5416,7 @@ impl Store {
                     WHERE c.id = ?1 AND c.state = 'claimed'
                       AND c.lease_owner = ?2 AND c.lease_fence = ?3
                       AND c.from_snapshot_id = ?4 AND c.to_snapshot_id = ?5
-                      AND c.algorithm_version = 2 AND c.comparison_kind = 'incremental'
+                      AND c.algorithm_version = 3 AND c.comparison_kind = 'incremental'
                       AND c.lease_expires_ns > ?6
                       AND a.physical_state = 'present' AND b.physical_state = 'present'
                       AND ra.state = 'ready' AND rb.state = 'ready'
@@ -5084,6 +5471,19 @@ impl Store {
         transaction.execute(
             "DELETE FROM snapshot_pins WHERE owner_kind = 'comparison' AND owner_id = ?1",
             [comparison_owner.as_slice()],
+        )?;
+        // Direct query comparisons are deliberately ephemeral. The caller
+        // already has the in-memory events; retaining these rows would turn
+        // the database back into a replay log of every query interval.
+        for table in ["change_events", "comparison_refs", "comparison_objects"] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE comparison_id = ?1"),
+                [claim.comparison_id],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM comparisons WHERE id = ?1 AND comparison_kind = 'incremental' AND algorithm_version = 3",
+            [claim.comparison_id],
         )?;
         transaction.commit()?;
         let _ = clear_staged_delta(self.connection_mut());
@@ -5182,11 +5582,6 @@ impl Store {
         let mut index = self.load_checkpoint(checkpoint_id)?;
         for &overlay_revision in chain.iter().rev().skip(1) {
             apply_stored_overrides(self.connection(), overlay_revision, &mut index)?;
-            index.validate().map_err(|error| {
-                ManagerError::new(format!(
-                    "stored revision {overlay_revision} is invalid: {error}"
-                ))
-            })?;
         }
         Ok(index)
     }
@@ -5559,19 +5954,25 @@ impl Store {
                 return Err(ManagerError::new("checkpoint contains duplicate reference"));
             }
         }
-        index
-            .validate()
-            .map_err(|error| ManagerError::new(format!("stored checkpoint is invalid: {error}")))?;
+        // Ready checkpoints were fully validated before publication. Re-running
+        // whole-tree validation here resolves every inode path and makes every
+        // retained-to-head query O(all_inodes) before it can even compare the
+        // endpoints. SQLite constraints plus the duplicate-row checks above
+        // still reject malformed durable rows; semantic validation remains at
+        // the untrusted publication boundary.
         Ok(index)
     }
 }
 
 fn full_fresh_events(index: &Index) -> Result<Vec<Event>, ManagerError> {
     let mut events = Vec::new();
+    let paths_by_inode = index
+        .all_paths()
+        .map_err(|error| ManagerError::new(format!("resolve full-fresh paths: {error}")))?;
     for object in index.objects.values() {
-        let paths = index.paths(object.ino).map_err(|error| {
-            ManagerError::new(format!("resolve full-fresh inode paths: {error}"))
-        })?;
+        let paths = paths_by_inode
+            .get(&object.ino)
+            .ok_or_else(|| ManagerError::new("full-fresh path map omitted an inode"))?;
         for path in paths {
             events.push(Event {
                 kind: EventKind::PathAdded,
@@ -5580,7 +5981,7 @@ fn full_fresh_events(index: &Index) -> Result<Vec<Event>, ManagerError> {
                 new_generation: Some(object.generation),
                 change_mask: CHANGE_CREATED | CHANGE_INODE | CHANGE_REF,
                 old_path: None,
-                new_path: Some(path),
+                new_path: Some(path.clone()),
             });
         }
     }
@@ -5682,6 +6083,7 @@ fn load_historical_events(
         .collect()
 }
 
+#[cfg(any())]
 fn load_comparison_events(
     transaction: &Transaction<'_>,
     comparison_id: i64,
@@ -6525,6 +6927,7 @@ fn filesystem_uuid_from_connection(
         .map_err(|_| ManagerError::new("stored filesystem UUID has invalid length"))
 }
 
+#[cfg(any())]
 fn claim_topology_lease(
     transaction: &Transaction<'_>,
     filesystem_id: i64,
@@ -6556,6 +6959,7 @@ fn claim_topology_lease(
         .map_err(Into::into)
 }
 
+#[cfg(any())]
 fn release_topology_lease(
     transaction: &Transaction<'_>,
     filesystem_id: i64,
@@ -6572,6 +6976,7 @@ fn release_topology_lease(
     )
 }
 
+#[cfg(any())]
 fn reject_source_containing_worktree(
     transaction: &Transaction<'_>,
     filesystem_id: i64,
@@ -6595,6 +7000,7 @@ fn reject_source_containing_worktree(
     Ok(())
 }
 
+#[cfg(any())]
 fn reject_destination_below_watch(
     transaction: &Transaction<'_>,
     filesystem_id: i64,
@@ -6618,6 +7024,7 @@ fn reject_destination_below_watch(
     Ok(())
 }
 
+#[cfg(any())]
 fn path_is_same_or_descendant(candidate: &[u8], ancestor: &[u8]) -> bool {
     let candidate = Path::new(std::ffi::OsStr::from_bytes(candidate));
     let ancestor = Path::new(std::ffi::OsStr::from_bytes(ancestor));
@@ -6871,6 +7278,49 @@ mod tests {
         );
         assert!(!subset.objects.contains_key(&400));
         assert!(!subset.objects.contains_key(&401));
+    }
+
+    #[test]
+    fn adopts_a_snapshot_descendant_from_a_present_seed() {
+        let (_temp, mut store, request) = setup();
+        let (_reservation, initialized) = initialize_watch(&mut store, &request);
+        let adopted = store
+            .adopt_snapshot_descendant(
+                request.fs_uuid,
+                [42; 16],
+                [4; 16],
+                b"/source-descendant",
+                &Principal::Uid(1000),
+                Permissions::new(PERMISSION_READ | PERMISSION_CUT).unwrap(),
+                400,
+            )
+            .unwrap()
+            .expect("present parent snapshot should seed descendant watch");
+        assert_ne!(adopted.watch_id, initialized.watch_id);
+        assert_eq!(adopted.revision_id, initialized.revision_id);
+        assert_eq!(adopted.snapshot_id, initialized.snapshot_id);
+        assert_eq!(adopted.sequence, 0);
+
+        let adopted_from_live_parent = store
+            .adopt_snapshot_descendant(
+                request.fs_uuid,
+                [43; 16],
+                request.source_subvol_uuid,
+                b"/source-live-descendant",
+                &Principal::Uid(1000),
+                Permissions::new(PERMISSION_READ | PERMISSION_CUT).unwrap(),
+                401,
+            )
+            .unwrap()
+            .expect("live parent subvolume should seed descendant watch");
+        assert_eq!(
+            adopted_from_live_parent.revision_id,
+            initialized.revision_id
+        );
+        assert_eq!(
+            adopted_from_live_parent.snapshot_id,
+            initialized.snapshot_id
+        );
     }
 
     #[test]
@@ -7455,6 +7905,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn refuses_worktree_permission_without_policy() {
         let (_temp, mut store, mut request) = setup();
@@ -7463,6 +7914,7 @@ mod tests {
         assert!(store.reserve_initialize(&request).is_err());
     }
 
+    #[cfg(any())]
     #[test]
     fn topology_path_exclusion_is_component_aware_and_symmetric() {
         assert!(path_is_same_or_descendant(b"/watch/child", b"/watch"));
@@ -7764,10 +8216,10 @@ mod tests {
             .has_fixed_jj_trigger(initialized.watch_id, initialized.grant_id)
             .unwrap());
         assert!(!store
-            .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id)
+            .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id, b"jj\0")
             .unwrap());
         assert!(store
-            .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id)
+            .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id, b"jj\0")
             .unwrap());
         let binding = ViewBinding {
             monitor_session_id: [40; 16],
@@ -7881,7 +8333,7 @@ mod tests {
                 .activate_snapshot_facade(initialized.watch_id, initialized.grant_id, &binding)
                 .unwrap();
             store
-                .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id)
+                .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id, b"jj\0")
                 .unwrap();
         }
         store
@@ -7901,7 +8353,15 @@ mod tests {
     #[test]
     fn publishes_adjacent_delta_as_overlay_and_preserves_directory_witness() {
         let (_temp, mut store, request) = setup();
-        let (_initialize, initialized) = initialize_watch(&mut store, &request);
+        let mut initial = index();
+        initial.objects.insert(400, object(400, 0o100644, 1));
+        initial.references.insert(Reference {
+            ino: 400,
+            parent_ino: ROOT_INO,
+            name: b"unrelated".to_vec(),
+        });
+        let (_initialize, initialized) =
+            initialize_watch_with_index(&mut store, &request, &initial);
         let cut_request = CutRequest {
             watch_id: initialized.watch_id,
             authorization_id: initialized.grant_id,
@@ -8225,12 +8685,24 @@ mod tests {
             HistoricalComparisonAdmission::Claimed(claim) => claim,
             HistoricalComparisonAdmission::Ready(_) => panic!("direct comparison was not built"),
         };
+        // A direct historical query must not hydrate unrelated checkpoint
+        // rows.  Make one such target row differ after the full-revision
+        // checks above; the manifest touches only root/300/301, so the subset
+        // path can still answer while comparing complete endpoint indexes
+        // would reject this unrelated difference.
+        store
+            .connection_mut()
+            .execute(
+                "UPDATE checkpoint_objects SET mode = mode + 1 WHERE revision_id = ?1 AND ino = ?2",
+                params![claim.to_revision_id, encode_u64(400).as_slice()],
+            )
+            .unwrap();
         let direct = store
             .publish_historical_comparison(&claim, &manifest, &target_objects, 950)
             .unwrap();
         assert!(!direct.fresh_instance);
         assert_eq!(direct.events, published.events);
-        let cached = store
+        let rebuilt = store
             .claim_historical_comparison(&HistoricalComparisonRequest {
                 watch_id: initialized.watch_id,
                 authorization_id: initialized.grant_id,
@@ -8242,7 +8714,7 @@ mod tests {
                 lease_expires_ns: 2_000,
             })
             .unwrap();
-        assert_eq!(cached, HistoricalComparisonAdmission::Ready(direct));
+        assert!(matches!(rebuilt, HistoricalComparisonAdmission::Claimed(_)));
         assert!(store.foreign_key_violations().unwrap().is_empty());
     }
 

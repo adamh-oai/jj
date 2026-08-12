@@ -40,4 +40,5 @@ if ! run_as_root test -e "$config_dir/broker.env"; then
 fi
 
 run_as_root systemctl daemon-reload
-run_as_root systemctl enable --now "$unit_name"
+run_as_root systemctl enable "$unit_name"
+run_as_root systemctl restart "$unit_name"

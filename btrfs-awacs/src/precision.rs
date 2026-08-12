@@ -251,6 +251,15 @@ impl PrecisionGuard {
                             return Err(PrecisionError::new("unscoped precision event"));
                         }
                         let path = join_relative(&parent, name);
+                        if ignored_client_metadata(&path) {
+                            // Git and JJ mutate their metadata while they are
+                            // consuming fsmonitor results. Watching those
+                            // paths makes the trigger scheduler wake itself
+                            // and race the foreground query even though both
+                            // client projections exclude them.
+                            offset = end;
+                            continue;
+                        }
                         let directory = mask & libc::IN_ISDIR != 0;
                         if directory {
                             output.push(MutationHint::DirectoryPrefix(path.clone()));
@@ -272,6 +281,9 @@ impl PrecisionGuard {
     }
 
     fn add_tree(&mut self, directory: &Path, relative: Vec<u8>) -> Result<(), PrecisionError> {
+        if ignored_client_metadata(&relative) {
+            return Ok(());
+        }
         let wd = self.add_watch(directory)?;
         self.directories
             .insert(wd, WatchedDirectory::Tree(relative.clone()));
@@ -332,6 +344,12 @@ fn join_relative(parent: &[u8], name: &[u8]) -> Vec<u8> {
     path
 }
 
+fn ignored_client_metadata(path: &[u8]) -> bool {
+    path.split(|byte| *byte == b'/')
+        .next()
+        .is_some_and(|component| matches!(component, b".git" | b".jj"))
+}
+
 #[derive(Debug)]
 pub struct PrecisionError {
     message: String,
@@ -389,6 +407,20 @@ mod tests {
         let marker = root.path().join("runtime");
         fs::create_dir(&marker).unwrap();
         assert!(PrecisionGuard::arm(root.path(), &marker, [8; 16]).is_err());
+    }
+
+    #[test]
+    fn client_metadata_does_not_wake_precision_guard() {
+        let root = TempDir::new().unwrap();
+        let runtime = TempDir::new().unwrap();
+        fs::create_dir(root.path().join(".jj")).unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let mut guard = PrecisionGuard::arm(root.path(), runtime.path(), [10; 16]).unwrap();
+        File::create(root.path().join(".jj").join("working-copy.lock")).unwrap();
+        File::create(root.path().join(".git").join("index.lock")).unwrap();
+        let (events, marker) = guard.read_events(b"not-a-marker").unwrap();
+        assert!(!marker);
+        assert!(events.is_empty());
     }
 
     #[test]

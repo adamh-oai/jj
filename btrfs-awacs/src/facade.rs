@@ -1,14 +1,13 @@
 //! Synchronized snapshot/query facade shared by Watchman and Git transports.
 
 use crate::compat::{
-    decode_clock, encode_clock, BoundaryKind, ClientFlavor, ClockClaims, Projection,
+    decode_clock, encode_clock, project_events, BoundaryKind, ClockClaims, Projection,
 };
 use crate::manager::{FacadeActivation, QueryLeaseReservation};
 use crate::namespace::NamespaceMonitor;
 use crate::namespace::ViewBinding;
 use crate::precision::PrecisionGuard;
 use crate::service::{ChangesOptions, Service};
-use crate::tree_index::PRIVILEGE_FSCRYPT;
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -43,7 +42,6 @@ pub struct PendingQueryCut {
     authorization_id: [u8; 16],
     watch_id: [u8; 16],
     old_clock: Option<String>,
-    flavor: ClientFlavor,
     requester_uid: u32,
     requester_gid: u32,
     now_ns: i64,
@@ -53,7 +51,7 @@ pub struct CompletedQueryCut {
     activation: FacadeActivation,
     authorization_id: [u8; 16],
     old_clock: Option<String>,
-    flavor: ClientFlavor,
+    requester_uid: u32,
     now_ns: i64,
     published: crate::manager::PublishedCut,
 }
@@ -74,7 +72,7 @@ impl PendingQueryCut {
             activation: self.activation,
             authorization_id: self.authorization_id,
             old_clock: self.old_clock,
-            flavor: self.flavor,
+            requester_uid: self.requester_uid,
             now_ns: self.now_ns,
             published,
         })
@@ -168,40 +166,40 @@ impl FacadeService {
                 "snapshot facade is disabled until the experimental dirty-witness ABI is verified",
             ));
         }
-        let revision_id: i64 = self
-            .service
-            .store()
-            .connection()
-            .query_row(
-                "SELECT indexed_revision_id FROM watches WHERE id = ?1 AND state = 'active'",
-                [watch_id.as_slice()],
-                |row| row.get(0),
-            )
-            .map_err(|error| FacadeError::context("load facade revision", error))?;
-        let index = self
-            .service
-            .store()
-            .load_revision(revision_id)
-            .map_err(|error| FacadeError::context("inspect facade revision", error))?;
-        if index
-            .objects
-            .values()
-            .any(|object| object.privilege_flags & PRIVILEGE_FSCRYPT != 0)
-        {
-            return Err(FacadeError::new(
-                "fscrypt-encrypted trees cannot use the snapshot facade",
-            ));
-        }
+        let activation_started = std::time::Instant::now();
+        // Every published revision is already proved fscrypt-free: full-index
+        // publication rejects it, and incremental publication rejects target
+        // objects before advancing the revision.  A descendant watch inherits
+        // that accepted revision, so rehydrating the complete index here only
+        // to repeat the fscrypt scan is both redundant and O(all paths).
+        let monitor_arm_started = std::time::Instant::now();
         let monitor = NamespaceMonitor::arm(root)
             .map_err(|error| FacadeError::context("arm namespace monitor", error))?;
+        tracing::info!(
+            elapsed_ms = monitor_arm_started.elapsed().as_millis() as u64,
+            root = %root.display(),
+            "facade activation armed namespace monitor"
+        );
+        let continuity_started = std::time::Instant::now();
         monitor
             .check_continuity()
             .map_err(|error| FacadeError::context("validate namespace monitor", error))?;
+        tracing::info!(
+            elapsed_ms = continuity_started.elapsed().as_millis() as u64,
+            root = %root.display(),
+            "facade activation checked namespace continuity"
+        );
+        let store_activation_started = std::time::Instant::now();
         let activation = self
             .service
             .store_mut()
             .activate_snapshot_facade(watch_id, authorization_id, monitor.binding())
             .map_err(|error| FacadeError::context("activate facade in store", error))?;
+        tracing::info!(
+            elapsed_ms = store_activation_started.elapsed().as_millis() as u64,
+            root = %root.display(),
+            "facade activation committed store binding"
+        );
         self.views.insert(
             watch_id,
             ActiveView {
@@ -210,6 +208,11 @@ impl FacadeService {
                 monitor,
                 precision: None,
             },
+        );
+        tracing::info!(
+            elapsed_ms = activation_started.elapsed().as_millis() as u64,
+            root = %root.display(),
+            "facade activation completed"
         );
         Ok(())
     }
@@ -275,7 +278,8 @@ impl FacadeService {
         Ok(())
     }
 
-    pub fn activate_proved_worktree(
+    #[cfg(any())]
+    fn legacy_activate_proved_worktree(
         &mut self,
         watch_id: [u8; 16],
         authorization_id: [u8; 16],
@@ -342,23 +346,21 @@ impl FacadeService {
         ))
     }
 
+    #[cfg(any())]
+    fn legacy_has_proved_worktree_handoff(&self, watch_id: [u8; 16]) -> bool {
+        self.service.has_worktree_view_handoff(watch_id)
+    }
+
     pub fn query(
         &mut self,
         watch_id: [u8; 16],
         old_clock: Option<&str>,
-        flavor: ClientFlavor,
         requester_uid: u32,
         requester_gid: u32,
         now_ns: i64,
     ) -> Result<QueryResult, FacadeError> {
-        let prepared = self.prepare_query(
-            watch_id,
-            old_clock,
-            flavor,
-            requester_uid,
-            requester_gid,
-            now_ns,
-        )?;
+        let prepared =
+            self.prepare_query(watch_id, old_clock, requester_uid, requester_gid, now_ns)?;
         self.finish_query_response(prepared)
     }
 
@@ -369,7 +371,6 @@ impl FacadeService {
         &mut self,
         watch_id: [u8; 16],
         old_clock: Option<&str>,
-        flavor: ClientFlavor,
         requester_uid: u32,
         requester_gid: u32,
         now_ns: i64,
@@ -393,7 +394,7 @@ impl FacadeService {
             authorization_id,
             published,
             old_clock,
-            flavor,
+            requester_uid,
             now_ns,
         )
     }
@@ -402,7 +403,6 @@ impl FacadeService {
         &mut self,
         watch_id: [u8; 16],
         old_clock: Option<&str>,
-        flavor: ClientFlavor,
         requester_uid: u32,
         requester_gid: u32,
         now_ns: i64,
@@ -421,7 +421,6 @@ impl FacadeService {
             authorization_id,
             watch_id,
             old_clock: old_clock.map(str::to_owned),
-            flavor,
             requester_uid,
             requester_gid,
             now_ns,
@@ -437,7 +436,7 @@ impl FacadeService {
             completed.authorization_id,
             completed.published,
             completed.old_clock.as_deref(),
-            completed.flavor,
+            completed.requester_uid,
             completed.now_ns,
         )
     }
@@ -448,7 +447,7 @@ impl FacadeService {
         authorization_id: [u8; 16],
         published: crate::manager::PublishedCut,
         old_clock: Option<&str>,
-        flavor: ClientFlavor,
+        requester_uid: u32,
         now_ns: i64,
     ) -> Result<PreparedQueryResult, FacadeError> {
         let watch_id = activation.watch_id;
@@ -491,12 +490,12 @@ impl FacadeService {
             algorithm_version: ALGORITHM_VERSION,
             target_snapshot_uuid: snapshot_uuid,
         };
-        let from_sequence = old_clock.and_then(|token| {
+        let from_boundary = old_clock.and_then(|token| {
             decode_clock(token, &metadata.clock_hmac_key)
                 .ok()
-                .filter(|old| self.old_clock_is_usable(old, &claims).unwrap_or(false))
-                .and_then(|old| i64::try_from(old.cut_sequence).ok())
+                .and_then(|old| self.replay_boundary_for_clock(&old, &claims).ok().flatten())
         });
+        let from_sequence = from_boundary.map(|(sequence, _)| sequence);
         let lease_expires_ns = now_ns
             .checked_add(60_000_000_000)
             .ok_or_else(|| FacadeError::new("query lease expiration overflow"))?;
@@ -511,25 +510,37 @@ impl FacadeService {
                 lease_expires_ns,
             )
             .map_err(|error| FacadeError::context("pin query inputs", error))?;
-        let projection = match self.service.store().project_ready_cut_range_with_lease(
-            watch_id,
-            from_sequence,
-            published.sequence,
-            flavor,
-            Some(&lease),
-        ) {
-            Ok(projection) => projection,
-            Err(error) => {
-                let release = self
-                    .service
-                    .store_mut()
-                    .release_query_lease(&lease, &activation);
-                return Err(match release {
-                    Ok(()) => FacadeError::context("project query range", error),
-                    Err(release) => FacadeError::new(format!(
-                        "project query range: {error}; release failed: {release}"
-                    )),
-                });
+        let projection = if let Some((_, from_snapshot_uuid)) = from_boundary {
+            match self.service.historical_changes(
+                watch_id,
+                authorization_id,
+                requester_uid,
+                from_snapshot_uuid,
+                snapshot_uuid,
+                now_ns,
+            ) {
+                Ok(changes) if !changes.fresh_instance => project_events(&changes.events),
+                Ok(_) => Projection {
+                    fresh_instance: true,
+                    paths: vec![b"/".to_vec()],
+                },
+                Err(error) => {
+                    let release = self
+                        .service
+                        .store_mut()
+                        .release_query_lease(&lease, &activation);
+                    return Err(match release {
+                        Ok(()) => FacadeError::context("compare retained snapshots", error),
+                        Err(release) => FacadeError::new(format!(
+                            "compare retained snapshots: {error}; release failed: {release}"
+                        )),
+                    });
+                }
+            }
+        } else {
+            Projection {
+                fresh_instance: true,
+                paths: vec![b"/".to_vec()],
             }
         };
         let clock = encode_clock(&claims, &metadata.clock_hmac_key);
@@ -618,11 +629,11 @@ impl FacadeService {
         Ok(())
     }
 
-    fn old_clock_is_usable(
+    fn replay_boundary_for_clock(
         &self,
         old: &ClockClaims,
         target: &ClockClaims,
-    ) -> Result<bool, FacadeError> {
+    ) -> Result<Option<(i64, [u8; 16])>, FacadeError> {
         if old.format_version != target.format_version
             || old.store_uuid != target.store_uuid
             || old.watch_id != target.watch_id
@@ -632,34 +643,41 @@ impl FacadeService {
             || old.algorithm_version != target.algorithm_version
             || old.cut_sequence > target.cut_sequence
         {
-            return Ok(false);
+            return Ok(None);
         }
-        let valid: Option<i64> = self
+        let old_sequence = i64::try_from(old.cut_sequence)
+            .map_err(|_| FacadeError::new("old clock sequence overflow"))?;
+        // The exact old snapshot may have been compacted. A retained older
+        // boundary is still safe: one direct retained-to-head comparison can
+        // only over-report paths, and the response advances the client.
+        let retained: Option<(i64, Vec<u8>)> = self
             .service
             .store()
             .connection()
             .query_row(
-                r#"SELECT 1
+                r#"SELECT b.cut_sequence, s.subvol_uuid
                      FROM fsmonitor_boundaries b
                      JOIN snapshots s ON s.id = b.target_snapshot_id
-                    WHERE b.watch_id = ?1 AND b.cut_sequence = ?2
-                      AND b.boundary_kind = ?3 AND b.clock_epoch = ?4
-                      AND s.subvol_uuid = ?5"#,
+                    WHERE b.watch_id = ?1 AND b.cut_sequence <= ?2
+                      AND b.clock_epoch = ?3 AND s.physical_state = 'present'
+                    ORDER BY b.cut_sequence DESC LIMIT 1"#,
                 rusqlite::params![
                     old.watch_id.as_slice(),
-                    i64::try_from(old.cut_sequence).unwrap_or(i64::MAX),
-                    match old.boundary_kind {
-                        BoundaryKind::Cut => "cut",
-                        BoundaryKind::ProvedWorktreeSeed => "proved_worktree_seed",
-                    },
+                    old_sequence,
                     old.clock_epoch.as_slice(),
-                    old.target_snapshot_uuid.as_slice(),
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|error| FacadeError::context("validate old clock boundary", error))?;
-        Ok(valid == Some(1))
+            .map_err(|error| FacadeError::context("resolve retained replay boundary", error))?;
+        retained
+            .map(|(sequence, uuid)| {
+                let uuid = uuid
+                    .try_into()
+                    .map_err(|_| FacadeError::new("retained boundary UUID has invalid length"))?;
+                Ok((sequence, uuid))
+            })
+            .transpose()
     }
 
     fn snapshot_uuid(&self, snapshot_id: i64) -> Result<[u8; 16], FacadeError> {

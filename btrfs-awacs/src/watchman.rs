@@ -1,11 +1,10 @@
 //! Focused Watchman command dispatcher used by jj and the hardened Git adapter.
 
 use crate::bser::{decode_frame, encode_frame, Limits, Value};
-use crate::compat::ClientFlavor;
 use crate::facade::{CompletedQueryCut, FacadeService, PendingQueryCut, PreparedQueryResult};
-use crate::manager::{Permissions, Principal, PERMISSION_CUT, PERMISSION_READ, PERMISSION_TRIGGER};
+use crate::manager::{Permissions, Principal, PERMISSION_CUT, PERMISSION_READ};
 use crate::namespace::ViewBinding;
-use crate::service::InitializeOptions;
+use crate::service::{InitializeOptions, Service};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
@@ -35,12 +34,15 @@ pub struct PreparedWatchmanFrame {
     query: Option<PreparedQueryResult>,
 }
 
+impl PreparedWatchmanFrame {
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 enum ConcurrentResponseKind {
     Clock,
-    Query {
-        flavor: ClientFlavor,
-        limits: Limits,
-    },
+    Query { expression: Value, limits: Limits },
 }
 
 pub struct PendingConcurrentWatchmanFrame {
@@ -150,6 +152,33 @@ impl WatchmanEndpoint {
         Ok(())
     }
 
+    /// Rebuilds the in-memory facade after the privileged broker has rotated
+    /// its manager session. The endpoint registrations are the durable-enough
+    /// source of truth for this daemon lifetime; each binding is revalidated
+    /// against the persistent manager store before the retry may proceed.
+    pub fn rebuild_facade(&self, service: Service) -> Result<FacadeService, WatchmanError> {
+        let registrations = self
+            .roots
+            .read()
+            .map_err(|_| WatchmanError::new("watch registration lock is poisoned"))?
+            .iter()
+            .map(|(root, registration)| (root.clone(), registration.clone()))
+            .collect::<Vec<_>>();
+        let mut facade = FacadeService::new(service);
+        for (root, registration) in registrations {
+            let root = Path::new(std::ffi::OsStr::from_bytes(&root));
+            self.register(
+                &mut facade,
+                root,
+                registration.watch_id,
+                registration.authorization_id,
+                registration.requester_uid,
+                registration.requester_gid,
+            )?;
+        }
+        Ok(facade)
+    }
+
     pub fn handle(
         &self,
         facade: &mut FacadeService,
@@ -204,15 +233,25 @@ impl WatchmanEndpoint {
                 now_ns,
                 limits,
             ),
-            b"trigger-list" => self
-                .trigger_list(facade, command, requester_uid, requester_gid)
-                .map(PreparedWatchmanResponse::immediate),
-            b"trigger-del" => self
-                .trigger_delete(facade, command, requester_uid, requester_gid)
-                .map(PreparedWatchmanResponse::immediate),
-            b"trigger" => self
-                .trigger_register(facade, command, requester_uid, requester_gid)
-                .map(PreparedWatchmanResponse::immediate),
+            b"trigger-del" => Ok(PreparedWatchmanResponse::immediate(object([
+                (b"version", Value::Bytes(VERSION.to_vec())),
+                (b"deleted", Value::Bool(false)),
+                (
+                    b"trigger",
+                    Value::Bytes(
+                        command
+                            .get(2)
+                            .and_then(|value| match value {
+                                Value::Bytes(name) => Some(name.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
+                    ),
+                ),
+            ]))),
+            b"trigger-list" | b"trigger" => Err(WatchmanError::new(
+                "Watchman triggers are unsupported; disable fsmonitor.watchman.register-snapshot-trigger",
+            )),
             _ => Err(WatchmanError::new(format!(
                 "unsupported Watchman command {:?}",
                 String::from_utf8_lossy(name)
@@ -297,7 +336,7 @@ impl WatchmanEndpoint {
         }) else {
             return Ok(None);
         };
-        let (registration, old_clock, flavor, kind) = match name {
+        let (registration, old_clock, kind) = match name {
             b"clock" => {
                 if !(2..=3).contains(&command.len()) {
                     return Err(WatchmanError::new(
@@ -314,12 +353,7 @@ impl WatchmanEndpoint {
                         return Err(WatchmanError::new("unsupported clock options"));
                     }
                 }
-                (
-                    registration,
-                    None,
-                    ClientFlavor::Jj,
-                    ConcurrentResponseKind::Clock,
-                )
+                (registration, None, ConcurrentResponseKind::Clock)
             }
             b"query" => {
                 if command.len() != 3 {
@@ -349,11 +383,10 @@ impl WatchmanEndpoint {
                         return Err(WatchmanError::new("unsupported query sync_timeout"));
                     }
                 }
-                let flavor = classify_expression(
-                    query
-                        .get(b"expression".as_slice())
-                        .ok_or_else(|| WatchmanError::new("query expression is required"))?,
-                )?;
+                let expression = query
+                    .get(b"expression".as_slice())
+                    .ok_or_else(|| WatchmanError::new("query expression is required"))?;
+                validate_expression(expression)?;
                 let old_clock = match query.get(b"since".as_slice()) {
                     None | Some(Value::Integer(_)) => None,
                     Some(Value::Bytes(value)) => Some(
@@ -368,8 +401,10 @@ impl WatchmanEndpoint {
                 (
                     registration,
                     old_clock,
-                    flavor,
-                    ConcurrentResponseKind::Query { flavor, limits },
+                    ConcurrentResponseKind::Query {
+                        expression: expression.clone(),
+                        limits,
+                    },
                 )
             }
             _ => return Ok(None),
@@ -378,7 +413,6 @@ impl WatchmanEndpoint {
             .begin_concurrent_query(
                 registration.watch_id,
                 old_clock.as_deref(),
-                flavor,
                 registration.requester_uid,
                 registration.requester_gid,
                 now_ns,
@@ -407,7 +441,8 @@ impl WatchmanEndpoint {
                     Value::Bytes(prepared.result.clock.as_bytes().to_vec()),
                 ),
             ]),
-            ConcurrentResponseKind::Query { flavor, limits } => {
+            ConcurrentResponseKind::Query { expression, limits } => {
+                filter_projection(&mut prepared.result.projection, &expression)?;
                 if !projection_fits_frame(
                     &prepared.result.projection.paths,
                     &prepared.result.clock,
@@ -415,21 +450,6 @@ impl WatchmanEndpoint {
                 ) {
                     prepared.result.projection.fresh_instance = true;
                     prepared.result.projection.paths = vec![b"/".to_vec()];
-                }
-                if flavor == ClientFlavor::Jj
-                    && prepared
-                        .result
-                        .projection
-                        .paths
-                        .iter()
-                        .any(|path| std::str::from_utf8(path).is_err())
-                {
-                    facade.finish_query_response(prepared).map_err(|error| {
-                        WatchmanError::context("release rejected jj response", error)
-                    })?;
-                    return Err(WatchmanError::new(
-                        "jj Watchman facade cannot represent a non-UTF-8 path",
-                    ));
                 }
                 object([
                     (b"version", Value::Bytes(VERSION.to_vec())),
@@ -538,19 +558,33 @@ impl WatchmanEndpoint {
         requester_gid: u32,
         now_ns: i64,
     ) -> Result<Value, WatchmanError> {
+        let watch_project_started = std::time::Instant::now();
         if command.len() != 2 {
             return Err(WatchmanError::new("watch-project requires one root"));
         }
         let requested_root = bytes(&command[1], "watch-project root")?;
+        let canonicalize_started = std::time::Instant::now();
         let root = std::fs::canonicalize(Path::new(&OsString::from_vec(requested_root.to_vec())))
             .map_err(|error| {
             WatchmanError::context("canonicalize watch-project root", error)
         })?;
+        tracing::info!(
+            elapsed_ms = canonicalize_started.elapsed().as_millis() as u64,
+            root = %root.display(),
+            "watch-project canonicalized root"
+        );
         let root_bytes = root.as_os_str().as_bytes().to_vec();
+        let registered_started = std::time::Instant::now();
         if self
             .registered(&root_bytes, requester_uid, requester_gid)?
             .is_none()
         {
+            tracing::info!(
+                elapsed_ms = registered_started.elapsed().as_millis() as u64,
+                root = %root.display(),
+                "watch-project checked endpoint registration"
+            );
+            let existing_started = std::time::Instant::now();
             let existing = facade
                 .service()
                 .store()
@@ -560,32 +594,70 @@ impl WatchmanEndpoint {
                     PERMISSION_READ | PERMISSION_CUT,
                 )
                 .map_err(|error| WatchmanError::context("find existing watch-project", error))?;
+            tracing::info!(
+                elapsed_ms = existing_started.elapsed().as_millis() as u64,
+                found = existing.is_some(),
+                root = %root.display(),
+                "watch-project looked up existing watch"
+            );
             let (watch_id, grant_id) = match existing {
                 Some(existing) => existing,
                 None => {
-                    let initialized = facade
+                    let options = InitializeOptions {
+                        principal: Principal::Uid(u64::from(requester_uid)),
+                        permissions: Permissions::new(PERMISSION_READ | PERMISSION_CUT)
+                            .map_err(|error| WatchmanError::context("build watch grant", error))?,
+                        requester_uid,
+                        requester_gid,
+                        now_ns,
+                    };
+                    let adoption_started = std::time::Instant::now();
+                    let initialized = match facade
                         .service_mut()
-                        .initialize(
-                            &root,
-                            &InitializeOptions {
-                                principal: Principal::Uid(u64::from(requester_uid)),
-                                permissions: Permissions::new(
-                                    PERMISSION_READ | PERMISSION_CUT | PERMISSION_TRIGGER,
-                                )
-                                .map_err(|error| {
-                                    WatchmanError::context("build watch grant", error)
-                                })?,
-                                requester_uid,
-                                requester_gid,
-                                now_ns,
-                            },
-                        )
+                        .adopt_snapshot_descendant(&root, &options)
                         .map_err(|error| {
-                            WatchmanError::context("initialize watch-project root", error)
-                        })?;
+                            WatchmanError::context("adopt watch-project lineage", error)
+                        })? {
+                        Some(initialized) => {
+                            tracing::info!(
+                                elapsed_ms = adoption_started.elapsed().as_millis() as u64,
+                                root = %root.display(),
+                                "watch-project adopted snapshot descendant"
+                            );
+                            initialized
+                        }
+                        None => {
+                            // TODO: Return an explicit adoption outcome so a
+                            // Btrfs snapshot descendant whose parent is a
+                            // known watched root cannot silently fall back to
+                            // full initialization.  `None` should remain
+                            // valid only for roots where missing lineage is
+                            // expected (for example an initial non-descendant
+                            // watch-project request).
+                            tracing::info!(
+                                elapsed_ms = adoption_started.elapsed().as_millis() as u64,
+                                root = %root.display(),
+                                "watch-project found no snapshot lineage"
+                            );
+                            let initialize_started = std::time::Instant::now();
+                            let initialized = facade
+                                .service_mut()
+                                .initialize(&root, &options)
+                                .map_err(|error| {
+                                    WatchmanError::context("initialize watch-project root", error)
+                                })?;
+                            tracing::info!(
+                                elapsed_ms = initialize_started.elapsed().as_millis() as u64,
+                                root = %root.display(),
+                                "watch-project initialized new root"
+                            );
+                            initialized
+                        }
+                    };
                     (initialized.watch_id, initialized.grant_id)
                 }
             };
+            let register_started = std::time::Instant::now();
             self.register(
                 facade,
                 &root,
@@ -594,7 +666,23 @@ impl WatchmanEndpoint {
                 requester_uid,
                 requester_gid,
             )?;
+            tracing::info!(
+                elapsed_ms = register_started.elapsed().as_millis() as u64,
+                root = %root.display(),
+                "watch-project registered facade root"
+            );
+        } else {
+            tracing::info!(
+                elapsed_ms = registered_started.elapsed().as_millis() as u64,
+                root = %root.display(),
+                "watch-project reused endpoint registration"
+            );
         }
+        tracing::info!(
+            elapsed_ms = watch_project_started.elapsed().as_millis() as u64,
+            root = %root.display(),
+            "watch-project dispatch completed"
+        );
         Ok(object([
             (b"version", Value::Bytes(VERSION.to_vec())),
             (b"watch", Value::Bytes(root_bytes)),
@@ -629,7 +717,6 @@ impl WatchmanEndpoint {
             .prepare_query(
                 registration.watch_id,
                 None,
-                ClientFlavor::Jj,
                 registration.requester_uid,
                 registration.requester_gid,
                 now_ns,
@@ -683,11 +770,10 @@ impl WatchmanEndpoint {
                 return Err(WatchmanError::new("unsupported query sync_timeout"));
             }
         }
-        let flavor = classify_expression(
-            query
-                .get(b"expression".as_slice())
-                .ok_or_else(|| WatchmanError::new("query expression is required"))?,
-        )?;
+        let expression = query
+            .get(b"expression".as_slice())
+            .ok_or_else(|| WatchmanError::new("query expression is required"))?;
+        validate_expression(expression)?;
         let old_clock = match query.get(b"since".as_slice()) {
             None | Some(Value::Integer(_)) => None,
             Some(Value::Bytes(value)) => Some(
@@ -700,12 +786,12 @@ impl WatchmanEndpoint {
             .prepare_query(
                 registration.watch_id,
                 old_clock,
-                flavor,
                 registration.requester_uid,
                 registration.requester_gid,
                 now_ns,
             )
             .map_err(|error| WatchmanError::context("run synchronized query", error))?;
+        filter_projection(&mut prepared.result.projection, expression)?;
         if !projection_fits_frame(
             &prepared.result.projection.paths,
             &prepared.result.clock,
@@ -713,21 +799,6 @@ impl WatchmanEndpoint {
         ) {
             prepared.result.projection.fresh_instance = true;
             prepared.result.projection.paths = vec![b"/".to_vec()];
-        }
-        if flavor == ClientFlavor::Jj
-            && prepared
-                .result
-                .projection
-                .paths
-                .iter()
-                .any(|path| std::str::from_utf8(path).is_err())
-        {
-            facade
-                .finish_query_response(prepared)
-                .map_err(|error| WatchmanError::context("release rejected jj response", error))?;
-            return Err(WatchmanError::new(
-                "jj Watchman facade cannot represent a non-UTF-8 path",
-            ));
         }
         let value = object([
             (b"version", Value::Bytes(VERSION.to_vec())),
@@ -759,6 +830,7 @@ impl WatchmanEndpoint {
         })
     }
 
+    /* trigger support removed: commands fail explicitly in dispatch.
     fn trigger_list(
         &self,
         facade: &FacadeService,
@@ -806,15 +878,15 @@ impl WatchmanEndpoint {
         }
         let root = bytes(&command[1], "trigger root")?;
         let registration = self.registration(root, requester_uid, requester_gid)?;
-        if &command[2] != fixed_trigger_definition() {
-            return Err(WatchmanError::new(
-                "only jj's fixed background snapshot trigger is supported",
-            ));
-        }
+        let command_argv = validated_trigger_argv(&command[2])?;
         let replaced = facade
             .service_mut()
             .store_mut()
-            .register_fixed_jj_trigger(registration.watch_id, registration.authorization_id)
+            .register_fixed_jj_trigger(
+                registration.watch_id,
+                registration.authorization_id,
+                &command_argv,
+            )
             .map_err(|error| WatchmanError::context("register jj trigger", error))?;
         Ok(object([
             (b"version", Value::Bytes(VERSION.to_vec())),
@@ -865,6 +937,7 @@ impl WatchmanEndpoint {
         ]))
     }
 
+    */
     fn registered(
         &self,
         root: &[u8],
@@ -926,16 +999,85 @@ fn current_time_ns() -> Result<i64, WatchmanError> {
         .map_err(|_| WatchmanError::new("precision activation time overflow"))
 }
 
-fn classify_expression(value: &Value) -> Result<ClientFlavor, WatchmanError> {
-    if value == &jj_expression() {
-        Ok(ClientFlavor::Jj)
-    } else if value == &git_expression() {
-        Ok(ClientFlavor::Git)
-    } else {
-        Err(WatchmanError::new("unsupported query expression"))
+fn validate_expression(value: &Value) -> Result<(), WatchmanError> {
+    expression_matches(value, b"").map(|_| ())
+}
+
+fn filter_projection(
+    projection: &mut crate::compat::Projection,
+    expression: &Value,
+) -> Result<(), WatchmanError> {
+    if projection.fresh_instance {
+        return Ok(());
+    }
+    let mut filtered = Vec::with_capacity(projection.paths.len());
+    for path in projection.paths.drain(..) {
+        if expression_matches(expression, &path)? {
+            filtered.push(path);
+        }
+    }
+    projection.paths = filtered;
+    Ok(())
+}
+
+fn expression_matches(value: &Value, path: &[u8]) -> Result<bool, WatchmanError> {
+    let expression = array(value, "query expression")?;
+    let operator = expression
+        .first()
+        .ok_or_else(|| WatchmanError::new("query expression is empty"))
+        .and_then(|value| bytes(value, "query expression operator"))?;
+    match operator {
+        b"true" if expression.len() == 1 => Ok(true),
+        b"false" if expression.len() == 1 => Ok(false),
+        b"not" if expression.len() == 2 => Ok(!expression_matches(&expression[1], path)?),
+        b"anyof" if expression.len() >= 2 => {
+            let mut matched = false;
+            for child in &expression[1..] {
+                matched |= expression_matches(child, path)?;
+            }
+            Ok(matched)
+        }
+        b"allof" if expression.len() >= 2 => {
+            let mut matched = true;
+            for child in &expression[1..] {
+                matched &= expression_matches(child, path)?;
+            }
+            Ok(matched)
+        }
+        b"name" if (2..=3).contains(&expression.len()) => {
+            let scope = match expression.get(2) {
+                None => b"basename".as_slice(),
+                Some(value) => bytes(value, "name scope")?,
+            };
+            let candidate = match scope {
+                b"wholename" => path,
+                b"basename" => path.rsplit(|byte| *byte == b'/').next().unwrap_or(path),
+                _ => return Err(WatchmanError::new("unsupported name scope")),
+            };
+            match &expression[1] {
+                Value::Bytes(name) => Ok(candidate == name),
+                Value::Array(names) => names.iter().try_fold(false, |matched, name| {
+                    Ok(matched || candidate == bytes(name, "name value")?)
+                }),
+                _ => Err(WatchmanError::new("name value is not a string or array")),
+            }
+        }
+        b"dirname" if expression.len() == 2 => {
+            let directory = bytes(&expression[1], "dirname value")?;
+            Ok(component_prefix(path, directory))
+        }
+        _ => Err(WatchmanError::new("unsupported query expression term")),
     }
 }
 
+fn component_prefix(path: &[u8], component: &[u8]) -> bool {
+    path == component
+        || path
+            .strip_prefix(component)
+            .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+#[cfg(test)]
 fn jj_expression() -> Value {
     Value::Array(vec![
         Value::Bytes(b"not".to_vec()),
@@ -961,6 +1103,7 @@ fn jj_expression() -> Value {
     ])
 }
 
+#[cfg(test)]
 fn git_expression() -> Value {
     Value::Array(vec![
         Value::Bytes(b"not".to_vec()),
@@ -971,6 +1114,7 @@ fn git_expression() -> Value {
     ])
 }
 
+/*
 fn fixed_trigger_definition() -> &'static Value {
     use std::sync::OnceLock;
     static DEFINITION: OnceLock<Value> = OnceLock::new();
@@ -1014,6 +1158,47 @@ fn fixed_trigger_description() -> Value {
         ),
     ])
 }
+
+fn validated_trigger_argv(definition: &Value) -> Result<Vec<u8>, WatchmanError> {
+    let Value::Object(definition) = definition else {
+        return Err(WatchmanError::new("trigger definition is not an object"));
+    };
+    for (key, expected) in [
+        (
+            b"name".as_slice(),
+            Value::Bytes(b"jj-background-monitor".to_vec()),
+        ),
+        (b"expression".as_slice(), jj_expression()),
+        (b"stdout".as_slice(), Value::Bytes(b">/dev/null".to_vec())),
+        (b"stderr".as_slice(), Value::Bytes(b">/dev/null".to_vec())),
+    ] {
+        if definition.get(key) != Some(&expected) {
+            return Err(WatchmanError::new(
+                "only the supported filesystem-monitor trigger shape is accepted",
+            ));
+        }
+    }
+    let Value::Array(command) = definition
+        .get(b"command".as_slice())
+        .ok_or_else(|| WatchmanError::new("trigger definition omitted command"))?
+    else {
+        return Err(WatchmanError::new("trigger command is not an array"));
+    };
+    if command.is_empty() {
+        return Err(WatchmanError::new("trigger command is empty"));
+    }
+    let mut encoded = Vec::new();
+    for argument in command {
+        let argument = bytes(argument, "trigger command argument")?;
+        if argument.contains(&0) {
+            return Err(WatchmanError::new("trigger command argument contains NUL"));
+        }
+        encoded.extend_from_slice(argument);
+        encoded.push(0);
+    }
+    Ok(encoded)
+}
+*/
 
 fn array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], WatchmanError> {
     match value {
@@ -1092,16 +1277,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_only_the_two_supported_client_expressions() {
-        assert_eq!(
-            classify_expression(&jj_expression()).unwrap(),
-            ClientFlavor::Jj
-        );
-        assert_eq!(
-            classify_expression(&git_expression()).unwrap(),
-            ClientFlavor::Git
-        );
-        assert!(classify_expression(&Value::Bool(true)).is_err());
+    fn evaluates_supported_path_expressions_without_client_classification() {
+        validate_expression(&jj_expression()).unwrap();
+        validate_expression(&git_expression()).unwrap();
+        assert!(expression_matches(&jj_expression(), b"README.md").unwrap());
+        assert!(!expression_matches(&jj_expression(), b".jj/working_copy/tree_state").unwrap());
+        assert!(!expression_matches(&git_expression(), b".git/index").unwrap());
+        assert!(validate_expression(&Value::Bool(true)).is_err());
     }
 
     #[test]

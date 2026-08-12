@@ -337,6 +337,7 @@ pub fn snapshot_delete_effect_hash(execution: &SnapshotDeleteExecution) -> [u8; 
     hash.finalize().into()
 }
 
+#[cfg(any())]
 pub fn worktree_rename_effect_hash(execution: &WorktreeRenameExecution) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"btrfs-awacs-worktree-rename-v1\0");
@@ -361,6 +362,7 @@ pub fn worktree_rename_effect_hash(execution: &WorktreeRenameExecution) -> [u8; 
     hash.finalize().into()
 }
 
+#[cfg(any())]
 fn hash_directory(hash: &mut Sha256, directory: &ExpectedManagedDirectory) {
     hash.update(directory.filesystem_uuid);
     hash.update(directory.device.to_be_bytes());
@@ -731,6 +733,7 @@ fn verify_reservation_file(
     Ok(metadata)
 }
 
+#[cfg(any())]
 fn verify_reservation(
     parent: BorrowedFd<'_>,
     expected: &ExpectedReservation,
@@ -747,6 +750,7 @@ fn verify_reservation(
     Ok(true)
 }
 
+#[cfg(any())]
 fn remove_reservation(
     parent: BorrowedFd<'_>,
     expected: &ExpectedReservation,
@@ -1088,6 +1092,7 @@ fn verify_completed_delete_receipt(
     Ok(())
 }
 
+#[cfg(any())]
 pub fn execute_worktree_rename(
     gate: &SessionGate,
     journal: &mut BrokerJournal,
@@ -1247,6 +1252,7 @@ pub fn execute_worktree_rename(
     }
 }
 
+#[cfg(any())]
 fn reconcile_worktree_rename(
     gate: &SessionGate,
     journal: &mut BrokerJournal,
@@ -1292,6 +1298,7 @@ fn reconcile_worktree_rename(
     }
 }
 
+#[cfg(any())]
 fn validate_worktree_rename_request(
     execution: &WorktreeRenameExecution,
 ) -> Result<(), BrokerError> {
@@ -1339,6 +1346,7 @@ fn validate_worktree_rename_request(
     Ok(())
 }
 
+#[cfg(any())]
 fn verify_published_worktree(
     execution: &WorktreeRenameExecution,
     staging_parent_fd: BorrowedFd<'_>,
@@ -1359,6 +1367,7 @@ fn verify_published_worktree(
     Ok(())
 }
 
+#[cfg(any())]
 fn rename_noreplace(
     source_parent: BorrowedFd<'_>,
     source_name: &[u8],
@@ -1387,6 +1396,7 @@ fn rename_noreplace(
 }
 
 #[repr(C)]
+#[cfg(any())]
 struct OpenHow {
     flags: u64,
     mode: u64,
@@ -1394,6 +1404,7 @@ struct OpenHow {
 }
 
 #[repr(C)]
+#[cfg(any())]
 struct MountIdRequest {
     size: u32,
     spare: u32,
@@ -1402,6 +1413,7 @@ struct MountIdRequest {
 }
 
 #[repr(C)]
+#[cfg(any())]
 struct StatMountBasic {
     size: u32,
     spare: u32,
@@ -1424,6 +1436,7 @@ struct StatMountBasic {
     mount_point: u32,
 }
 
+#[cfg(any())]
 fn reject_idmapped_mount(fd: BorrowedFd<'_>) -> Result<(), BrokerError> {
     // Request the non-recycled mount ID needed by statmount(2).
     // SAFETY: statx is zeroed and all pointer/size arguments are valid.
@@ -1472,6 +1485,7 @@ fn reject_idmapped_mount(fd: BorrowedFd<'_>) -> Result<(), BrokerError> {
     Ok(())
 }
 
+#[cfg(any())]
 fn open_directory_beneath(root: BorrowedFd<'_>, relative: &[u8]) -> Result<OwnedFd, BrokerError> {
     if relative.is_empty() {
         // SAFETY: fcntl duplicates the live descriptor and returns new ownership.
@@ -1519,6 +1533,7 @@ fn open_directory_beneath(root: BorrowedFd<'_>, relative: &[u8]) -> Result<Owned
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+#[cfg(any())]
 fn worktree_rename_result(execution: &WorktreeRenameExecution) -> WorktreeRenameResult {
     let mut hash = Sha256::new();
     hash.update(b"btrfs-awacs-worktree-published-v1\0");
@@ -1530,6 +1545,7 @@ fn worktree_rename_result(execution: &WorktreeRenameExecution) -> WorktreeRename
     }
 }
 
+#[cfg(any())]
 fn verify_completed_worktree_receipt(
     receipt: &Receipt,
     result: &WorktreeRenameResult,
@@ -2955,7 +2971,7 @@ mod tests {
     use super::*;
     use std::fs::{self, File, OpenOptions};
     use std::os::fd::AsFd;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use tempfile::tempdir;
 
     fn request() -> ReceiptRequest {
@@ -3058,6 +3074,7 @@ mod tests {
         execution
     }
 
+    #[cfg(any())]
     fn worktree_execution(session_id: [u8; 16]) -> WorktreeRenameExecution {
         let created = snapshot_execution(session_id);
         let receipt = ReceiptRequest {
@@ -3117,7 +3134,7 @@ mod tests {
         match left.peer_credentials() {
             Ok(credentials) => assert_eq!(credentials.uid, unsafe { libc::geteuid() }),
             Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
-                // The Codex sandbox blocks SO_PEERCRED; production startup
+                // Some sandboxes block SO_PEERCRED; production startup
                 // treats this as fatal rather than bypassing authentication.
             }
             Err(error) => panic!("read peer credentials: {error}"),
@@ -3301,6 +3318,7 @@ mod tests {
         assert!(journal.unresolved_receipts(store).unwrap().is_empty());
     }
 
+    #[cfg(any())]
     #[test]
     fn reservation_observation_requires_exact_private_inode_and_nonce() {
         let temp = tempdir().unwrap();
@@ -3322,6 +3340,7 @@ mod tests {
         assert!(verify_reservation(directory.as_fd(), &expected).is_err());
     }
 
+    #[cfg(any())]
     #[test]
     fn worktree_receipt_binds_both_directories_names_and_reservation() {
         let execution = worktree_execution([1; 16]);
@@ -3335,6 +3354,7 @@ mod tests {
         assert_ne!(worktree_rename_effect_hash(&another_nonce), original);
     }
 
+    #[cfg(any())]
     #[test]
     fn worktree_executor_rejects_unbound_arguments_before_receipt() {
         let gate = SessionGate::default();
@@ -3494,6 +3514,7 @@ mod tests {
         gate.authorize(store, second).unwrap();
     }
 
+    #[cfg(any())]
     #[test]
     fn worktree_parent_resolution_is_beneath_and_symlink_free() {
         let temp = tempdir().unwrap();

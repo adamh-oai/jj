@@ -206,6 +206,27 @@ impl Index {
         )
     }
 
+    /// Resolves every inode with one reverse-reference graph and one ancestry
+    /// memo. Callers that need a whole-tree projection must not call paths()
+    /// in a loop, because that would rebuild the full graph for every inode.
+    pub fn all_paths(&self) -> Result<BTreeMap<u64, Vec<Vec<u8>>>, IndexError> {
+        let mut refs_by_child: BTreeMap<u64, Vec<&Reference>> = BTreeMap::new();
+        for reference in &self.references {
+            refs_by_child
+                .entry(reference.ino)
+                .or_default()
+                .push(reference);
+        }
+        let mut memo = BTreeMap::new();
+        let mut paths = BTreeMap::new();
+        for &ino in self.objects.keys() {
+            let resolved =
+                self.paths_inner(ino, &refs_by_child, &mut memo, &mut BTreeSet::new())?;
+            paths.insert(ino, resolved);
+        }
+        Ok(paths)
+    }
+
     fn paths_inner(
         &self,
         ino: u64,
@@ -336,7 +357,29 @@ pub fn apply_manifest(
     manifest: &ChangedObjectsManifest,
     target_objects: &BTreeMap<u64, Object>,
 ) -> Result<ApplyResult, IndexError> {
-    base.validate()?;
+    apply_manifest_inner(base, manifest, target_objects, true)
+}
+
+/// Applies a kernel manifest between two already-published ready checkpoints.
+/// The caller must compare the returned index with its trusted target
+/// checkpoint before publishing any result.
+pub fn apply_manifest_to_trusted_checkpoint(
+    base: &Index,
+    manifest: &ChangedObjectsManifest,
+    target_objects: &BTreeMap<u64, Object>,
+) -> Result<ApplyResult, IndexError> {
+    apply_manifest_inner(base, manifest, target_objects, false)
+}
+
+fn apply_manifest_inner(
+    base: &Index,
+    manifest: &ChangedObjectsManifest,
+    target_objects: &BTreeMap<u64, Object>,
+    validate_endpoints: bool,
+) -> Result<ApplyResult, IndexError> {
+    if validate_endpoints {
+        base.validate()?;
+    }
     validate_delta_inputs(base, manifest, target_objects)?;
 
     let mut target = base.clone();
@@ -363,7 +406,9 @@ pub fn apply_manifest(
             )));
         }
     }
-    target.validate()?;
+    if validate_endpoints {
+        target.validate()?;
+    }
     let events = derive_events(base, &target, manifest)?;
     Ok(ApplyResult {
         state_hash: target.state_hash(),
@@ -457,15 +502,45 @@ fn derive_events(
     target: &Index,
     manifest: &ChangedObjectsManifest,
 ) -> Result<Vec<Event>, IndexError> {
+    // Resolving one inode path requires the reverse reference graph. Building
+    // that graph inside paths() for every changed inode turns a two-snapshot
+    // comparison into O(changed_inodes * all_references). Build it once per
+    // endpoint and retain ancestry memoization across the whole manifest.
+    let mut base_refs_by_child: BTreeMap<u64, Vec<&Reference>> = BTreeMap::new();
+    for reference in &base.references {
+        base_refs_by_child
+            .entry(reference.ino)
+            .or_default()
+            .push(reference);
+    }
+    let mut target_refs_by_child: BTreeMap<u64, Vec<&Reference>> = BTreeMap::new();
+    for reference in &target.references {
+        target_refs_by_child
+            .entry(reference.ino)
+            .or_default()
+            .push(reference);
+    }
+    let mut base_path_memo = BTreeMap::new();
+    let mut target_path_memo = BTreeMap::new();
     let mut events = Vec::new();
     for change in manifest.objects.values().copied() {
         let old_paths = if base.objects.contains_key(&change.ino) {
-            base.paths(change.ino)?
+            base.paths_inner(
+                change.ino,
+                &base_refs_by_child,
+                &mut base_path_memo,
+                &mut BTreeSet::new(),
+            )?
         } else {
             Vec::new()
         };
         let new_paths = if target.objects.contains_key(&change.ino) {
-            target.paths(change.ino)?
+            target.paths_inner(
+                change.ino,
+                &target_refs_by_child,
+                &mut target_path_memo,
+                &mut BTreeSet::new(),
+            )?
         } else {
             Vec::new()
         };

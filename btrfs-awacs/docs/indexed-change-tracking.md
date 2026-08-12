@@ -197,9 +197,10 @@ intermediate cut is irrecoverably lost, the next stream result is marked
 the original event history.
 
 The jj/Git compatibility layer has a stronger requirement than this core
-stream. Those clients receive a clock and then inspect the mutable worktree. A
-path they observe after that clock can disappear or revert before the next RO
-cut, so a comparison of semantic endpoint contents alone would be unsafe.
+stream. A VCS client stores a clock only after proving that its working-copy
+tree exactly matches that clock. After that point it needs endpoint tree
+differences, not a history of transient names which disappeared before the
+next RO cut.
 
 V1 requires a **persistent dirty-witness** invariant from the kernel ABI. RO
 snapshot creation is a transaction barrier. Every later client-visible
@@ -211,16 +212,11 @@ creation commits a transaction, inode-item updates store its `transid` and
 sequence, and `CHANGED_OBJECTS` deep-compares those items. This observation
 must become a documented ABI promise and an xfstest suite before production.
 
-The compatibility projection treats every changed directory not covered by a
-complete precision interval as a coarse subtree invalidation; jj requires a
-fresh/full crawl and Git can consume a trailing-slash prefix, with the root
-mapped to `/`. Thus a transient mutation
-cannot become an empty success even when its exact name no longer exists. An
-optional durable namespace guard records exact create/delete/rename names and
-wakes triggers so most such intervals can remain incremental. It improves
-precision and latency but is not the sole correctness mechanism; if its
-coverage is absent or gapped, the service falls back to the dirty witness
-rather than trusting a partial event journal.
+The Watchman projection exposes surviving endpoint path changes and keeps
+changed-directory witnesses internal. Thus a transient mutation may correctly
+become an empty VCS result when the endpoint tree is unchanged. An optional
+durable namespace guard still records exact create/delete/rename names for
+triggers and diagnostics, but it is not required for endpoint VCS status.
 
 The dirty witness covers mutations *inside* the watched subvolume, not changes
 to the VFS view which selects that subvolume. A transient rename/replacement of
@@ -339,7 +335,7 @@ later snapshots, and makes lexical timestamp order stand in for durable state.
 | Incremental object delta | Local `BTRFS_IOC_CHANGED_OBJECTS` v2; legacy fallback is experimental `BTRFS_IOC_SEND` with exactly `NO_FILE_DATA` plus `CHANGED_OBJECTS` | V2 receives source and target root fds, requires distinct RO roots on one filesystem, and emits endpoint identities, target attributes/xattrs, nested-boundary transitions, bounded records, and a checksummed completion footer. The legacy parent is a numeric root ID and is accepted only when the dedicated ioctl returns `ENOTTY`. Neither local extension is upstream ABI. |
 | Initial exact index | Userspace traversal of the immutable RO snapshot | Enumerate raw directory entries and obtain each reachable object's metadata through ordinary fd-relative VFS operations. The prototype still uses privileged `BTRFS_IOC_TREE_SEARCH_V2` while the VFS walker is implemented; `BTRFS_IOC_CHANGED_OBJECTS` has no full-index mode. |
 | Root-path-binding continuity | A separate `inotify_init1` fd watches every parent/component from the pinned process root to the watched subvolume root | Mandatory for clocks unless an equivalent immutable-path policy is enforced. Arm top-down before resolving the next component; relevant create/delete/move/self/ignored events, overflow, unmount, permission loss, or monitor restart rotate the clock epoch. Drain a private marker and re-resolve the complete inode/mount/UUID chain at admission and final response. This fd is separate from the optional recursive precision guard so subtree load cannot silently weaken authority. |
-| Optional precise namespace guard | Recursive `inotify_init1` / `inotify_add_watch` in the per-user daemon | Durably records exact create/delete/rename names and wakes triggers between cuts. It requires traversal/watch access to the whole worktree and does not observe every content mechanism (for example writable `mmap`). Content correctness comes from the dirty witness. Queue overflow, watch-install races, permission loss, restart, or an unresolvable event makes the interval imprecise; queries fall back to coarse directory invalidation. |
+| Optional precise namespace guard | Recursive `inotify_init1` / `inotify_add_watch` in the per-user daemon | Durably records exact create/delete/rename names and wakes triggers between cuts. It requires traversal/watch access to the whole worktree and does not observe every content mechanism (for example writable `mmap`). VCS endpoint correctness comes from snapshot comparison; guard gaps affect transient-name diagnostics and triggers, not ordinary status projection. |
 | Mount-topology continuity | Keep `/proc/self/mountinfo` open in the per-namespace daemon and poll it for `POLLERR`/`POLLPRI` | Mandatory for the client-visible namespace unless deployment can make its topology immutable. The kernel's `mnt_namespace.event` changes on attach/detach even when mountinfo text later returns to the same value. Because poll has no affected-path payload, any event rotates every clock epoch bound to that namespace monitor; reparsing only rejects mounts which remain. Check the poll state when admitting/finalizing every boundary and treat fd/daemon/boot loss as a gap. Local-kernel `FAN_REPORT_MNT`/`FAN_MARK_MNTNS` is an optional richer replacement; recursive inotify alone is insufficient. |
 | Delete managed snapshot | `BTRFS_IOC_SNAP_DESTROY_V2` | Run only after the DB marks a snapshot deleting and removes eligibility for new pins. |
 | Commit deletion | `BTRFS_IOC_START_SYNC` / `BTRFS_IOC_WAIT_SYNC` (or checked `syncfs`) | Wait for the namespace deletion's transaction to become durable before SQLite says `deleted`. |
@@ -979,14 +975,16 @@ CREATE TABLE mutation_events (
         OR (event_kind != 'full-invalidation' AND path IS NOT NULL))
 ) WITHOUT ROWID;
 
--- V1 persists only jj's fixed background-snapshot trigger. The kind columns
--- reconstruct the exact argv/expression/null-redirection response; arbitrary
--- commands and redirection paths are deliberately not stored or executed.
+-- Watchman trigger commands are durable opaque argv records. The daemon never
+-- invokes a shell; it executes the exact NUL-delimited argv supplied by the
+-- authenticated client. Expression support remains intentionally focused on
+-- the git/jj metadata exclusion used by filesystem-monitor clients.
 CREATE TABLE watchman_triggers (
     watch_id        BLOB NOT NULL REFERENCES watches(id),
-    name            TEXT NOT NULL CHECK (name = 'jj-background-monitor'),
+    name            BLOB NOT NULL,
     owner_grant_id  BLOB NOT NULL CHECK (length(owner_grant_id) = 16),
-    command_kind    TEXT NOT NULL CHECK (command_kind = 'jj-snapshot-v1'),
+    command_kind    TEXT NOT NULL CHECK (command_kind = 'argv-v1'),
+    command_argv    BLOB NOT NULL CHECK (length(command_argv) > 1),
     expression_kind TEXT NOT NULL CHECK (expression_kind = 'exclude-git-jj-v1'),
     state           TEXT NOT NULL CHECK (state IN ('active', 'deleting')),
     last_evaluated_seq INTEGER,
@@ -2485,17 +2483,13 @@ stop waiting and return an error, but the fenced operation can finish for other
 waiters and triggers. No Btrfs ioctl, path expansion, or client write occurs
 inside a long SQLite write transaction.
 
-For `query(since=A)` targeting B, the service walks every ready adjacent cut in
-`(A.cut_sequence, B.cut_sequence]`, not merely a new net A -> B comparison. It
-always unions their conservative dirty-witness projections. If A and B also
-carry retained complete cursors in the same precision epoch, it reads and
-unions every mutation event in `(A.guard_sequence, B.guard_sequence]`; only
-that case permits exact namespace events to replace coarse changed-directory
-fallbacks. A path observed at an intermediate cut or by the precision journal
-therefore remains dirty even if a later cut changes it again. If there were no
-intermediate cuts, the ordinary A -> B comparison is the immutable-state
-portion of the range. The result is byte-sorted for reproducibility; consumers
-must not attach meaning to order.
+For `query(since=A)` targeting B, the service returns endpoint path changes
+between the exact baseline named by A and the target cut B. Directory dirty
+witnesses remain stored for ordering, recovery, and non-VCS diagnostics but
+are not projected as client paths. If A and B also carry retained complete
+cursors in the same precision epoch, the service may read exact mutation
+events for trigger/diagnostic consumers. The VCS result is byte-sorted for
+reproducibility; consumers must not attach meaning to order.
 
 External clocks are soft state and do not pin history forever. GC maintains a
 count/time retention window and advances `replay_floor_seq` atomically with
@@ -2517,9 +2511,9 @@ falsely clean working copy.
 
 | Indexed evidence | Exact names always available | Snapshot-only fallback |
 | --- | --- | --- |
-| create/delete/ref add/ref remove | Every target/source name represented by endpoint refs | Also apply the changed-parent directory witnesses below |
+| create/delete/ref add/ref remove | Every target/source name represented by endpoint refs | No additional VCS path for endpoint-equal transient names |
 | file data, xattr, mode, type, or other object change | Every target alias, plus any removed/renamed source alias in the range | No additional namespace fallback for a non-directory object |
-| hardlinked object change | Every surviving target alias; explicit ref changes add old/new names | Also apply every changed-parent directory witness |
+| hardlinked object change | Every surviving target alias; explicit ref changes add old/new names | No additional directory witness projection |
 | file/symlink rename | Both old and new names | Also apply both changed parents' directory witnesses |
 | directory subtree move | Old and new prefixes plus the client-specific handling below | Coarse-invalidate every old/current changed-directory prefix |
 | surviving changed directory inode | Its old/current directory aliases | Coarse-invalidate the entire old/current subtree; root means the whole tree |
@@ -2531,35 +2525,21 @@ hardlinks. Names from excluded directories remain in the canonical index and
 history; expressions filter only the final presentation set.
 
 The directory rule is normative. If an interval lacks two retained, complete
-precision cursors in the same guard epoch, **every** surviving directory whose
-inode item changed is a coarse subtree witness, even when the interval also
-contains understandable net ref additions or removals in that directory. Net
-endpoint refs cannot prove that no additional name was created and removed
-between cuts. For example, creating and deleting `d/transient` plus retaining
-`d/persistent` changes the same parent inode; accounting for the persistent ref
-must not erase the witness for the transient name. The root witness maps to
-Git's `/` sentinel and to a fresh result for jj. A non-root witness maps to old
-and current trailing-slash prefixes for the direct Git hook; because jj treats
-returned names as exact files rather than recursive prefixes, its common query
-becomes fresh unless its expression proves the entire witnessed subtree is
-excluded.
+precision cursors in the same guard epoch, surviving directory inode changes
+remain stored as internal dirty witnesses. They prove that transient namespace
+activity occurred, but a VCS query with an exact baseline projects only
+surviving endpoint paths. For example, creating and deleting `d/transient`
+plus retaining `d/persistent` returns only `d/persistent` to Watchman.
 
-This fallback is correct but deliberately coarse. In snapshot-only mode,
-almost every create, delete, link, unlink, or rename changes a parent directory
-and therefore makes jj crawl again; data-only edits remain alias-precise. A
-complete namespace journal is optional for correctness but practically
-required for Watchman-like incremental performance on namespace-heavy
-workloads.
+This endpoint projection keeps snapshot-only VCS status incremental for common
+create, delete, link, and unlink operations. A complete namespace journal is
+optional for triggers and diagnostics which need transient names, not for VCS
+endpoint correctness.
 
 When both boundaries have a retained complete precision interval, its
-path-level create, delete, move, and attribute events replace—not merely try to
-"explain"—the coarse directory-witness fallback for that interval. Indexed
-object/ref evidence is still unioned in, so writable `mmap`, hardlink aliases,
-or another event class which inotify does not describe cannot disappear. A
-content/object journal notification uses its observed inode+generation and the
-source/target indexes to expand every hardlink alias. If the producer cannot
-prove coverage or alias identity, the interval uses the coarse witness instead
-of mixing a partial journal with an exact claim.
+path-level create, delete, move, and attribute events remain available to
+trigger and diagnostic consumers. Indexed object/ref evidence still supplies
+the VCS endpoint projection, including writable `mmap` and hardlink aliases.
 
 Recursive inotify is armed top-down with parent watches installed before
 enumerating children, then drained through a marker in the daemon's private
@@ -2567,9 +2547,7 @@ runtime directory watched by the same inotify fd before the guard becomes
 active and after every cut. Creating or moving in a directory first records a
 `directory-prefix` event for that known prefix, because activity may occur
 before recursive coverage completes; after its watches and another marker are
-certified, later events can be exact. For the direct Git hook the prefix is a
-trailing-slash invalidation. For jj it causes fresh unless the fixed expression
-excludes the whole prefix. Queue overflow, `IN_IGNORED`, unmount, permission
+certified, later events can be exact. Queue overflow, `IN_IGNORED`, unmount, permission
 loss, an unexpected watch disappearance, or an event whose affected prefix is
 unknown gaps the guard and restores snapshot-only projection; it never turns a
 partial event set into an empty success.
@@ -2622,12 +2600,9 @@ cut. A physically deleted snapshot is not by itself fresh when its immutable
 revision and every required event remain replayable. Corruption, recovery
 ambiguity, or a path-expansion limit has the same result. The daemon still
 completes a new cut B first, so the returned clock is a valid future baseline.
-A coarse directory witness which the common Watchman response cannot represent
-recursively, a scoped/unscoped precision invalidation, or a result-size budget
-also makes jj's result fresh. The direct Git adapter expresses the same
-complete or prefix invalidation as `/` or `dir/`. A changed root inode is fresh
-only when the interval lacks a complete precision journal; exact journaled
-root-level names may replace that coarse fallback.
+A subtree move whose changed descendants cannot be expanded, a scoped/unscoped
+precision invalidation, or a result-size budget also makes the common Watchman
+result fresh. The direct Git adapter consumes the same endpoint path result.
 
 A successful fresh result requires a committed B boundary, the verified
 persistent dirty-witness ABI, and continuous source, root-path-binding, mount,
@@ -2847,16 +2822,12 @@ performs a fresh crawl. A comparison of only semantic endpoint contents would
 not make that ordering safe: after B, a client can remember temporary path `p`,
 then `p` can disappear before C and the visible trees can again be equal.
 
-The required persistent dirty witness closes that race without requiring the
-optional namespace journal. Snapshot creation commits B as an ordering
-barrier. A later create/delete leaves a changed inode item on a surviving
-parent directory; a later modify/restore leaves one on the file; and C's
-comparison must retain that evidence even if public attributes and net refs
-match B. The next query therefore returns an exact alias or a coarse subtree
-invalidation. Root-path-binding and mount-topology guards separately rotate the
-clock for client-view changes outside the subvolume. A complete optional
-journal can replace the coarse directory invalidation with exact names, but it
-does not establish the fundamental ordering.
+The required persistent dirty witness closes baseline-establishment races
+without requiring the optional namespace journal. Snapshot creation commits B
+as an ordering barrier. Once a client proves its tree equals B and saves B's
+clock, later endpoint-equal create/delete or modify/restore sequences do not
+need to appear in its VCS result. Root-path-binding and mount-topology guards
+separately rotate the clock for client-view changes outside the subvolume.
 
 By contrast, calling `clock()` after independently scanning a mutable tree can
 still miss a change which lands between the scan and B: that mutation is
@@ -2881,15 +2852,11 @@ Accordingly:
 **Prototype compatibility note.** The current experimental `CHANGED_OBJECTS`
 ABI reports a root-directory dirty witness between the original RO seed and
 the first cut of its writable clone, even if no post-publication namespace
-mutation occurred. That witness is indistinguishable from a real root-level
-create/delete after the clock while the precision journal is disabled. The
-implementation therefore does not suppress it: on this ABI a Worktree seed
-clock is followed by one conservative fresh validation cut, after which the
-child watch is incremental. Returning a truly O(1) proved seed without that
-cut is gated on the stabilized ABI's explicit dirty-sequence/clone semantics
-or a complete mutation-exclusion proof spanning monitor arming and external
-rename. The compatibility facade is disabled by default and requires explicit
-experimental dirty-witness enablement until that conformance suite passes.
+mutation occurred. A generic caller still needs a fresh validation cut because
+it has not proved that its tree equals the seed clock; a caller which installs
+the exact Worktree seed can use the proved seed clock directly. The
+compatibility facade is disabled by default and requires explicit experimental
+dirty-witness enablement until that conformance suite passes.
 
 Client-side expected-tree changes also require invalidation. In particular,
 jj excludes `.git` and `.jj`, so the service cannot infer that a colocated Git
@@ -3003,21 +2970,21 @@ The critical dirty-witness suite runs first with the optional precision guard
 disabled. Pause clients after B's clock, then create/delete a file or whole
 subtree, modify/restore data and metadata (including writable `mmap`), mutate
 through one hardlink while another alias is cached, and perform root-level and
-nested namespace operations before C. Every case must leave an object or
-surviving-directory witness and project an exact alias, Git prefix, or jj fresh
-result even when B and C's public snapshot states compare equal. Include the
-mixed `d/transient` create/delete plus `d/persistent` net-create case and prove
-the known ref does not erase `d`'s coarse witness. Run each mutation around the
-snapshot ioctl/transaction barrier. Kernel versions which fail any witness
-test must refuse to mint facade clocks.
+nested namespace operations before C. Every case must retain its internal
+object or surviving-directory witness while the VCS projection reports only
+endpoint-visible paths. Include the mixed `d/transient` create/delete plus
+`d/persistent` net-create case and prove only `d/persistent` reaches the
+Watchman result. Run each mutation around the snapshot ioctl/transaction
+barrier. Kernel versions which fail any witness test must refuse to mint
+facade clocks.
 
 Then enable the optional precision guard and prove exact root-level and nested
-names replace coarse directory fallback only between two post-snapshot marker
-boundaries in one retained epoch. Exercise directory create/move-in scoped
+transient names are available only between two post-snapshot marker boundaries
+in one retained epoch. Exercise directory create/move-in scoped
 prefixes, queue overflow, producer restart, watch-install races, permission
 loss, unresolved/reused inodes, and hardlink alias-expansion failure. Each
-failure must gap precision and use a scoped/full or snapshot-only coarse result,
-never a partial or empty success.
+failure must gap precision for trigger/diagnostic consumers, never expose a
+partial exact event history.
 
 The mandatory namespace-view suite renames/replaces and restores the watched
 root and each ancestor component between queries; attaches/detaches bind, FUSE,
@@ -3206,7 +3173,7 @@ model. The Rust implementation now includes:
   exact stale-spool cleanup, unexpected-object quarantine, restart
   invalidation, and tracked Worktree branches which share their immutable seed
   revision;
-- authenticated clocks, query leases, conservative jj/Git projection, binding
+- authenticated clocks, query leases, generic endpoint Watchman projection, binding
   and mount-namespace continuity monitors, focused BSER-v2 Watchman commands,
   the Git hook-v2 byte protocol, response leases held through bounded daemon
   socket writes (with a five-second deadline and release on timeout/failure),

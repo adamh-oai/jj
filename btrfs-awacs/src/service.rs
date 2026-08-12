@@ -5,25 +5,23 @@
 
 use crate::broker::{
     snapshot_create_effect_hash, snapshot_delete_effect_hash, snapshot_target_locator_hash,
-    worktree_rename_effect_hash, ChangedObjectsExecution, EffectKind, ExpectedManagedDirectory,
-    ExpectedReservation, ExpectedSubvolume, ReceiptRequest, SeqPacket, SnapshotCreateExecution,
-    SnapshotDeleteExecution, WorktreeRenameExecution, MAX_CHANGED_OBJECT_OUTPUT,
+    ChangedObjectsExecution, EffectKind, ExpectedManagedDirectory, ExpectedSubvolume,
+    ReceiptRequest, SeqPacket, SnapshotCreateExecution, SnapshotDeleteExecution,
+    MAX_CHANGED_OBJECT_OUTPUT,
 };
 use crate::broker_protocol::{decode_index, decode_objects, BrokerClient, BrokerDispatcher};
-use crate::btrfs::{inode_generation, OpenedSubvolume};
+use crate::btrfs::OpenedSubvolume;
 use crate::index::{Index, Object};
 use crate::manager::{
-    worktree_policy_hash, CutAdmission, CutRequest, CutReservation, FacadeActivation,
-    HistoricalChanges, HistoricalComparisonAdmission, HistoricalComparisonRequest,
-    InitializeRequest, InitializeReservation, InitializedWatch, Permissions, Principal,
-    PublishedCut, RecordedSnapshot, SnapshotDeleteReservation, SnapshotIdentity, WorktreePolicy,
-    WorktreeRequest, WorktreeReservation,
+    CutAdmission, CutRequest, CutReservation, HistoricalChanges, HistoricalComparisonAdmission,
+    HistoricalComparisonRequest, InitializeRequest, InitializeReservation, InitializedWatch,
+    Permissions, Principal, PublishedCut, RecordedSnapshot, SnapshotDeleteReservation,
+    SnapshotIdentity,
 };
 use crate::manifest::{
     parse_changed_objects, parse_changed_objects_v2, ChangedObjectsManifest,
     CHANGED_OBJECTS_V2_MAGIC, CHANGE_CREATED, CHANGE_INODE, CHANGE_XATTR,
 };
-use crate::namespace::{NamespaceMonitor, PendingNamespaceMonitor};
 use crate::store::{decode_u64, BrokerJournal, Store};
 use crate::tree_index::{materialize_stream_object, PRIVILEGE_FSCRYPT};
 use sha2::{Digest, Sha256};
@@ -62,7 +60,6 @@ pub struct ServiceConfig {
     pub boot_id: [u8; 16],
     pub lease_ns: i64,
     pub max_manifest_bytes: u64,
-    pub experimental_dirty_witness_verified: bool,
     /// When set, connect to the separately privileged broker instead of
     /// starting the embedded UML/test dispatcher.
     pub broker_socket: Option<PathBuf>,
@@ -89,7 +86,6 @@ impl ServiceConfig {
             boot_id,
             lease_ns: DEFAULT_LEASE_NS,
             max_manifest_bytes: MAX_CHANGED_OBJECT_OUTPUT,
-            experimental_dirty_witness_verified: false,
             broker_socket: None,
             fault_after_initialize_snapshot: false,
             fault_after_cut_snapshot: false,
@@ -101,11 +97,6 @@ impl ServiceConfig {
             replay_window_cuts: 128,
             replay_window_ns: 86_400_000_000_000,
         }
-    }
-
-    pub fn allow_experimental_dirty_witness(mut self) -> Self {
-        self.experimental_dirty_witness_verified = true;
-        self
     }
 
     pub fn with_broker_socket(mut self, path: PathBuf) -> Self {
@@ -173,6 +164,7 @@ pub struct ChangesOptions {
     pub now_ns: i64,
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug)]
 pub struct WorktreeOptions {
     pub watch_id: [u8; 16],
@@ -187,6 +179,7 @@ pub struct WorktreeOptions {
     pub now_ns: i64,
 }
 
+#[cfg(any())]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedWorktree {
     pub worktree_id: [u8; 16],
@@ -198,6 +191,7 @@ pub struct PublishedWorktree {
     pub seed_snapshot_id: i64,
 }
 
+#[cfg(any())]
 #[derive(Debug)]
 pub(crate) struct WorktreeViewHandoff {
     pub authorization_id: [u8; 16],
@@ -306,6 +300,7 @@ struct RecoveringSnapshotDeleteRow {
     created_ns: i64,
 }
 
+#[cfg(any())]
 struct RecoveringWorktree {
     reservation: WorktreeReservation,
     lease_owner: [u8; 16],
@@ -325,6 +320,7 @@ struct RecoveringWorktree {
     discovered_uuid: Option<[u8; 16]>,
 }
 
+#[cfg(any())]
 struct RecoveringWorktreeRow {
     operation_id: Vec<u8>,
     worktree_id: Vec<u8>,
@@ -359,7 +355,6 @@ pub struct Service {
     manager_session_id: [u8; 16],
     lease_owner: [u8; 16],
     config: ServiceConfig,
-    worktree_view_handoffs: BTreeMap<[u8; 16], WorktreeViewHandoff>,
 }
 
 impl Service {
@@ -412,7 +407,6 @@ impl Service {
             manager_session_id,
             lease_owner,
             config,
-            worktree_view_handoffs: BTreeMap::new(),
         };
         let recovery_now = current_unix_time_ns()?;
         service
@@ -428,7 +422,6 @@ impl Service {
             .map_err(|error| ServiceError::context("take over recovery leases", error))?;
         service.recover_initialize_operations()?;
         service.recover_cut_operations()?;
-        service.recover_worktree_operations()?;
         service.recover_snapshot_delete_operations()?;
         cleanup_stale_spool_files(&service.config.spool_directory)?;
         quarantine_unexpected_managed_entries(
@@ -475,7 +468,6 @@ impl Service {
             manager_session_id,
             lease_owner,
             config,
-            worktree_view_handoffs: BTreeMap::new(),
         };
         let recovery_now = current_unix_time_ns()?;
         service
@@ -491,7 +483,6 @@ impl Service {
             .map_err(|error| ServiceError::context("take over recovery leases", error))?;
         service.recover_initialize_operations()?;
         service.recover_cut_operations()?;
-        service.recover_worktree_operations()?;
         service.recover_snapshot_delete_operations()?;
         cleanup_stale_spool_files(&service.config.spool_directory)?;
         quarantine_unexpected_managed_entries(
@@ -794,6 +785,7 @@ impl Service {
         rows.into_iter().map(decode_recovering_cut).collect()
     }
 
+    #[cfg(any())]
     fn recover_worktree_operations(&mut self) -> Result<(), ServiceError> {
         for mut operation in self.load_recovering_worktrees()? {
             let mut staged = None;
@@ -868,6 +860,7 @@ impl Service {
         Ok(())
     }
 
+    #[cfg(any())]
     fn load_recovering_worktrees(&self) -> Result<Vec<RecoveringWorktree>, ServiceError> {
         let mut statement = self
             .store
@@ -926,6 +919,7 @@ impl Service {
         rows.into_iter().map(decode_recovering_worktree).collect()
     }
 
+    #[cfg(any())]
     fn finish_recovered_worktree(
         &mut self,
         operation: &RecoveringWorktree,
@@ -1184,6 +1178,7 @@ impl Service {
         &mut self.store
     }
 
+    #[cfg(any())]
     pub(crate) fn take_worktree_view_handoff(
         &mut self,
         watch_id: [u8; 16],
@@ -1203,15 +1198,19 @@ impl Service {
         }
     }
 
-    pub fn snapshot_facade_is_enabled(&self) -> bool {
-        self.config.experimental_dirty_witness_verified
+    #[cfg(any())]
+    pub(crate) fn has_worktree_view_handoff(&self, watch_id: [u8; 16]) -> bool {
+        self.worktree_view_handoffs.contains_key(&watch_id)
     }
 
-    /// Bootstrap has no changed-objects stream and therefore cannot prove the
-    /// output-only dirty-witness capability. The operator's explicit opt-in
-    /// enables fresh-baseline clocks; every later changed-objects comparison
-    /// must independently advertise the capability before it can be
-    /// published.
+    pub fn snapshot_facade_is_enabled(&self) -> bool {
+        true
+    }
+
+    /// Bootstrap has no changed-objects stream. Fresh-baseline clocks are
+    /// therefore available immediately, while every later changed-objects
+    /// comparison must independently advertise the dirty-witness capability
+    /// before it can be published.
     pub fn ensure_snapshot_facade_is_enabled(
         &self,
         _watch_id: [u8; 16],
@@ -1241,7 +1240,6 @@ impl Service {
             manager_session_id: self.manager_session_id,
             lease_owner: random_id(),
             config: self.config.clone(),
-            worktree_view_handoffs: BTreeMap::new(),
         })
     }
 
@@ -1330,6 +1328,71 @@ impl Service {
             .map_err(|error| ServiceError::context("publish initial checkpoint", error))
     }
 
+    pub fn adopt_snapshot_descendant(
+        &mut self,
+        source_path: &Path,
+        options: &InitializeOptions,
+    ) -> Result<Option<InitializedWatch>, ServiceError> {
+        let adoption_started = std::time::Instant::now();
+        let canonicalize_started = std::time::Instant::now();
+        let canonical_source = fs::canonicalize(source_path)
+            .map_err(|error| ServiceError::context("canonicalize descendant source", error))?;
+        tracing::info!(
+            elapsed_ms = canonicalize_started.elapsed().as_millis() as u64,
+            source = %canonical_source.display(),
+            "descendant adoption canonicalized source"
+        );
+        let reject_started = std::time::Instant::now();
+        reject_managed_descendant(&canonical_source, &self.config.managed_snapshot_directory)?;
+        tracing::info!(
+            elapsed_ms = reject_started.elapsed().as_millis() as u64,
+            source = %canonical_source.display(),
+            "descendant adoption checked managed path"
+        );
+        let open_started = std::time::Instant::now();
+        let source = OpenedSubvolume::open(&canonical_source)
+            .map_err(|error| ServiceError::context("open descendant source", error))?;
+        tracing::info!(
+            elapsed_ms = open_started.elapsed().as_millis() as u64,
+            source = %canonical_source.display(),
+            "descendant adoption opened subvolume"
+        );
+        let Some(parent_uuid) = source.subvolume.parent_uuid else {
+            tracing::info!(
+                elapsed_ms = adoption_started.elapsed().as_millis() as u64,
+                source = %canonical_source.display(),
+                "descendant adoption found no parent UUID"
+            );
+            return Ok(None);
+        };
+        let store_started = std::time::Instant::now();
+        let initialized = self
+            .store
+            .adopt_snapshot_descendant(
+                source.filesystem.fs_uuid,
+                source.subvolume.uuid,
+                parent_uuid,
+                canonical_source.as_os_str().as_bytes(),
+                &options.principal,
+                options.permissions,
+                options.now_ns,
+            )
+            .map_err(|error| ServiceError::context("adopt snapshot descendant", error))?;
+        tracing::info!(
+            elapsed_ms = store_started.elapsed().as_millis() as u64,
+            adopted = initialized.is_some(),
+            source = %canonical_source.display(),
+            "descendant adoption updated store"
+        );
+        tracing::info!(
+            elapsed_ms = adoption_started.elapsed().as_millis() as u64,
+            adopted = initialized.is_some(),
+            source = %canonical_source.display(),
+            "descendant adoption completed"
+        );
+        Ok(initialized)
+    }
+
     pub fn changes(&mut self, options: &ChangesOptions) -> Result<PublishedCut, ServiceError> {
         let admission_expiry = lease_expiry(options.now_ns, self.config.lease_ns)?;
         if let Some(admission) = self
@@ -1413,6 +1476,7 @@ impl Service {
         self.store
             .start_cut_filesystem_effect(&reservation, self.lease_owner, options.now_ns)
             .map_err(|error| ServiceError::context("start cut effect", error))?;
+        let snapshot_started = std::time::Instant::now();
         let target = self.create_snapshot(
             &live,
             &destination_name,
@@ -1421,6 +1485,10 @@ impl Service {
             true,
             options.now_ns,
         )?;
+        tracing::info!(
+            elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
+            "query cut snapshot created"
+        );
         if self.config.fault_after_cut_snapshot {
             return Err(ServiceError::new(
                 "injected failure after cut snapshot effect",
@@ -1451,19 +1519,6 @@ impl Service {
         to_snapshot_uuid: [u8; 16],
         now_ns: i64,
     ) -> Result<HistoricalChanges, ServiceError> {
-        let replayed = self
-            .store
-            .replay_historical_changes(
-                watch_id,
-                authorization_id,
-                requester_uid,
-                from_snapshot_uuid,
-                to_snapshot_uuid,
-            )
-            .map_err(|error| ServiceError::context("replay retained history", error))?;
-        if !replayed.fresh_instance {
-            return Ok(replayed);
-        }
         let admission = match self
             .store
             .claim_historical_comparison(&HistoricalComparisonRequest {
@@ -1477,10 +1532,12 @@ impl Service {
                 lease_expires_ns: lease_expiry(now_ns, self.config.lease_ns)?,
             }) {
             Ok(admission) => admission,
-            // A fresh result is already a complete, safe answer. A direct job
-            // is an optimization available only while both endpoint revisions
-            // remain retained and no other worker owns the comparison fence.
-            Err(_) => return Ok(replayed),
+            Err(error) => {
+                return Err(ServiceError::context(
+                    "claim direct retained-snapshot comparison",
+                    error,
+                ));
+            }
         };
         let claim = match admission {
             HistoricalComparisonAdmission::Ready(changes) => return Ok(changes),
@@ -1540,10 +1597,7 @@ impl Service {
         }
         let parsed = parse_kernel_changed_objects(&bytes)
             .map_err(|error| ServiceError::context("parse historical manifest", error))?;
-        require_dirty_witness_contract(
-            self.config.experimental_dirty_witness_verified,
-            parsed.dirty_witness_contract,
-        )?;
+        require_dirty_witness_contract(parsed.dirty_witness_contract)?;
         let required: BTreeSet<_> = parsed
             .manifest
             .objects
@@ -1590,6 +1644,7 @@ impl Service {
     }
 
     fn finish_cut(&mut self, completion: CutCompletion) -> Result<PublishedCut, ServiceError> {
+        let finish_cut_started = std::time::Instant::now();
         let reservation = &completion.reservation;
         let target = completion
             .target
@@ -1662,6 +1717,7 @@ impl Service {
                 parsed
             } else {
                 let mut spool = create_private_spool(&spool_path)?;
+                let changed_objects_started = std::time::Instant::now();
                 let comparison = self
                     .broker
                     .changed_objects(
@@ -1676,6 +1732,12 @@ impl Service {
                         spool.as_fd(),
                     )
                     .map_err(|error| ServiceError::context("compare immutable snapshots", error))?;
+                tracing::info!(
+                    elapsed_ms = changed_objects_started.elapsed().as_millis() as u64,
+                    output_bytes = comparison.output_bytes,
+                    "query cut changed-object comparison completed"
+                );
+                let manifest_read_started = std::time::Instant::now();
                 spool
                     .seek(SeekFrom::Start(0))
                     .map_err(|error| ServiceError::context("rewind manifest", error))?;
@@ -1693,9 +1755,21 @@ impl Service {
                         "spooled changed-object manifest failed its broker hash",
                     ));
                 }
+                tracing::info!(
+                    elapsed_ms = manifest_read_started.elapsed().as_millis() as u64,
+                    output_bytes = comparison.output_bytes,
+                    "query cut changed-object manifest read"
+                );
+                let manifest_parse_started = std::time::Instant::now();
                 let parsed = parse_kernel_changed_objects(&bytes).map_err(|error| {
                     ServiceError::context("parse changed-object manifest", error)
                 })?;
+                tracing::info!(
+                    elapsed_ms = manifest_parse_started.elapsed().as_millis() as u64,
+                    changed_objects = parsed.manifest.objects.len(),
+                    target_objects = parsed.target_objects.as_ref().map_or(0, BTreeMap::len),
+                    "query cut changed-object manifest parsed"
+                );
                 write_manifest_stage_trailer(
                     &mut spool,
                     comparison.output_bytes,
@@ -1708,12 +1782,14 @@ impl Service {
             // records. Legacy kernels have no such contract, so retain the
             // fail-closed namespace scan for them.
             if parsed.target_objects.is_none() {
+                let nested_scan_started = std::time::Instant::now();
                 reject_nested_subvolumes(&completion.destination_path)?;
+                tracing::info!(
+                    elapsed_ms = nested_scan_started.elapsed().as_millis() as u64,
+                    "query cut legacy nested-subvolume scan completed"
+                );
             }
-            require_dirty_witness_contract(
-                self.config.experimental_dirty_witness_verified,
-                parsed.dirty_witness_contract,
-            )?;
+            require_dirty_witness_contract(parsed.dirty_witness_contract)?;
             let required: BTreeSet<_> = parsed
                 .manifest
                 .objects
@@ -1730,12 +1806,20 @@ impl Service {
                     "injected failure after durable manifest staging",
                 ));
             }
+            let resolve_target_objects_started = std::time::Instant::now();
             let target_objects = self.resolve_target_objects(
                 &parsed,
                 &target_expected,
                 target_fd.as_fd(),
                 &required,
             )?;
+            tracing::info!(
+                elapsed_ms = resolve_target_objects_started.elapsed().as_millis() as u64,
+                required_objects = required.len(),
+                resolved_objects = target_objects.len(),
+                "query cut target objects resolved"
+            );
+            let publish_started = std::time::Instant::now();
             let published = self
                 .store
                 .publish_adjacent_delta(
@@ -1747,10 +1831,20 @@ impl Service {
                     completion.now_ns,
                 )
                 .map_err(|error| ServiceError::context("publish indexed cut", error))?;
+            tracing::info!(
+                elapsed_ms = publish_started.elapsed().as_millis() as u64,
+                changed_objects = parsed.manifest.objects.len(),
+                target_objects = target_objects.len(),
+                "query cut adjacent delta published"
+            );
             // The cut is committed. Startup spool reconciliation can remove a
             // leftover file, so cleanup failure must not manufacture a false
             // publication failure and trigger a second publication attempt.
             let _ = fs::remove_file(&spool_path);
+            tracing::info!(
+                elapsed_ms = finish_cut_started.elapsed().as_millis() as u64,
+                "query cut finished"
+            );
             Ok(published)
         })();
         match incremental {
@@ -1825,55 +1919,32 @@ impl Service {
     }
 
     pub fn maintain_history(&mut self, now_ns: i64) -> Result<usize, ServiceError> {
-        let cutoff_ns = now_ns.saturating_sub(self.config.replay_window_ns);
+        let _ = now_ns;
         let watches = {
             let mut statement = self
                 .store
                 .connection()
                 .prepare(
-                    "SELECT id, replay_floor_seq, indexed_seq FROM watches \
+                    "SELECT id FROM watches \
                      WHERE state IN ('active', 'blocked') ORDER BY id",
                 )
                 .map_err(|error| ServiceError::context("prepare history maintenance", error))?;
             let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
                 .map_err(|error| ServiceError::context("query history maintenance", error))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| ServiceError::context("decode history maintenance", error))?;
             rows
         };
         let mut reclaimed = 0_usize;
-        for (watch_bytes, current_floor, indexed_sequence) in watches {
+        for watch_bytes in watches {
             let watch_id = fixed_service_blob(&watch_bytes, "history-maintenance watch ID")?;
-            let count_floor = indexed_sequence
-                .saturating_sub(self.config.replay_window_cuts)
-                .max(current_floor);
-            let time_floor: Option<i64> = self
+            reclaimed += self
                 .store
-                .connection()
-                .query_row(
-                    r#"SELECT max(sequence) FROM operations
-                        WHERE watch_id = ?1 AND kind = 'cut' AND state = 'done'
-                          AND sequence <= ?2 AND updated_ns <= ?3"#,
-                    rusqlite::params![watch_id.as_slice(), count_floor, cutoff_ns],
-                    |row| row.get(0),
-                )
-                .map_err(|error| ServiceError::context("select replay retention floor", error))?;
-            let target_floor = time_floor.unwrap_or(current_floor).max(current_floor);
-            if target_floor > current_floor {
-                reclaimed += self
-                    .store
-                    .advance_replay_floor(watch_id, target_floor, now_ns, self.lease_owner)
-                    .map_err(|error| {
-                        ServiceError::context("advance replay retention floor", error)
-                    })?;
-            }
+                .retain_exponential_replay_checkpoints(watch_id, self.lease_owner)
+                .map_err(|error| {
+                    ServiceError::context("retain exponential replay checkpoints", error)
+                })?;
         }
         Ok(reclaimed)
     }
@@ -1971,7 +2042,8 @@ impl Service {
             .map_err(|error| ServiceError::context("record durable snapshot GC", error))
     }
 
-    pub fn provision_sanitized_worktree_policy(
+    #[cfg(any())]
+    fn legacy_provision_sanitized_worktree_policy(
         &mut self,
         watch_id: [u8; 16],
         authorization_id: [u8; 16],
@@ -2001,7 +2073,8 @@ impl Service {
         Ok(policy)
     }
 
-    pub fn worktree(
+    #[cfg(any())]
+    fn legacy_worktree(
         &mut self,
         policy: &WorktreePolicy,
         options: &WorktreeOptions,
@@ -2167,25 +2240,30 @@ impl Service {
             &execution.destination_name,
         );
         execution.receipt.effect_arguments_hash = worktree_rename_effect_hash(&execution);
-        let pending_view = self
-            .config
-            .experimental_dirty_witness_verified
-            .then(|| {
-                PendingNamespaceMonitor::arm(&options.destination_parent, &options.destination_name)
-            })
-            .transpose()
-            .ok()
-            .flatten();
+        let pending_view = match PendingNamespaceMonitor::arm(
+            &options.destination_parent,
+            &options.destination_name,
+        ) {
+            Ok(monitor) => Some(monitor),
+            Err(error) => {
+                eprintln!("btrfs-awacs Worktree monitor arm failed: {error}");
+                None
+            }
+        };
         self.broker
             .publish_worktree(&execution, staging_parent.as_fd(), root.as_fd())
             .map_err(|error| ServiceError::context("publish Worktree", error))?;
         let completed_view = pending_view.and_then(|pending| {
-            pending
-                .complete(
-                    policy.destination_fs_uuid,
-                    execution.worktree.subvolume_uuid,
-                )
-                .ok()
+            match pending.complete(
+                policy.destination_fs_uuid,
+                execution.worktree.subvolume_uuid,
+            ) {
+                Ok(monitor) => Some(monitor),
+                Err(error) => {
+                    eprintln!("btrfs-awacs Worktree monitor completion failed: {error}");
+                    None
+                }
+            }
         });
         if self.config.fault_after_worktree_publish {
             return Err(ServiceError::new(
@@ -2539,6 +2617,7 @@ fn reject_fscrypt_index(index: &Index) -> Result<(), ServiceError> {
     Ok(())
 }
 
+#[cfg(any())]
 fn find_directory_by_identity(
     root: &Path,
     wanted_ino: u64,
@@ -2583,6 +2662,7 @@ fn find_directory_by_identity(
     ))
 }
 
+#[cfg(any())]
 fn relative_directory_bytes(root: &Path, child: &Path) -> Result<Vec<u8>, ServiceError> {
     let relative = child
         .strip_prefix(root)
@@ -2778,6 +2858,7 @@ fn decode_recovering_snapshot_delete(
     })
 }
 
+#[cfg(any())]
 fn decode_recovering_worktree(
     row: RecoveringWorktreeRow,
 ) -> Result<RecoveringWorktree, ServiceError> {
@@ -3041,11 +3122,8 @@ fn parse_kernel_changed_objects(bytes: &[u8]) -> Result<ParsedKernelChangedObjec
     }
 }
 
-fn require_dirty_witness_contract(
-    experimental_dirty_witness_verified: bool,
-    observed: bool,
-) -> Result<(), ServiceError> {
-    if experimental_dirty_witness_verified && !observed {
+fn require_dirty_witness_contract(observed: bool) -> Result<(), ServiceError> {
+    if !observed {
         return Err(ServiceError::new(
             "changed-objects stream does not advertise the dirty-witness capability",
         ));
@@ -3320,6 +3398,7 @@ fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+#[cfg(any())]
 fn derived_effect_id(operation_id: [u8; 16], label: &[u8]) -> [u8; 16] {
     let mut hash = Sha256::new();
     hash.update(b"btrfs-awacs-effect-id-v1\0");
@@ -3363,10 +3442,9 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn dirty_witness_capability_is_required_only_for_opted_in_incremental_streams() {
-        assert!(require_dirty_witness_contract(false, false).is_ok());
-        assert!(require_dirty_witness_contract(true, true).is_ok());
-        let error = require_dirty_witness_contract(true, false).unwrap_err();
+    fn dirty_witness_capability_is_required_for_incremental_streams() {
+        assert!(require_dirty_witness_contract(true).is_ok());
+        let error = require_dirty_witness_contract(false).unwrap_err();
         assert_eq!(
             error.to_string(),
             "changed-objects stream does not advertise the dirty-witness capability"

@@ -6,11 +6,10 @@
 
 use crate::broker::{
     execute_changed_objects, execute_full_index, execute_snapshot_create, execute_snapshot_delete,
-    execute_target_object_lookup, execute_worktree_rename, ChangedObjectsExecution,
-    ChangedObjectsResult, EffectKind, ExpectedManagedDirectory, ExpectedReservation,
-    ExpectedSubvolume, Frame, Opcode, PeerCredentials, ReceiptRequest, SeqPacket, SessionGate,
-    SnapshotCreateExecution, SnapshotCreateResult, SnapshotDeleteExecution, SnapshotDeleteResult,
-    StoredBrokerRequest, WorktreeRenameExecution, WorktreeRenameResult,
+    execute_target_object_lookup, ChangedObjectsExecution, ChangedObjectsResult, EffectKind,
+    ExpectedManagedDirectory, ExpectedSubvolume, Frame, Opcode, PeerCredentials, ReceiptRequest,
+    SeqPacket, SessionGate, SnapshotCreateExecution, SnapshotCreateResult, SnapshotDeleteExecution,
+    SnapshotDeleteResult, StoredBrokerRequest, WorktreeRenameResult,
 };
 use crate::btrfs::{filesystem_info, subvolume_info};
 use crate::index::{Index, Object};
@@ -231,27 +230,10 @@ impl BrokerDispatcher {
                 Ok(output.finish())
             }
             Opcode::PublishWorktree => {
-                require_fd_count(fds, 2)?;
-                let execution = decoder.worktree_rename()?;
-                decoder.finish()?;
-                verify_receipt_session(&execution.receipt, store_uuid, session_id)?;
-                let mut journal = self.journal()?;
-                journal.record_request_payload(
-                    &execution.receipt,
-                    Opcode::PublishWorktree,
-                    &frame.payload,
-                )?;
-                let result = execute_worktree_rename(
-                    &self.gate,
-                    &mut journal,
-                    &execution,
-                    fds[0].as_fd(),
-                    fds[1].as_fd(),
-                )?;
-                let mut output = Encoder::default();
-                output.array(result.worktree_subvolume_uuid);
-                output.array(result.result_hash);
-                Ok(output.finish())
+                let _ = (decoder, fds);
+                Err(BrokerError::new(
+                    "AWACS never creates or publishes worktrees; create the Btrfs snapshot externally and let watch-project adopt its parent UUID",
+                ))
             }
             Opcode::ReconcileReceipt => {
                 if decoder.remaining() == 0 {
@@ -400,17 +382,10 @@ fn reconcile_stored_request(
             Ok(output.finish())
         }
         Opcode::PublishWorktree => {
-            require_fd_count(fds, 2)?;
-            let mut execution = decoder.worktree_rename()?;
-            decoder.finish()?;
-            verify_stored_receipt(&stored, &execution.receipt)?;
-            execution.receipt.manager_session_id = session_id;
-            let result =
-                execute_worktree_rename(gate, journal, &execution, fds[0].as_fd(), fds[1].as_fd())?;
-            let mut output = Encoder::default();
-            output.array(result.worktree_subvolume_uuid);
-            output.array(result.result_hash);
-            Ok(output.finish())
+            let _ = (gate, journal, decoder, fds, session_id);
+            Err(BrokerError::new(
+                "legacy Worktree publication receipts are unsupported",
+            ))
         }
         _ => Err(BrokerError::new(
             "stored request is not a reconcilable effect opcode",
@@ -623,6 +598,7 @@ impl BrokerClient {
         Ok(result)
     }
 
+    #[cfg(any())]
     pub fn publish_worktree(
         &self,
         execution: &WorktreeRenameExecution,
@@ -749,6 +725,7 @@ impl BrokerClient {
         Ok(result)
     }
 
+    #[cfg(any())]
     pub fn reconcile_worktree_publish(
         &self,
         operation_id: [u8; 16],
@@ -1145,6 +1122,7 @@ impl Encoder {
         self.i64(value.started_ns);
     }
 
+    #[cfg(any())]
     fn reservation(&mut self, value: &ExpectedReservation) -> Result<(), BrokerError> {
         self.byte_string(&value.name)?;
         self.u64(value.device);
@@ -1170,6 +1148,7 @@ impl Encoder {
         self.byte_string(&value.destination_name)
     }
 
+    #[cfg(any())]
     fn worktree_rename(&mut self, value: &WorktreeRenameExecution) -> Result<(), BrokerError> {
         self.receipt(&value.receipt);
         self.expected_subvolume(&value.worktree);
@@ -1329,6 +1308,7 @@ impl<'a> Decoder<'a> {
         })
     }
 
+    #[cfg(any())]
     fn reservation(&mut self) -> Result<ExpectedReservation, BrokerError> {
         Ok(ExpectedReservation {
             name: self.byte_string()?,
@@ -1362,6 +1342,7 @@ impl<'a> Decoder<'a> {
         })
     }
 
+    #[cfg(any())]
     fn worktree_rename(&mut self) -> Result<WorktreeRenameExecution, BrokerError> {
         Ok(WorktreeRenameExecution {
             receipt: self.receipt()?,
