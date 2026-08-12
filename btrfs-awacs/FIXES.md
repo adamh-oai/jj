@@ -135,16 +135,25 @@ publication and what durable state follows rejection.
 
 ### P-01: Production has no snapshot or history garbage collection
 
-`src/service.rs` implements maintenance helpers, but daemon startup and request
-processing do not invoke them. Long-lived use retains snapshots, revisions,
-events, SQLite/WAL storage, and copy-on-write extents without a bound.
+**Status:** Production wiring is implemented in the current retention change;
+keep open until the kernel-backed recovery/latency acceptance matrix passes.
 
-**Remediate:** Repair retained-boundary foreign keys, then run bounded,
-observable production maintenance that honors heads, leases, grants, pins,
-operations, and broker fences.
+The scan daemon now starts a named periodic maintenance worker on its own
+store/broker handle, so filesystem deletion never holds the request-facade
+mutex. Each tick expires bounded query, retention, and historical-comparison
+leases, processes a round-robin bounded watch slice, applies the configured
+replay windows, reclaims bounded orphan work independently of watch length,
+and drives bounded one-at-a-time snapshot deletion through the existing
+durable broker fences with live reconciliation of post-effect rows. The tick
+reports elapsed time, expired leases, watches, reclaimed history rows, deleted
+snapshots, and whether more work remains.
 
-**Dependency:** P-01 cannot be accepted until C-06 makes retention
-foreign-key-safe and atomic.
+**Remediate:** Keep the bounded worker observable and verify that maintenance
+honors heads, surviving boundaries, leases, grants, pins, operations, and
+broker fences under restart and sustained load.
+
+**Dependency:** P-01 acceptance remains gated on C-06's crash/restart
+acceptance.
 
 ### P-02: Each successful direct scan or GC delete can flush unrelated writes
 
@@ -160,12 +169,19 @@ under unrelated write pressure.
 
 ### C-06: History compaction violates retained-boundary foreign keys
 
-`retain_exponential_replay_checkpoints` first commits removal of unretained
-boundaries and pin changes, then `reclaim_unreferenced_cut_comparisons`
-deletes every older `watch_cuts` row. Some of those cut rows are still parents
-of retained `fsmonitor_boundaries` through the composite
-`(watch_id, cut_sequence, target_snapshot_id, cut_operation_id)` foreign key,
-so SQLite rejects the later delete after earlier retention work has committed.
+**Status:** Implemented in the current retention change; keep open until the
+crash/restart acceptance matrix passes.
+
+The earlier retention path committed boundary removal separately, wrote an
+unsupported `replay-boundary` pin kind, then deleted every older `watch_cuts`
+row even when a retained `fsmonitor_boundaries` row still named it through the
+composite foreign key. The current path treats surviving boundaries as the
+ownership authority, expires stale query pins, re-reads active source/target
+endpoints under the same writer transaction, and deletes only bounded
+boundary/cut/operation groups that have no surviving boundary. Comparison and
+revision orphan cleanup run as separate bounded work after that atomic
+boundary transaction, so a crash can leak rows but cannot leave an invalid
+replay set.
 
 **Remediate:** Make retained boundary ownership and deletion order
 foreign-key-safe and transactionally atomic: co-retain the parent cut rows or
@@ -323,13 +339,16 @@ lifecycle failures and need independent tests.
 
 ### C-23: Parsed kernel identities and completion counters are incomplete
 
-The v2 parser validates its header and completion footer internally, but
-`ParsedKernelChangedObjects` drops the parsed endpoint header before
-`src/service.rs` can compare it with the admitted parent and target.
-`src/broker.rs` also receives ioctl-reported output byte/record counts but
-does not require them to equal the file length and parsed footer counters.
-Recovered staged manifests take the same path. Legacy streams do not advertise
-these v2 fields and must not be treated as if they did.
+**Status:** Implemented in the current immutable-cut change; keep open until
+kernel-backed injected-stream acceptance passes.
+
+The earlier v2 parser validated its header and completion footer internally but
+dropped that proof before service publication. The current path carries the
+header and completion through normal and recovered staged manifests, carries
+ioctl byte/record counters through the broker protocol, and compares FSID,
+source/target UUIDs, ctransids, root IDs, file length, footer counters, and
+ioctl counters before physical or indexed publication. Legacy streams remain
+explicitly proof-less instead of inheriting v2 guarantees.
 
 **Remediate:** Carry the v2 endpoint header and completion counters through
 normal and recovered manifest parsing; compare FSID, source/target UUID,

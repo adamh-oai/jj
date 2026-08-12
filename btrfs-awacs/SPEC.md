@@ -174,9 +174,9 @@ pinned until every active lease releases them.
 
 Recovery reconciles broker receipts and fenced manager operations before
 retrying effects. It must reject unmanaged lookalike snapshots, stale grants,
-continuity loss, and mismatched identities. Physical garbage collection,
-history retention, and compaction helpers exist, but production scheduling and
-retained-boundary cleanup remain incomplete.
+continuity loss, and mismatched identities. A periodic production worker runs
+bounded lease expiry, retained-boundary cleanup, orphan-history reclamation,
+and receipt-fenced physical garbage collection on a separate manager handle.
 
 ## 8. Direct API and Jujutsu transaction
 
@@ -278,8 +278,9 @@ configuration.
 
 AWACS is not a filesystem-independent watcher, a client of unmodified upstream
 Btrfs kernels, a proof that recursive inotify sees every content mutation, a
-guarantee that retention/GC is wired in production, or a safe reason to share
-mutable Jujutsu/Git state between filesystem snapshots.
+proof that the retention/GC latency envelope has passed sustained
+kernel-backed acceptance, or a safe reason to share mutable Jujutsu/Git state
+between filesystem snapshots.
 
 ## 13. Reading guide
 

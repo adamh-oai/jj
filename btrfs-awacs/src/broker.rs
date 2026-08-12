@@ -1,6 +1,7 @@
 use crate::btrfs::{
     changed_objects_v2, create_snapshot, destroy_snapshot, filesystem_info, send_changed_objects,
-    subvolume_info, FilesystemInfo, SubvolumeInfo, ROOT_INODE, SUBVOL_NAME_MAX,
+    subvolume_info, ChangedObjectsIoctlResult, FilesystemInfo, SubvolumeInfo, ROOT_INODE,
+    SUBVOL_NAME_MAX,
 };
 use crate::index::Index;
 use crate::store::BrokerJournal;
@@ -20,7 +21,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const BROKER_PROTOCOL_VERSION: u16 = 1;
+pub const BROKER_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const MAX_FRAME_FDS: usize = 4;
 const FRAME_MAGIC: &[u8; 4] = b"BAWB";
@@ -920,6 +921,9 @@ pub struct ChangedObjectsExecution {
 pub struct ChangedObjectsResult {
     pub output_bytes: u64,
     pub manifest_hash: [u8; 32],
+    /// Present only when the dedicated v2 ioctl succeeded. Legacy send-flag
+    /// fallback has no kernel completion counters to prove.
+    pub v2_ioctl: Option<ChangedObjectsIoctlResult>,
 }
 
 pub const MAX_CHANGED_OBJECT_OUTPUT: u64 = 1024 * 1024 * 1024;
@@ -991,7 +995,7 @@ pub fn execute_changed_objects(
     let target_before = verify_subvolume(target_fd, &request.target)?;
     verify_output_file(output_fd, request.output_owner_uid, true)?;
 
-    match changed_objects_v2(
+    let v2_ioctl = match changed_objects_v2(
         target_fd,
         parent_fd,
         output_fd,
@@ -1004,6 +1008,7 @@ pub fn execute_changed_objects(
                     "v2 changed-object ioctl exceeded its output limit",
                 ));
             }
+            Some(result)
         }
         Err(error) if error.raw_os_error() == Some(libc::ENOTTY) => {
             // Transitional compatibility for kernels carrying only the
@@ -1016,13 +1021,14 @@ pub fn execute_changed_objects(
                     ))
                 },
             )?;
+            None
         }
         Err(error) => {
             return Err(BrokerError::new(format!(
                 "run fd-anchored changed-object ioctl: {error}"
             )))
         }
-    }
+    };
     // A successful return must be durable before the manager can promote the
     // manifest from its fence-specific .part name.
     if unsafe { libc::fsync(output_fd.as_raw_fd()) } != 0 {
@@ -1049,10 +1055,16 @@ pub fn execute_changed_objects(
             request.max_output_bytes
         )));
     }
+    if v2_ioctl.is_some_and(|result| result.output_bytes != output_bytes) {
+        return Err(BrokerError::new(
+            "v2 changed-object ioctl byte count differs from output length",
+        ));
+    }
     let manifest_hash = hash_fd(output_fd, output_bytes)?;
     Ok(ChangedObjectsResult {
         output_bytes,
         manifest_hash,
+        v2_ioctl,
     })
 }
 

@@ -11,6 +11,7 @@ use crate::broker::{
     SeqPacket, SessionGate, SnapshotCreateExecution, SnapshotCreateResult, SnapshotDeleteExecution,
     SnapshotDeleteResult, StoredBrokerRequest,
 };
+use crate::btrfs::ChangedObjectsIoctlResult;
 use crate::btrfs::{filesystem_info, subvolume_info};
 use crate::index::{Index, Object};
 use crate::manifest::Reference;
@@ -137,10 +138,7 @@ impl BrokerDispatcher {
                     fds[1].as_fd(),
                     fds[2].as_fd(),
                 )?;
-                Ok(encode_file_result(
-                    result.output_bytes,
-                    result.manifest_hash,
-                ))
+                Ok(encode_changed_objects_result(&result))
             }
             Opcode::FullIndex => {
                 require_fd_count(fds, 2)?;
@@ -486,11 +484,7 @@ impl BrokerClient {
             &[parent, target, output],
         )?;
         let response = receive_response(&self.socket, Opcode::ChangedObjects)?;
-        let (output_bytes, manifest_hash) = decode_file_result(&response)?;
-        Ok(ChangedObjectsResult {
-            output_bytes,
-            manifest_hash,
-        })
+        decode_changed_objects_result(&response)
     }
 
     pub fn full_index(
@@ -724,6 +718,7 @@ impl BrokerClient {
         Ok(ChangedObjectsResult {
             output_bytes,
             manifest_hash,
+            v2_ioctl: None,
         })
     }
 
@@ -875,6 +870,7 @@ fn write_index_output(
     Ok(ChangedObjectsResult {
         output_bytes: length,
         manifest_hash: Sha256::digest(bytes).into(),
+        v2_ioctl: None,
     })
 }
 
@@ -979,6 +975,41 @@ fn decode_file_result(bytes: &[u8]) -> Result<(u64, [u8; 32]), BrokerError> {
     let hash = decoder.array::<32>()?;
     decoder.finish()?;
     Ok((length, hash))
+}
+
+fn encode_changed_objects_result(result: &ChangedObjectsResult) -> Vec<u8> {
+    let mut encoder = Encoder::default();
+    encoder.u64(result.output_bytes);
+    encoder.array(result.manifest_hash);
+    match result.v2_ioctl {
+        Some(ioctl) => {
+            encoder.u8(1);
+            encoder.u64(ioctl.output_bytes);
+            encoder.u64(ioctl.output_records);
+        }
+        None => encoder.u8(0),
+    }
+    encoder.finish()
+}
+
+fn decode_changed_objects_result(bytes: &[u8]) -> Result<ChangedObjectsResult, BrokerError> {
+    let mut decoder = Decoder::new(bytes);
+    let output_bytes = decoder.u64()?;
+    let manifest_hash = decoder.array::<32>()?;
+    let v2_ioctl = match decoder.u8()? {
+        0 => None,
+        1 => Some(ChangedObjectsIoctlResult {
+            output_bytes: decoder.u64()?,
+            output_records: decoder.u64()?,
+        }),
+        _ => return Err(BrokerError::new("invalid changed-object result kind")),
+    };
+    decoder.finish()?;
+    Ok(ChangedObjectsResult {
+        output_bytes,
+        manifest_hash,
+        v2_ioctl,
+    })
 }
 
 fn io_error(context: &str) -> BrokerError {
@@ -1337,5 +1368,21 @@ mod tests {
         let mut bytes = encode_objects(&objects).unwrap();
         bytes.push(0);
         assert!(decode_objects(&bytes).is_err());
+    }
+
+    #[test]
+    fn changed_object_result_wire_preserves_v2_ioctl_counters() {
+        let result = ChangedObjectsResult {
+            output_bytes: 144,
+            manifest_hash: [7; 32],
+            v2_ioctl: Some(ChangedObjectsIoctlResult {
+                output_bytes: 144,
+                output_records: 3,
+            }),
+        };
+        assert_eq!(
+            decode_changed_objects_result(&encode_changed_objects_result(&result)).unwrap(),
+            result
+        );
     }
 }

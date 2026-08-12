@@ -677,13 +677,15 @@ impl Store {
              WHERE state = 'active'",
             [],
         )?;
-        // These read-only jobs are owned by one manager process.  A restart
-        // invalidates their publication fence, but their endpoint pins must
-        // also be released so that they cannot leak retained snapshots.
+        // These ephemeral historical-read jobs are owned by one manager
+        // process. A restart invalidates their publication fence, but their
+        // endpoint pins must also be released so they cannot leak retained
+        // snapshots. Canonical algorithm-v2 cut comparisons are recovered by
+        // their cut operation instead of being abandoned here.
         let historical_comparison_ids = {
             let mut statement = transaction.prepare(
                 "SELECT id FROM comparisons \
-                  WHERE algorithm_version = 2 AND state = 'claimed'",
+                  WHERE algorithm_version = 3 AND state = 'claimed'",
             )?;
             let ids = statement
                 .query_map([], |row| row.get::<_, i64>(0))?
@@ -705,7 +707,7 @@ impl Store {
             r#"UPDATE comparisons
                   SET state = 'failed', lease_owner = NULL,
                       lease_expires_ns = NULL, lease_fence = lease_fence + 1
-                WHERE algorithm_version = 2 AND state = 'claimed'"#,
+                WHERE algorithm_version = 3 AND state = 'claimed'"#,
             [],
         )?;
         let mut statement = transaction
@@ -1592,6 +1594,164 @@ impl Store {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Releases expired direct-query leases and their revision/comparison
+    /// pins in one writer transaction.
+    pub fn expire_query_leases(&mut self, now_ns: i64) -> Result<usize, ManagerError> {
+        self.expire_query_leases_inner(now_ns, None)
+    }
+
+    /// Releases at most `limit` expired direct-query leases and their pins in
+    /// one writer transaction. Production maintenance uses this bounded form
+    /// so an abandoned-client backlog cannot monopolize one tick.
+    pub fn expire_query_leases_bounded(
+        &mut self,
+        now_ns: i64,
+        limit: usize,
+    ) -> Result<usize, ManagerError> {
+        if limit == 0 {
+            return Err(ManagerError::new(
+                "query lease expiry limit must be positive",
+            ));
+        }
+        self.expire_query_leases_inner(now_ns, Some(limit))
+    }
+
+    fn expire_query_leases_inner(
+        &mut self,
+        now_ns: i64,
+        limit: Option<usize>,
+    ) -> Result<usize, ManagerError> {
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expired: i64;
+        if let Some(limit) = limit {
+            let limit = i64::try_from(limit)
+                .map_err(|_| ManagerError::new("query lease expiry limit overflow"))?;
+            expired = transaction.query_row(
+                r#"SELECT count(*) FROM (
+                       SELECT id FROM query_leases
+                        WHERE state = 'active' AND lease_expires_ns <= ?1
+                        ORDER BY id LIMIT ?2
+                   )"#,
+                params![now_ns, limit],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                r#"DELETE FROM query_revision_pins WHERE query_id IN (
+                       SELECT id FROM query_leases
+                        WHERE state = 'active' AND lease_expires_ns <= ?1
+                        ORDER BY id LIMIT ?2
+                   )"#,
+                params![now_ns, limit],
+            )?;
+            transaction.execute(
+                r#"DELETE FROM query_comparison_pins WHERE query_id IN (
+                       SELECT id FROM query_leases
+                        WHERE state = 'active' AND lease_expires_ns <= ?1
+                        ORDER BY id LIMIT ?2
+                   )"#,
+                params![now_ns, limit],
+            )?;
+            transaction.execute(
+                r#"UPDATE query_leases
+                      SET state = 'released', lease_fence = lease_fence + 1
+                    WHERE id IN (
+                       SELECT id FROM query_leases
+                        WHERE state = 'active' AND lease_expires_ns <= ?1
+                        ORDER BY id LIMIT ?2
+                    )"#,
+                params![now_ns, limit],
+            )?;
+        } else {
+            expired = transaction.query_row(
+                "SELECT count(*) FROM query_leases WHERE state = 'active' AND lease_expires_ns <= ?1",
+                [now_ns],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                r#"DELETE FROM query_revision_pins WHERE query_id IN (
+                       SELECT id FROM query_leases
+                        WHERE state = 'active' AND lease_expires_ns <= ?1
+                   )"#,
+                [now_ns],
+            )?;
+            transaction.execute(
+                r#"DELETE FROM query_comparison_pins WHERE query_id IN (
+                       SELECT id FROM query_leases
+                        WHERE state = 'active' AND lease_expires_ns <= ?1
+                   )"#,
+                [now_ns],
+            )?;
+            transaction.execute(
+                r#"UPDATE query_leases
+                      SET state = 'released', lease_fence = lease_fence + 1
+                    WHERE state = 'active' AND lease_expires_ns <= ?1"#,
+                [now_ns],
+            )?;
+        }
+        transaction.commit()?;
+        usize::try_from(expired).map_err(|_| ManagerError::new("expired query count overflow"))
+    }
+
+    /// Fails at most `limit` expired ephemeral historical comparisons and
+    /// releases their endpoint pins. A worker that outlives its lease will
+    /// subsequently fail its publication fence instead of keeping snapshots
+    /// pinned until restart.
+    pub fn expire_historical_comparisons_bounded(
+        &mut self,
+        now_ns: i64,
+        limit: usize,
+    ) -> Result<usize, ManagerError> {
+        if limit == 0 {
+            return Err(ManagerError::new(
+                "historical comparison expiry limit must be positive",
+            ));
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| ManagerError::new("historical comparison expiry limit overflow"))?;
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let comparison_ids = {
+            let mut statement = transaction.prepare(
+                r#"SELECT id FROM comparisons
+                    WHERE comparison_kind = 'incremental'
+                      AND algorithm_version = 3 AND state = 'claimed'
+                      AND lease_expires_ns <= ?1
+                    ORDER BY id LIMIT ?2"#,
+            )?;
+            let rows = statement
+                .query_map(params![now_ns, limit], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for comparison_id in &comparison_ids {
+            let owner_id = encode_u64(
+                u64::try_from(*comparison_id)
+                    .map_err(|_| ManagerError::new("comparison ID is negative"))?,
+            );
+            transaction.execute(
+                "DELETE FROM snapshot_pins WHERE owner_kind = 'comparison' AND owner_id = ?1",
+                [owner_id.as_slice()],
+            )?;
+            require_one(
+                transaction.execute(
+                    r#"UPDATE comparisons
+                          SET state = 'failed', lease_owner = NULL,
+                              lease_expires_ns = NULL, lease_fence = lease_fence + 1
+                        WHERE id = ?1 AND comparison_kind = 'incremental'
+                          AND algorithm_version = 3 AND state = 'claimed'
+                          AND lease_expires_ns <= ?2"#,
+                    params![comparison_id, now_ns],
+                )?,
+                "expire historical comparison",
+            )?;
+        }
+        transaction.commit()?;
+        Ok(comparison_ids.len())
     }
 
     pub fn reserve_initialize(
@@ -3611,6 +3771,7 @@ impl Store {
                                              WHERE wc.comparison_id = c.id) \
                             AND NOT EXISTS (SELECT 1 FROM query_comparison_pins p \
                                              WHERE p.comparison_id = c.id) \
+                            AND c.state != 'claimed' \
                             AND NOT (c.algorithm_version = 2 \
                                      AND c.state = 'index_ready' \
                                      AND EXISTS (SELECT 1 FROM revisions a \
@@ -3635,6 +3796,7 @@ impl Store {
                   AND NOT EXISTS (
                     SELECT 1 FROM query_comparison_pins p
                      WHERE p.comparison_id = comparisons.id)
+                  AND comparisons.state != 'claimed'
                   AND NOT (comparisons.algorithm_version = 2
                            AND comparisons.state = 'index_ready'
                            AND EXISTS (SELECT 1 FROM revisions a
@@ -3651,47 +3813,83 @@ impl Store {
 
     /// Attempts to retain exponentially spaced physical replay checkpoints.
     ///
-    /// FIXME: The cleanup currently conflicts with retained boundary foreign
-    /// keys, and an older checkpoint cannot safely replace a client's exact
-    /// baseline. Both retention issues are described in FIXES.md.
+    /// Boundary removal and old-cut reclamation are one immediate transaction
+    /// so a retained boundary never loses the watch_cuts row named by its
+    /// composite foreign key. Policy discovery uses indexed point/range
+    /// queries, and the destructive query itself excludes active endpoints,
+    /// so one hot watch cannot turn a production tick into a full-history
+    /// scan.
     pub fn retain_exponential_replay_checkpoints(
         &mut self,
         watch_id: [u8; 16],
         compactor_owner: [u8; 16],
+        now_ns: i64,
+        max_cuts: i64,
+        max_age_ns: i64,
+        delete_limit: usize,
     ) -> Result<usize, ManagerError> {
-        let boundaries: Vec<(i64, i64)> = {
-            let mut statement = self.connection().prepare(
-                r#"SELECT b.cut_sequence, r.id
-                     FROM fsmonitor_boundaries b
-                     JOIN revisions r ON r.snapshot_id = b.target_snapshot_id
-                    WHERE b.watch_id = ?1 AND r.state = 'ready'
-                    ORDER BY b.cut_sequence"#,
+        if max_cuts <= 0 || max_age_ns <= 0 || delete_limit == 0 {
+            return Err(ManagerError::new("invalid replay retention limits"));
+        }
+        // Keep this public helper correct when called directly outside the
+        // production scheduler. The bounded global sweep normally does this
+        // first; this per-watch slice prevents expired endpoints from
+        // protecting history forever without making one tick unbounded.
+        self.expire_query_leases_bounded(now_ns, delete_limit)?;
+        let (boundary_count, oldest, newest): (i64, Option<i64>, Option<i64>) =
+            self.connection().query_row(
+                r#"SELECT count(*), min(cut_sequence), max(cut_sequence)
+                     FROM fsmonitor_boundaries WHERE watch_id = ?1"#,
+                [watch_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            let rows = statement
-                .query_map([watch_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
-        if boundaries.len() <= 2 {
+        if boundary_count <= 2 {
             return Ok(0);
         }
-
-        let sequences = boundaries
-            .iter()
-            .map(|(sequence, _)| *sequence)
-            .collect::<BTreeSet<_>>();
-        let oldest = *sequences
-            .first()
-            .ok_or_else(|| ManagerError::new("replay checkpoint set is empty"))?;
-        let newest = *sequences
-            .last()
-            .ok_or_else(|| ManagerError::new("replay checkpoint set is empty"))?;
-        let mut retained = BTreeSet::from([oldest, newest]);
+        let oldest = oldest.ok_or_else(|| ManagerError::new("replay checkpoint set is empty"))?;
+        let newest = newest.ok_or_else(|| ManagerError::new("replay checkpoint set is empty"))?;
+        let sequence_floor = newest
+            .saturating_sub(max_cuts.saturating_sub(1))
+            .max(oldest);
+        let age_cutoff = now_ns.saturating_sub(max_age_ns);
+        let age_floor = self
+            .connection()
+            .query_row(
+                r#"SELECT b.cut_sequence
+                     FROM fsmonitor_boundaries b
+                     JOIN snapshots s ON s.id = b.target_snapshot_id
+                    WHERE b.watch_id = ?1 AND s.created_ns >= ?2
+                    ORDER BY b.cut_sequence LIMIT 1"#,
+                params![watch_id.as_slice(), age_cutoff],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(newest);
+        let wanted_floor = sequence_floor.max(age_floor);
+        let floor = self
+            .connection()
+            .query_row(
+                r#"SELECT min(cut_sequence) FROM fsmonitor_boundaries
+                    WHERE watch_id = ?1 AND cut_sequence >= ?2"#,
+                params![watch_id.as_slice(), wanted_floor],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .unwrap_or(newest);
+        let mut retained = BTreeSet::from([floor, newest]);
         let mut distance = 1_i64;
-        while newest.saturating_sub(distance) > oldest {
+        while newest.saturating_sub(distance) > floor {
             let wanted = newest.saturating_sub(distance);
-            if let Some(sequence) = sequences.range(..=wanted).next_back() {
-                retained.insert(*sequence);
+            let sequence = self.connection().query_row(
+                r#"SELECT max(cut_sequence) FROM fsmonitor_boundaries
+                    WHERE watch_id = ?1 AND cut_sequence >= ?2
+                      AND cut_sequence <= ?3"#,
+                params![watch_id.as_slice(), floor, wanted],
+                |row| row.get::<_, Option<i64>>(0),
+            )?;
+            if let Some(sequence) = sequence {
+                if sequence >= floor {
+                    retained.insert(sequence);
+                }
             }
             let next = distance.saturating_mul(2);
             if next == distance {
@@ -3700,79 +3898,220 @@ impl Store {
             distance = next;
         }
 
-        // An in-flight response pins its exact source and target boundaries.
-        let mut statement = self.connection().prepare(
-            r#"SELECT from_cut_sequence, to_cut_sequence
-                 FROM query_leases
-                WHERE watch_id = ?1 AND state = 'active'"#,
-        )?;
-        let active = statement
-            .query_map([watch_id.as_slice()], |row| {
-                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        for (from, to) in active {
-            if let Some(from) = from {
-                retained.insert(from);
-            }
-            retained.insert(to);
-        }
-
         // A retained snapshot also keeps its compact inode/path checkpoint so
         // a direct retained-to-head comparison can resolve raw changed-object
-        // identities without replaying intermediate cuts.
-        for (_, revision_id) in boundaries
-            .iter()
-            .filter(|(sequence, _)| retained.contains(sequence))
-        {
-            self.compact_revision(*revision_id, compactor_owner)?;
+        // identities without replaying intermediate cuts. Compact at most one
+        // missing checkpoint per slice; already compact checkpoints are cheap
+        // to identify, while materializing one can be O(repo size).
+        for sequence in &retained {
+            let revision = self
+                .connection()
+                .query_row(
+                    r#"SELECT r.id, r.storage_base_revision_id, r.delta_depth,
+                              r.summary_version, rc.state
+                         FROM fsmonitor_boundaries b
+                         JOIN revisions r ON r.snapshot_id = b.target_snapshot_id
+                         LEFT JOIN revision_checkpoints rc ON rc.revision_id = r.id
+                        WHERE b.watch_id = ?1 AND b.cut_sequence = ?2
+                          AND r.state = 'ready'"#,
+                    params![watch_id.as_slice(), sequence],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((revision_id, storage_base, delta_depth, summary_version, checkpoint_state)) =
+                revision
+            else {
+                return Err(ManagerError::new(
+                    "retained boundary lacks a ready revision",
+                ));
+            };
+            if storage_base.is_some()
+                || delta_depth != 0
+                || summary_version != 2
+                || checkpoint_state.as_deref() != Some("ready")
+            {
+                self.compact_revision(revision_id, compactor_owner)?;
+                break;
+            }
         }
 
         let transaction = self
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Fetch only a bounded prefix. Active endpoints are excluded in SQL
+        // under this writer transaction: a Begin either committed before this
+        // query and is protected here, or waits and sees the post-GC set.
+        let candidate_limit = delete_limit
+            .checked_add(retained.len())
+            .ok_or_else(|| ManagerError::new("boundary candidate limit overflow"))?;
+        let candidates = {
+            let mut statement = transaction.prepare(
+                r#"SELECT b.cut_sequence
+                     FROM fsmonitor_boundaries b
+                    WHERE b.watch_id = ?1 AND b.cut_sequence <= ?2
+                      AND NOT EXISTS (
+                          SELECT 1 FROM query_leases q
+                           WHERE q.watch_id = b.watch_id AND q.state = 'active'
+                             AND q.lease_expires_ns > ?3
+                             AND (q.from_cut_sequence = b.cut_sequence
+                                  OR q.to_cut_sequence = b.cut_sequence)
+                      )
+                    ORDER BY b.cut_sequence LIMIT ?4"#,
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        watch_id.as_slice(),
+                        newest,
+                        now_ns,
+                        i64::try_from(candidate_limit).map_err(|_| {
+                            ManagerError::new("boundary candidate limit exceeds SQLite integer")
+                        })?,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut removed = 0_usize;
+        let mut removed_sequences = Vec::new();
+        for sequence in candidates
+            .into_iter()
+            .filter(|sequence| !retained.contains(sequence))
+            .take(delete_limit)
+        {
+            let changed = transaction.execute(
+                r#"DELETE FROM fsmonitor_boundaries
+                    WHERE watch_id = ?1 AND cut_sequence = ?2
+                      AND NOT EXISTS (
+                          SELECT 1 FROM query_leases q
+                           WHERE q.watch_id = fsmonitor_boundaries.watch_id
+                             AND q.state = 'active' AND q.lease_expires_ns > ?3
+                             AND (q.from_cut_sequence = fsmonitor_boundaries.cut_sequence
+                                  OR q.to_cut_sequence = fsmonitor_boundaries.cut_sequence)
+                      )"#,
+                params![watch_id.as_slice(), sequence, now_ns],
+            )?;
+            if changed != 0 {
+                removed += changed;
+                removed_sequences.push(sequence);
+            }
+        }
+        let replay_floor: i64 = transaction
+            .query_row(
+                "SELECT min(cut_sequence) FROM fsmonitor_boundaries WHERE watch_id = ?1",
+                [watch_id.as_slice()],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .ok_or_else(|| ManagerError::new("retained replay set is empty"))?;
         transaction.execute(
-            "DELETE FROM snapshot_pins WHERE owner_kind = 'replay-boundary' AND owner_id = ?1",
-            [watch_id.as_slice()],
+            r#"UPDATE watches SET replay_floor_seq = ?2
+                WHERE id = ?1 AND replay_floor_seq < ?2"#,
+            params![watch_id.as_slice(), replay_floor],
         )?;
-        for sequence in &retained {
+        // Drop only cuts whose boundary was removed above. Surviving
+        // boundaries continue to own their exact composite parent row.
+        for sequence in removed_sequences {
             transaction.execute(
-                r#"INSERT OR IGNORE INTO snapshot_pins(
-                       snapshot_id, owner_kind, owner_id, reason
-                   )
-                   SELECT target_snapshot_id, 'replay-boundary', ?1,
-                          'exponential-replay-checkpoint'
-                     FROM fsmonitor_boundaries
-                    WHERE watch_id = ?1 AND cut_sequence = ?2"#,
+                r#"DELETE FROM cut_admissions WHERE operation_id IN (
+                       SELECT operation_id FROM watch_cuts
+                        WHERE watch_id = ?1 AND sequence = ?2
+                   )"#,
                 params![watch_id.as_slice(), sequence],
             )?;
-        }
-        let mut removed = 0_usize;
-        for (sequence, _) in boundaries
-            .iter()
-            .filter(|(sequence, _)| !retained.contains(sequence))
-        {
-            removed += transaction.execute(
-                "DELETE FROM fsmonitor_boundaries WHERE watch_id = ?1 AND cut_sequence = ?2",
+            transaction.execute(
+                "DELETE FROM watch_cuts WHERE watch_id = ?1 AND sequence = ?2",
+                params![watch_id.as_slice(), sequence],
+            )?;
+            transaction.execute(
+                r#"DELETE FROM operations WHERE watch_id = ?1 AND kind = 'cut'
+                    AND state = 'done' AND sequence = ?2"#,
                 params![watch_id.as_slice(), sequence],
             )?;
         }
         transaction.commit()?;
-
-        // Once intermediate boundaries no longer pin their snapshots, reclaim
-        // their indexes before dropping the now-useless adjacent cut events.
-        let reclaimed = self.reclaim_unreferenced_revisions()?;
-        self.reclaim_unreferenced_cut_comparisons(watch_id, newest)?;
-        Ok(removed + reclaimed)
+        Ok(removed)
     }
 
-    fn reclaim_unreferenced_revisions(&mut self) -> Result<usize, ManagerError> {
+    /// Reclaims at most `limit` orphan comparison/revision units independent
+    /// of any watch slice. Keeping this separate from boundary retention means
+    /// idle or short-history watches cannot starve global cleanup.
+    pub fn reclaim_orphan_history_bounded(&mut self, limit: usize) -> Result<usize, ManagerError> {
+        if limit == 0 {
+            return Err(ManagerError::new("history reclaim limit must be positive"));
+        }
+        let reclaimed_comparisons = self.reclaim_unreferenced_comparisons(limit)?;
+        let remaining = limit.saturating_sub(reclaimed_comparisons);
+        let reclaimed_revisions = if remaining == 0 {
+            0
+        } else {
+            self.reclaim_unreferenced_revisions(remaining)?
+        };
+        reclaimed_comparisons
+            .checked_add(reclaimed_revisions)
+            .ok_or_else(|| ManagerError::new("history reclaim count overflow"))
+    }
+
+    fn reclaim_unreferenced_comparisons(&mut self, limit: usize) -> Result<usize, ManagerError> {
+        if limit == 0 {
+            return Err(ManagerError::new(
+                "comparison reclaim limit must be positive",
+            ));
+        }
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let orphan_comparisons = {
+            let mut statement = transaction.prepare(
+                r#"SELECT id FROM comparisons
+                    WHERE NOT EXISTS (SELECT 1 FROM revisions r
+                                       WHERE r.provenance_comparison_id = comparisons.id)
+                      AND NOT EXISTS (SELECT 1 FROM watch_cuts wc
+                                       WHERE wc.comparison_id = comparisons.id)
+                      AND NOT EXISTS (SELECT 1 FROM query_comparison_pins p
+                                       WHERE p.comparison_id = comparisons.id)
+                      AND comparisons.state != 'claimed'
+                    ORDER BY id LIMIT ?1"#,
+            )?;
+            let rows = statement
+                .query_map(
+                    [i64::try_from(limit)
+                        .map_err(|_| ManagerError::new("comparison reclaim limit overflow"))?],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for comparison_id in &orphan_comparisons {
+            for table in ["change_events", "comparison_refs", "comparison_objects"] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE comparison_id = ?1"),
+                    [comparison_id],
+                )?;
+            }
+            transaction.execute("DELETE FROM comparisons WHERE id = ?1", [comparison_id])?;
+        }
+        transaction.commit()?;
+        Ok(orphan_comparisons.len())
+    }
+
+    fn reclaim_unreferenced_revisions(&mut self, limit: usize) -> Result<usize, ManagerError> {
+        if limit == 0 {
+            return Err(ManagerError::new("revision reclaim limit must be positive"));
+        }
         let transaction = self
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut reclaimed = 0_usize;
-        loop {
+        while reclaimed < limit {
             let candidate: Option<i64> = transaction
                 .query_row(
                     r#"SELECT r.id FROM revisions r
@@ -3822,60 +4161,6 @@ impl Store {
         }
         transaction.commit()?;
         Ok(reclaimed)
-    }
-
-    fn reclaim_unreferenced_cut_comparisons(
-        &mut self,
-        watch_id: [u8; 16],
-        newest_sequence: i64,
-    ) -> Result<(), ManagerError> {
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM cut_admissions WHERE operation_id IN (\
-                 SELECT operation_id FROM watch_cuts \
-                  WHERE watch_id = ?1 AND sequence < ?2\
-             )",
-            params![watch_id.as_slice(), newest_sequence],
-        )?;
-        transaction.execute(
-            "DELETE FROM watch_cuts WHERE watch_id = ?1 AND sequence < ?2",
-            params![watch_id.as_slice(), newest_sequence],
-        )?;
-        transaction.execute(
-            "DELETE FROM operations WHERE watch_id = ?1 AND kind = 'cut' \
-             AND state = 'done' AND sequence < ?2",
-            params![watch_id.as_slice(), newest_sequence],
-        )?;
-        for table in ["change_events", "comparison_refs", "comparison_objects"] {
-            transaction.execute(
-                &format!(
-                    "DELETE FROM {table} WHERE comparison_id IN (\
-                         SELECT c.id FROM comparisons c \
-                          WHERE NOT EXISTS (SELECT 1 FROM revisions r \
-                                             WHERE r.provenance_comparison_id = c.id) \
-                            AND NOT EXISTS (SELECT 1 FROM watch_cuts wc \
-                                             WHERE wc.comparison_id = c.id) \
-                            AND NOT EXISTS (SELECT 1 FROM query_comparison_pins p \
-                                             WHERE p.comparison_id = c.id)\
-                     )"
-                ),
-                [],
-            )?;
-        }
-        transaction.execute(
-            r#"DELETE FROM comparisons
-                WHERE NOT EXISTS (SELECT 1 FROM revisions r
-                                   WHERE r.provenance_comparison_id = comparisons.id)
-                  AND NOT EXISTS (SELECT 1 FROM watch_cuts wc
-                                   WHERE wc.comparison_id = comparisons.id)
-                  AND NOT EXISTS (SELECT 1 FROM query_comparison_pins p
-                                   WHERE p.comparison_id = comparisons.id)"#,
-            [],
-        )?;
-        transaction.commit()?;
-        Ok(())
     }
 
     pub fn create_retention_lease(
@@ -3988,30 +4273,93 @@ impl Store {
     }
 
     pub fn expire_retention_leases(&mut self, now_ns: i64) -> Result<usize, ManagerError> {
+        self.expire_retention_leases_inner(now_ns, None)
+    }
+
+    /// Releases at most `limit` expired caller-retention leases and their
+    /// pins in one writer transaction for bounded production maintenance.
+    pub fn expire_retention_leases_bounded(
+        &mut self,
+        now_ns: i64,
+        limit: usize,
+    ) -> Result<usize, ManagerError> {
+        if limit == 0 {
+            return Err(ManagerError::new(
+                "retention lease expiry limit must be positive",
+            ));
+        }
+        self.expire_retention_leases_inner(now_ns, Some(limit))
+    }
+
+    fn expire_retention_leases_inner(
+        &mut self,
+        now_ns: i64,
+        limit: Option<usize>,
+    ) -> Result<usize, ManagerError> {
         let transaction = self
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let expired: i64 = transaction.query_row(
-            "SELECT count(*) FROM retention_leases \
-             WHERE state = 'active' AND expires_ns <= ?1",
-            [now_ns],
-            |row| row.get(0),
-        )?;
-        transaction.execute(
-            r#"DELETE FROM snapshot_pins
-                WHERE owner_kind = 'retention-lease'
-                  AND EXISTS (
-                      SELECT 1 FROM retention_leases r
-                       WHERE r.id = snapshot_pins.owner_id
-                         AND r.snapshot_id = snapshot_pins.snapshot_id
-                         AND r.state = 'active' AND r.expires_ns <= ?1)"#,
-            [now_ns],
-        )?;
-        transaction.execute(
-            "UPDATE retention_leases SET state = 'expired', lease_fence = lease_fence + 1 \
-             WHERE state = 'active' AND expires_ns <= ?1",
-            [now_ns],
-        )?;
+        let expired: i64;
+        if let Some(limit) = limit {
+            let limit = i64::try_from(limit)
+                .map_err(|_| ManagerError::new("retention lease expiry limit overflow"))?;
+            expired = transaction.query_row(
+                r#"SELECT count(*) FROM (
+                       SELECT id FROM retention_leases
+                        WHERE state = 'active' AND expires_ns <= ?1
+                        ORDER BY id LIMIT ?2
+                   )"#,
+                params![now_ns, limit],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                r#"DELETE FROM snapshot_pins
+                    WHERE owner_kind = 'retention-lease'
+                      AND EXISTS (
+                          SELECT 1 FROM retention_leases r
+                           WHERE r.id = snapshot_pins.owner_id
+                             AND r.snapshot_id = snapshot_pins.snapshot_id
+                             AND r.state = 'active' AND r.expires_ns <= ?1
+                             AND r.id IN (
+                                 SELECT id FROM retention_leases
+                                  WHERE state = 'active' AND expires_ns <= ?1
+                                  ORDER BY id LIMIT ?2
+                             ))"#,
+                params![now_ns, limit],
+            )?;
+            transaction.execute(
+                r#"UPDATE retention_leases
+                      SET state = 'expired', lease_fence = lease_fence + 1
+                    WHERE id IN (
+                       SELECT id FROM retention_leases
+                        WHERE state = 'active' AND expires_ns <= ?1
+                        ORDER BY id LIMIT ?2
+                    )"#,
+                params![now_ns, limit],
+            )?;
+        } else {
+            expired = transaction.query_row(
+                "SELECT count(*) FROM retention_leases \
+                 WHERE state = 'active' AND expires_ns <= ?1",
+                [now_ns],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                r#"DELETE FROM snapshot_pins
+                    WHERE owner_kind = 'retention-lease'
+                      AND EXISTS (
+                          SELECT 1 FROM retention_leases r
+                           WHERE r.id = snapshot_pins.owner_id
+                             AND r.snapshot_id = snapshot_pins.snapshot_id
+                             AND r.state = 'active' AND r.expires_ns <= ?1)"#,
+                [now_ns],
+            )?;
+            transaction.execute(
+                "UPDATE retention_leases SET state = 'expired', lease_fence = lease_fence + 1 \
+                 WHERE state = 'active' AND expires_ns <= ?1",
+                [now_ns],
+            )?;
+        }
         transaction.commit()?;
         usize::try_from(expired).map_err(|_| ManagerError::new("expired lease count overflow"))
     }
@@ -4043,6 +4391,15 @@ impl Store {
                           SELECT 1 FROM snapshot_pins p WHERE p.snapshot_id = s.id
                       )
                       AND NOT EXISTS (
+                          SELECT 1 FROM fsmonitor_boundaries b
+                           WHERE b.target_snapshot_id = s.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM query_revision_pins p
+                          JOIN revisions r ON r.id = p.revision_id
+                           WHERE r.snapshot_id = s.id
+                      )
+                      AND NOT EXISTS (
                           SELECT 1 FROM snapshot_delete_operations d
                            WHERE d.snapshot_id = s.id AND d.state != 'done'
                       )
@@ -4064,6 +4421,15 @@ impl Store {
                     WHERE id = ?1 AND physical_state = 'present'
                       AND NOT EXISTS (
                           SELECT 1 FROM snapshot_pins p WHERE p.snapshot_id = snapshots.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM fsmonitor_boundaries b
+                           WHERE b.target_snapshot_id = snapshots.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM query_revision_pins p
+                          JOIN revisions r ON r.id = p.revision_id
+                           WHERE r.snapshot_id = snapshots.id
                       )"#,
                 [snapshot_id],
             )?;
@@ -4119,6 +4485,55 @@ impl Store {
             )?,
             "start snapshot delete",
         )
+    }
+
+    /// Rolls back an intent that never crossed the fs_started effect boundary.
+    /// This is safe without broker reconciliation because a delete effect is
+    /// forbidden until start_snapshot_delete has committed.
+    pub fn cancel_planned_snapshot_delete(
+        &mut self,
+        reservation: &SnapshotDeleteReservation,
+        lease_owner: [u8; 16],
+    ) -> Result<(), ManagerError> {
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_one(
+            transaction.execute(
+                r#"UPDATE snapshots
+                      SET physical_state = 'present'
+                    WHERE id = ?1 AND physical_state = 'deleting'
+                      AND EXISTS (
+                          SELECT 1 FROM snapshot_delete_operations d
+                           WHERE d.id = ?2 AND d.snapshot_id = snapshots.id
+                             AND d.state = 'planned' AND d.lease_owner = ?3
+                             AND d.lease_fence = ?4
+                      )"#,
+                params![
+                    reservation.snapshot_id,
+                    reservation.operation_id.as_slice(),
+                    lease_owner.as_slice(),
+                    reservation.operation_fence,
+                ],
+            )?,
+            "restore planned snapshot delete",
+        )?;
+        require_one(
+            transaction.execute(
+                r#"DELETE FROM snapshot_delete_operations
+                    WHERE id = ?1 AND snapshot_id = ?2 AND state = 'planned'
+                      AND lease_owner = ?3 AND lease_fence = ?4"#,
+                params![
+                    reservation.operation_id.as_slice(),
+                    reservation.snapshot_id,
+                    lease_owner.as_slice(),
+                    reservation.operation_fence,
+                ],
+            )?,
+            "cancel planned snapshot delete",
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn record_snapshot_delete_durable(
@@ -6471,6 +6886,275 @@ mod tests {
         }
     }
 
+    fn append_ready_boundary(
+        store: &mut Store,
+        initialized: &InitializedWatch,
+        sequence: u8,
+    ) -> (i64, i64) {
+        let request = CutRequest {
+            watch_id: initialized.watch_id,
+            authorization_id: initialized.grant_id,
+            reserved_snapshot_path: format!("/store/snapshots/w/s-{sequence}").into_bytes(),
+            requester_uid: 1000,
+            requester_gid: 1000,
+            lease_owner: [sequence; 16],
+            now_ns: 400 + i64::from(sequence) * 100,
+            lease_expires_ns: 2_000 + i64::from(sequence) * 100,
+        };
+        let cut = store.reserve_cut(&request).unwrap();
+        store
+            .start_cut_filesystem_effect(&cut, request.lease_owner, request.now_ns + 10)
+            .unwrap();
+        let mut identity = cut_snapshot(&request, cut.source_subvol_uuid);
+        identity.subvol_uuid = [sequence.saturating_add(10); 16];
+        identity.root_id = 900 + u64::from(sequence);
+        identity.ctransid = 10 + u64::from(sequence);
+        identity.otransid = 9 + u64::from(sequence);
+        identity.created_ns = request.now_ns + 20;
+        let recorded = store
+            .record_cut_snapshot(&cut, request.lease_owner, &identity, request.now_ns + 20)
+            .unwrap();
+        store
+            .publish_validated_physical_cut(
+                &cut,
+                request.lease_owner,
+                &recorded,
+                request.now_ns + 30,
+            )
+            .unwrap();
+        store
+            .publish_full_fresh_checkpoint(
+                &cut,
+                request.lease_owner,
+                &recorded,
+                &index(),
+                request.now_ns + 40,
+            )
+            .unwrap();
+        store
+            .connection_mut()
+            .execute(
+                r#"INSERT INTO fsmonitor_boundaries(
+                       watch_id, cut_sequence, target_snapshot_id, boundary_kind,
+                       cut_operation_id, clock_epoch,
+                       guard_epoch, guard_sequence, guard_complete
+                   )
+                   SELECT c.watch_id, c.sequence, c.target_snapshot_id, 'cut',
+                          c.operation_id, w.clock_epoch, NULL, NULL, 0
+                     FROM watch_cuts c JOIN watches w ON w.id = c.watch_id
+                    WHERE c.watch_id = ?1 AND c.sequence = ?2"#,
+                params![initialized.watch_id.as_slice(), cut.sequence],
+            )
+            .unwrap();
+        (cut.sequence, recorded.snapshot_id)
+    }
+
+    #[test]
+    fn retained_boundaries_keep_parent_cuts_and_active_query_endpoints() {
+        let (_temp, mut store, request) = setup();
+        let (_initialize, initialized) = initialize_watch(&mut store, &request);
+        for sequence in 1..=5 {
+            append_ready_boundary(&mut store, &initialized, sequence);
+        }
+        store
+            .connection_mut()
+            .execute(
+                r#"INSERT INTO query_leases(
+                       id, watch_id, authorization_id, clock_epoch,
+                       from_cut_sequence, to_cut_sequence,
+                       guard_epoch, from_guard_sequence, to_guard_sequence,
+                       lease_owner, lease_fence, lease_expires_ns, state
+                   )
+                   SELECT ?1, w.id, ?2, w.clock_epoch, 1, 5,
+                          NULL, NULL, NULL, ?3, 1, 1500, 'active'
+                     FROM watches w WHERE w.id = ?4"#,
+                params![
+                    [90_u8; 16].as_slice(),
+                    initialized.grant_id.as_slice(),
+                    [91_u8; 16].as_slice(),
+                    initialized.watch_id.as_slice(),
+                ],
+            )
+            .unwrap();
+        store
+            .retain_exponential_replay_checkpoints(
+                initialized.watch_id,
+                [92; 16],
+                1_000,
+                3,
+                10_000,
+                16,
+            )
+            .unwrap();
+        let retained: Vec<i64> = store
+            .connection()
+            .prepare(
+                "SELECT cut_sequence FROM fsmonitor_boundaries WHERE watch_id = ?1 ORDER BY cut_sequence",
+            )
+            .unwrap()
+            .query_map([initialized.watch_id.as_slice()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(retained, vec![1, 3, 4, 5]);
+        assert!(store.foreign_key_violations().unwrap().is_empty());
+
+        store
+            .retain_exponential_replay_checkpoints(
+                initialized.watch_id,
+                [92; 16],
+                2_000,
+                3,
+                10_000,
+                16,
+            )
+            .unwrap();
+        let retained: Vec<i64> = store
+            .connection()
+            .prepare(
+                "SELECT cut_sequence FROM fsmonitor_boundaries WHERE watch_id = ?1 ORDER BY cut_sequence",
+            )
+            .unwrap()
+            .query_map([initialized.watch_id.as_slice()], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(retained, vec![3, 4, 5]);
+        let query_state: String = store
+            .connection()
+            .query_row(
+                "SELECT state FROM query_leases WHERE id = ?1",
+                [[90_u8; 16].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(query_state, "released");
+        assert!(store.foreign_key_violations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_boundary_cleanup_does_not_reap_claimed_historical_comparison() {
+        let (_temp, mut store, request) = setup();
+        let (_initialize, initialized) = initialize_watch(&mut store, &request);
+        for sequence in 1..=4 {
+            append_ready_boundary(&mut store, &initialized, sequence);
+        }
+        let claim = match store
+            .claim_historical_comparison(&HistoricalComparisonRequest {
+                watch_id: initialized.watch_id,
+                authorization_id: initialized.grant_id,
+                requester_uid: 1000,
+                from_snapshot_uuid: [11; 16],
+                to_snapshot_uuid: [14; 16],
+                lease_owner: [96; 16],
+                now_ns: 1_000,
+                lease_expires_ns: 2_000,
+            })
+            .unwrap()
+        {
+            HistoricalComparisonAdmission::Claimed(claim) => claim,
+            HistoricalComparisonAdmission::Ready(_) => panic!("comparison was not claimed"),
+        };
+        store
+            .retain_exponential_replay_checkpoints(
+                initialized.watch_id,
+                [97; 16],
+                1_100,
+                2,
+                10_000,
+                16,
+            )
+            .unwrap();
+        let state: String = store
+            .connection()
+            .query_row(
+                "SELECT state FROM comparisons WHERE id = ?1",
+                [claim.comparison_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "claimed");
+        assert_eq!(
+            store
+                .expire_historical_comparisons_bounded(2_000, 1)
+                .unwrap(),
+            1
+        );
+        let state: String = store
+            .connection()
+            .query_row(
+                "SELECT state FROM comparisons WHERE id = ?1",
+                [claim.comparison_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        let owner_id = encode_u64(u64::try_from(claim.comparison_id).unwrap());
+        let pins: i64 = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM snapshot_pins WHERE owner_kind = 'comparison' AND owner_id = ?1",
+                [owner_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pins, 0);
+        assert!(store.foreign_key_violations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn snapshot_gc_skips_boundary_owned_and_query_pinned_snapshots() {
+        let (_temp, mut store, request) = setup();
+        let (_initialize, initialized) = initialize_watch(&mut store, &request);
+        let (_first_sequence, first_snapshot_id) =
+            append_ready_boundary(&mut store, &initialized, 1);
+        append_ready_boundary(&mut store, &initialized, 2);
+        store
+            .connection_mut()
+            .execute(
+                "DELETE FROM snapshot_pins WHERE snapshot_id IN (?1, ?2)",
+                params![initialized.snapshot_id, first_snapshot_id],
+            )
+            .unwrap();
+        store
+            .connection_mut()
+            .execute(
+                r#"INSERT INTO query_leases(
+                       id, watch_id, authorization_id, clock_epoch,
+                       from_cut_sequence, to_cut_sequence,
+                       guard_epoch, from_guard_sequence, to_guard_sequence,
+                       lease_owner, lease_fence, lease_expires_ns, state
+                   )
+                   SELECT ?1, w.id, ?2, w.clock_epoch, NULL, 2,
+                          NULL, NULL, NULL, ?3, 1, 2000, 'active'
+                     FROM watches w WHERE w.id = ?4"#,
+                params![
+                    [93_u8; 16].as_slice(),
+                    initialized.grant_id.as_slice(),
+                    [94_u8; 16].as_slice(),
+                    initialized.watch_id.as_slice(),
+                ],
+            )
+            .unwrap();
+        store
+            .connection_mut()
+            .execute(
+                "INSERT INTO query_revision_pins(query_id, revision_id) VALUES (?1, ?2)",
+                params![[93_u8; 16].as_slice(), initialized.revision_id],
+            )
+            .unwrap();
+        let reservations = store
+            .reserve_unpinned_snapshot_deletes([95; 16], 1_000, 2_000, 8)
+            .unwrap();
+        assert!(reservations
+            .iter()
+            .all(
+                |reservation| reservation.snapshot_id != initialized.snapshot_id
+                    && reservation.snapshot_id != first_snapshot_id
+            ));
+        assert!(store.foreign_key_violations().unwrap().is_empty());
+    }
+
     #[test]
     fn invalid_unpublished_cut_preserves_heads_and_records_a_gap() {
         let (_temp, mut store, request) = setup();
@@ -7075,7 +7759,7 @@ mod tests {
                        from_snapshot_id, to_snapshot_id, comparison_kind,
                        algorithm_version, state, lease_owner, lease_fence,
                        lease_expires_ns)
-                   VALUES (?1, ?1, 'incremental', 2, 'claimed', ?2, 4, 9999)"#,
+                   VALUES (?1, ?1, 'incremental', 3, 'claimed', ?2, 4, 9999)"#,
                 params![initialized.snapshot_id, [88_u8; 16].as_slice()],
             )
             .unwrap();

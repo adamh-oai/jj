@@ -319,10 +319,10 @@ The important failure boundaries are not symmetric:
 
 An additional daemon-side race remains: the direct handler inserts its active
 session before the transport writes the successful Begin response. If the
-client disconnects during that write, no client holds the returned session ID,
-but the prepared query can remain pinned until some *later* request triggers
-opportunistic session cleanup. An idle daemon has no independent maintenance
-scheduler ([C-25](/review/p1-correctness/)).
+client disconnects during that write, no client holds the returned session ID.
+The independent maintenance scheduler now bounds how long that abandoned
+query can keep its snapshot pin, but the transport should still abort the
+session immediately on response failure ([C-25](/review/p1-correctness/)).
 
 ## Race 7: The root changes identity between checks
 

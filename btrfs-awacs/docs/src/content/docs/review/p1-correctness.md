@@ -6,12 +6,12 @@ sidebar:
 ---
 This page contains **16 P1 correctness findings**. Identifiers correspond to the reviewed source specification.
 
-**C-06 — History maintenance violates its own retained-boundary foreign keys.**
-`src/manager.rs` deliberately retains the oldest and newest
-filesystem-monitor boundaries, then deletes every older `watch_cuts` parent.
-The retained boundaries reference those cut rows. SQLite rejects maintenance
-after earlier compaction/boundary changes have already committed, leaving
-partially applied retention work.
+**C-06 — Retained-boundary cleanup is implemented; crash acceptance remains.**
+`src/manager.rs` now treats surviving filesystem-monitor boundaries as the
+ownership authority, deletes only boundary/cut/operation groups with no
+surviving boundary, and does that work under one writer transaction while
+excluding active query endpoints. Bounded orphan cleanup runs separately. The
+remaining gate is crash/restart acceptance under the kernel-backed matrix.
 
 ---
 
@@ -158,13 +158,13 @@ workspace as well as failing direct registration of the new child.
 
 ---
 
-**C-23 — Parsed kernel stream identities and completion counters are not fully
-enforced.** `src/service.rs` parses v2 endpoint metadata but
-does not compare all advertised filesystem/source/target identities and
-transaction fields with the actual descriptors.
-`src/broker.rs` also fails to reconcile all ioctl-reported
-record/byte totals with the persisted stream. A malformed or mismatched custom
-kernel stream can cross the trust boundary without the intended proof.
+**C-23 — Parsed kernel stream identity proof is implemented; injected-stream
+acceptance remains.** `src/service.rs` now carries v2 endpoint/header and
+completion proof through normal and recovered manifests and compares
+filesystem/source/target identities, ctransids, root IDs, persisted bytes,
+footer counters, and ioctl counters before publication. Legacy streams remain
+explicitly proof-less. The remaining gate is kernel-backed injected-stream
+acceptance.
 
 ---
 
@@ -172,6 +172,7 @@ kernel stream can cross the trust boundary without the intended proof.
 `src/scan_facade.rs` inserts an active session and retains
 its prepared query before `src/scan.rs` sends the Begin response
 and descriptor. A failed response disconnects without aborting that inserted
-session. Expired sessions are reclaimed only while servicing a later
-Begin/Renew/Finish, and the daemon has no independent maintenance scheduler;
-an idle daemon can therefore retain the abandoned snapshot pin indefinitely.
+session. Expired sessions are now reclaimed by the independent bounded
+maintenance scheduler as well as request traffic, so an idle daemon bounds the
+leak. The response-failure path should still abort the inserted session
+immediately.

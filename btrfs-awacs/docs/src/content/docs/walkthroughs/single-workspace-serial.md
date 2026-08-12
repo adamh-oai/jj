@@ -349,9 +349,9 @@ clean path:
 - Broker snapshot creation calls filesystem-wide `syncfs`, so unrelated writes
   anywhere on the same Btrfs filesystem can delay the command
   ([P-02](/review/p0-performance/)).
-- The production daemon never invokes its available history-maintenance or
-  snapshot-garbage-collection routines, so these clean-command snapshots
-  accumulate indefinitely ([P-01](/review/p0-performance/)).
+- The production daemon now invokes bounded history maintenance and
+  receipt-fenced snapshot garbage collection, but the sustained kernel-backed
+  recovery/latency matrix is still the acceptance gate ([P-01](/review/p0-performance/)).
 
 The direct facade also redoes historical snapshot comparisons even when the
 just-published adjacent cut already contains the needed events

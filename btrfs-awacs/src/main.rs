@@ -498,15 +498,7 @@ fn automatic_scan_paths(root: &Path) -> Result<AutomaticScanPaths, String> {
         })?;
     let manager_db = env::var_os("BTRFS_AWACS_MANAGER_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let current = state_dir.join("manager.sqlite3");
-            let legacy = state_dir.join("watchman.sqlite3");
-            if !current.exists() && legacy.exists() {
-                legacy
-            } else {
-                current
-            }
-        });
+        .unwrap_or_else(|| state_dir.join("manager.sqlite3"));
     if let Some(parent) = manager_db.parent() {
         fs::DirBuilder::new()
             .recursive(true)
@@ -1188,6 +1180,12 @@ fn run_scan_server(arguments: ScanServeArgs) -> Result<(), String> {
     };
     let config = ServiceConfig::new(managed, spool, boot_id).with_broker_socket(broker_socket);
     let service = Service::new_external(store, config).map_err(|error| error.to_string())?;
+    // Keep maintenance on its own store/broker connection. Snapshot deletion
+    // can include filesystem durability work, so it must not hold the
+    // request facade mutex while a client is waiting for Begin/Renew/Finish.
+    let mut maintenance_service = service
+        .maintenance_worker()
+        .map_err(|error| format!("create AWACS maintenance worker: {error}"))?;
     let facade = std::sync::Arc::new(std::sync::Mutex::new(FacadeService::new(service)));
     let precision_marker_directory = (env::var_os("BTRFS_AWACS_PRECISION_GUARD").as_deref()
         == Some(OsStr::new("1")))
@@ -1200,6 +1198,39 @@ fn run_scan_server(arguments: ScanServeArgs) -> Result<(), String> {
         uid,
         gid,
     )));
+    std::thread::Builder::new()
+        .name("btrfs-awacs-maintenance".to_owned())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(30));
+            let now_ns = match current_time_ns() {
+                Ok(now_ns) => now_ns,
+                Err(error) => {
+                    warn!(error = %error, "skip AWACS maintenance tick");
+                    continue;
+                }
+            };
+            let started = Instant::now();
+            let result = maintenance_service.maintenance_tick(now_ns);
+            match result {
+                Ok(report) => info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    expired_query_leases = report.expired_query_leases,
+                    expired_retention_leases = report.expired_retention_leases,
+                    expired_historical_comparisons = report.expired_historical_comparisons,
+                    watches_processed = report.watches_processed,
+                    history_rows_reclaimed = report.history_rows_reclaimed,
+                    snapshots_deleted = report.snapshots_deleted,
+                    more_work = report.more_work,
+                    "AWACS maintenance tick completed"
+                ),
+                Err(error) => warn!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    error = %error,
+                    "AWACS maintenance tick failed"
+                ),
+            }
+        })
+        .map_err(|error| format!("start AWACS maintenance worker: {error}"))?;
     loop {
         let connection = listener
             .accept()

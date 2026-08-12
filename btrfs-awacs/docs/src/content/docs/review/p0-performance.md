@@ -6,12 +6,12 @@ sidebar:
 ---
 This page contains **2 P0 performance findings**. Identifiers correspond to the reviewed source specification.
 
-**P-01 — Production snapshots are never garbage-collected.**
-`src/service.rs` defines `garbage_collect` and
-`maintain_history`, but no daemon path invokes them. Every status/query creates
-a managed snapshot, and configured replay retention fields are never enforced.
-Long-lived use therefore retains snapshots, indexes, events, SQLite rows, and
-copy-on-write extents without a bound.
+**P-01 — Production retention and GC need sustained acceptance.**
+The scan daemon now starts a bounded periodic maintenance worker on a separate
+manager handle. It expires stale leases, applies retained-boundary policy,
+reclaims orphan history, and drives one-at-a-time receipt-fenced snapshot
+deletion. The remaining gate is sustained kernel-backed recovery and latency
+validation under load.
 
 ---
 

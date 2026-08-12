@@ -62,6 +62,22 @@ pub struct ChangedObjectsV2Header {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChangedObjectsV2Completion {
+    /// Number of non-completion records authenticated by the footer.
+    pub record_count: u64,
+    /// Number of bytes before the completion record, including the header.
+    pub stream_bytes: u64,
+}
+
+impl ChangedObjectsV2Completion {
+    /// Returns the complete stream length including the fixed completion
+    /// record, if it fits in a `u64`.
+    pub fn output_bytes(self) -> Option<u64> {
+        self.stream_bytes.checked_add(V2_COMPLETION_SIZE as u64)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TargetObjectMetadata {
     pub generation: u64,
     pub change_sequence: u64,
@@ -76,6 +92,7 @@ pub struct TargetObjectMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChangedObjectsV2 {
     pub header: ChangedObjectsV2Header,
+    pub completion: ChangedObjectsV2Completion,
     pub manifest: ChangedObjectsManifest,
     pub target_objects: BTreeMap<u64, TargetObjectMetadata>,
     /// Present only for objects whose relevant target xattr set was reset.
@@ -279,7 +296,7 @@ pub fn parse_changed_objects_v2(bytes: &[u8]) -> Result<ChangedObjectsV2, ParseE
     let mut boundary_deletes = BTreeSet::new();
     let mut offset = V2_HEADER_SIZE;
     let mut record_count = 0_u64;
-    let completion_offset;
+    let completion;
     loop {
         if offset + RECORD_HEADER_SIZE > bytes.len() {
             return Err(ParseError::new(
@@ -303,17 +320,21 @@ pub fn parse_changed_objects_v2(bytes: &[u8]) -> Result<ChangedObjectsV2, ParseE
             if flags != 0 || record_len != V2_COMPLETION_SIZE || end != bytes.len() {
                 return Err(ParseError::new("invalid changed-objects v2 completion"));
             }
-            completion_offset = offset;
             let declared_records = read_u64(bytes, offset + 8)?;
-            let declared_bytes = usize::try_from(read_u64(bytes, offset + 16)?)
+            let declared_stream_bytes = read_u64(bytes, offset + 16)?;
+            let declared_bytes = usize::try_from(declared_stream_bytes)
                 .map_err(|_| ParseError::new("v2 stream byte count does not fit usize"))?;
             if declared_records != record_count
-                || declared_bytes != completion_offset
+                || declared_bytes != offset
                 || read_u32(bytes, offset + 28)? != 0
-                || crc32c(&bytes[..completion_offset]) != read_u32(bytes, offset + 24)?
+                || crc32c(&bytes[..offset]) != read_u32(bytes, offset + 24)?
             {
                 return Err(ParseError::new("changed-objects v2 completion mismatch"));
             }
+            completion = ChangedObjectsV2Completion {
+                record_count: declared_records,
+                stream_bytes: declared_stream_bytes,
+            };
             break;
         }
 
@@ -500,6 +521,7 @@ pub fn parse_changed_objects_v2(bytes: &[u8]) -> Result<ChangedObjectsV2, ParseE
     }
     Ok(ChangedObjectsV2 {
         header,
+        completion,
         manifest: ChangedObjectsManifest {
             objects,
             ref_adds: raw_adds,
@@ -857,6 +879,8 @@ mod tests {
         assert_eq!(parsed.header.target_uuid, [3; 16]);
         assert!(parsed.header.boundary_records);
         assert!(parsed.header.dirty_witness);
+        assert_eq!(parsed.completion.record_count, 5);
+        assert_eq!(parsed.completion.output_bytes(), Some(bytes.len() as u64));
         assert_eq!(parsed.manifest.ref_adds.len(), 1);
         assert_eq!(parsed.target_objects.get(&300).unwrap().uid, 1000);
         assert_eq!(

@@ -5,12 +5,12 @@
 
 use crate::broker::{
     snapshot_create_effect_hash, snapshot_delete_effect_hash, snapshot_target_locator_hash,
-    ChangedObjectsExecution, EffectKind, ExpectedManagedDirectory, ExpectedSubvolume,
-    ReceiptRequest, SeqPacket, SnapshotCreateExecution, SnapshotDeleteExecution,
+    ChangedObjectsExecution, ChangedObjectsResult, EffectKind, ExpectedManagedDirectory,
+    ExpectedSubvolume, ReceiptRequest, SeqPacket, SnapshotCreateExecution, SnapshotDeleteExecution,
     MAX_CHANGED_OBJECT_OUTPUT,
 };
 use crate::broker_protocol::{decode_index, decode_objects, BrokerClient, BrokerDispatcher};
-use crate::btrfs::{OpenedSubvolume, ROOT_INODE};
+use crate::btrfs::{ChangedObjectsIoctlResult, OpenedSubvolume, ROOT_INODE};
 use crate::index::{Index, Object};
 use crate::manager::{
     CutAdmission, CutRequest, CutReservation, HistoricalChanges, HistoricalComparisonAdmission,
@@ -20,7 +20,8 @@ use crate::manager::{
 };
 use crate::manifest::{
     parse_changed_objects, parse_changed_objects_v2, ChangedObjectsManifest,
-    CHANGED_OBJECTS_V2_MAGIC, CHANGE_CREATED, CHANGE_INODE, CHANGE_XATTR,
+    ChangedObjectsV2Completion, ChangedObjectsV2Header, CHANGED_OBJECTS_V2_MAGIC, CHANGE_CREATED,
+    CHANGE_INODE, CHANGE_XATTR,
 };
 use crate::store::{decode_u64, BrokerJournal, Store};
 use crate::tree_index::{materialize_stream_object, PRIVILEGE_FSCRYPT};
@@ -43,6 +44,21 @@ struct ParsedKernelChangedObjects {
     /// absent and use the broker's bounded target-object tree search.
     target_objects: Option<BTreeMap<u64, Object>>,
     dirty_witness_contract: bool,
+    /// V2 streams must retain their endpoint/header and footer proof until
+    /// the broker-verified endpoints and ioctl completion can be compared.
+    v2_proof: Option<ParsedV2Proof>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedV2Proof {
+    header: ChangedObjectsV2Header,
+    completion: ChangedObjectsV2Completion,
+}
+
+#[derive(Debug)]
+struct StagedKernelChangedObjects {
+    parsed: ParsedKernelChangedObjects,
+    broker_result: ChangedObjectsResult,
 }
 
 struct FullIndexResult {
@@ -50,8 +66,12 @@ struct FullIndexResult {
 }
 
 const DEFAULT_LEASE_NS: i64 = 300_000_000_000;
-const MANIFEST_STAGE_TRAILER_MAGIC: &[u8; 16] = b"bsend-stage-v1\0\0";
-const MANIFEST_STAGE_TRAILER_LEN: usize = 16 + 8 + 32;
+const DEFAULT_MAINTENANCE_WATCH_LIMIT: usize = 1;
+const DEFAULT_MAINTENANCE_BOUNDARY_DELETE_LIMIT: usize = 16;
+const DEFAULT_MAINTENANCE_SNAPSHOT_DELETE_LIMIT: usize = 2;
+const MANIFEST_STAGE_TRAILER_MAGIC: &[u8; 16] = b"bsend-stage-v2\0\0";
+const MANIFEST_STAGE_TRAILER_LEN: usize = 16 + 8 + 32 + 8 + 8 + 8;
+const MANIFEST_STAGE_V2_IOCTL: u64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -70,6 +90,9 @@ pub struct ServiceConfig {
     pub fault_after_snapshot_delete: bool,
     pub replay_window_cuts: i64,
     pub replay_window_ns: i64,
+    pub maintenance_watch_limit: usize,
+    pub maintenance_boundary_delete_limit: usize,
+    pub maintenance_snapshot_delete_limit: usize,
 }
 
 impl ServiceConfig {
@@ -92,6 +115,9 @@ impl ServiceConfig {
             fault_after_snapshot_delete: false,
             replay_window_cuts: 128,
             replay_window_ns: 86_400_000_000_000,
+            maintenance_watch_limit: DEFAULT_MAINTENANCE_WATCH_LIMIT,
+            maintenance_boundary_delete_limit: DEFAULT_MAINTENANCE_BOUNDARY_DELETE_LIMIT,
+            maintenance_snapshot_delete_limit: DEFAULT_MAINTENANCE_SNAPSHOT_DELETE_LIMIT,
         }
     }
 
@@ -130,6 +156,29 @@ impl ServiceConfig {
         self.replay_window_ns = duration_ns;
         self
     }
+
+    pub fn with_maintenance_limits(
+        mut self,
+        watches: usize,
+        boundary_deletes: usize,
+        snapshot_deletes: usize,
+    ) -> Self {
+        self.maintenance_watch_limit = watches;
+        self.maintenance_boundary_delete_limit = boundary_deletes;
+        self.maintenance_snapshot_delete_limit = snapshot_deletes;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceReport {
+    pub expired_query_leases: usize,
+    pub expired_retention_leases: usize,
+    pub expired_historical_comparisons: usize,
+    pub watches_processed: usize,
+    pub history_rows_reclaimed: usize,
+    pub snapshots_deleted: usize,
+    pub more_work: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -258,6 +307,9 @@ pub struct Service {
     manager_session_id: [u8; 16],
     lease_owner: [u8; 16],
     config: ServiceConfig,
+    maintenance_after_watch: Option<[u8; 16]>,
+    last_maintenance_watches_processed: usize,
+    last_maintenance_more_watches: bool,
 }
 
 impl Service {
@@ -328,6 +380,12 @@ impl Service {
         if config.replay_window_cuts <= 0 || config.replay_window_ns <= 0 {
             return Err(ServiceError::new("invalid replay retention window"));
         }
+        if config.maintenance_watch_limit == 0
+            || config.maintenance_boundary_delete_limit == 0
+            || config.maintenance_snapshot_delete_limit == 0
+        {
+            return Err(ServiceError::new("invalid maintenance limits"));
+        }
         let manager_store_uuid = store
             .metadata()
             .map_err(|error| ServiceError::context("read manager metadata", error))?
@@ -356,6 +414,9 @@ impl Service {
             manager_session_id,
             lease_owner,
             config,
+            maintenance_after_watch: None,
+            last_maintenance_watches_processed: 0,
+            last_maintenance_more_watches: false,
         };
         let recovery_now = current_unix_time_ns()?;
         service
@@ -393,6 +454,12 @@ impl Service {
         if config.replay_window_cuts <= 0 || config.replay_window_ns <= 0 {
             return Err(ServiceError::new("invalid replay retention window"));
         }
+        if config.maintenance_watch_limit == 0
+            || config.maintenance_boundary_delete_limit == 0
+            || config.maintenance_snapshot_delete_limit == 0
+        {
+            return Err(ServiceError::new("invalid maintenance limits"));
+        }
         let socket_path = config
             .broker_socket
             .as_ref()
@@ -417,6 +484,9 @@ impl Service {
             manager_session_id,
             lease_owner,
             config,
+            maintenance_after_watch: None,
+            last_maintenance_watches_processed: 0,
+            last_maintenance_more_watches: false,
         };
         let recovery_now = current_unix_time_ns()?;
         service
@@ -675,7 +745,24 @@ impl Service {
                     },
                 );
             }
-            self.finish_cut(operation.completion)?;
+            let operation_id = operation.completion.reservation.operation_id;
+            if let Err(error) = self.finish_cut(operation.completion) {
+                // A deterministic invalid target is already fenced into a
+                // failed gap by `finish_cut`. Recovery must not make that
+                // durable terminal state into a startup loop; only continue
+                // once the failed operation row proves the transition landed.
+                if is_terminal_unpublished_cut_rejection(&error)
+                    && self.cut_operation_is_failed(operation_id)?
+                {
+                    tracing::warn!(
+                        operation_id = %hex_id(&operation_id),
+                        error = %error,
+                        "recovery terminally rejected unpublished cut"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -738,8 +825,45 @@ impl Service {
         rows.into_iter().map(decode_recovering_cut).collect()
     }
 
+    fn cut_operation_is_failed(&self, operation_id: [u8; 16]) -> Result<bool, ServiceError> {
+        let state: String = self
+            .store
+            .connection()
+            .query_row(
+                "SELECT state FROM operations WHERE id = ?1",
+                [operation_id.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| ServiceError::context("load recovered cut state", error))?;
+        Ok(state == "failed")
+    }
+
     fn recover_snapshot_delete_operations(&mut self) -> Result<(), ServiceError> {
-        for operation in self.load_recovering_snapshot_deletes()? {
+        self.recover_snapshot_delete_operations_with_limit(i64::MAX)
+            .map(|_| ())
+    }
+
+    fn recover_snapshot_delete_operations_bounded(
+        &mut self,
+        limit: usize,
+    ) -> Result<usize, ServiceError> {
+        if limit == 0 {
+            return Err(ServiceError::new(
+                "snapshot-delete recovery limit must be positive",
+            ));
+        }
+        let limit = i64::try_from(limit)
+            .map_err(|_| ServiceError::new("snapshot-delete recovery limit overflow"))?;
+        self.recover_snapshot_delete_operations_with_limit(limit)
+    }
+
+    fn recover_snapshot_delete_operations_with_limit(
+        &mut self,
+        limit: i64,
+    ) -> Result<usize, ServiceError> {
+        let operations = self.load_recovering_snapshot_deletes(limit)?;
+        let recovered = operations.len();
+        for operation in operations {
             if operation.state == "fs_started" {
                 self.execute_or_reconcile_snapshot_delete(
                     &operation.reservation,
@@ -760,11 +884,12 @@ impl Service {
                     ServiceError::context("finish recovered snapshot deletion", error)
                 })?;
         }
-        Ok(())
+        Ok(recovered)
     }
 
     fn load_recovering_snapshot_deletes(
         &self,
+        limit: i64,
     ) -> Result<Vec<RecoveringSnapshotDelete>, ServiceError> {
         let mut statement = self
             .store
@@ -775,14 +900,15 @@ impl Service {
                           s.parent_uuid, s.received_uuid, s.root_id, s.ctransid,
                           s.otransid, s.path, s.readonly, s.created_ns
                      FROM snapshot_delete_operations d
-                     JOIN snapshots s ON s.id = d.snapshot_id
-                     JOIN filesystems f ON f.id = d.filesystem_id
+                    JOIN snapshots s ON s.id = d.snapshot_id
+                    JOIN filesystems f ON f.id = d.filesystem_id
                     WHERE d.state IN ('fs_started', 'delete_durable')
-                    ORDER BY d.updated_ns, d.id"#,
+                    ORDER BY d.updated_ns, d.id
+                    LIMIT ?1"#,
             )
             .map_err(|error| ServiceError::context("prepare snapshot-delete recovery", error))?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([limit], |row| {
                 Ok(RecoveringSnapshotDeleteRow {
                     operation_id: row.get(0)?,
                     snapshot_id: row.get(1)?,
@@ -833,11 +959,10 @@ impl Service {
         Ok(self.snapshot_facade_is_enabled())
     }
 
-    pub fn query_worker(&self) -> Result<Self, ServiceError> {
-        let socket_path =
-            self.config.broker_socket.as_ref().ok_or_else(|| {
-                ServiceError::new("concurrent query workers require external broker")
-            })?;
+    fn worker_handle(&self, role: &str) -> Result<Self, ServiceError> {
+        let socket_path = self.config.broker_socket.as_ref().ok_or_else(|| {
+            ServiceError::new(format!("concurrent {role} workers require external broker"))
+        })?;
         let store = Store::open(self.store.path())
             .map_err(|error| ServiceError::context("open query-worker store", error))?;
         let socket = SeqPacket::connect(socket_path)
@@ -855,7 +980,20 @@ impl Service {
             manager_session_id: self.manager_session_id,
             lease_owner: random_id(),
             config: self.config.clone(),
+            maintenance_after_watch: None,
+            last_maintenance_watches_processed: 0,
+            last_maintenance_more_watches: false,
         })
+    }
+
+    pub fn query_worker(&self) -> Result<Self, ServiceError> {
+        self.worker_handle("query")
+    }
+
+    /// Opens a second store/broker handle in the current manager session
+    /// without running startup recovery or rotating any live leases.
+    pub fn maintenance_worker(&self) -> Result<Self, ServiceError> {
+        self.worker_handle("maintenance")
     }
 
     pub fn initialize(
@@ -1191,7 +1329,7 @@ impl Service {
             .broker
             .changed_objects(
                 &ChangedObjectsExecution {
-                    parent: source_expected,
+                    parent: source_expected.clone(),
                     target: target_expected.clone(),
                     output_owner_uid: unsafe { libc::geteuid() },
                     max_output_bytes: self.config.max_manifest_bytes,
@@ -1218,6 +1356,7 @@ impl Service {
         }
         let parsed = parse_kernel_changed_objects(&bytes)
             .map_err(|error| ServiceError::context("parse historical manifest", error))?;
+        validate_changed_objects_proof(&parsed, &source_expected, &target_expected, &comparison)?;
         require_dirty_witness_contract(parsed.dirty_witness_contract)?;
         let required: BTreeSet<_> = parsed
             .manifest
@@ -1339,8 +1478,8 @@ impl Service {
                     "injected terminal incremental comparison failure",
                 ));
             }
-            let parsed = if let Some(parsed) = staged_manifest {
-                parsed
+            let (parsed, comparison_result) = if let Some(staged) = staged_manifest {
+                (staged.parsed, staged.broker_result)
             } else {
                 let mut spool = create_private_spool(&spool_path)?;
                 let changed_objects_started = std::time::Instant::now();
@@ -1348,7 +1487,7 @@ impl Service {
                     .broker
                     .changed_objects(
                         &ChangedObjectsExecution {
-                            parent: parent_expected,
+                            parent: parent_expected.clone(),
                             target: target_expected.clone(),
                             output_owner_uid: unsafe { libc::geteuid() },
                             max_output_bytes: self.config.max_manifest_bytes,
@@ -1396,13 +1535,15 @@ impl Service {
                     target_objects = parsed.target_objects.as_ref().map_or(0, BTreeMap::len),
                     "query cut changed-object manifest parsed"
                 );
-                write_manifest_stage_trailer(
-                    &mut spool,
-                    comparison.output_bytes,
-                    comparison.manifest_hash,
-                )?;
-                parsed
+                write_manifest_stage_trailer(&mut spool, &comparison)?;
+                (parsed, comparison)
             };
+            validate_changed_objects_proof(
+                &parsed,
+                &parent_expected,
+                &target_expected,
+                &comparison_result,
+            )?;
             // V2 proves the target remains boundary-free from the accepted
             // boundary-free base using mandatory DIR_INDEX transition
             // records. Legacy kernels have no such contract, so retain the
@@ -1490,6 +1631,22 @@ impl Service {
         match incremental {
             Ok(published) => Ok(published),
             Err(error) if inject_manifest_stage_failure => Err(error),
+            Err(error) if is_terminal_unpublished_cut_rejection(&error) => {
+                if !physical_published {
+                    self.store
+                        .fail_unpublished_cut(
+                            reservation,
+                            completion.lease_owner,
+                            &recorded,
+                            &error.to_string(),
+                            completion.now_ns,
+                        )
+                        .map_err(|failure| {
+                            ServiceError::new(format!("{error}; fail unpublished cut: {failure}"))
+                        })?;
+                }
+                Err(error)
+            }
             Err(incremental_error) => {
                 let full_index = (|| -> Result<FullIndexResult, ServiceError> {
                     discard_private_spool(&spool_path)?;
@@ -1582,25 +1739,105 @@ impl Service {
         }
     }
 
+    /// Runs one bounded production-maintenance slice.
+    ///
+    /// Database work is bounded, and broker deletion I/O stays outside a
+    /// SQLite transaction behind the existing reserve/start/finish fences.
+    pub fn maintenance_tick(&mut self, now_ns: i64) -> Result<MaintenanceReport, ServiceError> {
+        let expired_query_leases = self
+            .store
+            .expire_query_leases_bounded(now_ns, self.config.maintenance_boundary_delete_limit)
+            .map_err(|error| ServiceError::context("expire query leases", error))?;
+        let expired_retention_leases = self
+            .store
+            .expire_retention_leases_bounded(now_ns, self.config.maintenance_boundary_delete_limit)
+            .map_err(|error| ServiceError::context("expire retention leases", error))?;
+        let expired_historical_comparisons = self
+            .store
+            .expire_historical_comparisons_bounded(
+                now_ns,
+                self.config.maintenance_boundary_delete_limit,
+            )
+            .map_err(|error| ServiceError::context("expire historical comparisons", error))?;
+        let retained_boundaries = self.maintain_history(now_ns)?;
+        let orphan_history_rows = self
+            .store
+            .reclaim_orphan_history_bounded(self.config.maintenance_boundary_delete_limit)
+            .map_err(|error| ServiceError::context("reclaim orphan history", error))?;
+        let history_rows_reclaimed = retained_boundaries
+            .checked_add(orphan_history_rows)
+            .ok_or_else(|| ServiceError::new("maintenance history count overflow"))?;
+        let snapshots_deleted =
+            self.collect_snapshots(now_ns, self.config.maintenance_snapshot_delete_limit)?;
+        Ok(MaintenanceReport {
+            expired_query_leases,
+            expired_retention_leases,
+            expired_historical_comparisons,
+            watches_processed: self.last_maintenance_watches_processed,
+            history_rows_reclaimed,
+            snapshots_deleted,
+            more_work: self.last_maintenance_more_watches
+                || expired_query_leases == self.config.maintenance_boundary_delete_limit
+                || expired_retention_leases == self.config.maintenance_boundary_delete_limit
+                || expired_historical_comparisons == self.config.maintenance_boundary_delete_limit
+                || history_rows_reclaimed >= self.config.maintenance_boundary_delete_limit
+                || snapshots_deleted == self.config.maintenance_snapshot_delete_limit,
+        })
+    }
+
     pub fn garbage_collect(&mut self, now_ns: i64, limit: usize) -> Result<usize, ServiceError> {
         self.store
-            .expire_retention_leases(now_ns)
+            .expire_query_leases_bounded(now_ns, limit)
+            .map_err(|error| ServiceError::context("expire query leases", error))?;
+        self.store
+            .expire_retention_leases_bounded(now_ns, limit)
             .map_err(|error| ServiceError::context("expire retention leases", error))?;
+        self.store
+            .expire_historical_comparisons_bounded(now_ns, limit)
+            .map_err(|error| ServiceError::context("expire historical comparisons", error))?;
         self.maintain_history(now_ns)?;
-        let reservations = self
-            .store
-            .reserve_unpinned_snapshot_deletes(
-                self.lease_owner,
-                now_ns,
-                lease_expiry(now_ns, self.config.lease_ns)?,
-                limit,
-            )
-            .map_err(|error| ServiceError::context("reserve snapshot GC", error))?;
-        let mut completed = 0;
-        for reservation in reservations {
-            self.store
-                .start_snapshot_delete(&reservation, self.lease_owner, now_ns)
-                .map_err(|error| ServiceError::context("start snapshot GC effect", error))?;
+        self.store
+            .reclaim_orphan_history_bounded(limit)
+            .map_err(|error| ServiceError::context("reclaim orphan history", error))?;
+        self.collect_snapshots(now_ns, limit)
+    }
+
+    fn collect_snapshots(&mut self, now_ns: i64, limit: usize) -> Result<usize, ServiceError> {
+        if limit == 0 {
+            return Err(ServiceError::new("snapshot GC limit must be positive"));
+        }
+        // Finish live post-effect rows before reserving more work. This keeps
+        // an effect failure from wedging a snapshot in deleting until process
+        // restart, while still bounding filesystem I/O per tick.
+        let mut completed = self.recover_snapshot_delete_operations_bounded(limit)?;
+        while completed < limit {
+            // Reserve one intent at a time. If this iteration fails after its
+            // effect boundary, the next tick reconciles exactly that row; no
+            // later batch members are left in planned/deleting limbo.
+            let mut reservations = self
+                .store
+                .reserve_unpinned_snapshot_deletes(
+                    self.lease_owner,
+                    now_ns,
+                    lease_expiry(now_ns, self.config.lease_ns)?,
+                    1,
+                )
+                .map_err(|error| ServiceError::context("reserve snapshot GC", error))?;
+            let Some(reservation) = reservations.pop() else {
+                break;
+            };
+            if let Err(error) =
+                self.store
+                    .start_snapshot_delete(&reservation, self.lease_owner, now_ns)
+            {
+                // No broker effect may start before this transition commits.
+                // Best-effort rollback avoids leaving a purely planned row
+                // unavailable to later GC after a local start failure.
+                let _ = self
+                    .store
+                    .cancel_planned_snapshot_delete(&reservation, self.lease_owner);
+                return Err(ServiceError::context("start snapshot GC effect", error));
+            }
             self.execute_or_reconcile_snapshot_delete(
                 &reservation,
                 self.lease_owner,
@@ -1621,34 +1858,108 @@ impl Service {
     }
 
     pub fn maintain_history(&mut self, now_ns: i64) -> Result<usize, ServiceError> {
-        let _ = now_ns;
-        let watches = {
-            let mut statement = self
-                .store
-                .connection()
-                .prepare(
-                    "SELECT id FROM watches \
-                     WHERE state IN ('active', 'blocked') ORDER BY id",
-                )
-                .map_err(|error| ServiceError::context("prepare history maintenance", error))?;
-            let rows = statement
-                .query_map([], |row| row.get::<_, Vec<u8>>(0))
-                .map_err(|error| ServiceError::context("query history maintenance", error))?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| ServiceError::context("decode history maintenance", error))?;
-            rows
-        };
+        let watches = self.next_maintenance_watches()?;
+        self.last_maintenance_watches_processed = watches.len();
         let mut reclaimed = 0_usize;
-        for watch_bytes in watches {
-            let watch_id = fixed_service_blob(&watch_bytes, "history-maintenance watch ID")?;
+        for watch_id in watches {
             reclaimed += self
                 .store
-                .retain_exponential_replay_checkpoints(watch_id, self.lease_owner)
+                .retain_exponential_replay_checkpoints(
+                    watch_id,
+                    self.lease_owner,
+                    now_ns,
+                    self.config.replay_window_cuts,
+                    self.config.replay_window_ns,
+                    self.config.maintenance_boundary_delete_limit,
+                )
                 .map_err(|error| {
                     ServiceError::context("retain exponential replay checkpoints", error)
                 })?;
         }
         Ok(reclaimed)
+    }
+
+    fn next_maintenance_watches(&mut self) -> Result<Vec<[u8; 16]>, ServiceError> {
+        let limit = i64::try_from(self.config.maintenance_watch_limit)
+            .map_err(|_| ServiceError::new("maintenance watch limit overflow"))?;
+        let total: i64 = self
+            .store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM watches WHERE state IN ('active', 'blocked')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| ServiceError::context("count maintenance watches", error))?;
+        let mut rows = if let Some(after) = self.maintenance_after_watch {
+            let mut statement = self
+                .store
+                .connection()
+                .prepare(
+                    "SELECT id FROM watches WHERE state IN ('active', 'blocked') AND id > ?1 ORDER BY id LIMIT ?2",
+                )
+                .map_err(|error| ServiceError::context("prepare maintenance watches", error))?;
+            let rows = statement
+                .query_map(rusqlite::params![after.as_slice(), limit], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .map_err(|error| ServiceError::context("query maintenance watches", error))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| ServiceError::context("decode maintenance watches", error))?;
+            rows
+        } else {
+            let mut statement = self
+                .store
+                .connection()
+                .prepare(
+                    "SELECT id FROM watches WHERE state IN ('active', 'blocked') ORDER BY id LIMIT ?1",
+                )
+                .map_err(|error| ServiceError::context("prepare maintenance watches", error))?;
+            let rows = statement
+                .query_map([limit], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(|error| ServiceError::context("query maintenance watches", error))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| ServiceError::context("decode maintenance watches", error))?;
+            rows
+        };
+        if let Some(after) = self.maintenance_after_watch {
+            if rows.len() < self.config.maintenance_watch_limit {
+                let remaining = i64::try_from(self.config.maintenance_watch_limit - rows.len())
+                    .map_err(|_| ServiceError::new("maintenance wrap limit overflow"))?;
+                let mut statement = self
+                    .store
+                    .connection()
+                    .prepare(
+                        "SELECT id FROM watches WHERE state IN ('active', 'blocked') AND id <= ?1 ORDER BY id LIMIT ?2",
+                    )
+                    .map_err(|error| {
+                        ServiceError::context("prepare wrapped maintenance watches", error)
+                    })?;
+                let wrapped = statement
+                    .query_map(rusqlite::params![after.as_slice(), remaining], |row| {
+                        row.get::<_, Vec<u8>>(0)
+                    })
+                    .map_err(|error| {
+                        ServiceError::context("query wrapped maintenance watches", error)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        ServiceError::context("decode wrapped maintenance watches", error)
+                    })?;
+                rows.extend(wrapped);
+            }
+        }
+        let watches = rows
+            .iter()
+            .map(|bytes| fixed_service_blob(bytes, "history-maintenance watch ID"))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(last) = watches.last() {
+            self.maintenance_after_watch = Some(*last);
+        }
+        self.last_maintenance_more_watches = usize::try_from(total)
+            .map(|count| count > watches.len())
+            .unwrap_or(true);
+        Ok(watches)
     }
 
     fn execute_or_reconcile_snapshot_delete(
@@ -2048,6 +2359,24 @@ fn is_nested_subvolume_rejection(error: &ServiceError) -> bool {
         .starts_with("immutable snapshot contains nested subvolume")
 }
 
+fn is_terminal_unpublished_cut_rejection(error: &ServiceError) -> bool {
+    let message = error
+        .message
+        .strip_prefix("parse changed-object manifest: ")
+        .unwrap_or(&error.message);
+    [
+        "parse changed-objects v2 stream:",
+        "changed-objects v2 ",
+        "legacy changed-object stream has a v2 ioctl completion",
+        "immutable snapshot contains nested subvolume",
+        "immutable snapshot contains fscrypt inode ",
+        "materialize v2 target object:",
+        "changed-objects stream does not advertise the dirty-witness capability",
+    ]
+    .iter()
+    .any(|prefix| message.starts_with(prefix))
+}
+
 fn reject_fscrypt_index(index: &Index) -> Result<(), ServiceError> {
     if let Some(object) = index
         .objects
@@ -2304,21 +2633,31 @@ fn current_unix_time_ns() -> Result<i64, ServiceError> {
 
 fn write_manifest_stage_trailer(
     spool: &mut File,
-    manifest_len: u64,
-    manifest_hash: [u8; 32],
+    result: &ChangedObjectsResult,
 ) -> Result<(), ServiceError> {
     let end = spool
         .seek(SeekFrom::End(0))
         .map_err(|error| ServiceError::context("seek manifest stage end", error))?;
-    if end != manifest_len {
+    if end != result.output_bytes {
         return Err(ServiceError::new(
             "manifest stage length changed before completion",
         ));
     }
+    let (flags, ioctl_bytes, ioctl_records) = match result.v2_ioctl {
+        Some(ioctl) => (
+            MANIFEST_STAGE_V2_IOCTL,
+            ioctl.output_bytes,
+            ioctl.output_records,
+        ),
+        None => (0, 0, 0),
+    };
     spool
         .write_all(MANIFEST_STAGE_TRAILER_MAGIC)
-        .and_then(|()| spool.write_all(&manifest_len.to_le_bytes()))
-        .and_then(|()| spool.write_all(&manifest_hash))
+        .and_then(|()| spool.write_all(&result.output_bytes.to_le_bytes()))
+        .and_then(|()| spool.write_all(&result.manifest_hash))
+        .and_then(|()| spool.write_all(&flags.to_le_bytes()))
+        .and_then(|()| spool.write_all(&ioctl_bytes.to_le_bytes()))
+        .and_then(|()| spool.write_all(&ioctl_records.to_le_bytes()))
         .and_then(|()| spool.sync_all())
         .map_err(|error| ServiceError::context("durably complete manifest stage", error))
 }
@@ -2326,7 +2665,7 @@ fn write_manifest_stage_trailer(
 fn load_staged_manifest(
     path: &Path,
     max_manifest_bytes: u64,
-) -> Result<Option<ParsedKernelChangedObjects>, ServiceError> {
+) -> Result<Option<StagedKernelChangedObjects>, ServiceError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2358,7 +2697,7 @@ fn load_staged_manifest(
         .take(maximum + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| ServiceError::context("read manifest stage", error))?;
-    let valid = (|| -> Option<&[u8]> {
+    let valid = (|| -> Option<(&[u8], ChangedObjectsResult)> {
         let split = bytes.len().checked_sub(MANIFEST_STAGE_TRAILER_LEN)?;
         let (manifest, trailer) = bytes.split_at(split);
         if trailer.get(..16)? != MANIFEST_STAGE_TRAILER_MAGIC {
@@ -2366,17 +2705,38 @@ fn load_staged_manifest(
         }
         let declared_len = u64::from_le_bytes(trailer.get(16..24)?.try_into().ok()?);
         let expected_hash: [u8; 32] = trailer.get(24..56)?.try_into().ok()?;
+        let flags = u64::from_le_bytes(trailer.get(56..64)?.try_into().ok()?);
+        let ioctl_bytes = u64::from_le_bytes(trailer.get(64..72)?.try_into().ok()?);
+        let ioctl_records = u64::from_le_bytes(trailer.get(72..80)?.try_into().ok()?);
         if declared_len != manifest.len() as u64 || hash_bytes(manifest) != expected_hash {
             return None;
         }
-        Some(manifest)
+        let v2_ioctl = match flags {
+            0 if ioctl_bytes == 0 && ioctl_records == 0 => None,
+            MANIFEST_STAGE_V2_IOCTL => Some(ChangedObjectsIoctlResult {
+                output_bytes: ioctl_bytes,
+                output_records: ioctl_records,
+            }),
+            _ => return None,
+        };
+        Some((
+            manifest,
+            ChangedObjectsResult {
+                output_bytes: declared_len,
+                manifest_hash: expected_hash,
+                v2_ioctl,
+            },
+        ))
     })();
-    let Some(manifest_bytes) = valid else {
+    let Some((manifest_bytes, broker_result)) = valid else {
         discard_private_spool(path)?;
         return Ok(None);
     };
     match parse_kernel_changed_objects(manifest_bytes) {
-        Ok(manifest) => Ok(Some(manifest)),
+        Ok(parsed) => Ok(Some(StagedKernelChangedObjects {
+            parsed,
+            broker_result,
+        })),
         Err(_) => {
             discard_private_spool(path)?;
             Ok(None)
@@ -2414,6 +2774,10 @@ fn parse_kernel_changed_objects(bytes: &[u8]) -> Result<ParsedKernelChangedObjec
             manifest: parsed.manifest,
             target_objects: Some(target_objects),
             dirty_witness_contract: parsed.header.dirty_witness,
+            v2_proof: Some(ParsedV2Proof {
+                header: parsed.header,
+                completion: parsed.completion,
+            }),
         })
     } else {
         parse_changed_objects(bytes)
@@ -2421,9 +2785,53 @@ fn parse_kernel_changed_objects(bytes: &[u8]) -> Result<ParsedKernelChangedObjec
                 manifest,
                 target_objects: None,
                 dirty_witness_contract: false,
+                v2_proof: None,
             })
             .map_err(|error| ServiceError::context("parse legacy changed-object stream", error))
     }
+}
+
+fn validate_changed_objects_proof(
+    parsed: &ParsedKernelChangedObjects,
+    parent: &ExpectedSubvolume,
+    target: &ExpectedSubvolume,
+    broker_result: &ChangedObjectsResult,
+) -> Result<(), ServiceError> {
+    let Some(proof) = parsed.v2_proof else {
+        if broker_result.v2_ioctl.is_some() {
+            return Err(ServiceError::new(
+                "legacy changed-object stream has a v2 ioctl completion",
+            ));
+        }
+        return Ok(());
+    };
+    let Some(ioctl) = broker_result.v2_ioctl else {
+        return Err(ServiceError::new(
+            "changed-objects v2 stream lacks a broker ioctl completion",
+        ));
+    };
+    if proof.header.fs_uuid != parent.filesystem_uuid
+        || proof.header.fs_uuid != target.filesystem_uuid
+        || proof.header.source_uuid != parent.subvolume_uuid
+        || proof.header.target_uuid != target.subvolume_uuid
+        || proof.header.source_ctransid != parent.ctransid
+        || proof.header.target_ctransid != target.ctransid
+        || proof.header.source_root_id != parent.root_id
+        || proof.header.target_root_id != target.root_id
+    {
+        return Err(ServiceError::new(
+            "changed-objects v2 endpoint header does not match broker-verified endpoints",
+        ));
+    }
+    if proof.completion.output_bytes() != Some(broker_result.output_bytes)
+        || ioctl.output_bytes != broker_result.output_bytes
+        || proof.completion.record_count != ioctl.output_records
+    {
+        return Err(ServiceError::new(
+            "changed-objects v2 completion counters do not match broker ioctl result",
+        ));
+    }
+    Ok(())
 }
 
 fn require_dirty_witness_contract(observed: bool) -> Result<(), ServiceError> {
@@ -2730,7 +3138,10 @@ impl std::error::Error for ServiceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{CHANGED_OBJECTS_MAGIC, CHANGED_OBJECTS_VERSION};
+    use crate::manifest::{
+        CHANGED_OBJECTS_MAGIC, CHANGED_OBJECTS_V2_MAGIC, CHANGED_OBJECTS_V2_VERSION,
+        CHANGED_OBJECTS_VERSION,
+    };
     use crate::store::ServiceMetadata;
     use tempfile::tempdir;
 
@@ -2777,6 +3188,32 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_tick_reports_a_bounded_idle_slice() {
+        let temp = tempdir().unwrap();
+        let managed = temp.path().join("managed");
+        let spool = temp.path().join("spool");
+        fs::create_dir(&managed).unwrap();
+        fs::create_dir(&spool).unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&spool, fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = ServiceMetadata {
+            store_uuid: [21; 16],
+            clock_hmac_key: [22; 32],
+            clock_format_version: 1,
+            last_boot_id: [23; 16],
+            created_ns: 1,
+        };
+        let store = Store::create(&temp.path().join("state.sqlite3"), &metadata).unwrap();
+        let journal = BrokerJournal::create(&temp.path().join("broker.sqlite3")).unwrap();
+        let config = ServiceConfig::new(managed, spool, [23; 16]).with_maintenance_limits(1, 1, 1);
+        let mut service = Service::new(store, journal, config).unwrap();
+        assert_eq!(
+            service.maintenance_tick(1_000).unwrap(),
+            MaintenanceReport::default()
+        );
+    }
+
+    #[test]
     fn startup_spool_sweep_removes_only_exact_private_formats() {
         let spool = tempdir().unwrap();
         for name in [
@@ -2817,11 +3254,16 @@ mod tests {
             .open(&complete_path)
             .unwrap();
         complete.write_all(&manifest).unwrap();
-        write_manifest_stage_trailer(&mut complete, manifest.len() as u64, hash_bytes(&manifest))
-            .unwrap();
+        let result = ChangedObjectsResult {
+            output_bytes: manifest.len() as u64,
+            manifest_hash: hash_bytes(&manifest),
+            v2_ioctl: None,
+        };
+        write_manifest_stage_trailer(&mut complete, &result).unwrap();
         drop(complete);
         let reused = load_staged_manifest(&complete_path, 1024).unwrap().unwrap();
-        assert!(reused.manifest.objects.is_empty());
+        assert!(reused.parsed.manifest.objects.is_empty());
+        assert!(reused.broker_result.v2_ioctl.is_none());
         assert!(complete_path.exists());
 
         let partial_path = spool
@@ -2837,6 +3279,158 @@ mod tests {
         drop(partial);
         assert!(load_staged_manifest(&partial_path, 1024).unwrap().is_none());
         assert!(!partial_path.exists());
+    }
+
+    #[test]
+    fn v2_endpoint_and_completion_proof_rejects_normal_mismatches() {
+        let bytes = empty_v2_stream();
+        let parsed = parse_kernel_changed_objects(&bytes).unwrap();
+        let parent = expected_subvolume([1; 16], [2; 16], 256, 10);
+        let target = expected_subvolume([1; 16], [3; 16], 257, 11);
+        let result = v2_result(&bytes, 0);
+        validate_changed_objects_proof(&parsed, &parent, &target, &result).unwrap();
+
+        let wrong_parent = expected_subvolume([1; 16], [9; 16], 256, 10);
+        let endpoint_error =
+            validate_changed_objects_proof(&parsed, &wrong_parent, &target, &result).unwrap_err();
+        assert!(endpoint_error.to_string().contains("endpoint header"));
+
+        let mut wrong_bytes = result.clone();
+        wrong_bytes.v2_ioctl.as_mut().unwrap().output_bytes += 1;
+        let bytes_error =
+            validate_changed_objects_proof(&parsed, &parent, &target, &wrong_bytes).unwrap_err();
+        assert!(bytes_error.to_string().contains("completion counters"));
+
+        let mut wrong_records = result;
+        wrong_records.v2_ioctl.as_mut().unwrap().output_records += 1;
+        let records_error =
+            validate_changed_objects_proof(&parsed, &parent, &target, &wrong_records).unwrap_err();
+        assert!(records_error.to_string().contains("completion counters"));
+    }
+
+    #[test]
+    fn recovered_v2_stage_keeps_ioctl_proof_and_rejects_counter_mismatch() {
+        let spool = tempdir().unwrap();
+        let path = spool
+            .path()
+            .join("manifest-0123456789abcdef0123456789abcdef-7.part");
+        let bytes = empty_v2_stream();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        let mut result = v2_result(&bytes, 0);
+        result.v2_ioctl.as_mut().unwrap().output_records = 1;
+        write_manifest_stage_trailer(&mut file, &result).unwrap();
+        drop(file);
+
+        let staged = load_staged_manifest(&path, 1024).unwrap().unwrap();
+        assert_eq!(staged.broker_result.v2_ioctl.unwrap().output_records, 1);
+        let parent = expected_subvolume([1; 16], [2; 16], 256, 10);
+        let target = expected_subvolume([1; 16], [3; 16], 257, 11);
+        let error =
+            validate_changed_objects_proof(&staged.parsed, &parent, &target, &staged.broker_result)
+                .unwrap_err();
+        assert!(error.to_string().contains("completion counters"));
+    }
+
+    #[test]
+    fn v2_proof_and_invalid_target_failures_are_terminal_before_publication() {
+        for message in [
+            "changed-objects v2 endpoint header does not match broker-verified endpoints",
+            "changed-objects v2 completion counters do not match broker ioctl result",
+            "parse changed-objects v2 stream: changed-objects v2 completion mismatch",
+            "parse changed-object manifest: changed-objects v2 endpoint header does not match broker-verified endpoints",
+            "immutable snapshot contains nested subvolume boundary parent=1 child_root=2 name=[]",
+            "immutable snapshot contains fscrypt inode 256",
+        ] {
+            assert!(
+                is_terminal_unpublished_cut_rejection(&ServiceError::new(message)),
+                "{message}"
+            );
+        }
+    }
+
+    fn expected_subvolume(
+        filesystem_uuid: [u8; 16],
+        subvolume_uuid: [u8; 16],
+        root_id: u64,
+        ctransid: u64,
+    ) -> ExpectedSubvolume {
+        ExpectedSubvolume {
+            filesystem_uuid,
+            subvolume_uuid,
+            root_id,
+            generation: 1,
+            ctransid,
+            otransid: 1,
+            parent_uuid: None,
+            received_uuid: None,
+            readonly: true,
+        }
+    }
+
+    fn v2_result(bytes: &[u8], output_records: u64) -> ChangedObjectsResult {
+        ChangedObjectsResult {
+            output_bytes: bytes.len() as u64,
+            manifest_hash: hash_bytes(bytes),
+            v2_ioctl: Some(ChangedObjectsIoctlResult {
+                output_bytes: bytes.len() as u64,
+                output_records,
+            }),
+        }
+    }
+
+    fn empty_v2_stream() -> Vec<u8> {
+        let mut bytes = CHANGED_OBJECTS_V2_MAGIC.to_vec();
+        push_u32(&mut bytes, CHANGED_OBJECTS_V2_VERSION);
+        push_u32(&mut bytes, 112);
+        push_u64(&mut bytes, (1 << 1) | (1 << 2));
+        bytes.extend_from_slice(&[1; 16]);
+        bytes.extend_from_slice(&[2; 16]);
+        bytes.extend_from_slice(&[3; 16]);
+        push_u64(&mut bytes, 10);
+        push_u64(&mut bytes, 11);
+        push_u64(&mut bytes, 256);
+        push_u64(&mut bytes, 257);
+        let stream_bytes = bytes.len() as u64;
+        let checksum = test_crc32c(&bytes);
+        bytes.extend_from_slice(&0xffff_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        push_u32(&mut bytes, 32);
+        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, stream_bytes);
+        push_u32(&mut bytes, checksum);
+        push_u32(&mut bytes, 0);
+        bytes
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn test_crc32c(bytes: &[u8]) -> u32 {
+        let mut table = [0_u32; 256];
+        for (index, entry) in table.iter_mut().enumerate() {
+            let mut value = index as u32;
+            for _ in 0..8 {
+                value = (value >> 1) ^ (0x82f6_3b78 & (0_u32.wrapping_sub(value & 1)));
+            }
+            *entry = value;
+        }
+        let mut crc = !0_u32;
+        for byte in bytes {
+            crc = table[((crc ^ u32::from(*byte)) & 0xff) as usize] ^ (crc >> 8);
+        }
+        !crc
     }
 
     #[test]
