@@ -26,6 +26,9 @@ use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
+use crate::commands::btrfs::is_btrfs_subvolume;
+use crate::commands::btrfs::is_subvolume_mode_enabled;
+use crate::commands::btrfs::set_subvolume_mode;
 use crate::ui::Ui;
 
 /// Adopt the current linked Git worktree as a jj workspace.
@@ -81,6 +84,13 @@ pub async fn cmd_workspace_adopt(
             "The linked Git worktree does not belong to the jj repository's Git backend",
         ));
     }
+    let snapshot = is_subvolume_mode_enabled(main_workspace_root);
+    if snapshot && !is_btrfs_subvolume(&worktree.root)? {
+        return Err(user_error(
+            "Cannot adopt a plain Git worktree while Btrfs subvolume mode is enabled",
+        )
+        .hinted("Adopt a linked Git worktree whose root is already a Btrfs subvolume."));
+    }
 
     let workspace_name = workspace_name(&worktree.root, args)?;
     let op = command.resolve_operation(
@@ -111,6 +121,9 @@ pub async fn cmd_workspace_adopt(
         workspace_name.clone(),
     )
     .await?;
+    if snapshot {
+        set_subvolume_mode(&worktree.root, true)?;
+    }
 
     // `init_workspace_with_existing_repo()` starts at the root commit. Replace
     // that placeholder with an empty working-copy commit on the existing Git

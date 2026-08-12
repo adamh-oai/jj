@@ -89,6 +89,26 @@ registers a distinct working-copy commit at the worktree's existing Git HEAD,
 and then snapshots any local changes without rewriting the worktree files,
 Git HEAD, or index.
 
+Run `jj util subvolume enable` in the main Git-colocated workspace to enable
+the persistent snapshot-backed working-copy mode. The command verifies that
+the checkout is on Btrfs, converts the repository root into a subvolume when
+needed, creates a nested subvolume for `.git`, and records the mode in local
+working-copy state. It also resets the local working-copy baseline so the next
+snapshot establishes state for the new topology.
+
+While that mode is enabled, `jj workspace add` creates a Btrfs snapshot of the
+current checkout automatically. This preserves already-materialized files such as
+ignored build outputs while assigning the new workspace its own `.jj` metadata.
+In a Git-colocated repo, the command also creates a new linked Git worktree
+identity without rewriting the copied files. Run `jj util subvolume disable`
+to convert the repository and `.git` back to ordinary directories.
+
+`jj workspace adopt` can also attach an existing linked Git worktree while
+subvolume mode is enabled, but only if that worktree root is already a Btrfs
+subvolume. Adoption records the inherited files as the initial snapshot
+baseline without rewriting them; it rejects a plain directory rather than
+silently creating a non-snapshot-backed workspace.
+
 Having multiple workspaces can be useful for running long-running tests in one
 while you continue developing in another, for example. If needed,
 `jj workspace root --name <workspace>` prints the root path of the specified
@@ -96,8 +116,16 @@ workspace (defaults to the current one).
 
 `jj workspace list` shows every workspace together with its available root path.
 
-When you're done using a workspace, use `jj workspace forget` to make the repo
-forget about it. The files can be deleted from disk separately (either before or
+Use `jj workspace remove <name>` to forget a workspace and remove its files
+from disk. Subvolume targets use `btrfs subvolume delete`; ordinary directories
+use regular directory removal. Unprivileged subvolume deletion requires the
+Btrfs filesystem to be mounted with `user_subvol_rm_allowed`. If deletion
+fails, the workspace is still forgotten and `jj` prints a
+`sudo btrfs subvolume delete` command for manually removing the remaining
+subvolume.
+
+Use `jj workspace forget` when you only want to make the repo forget about a
+workspace. The files can be deleted from disk separately (either before or
 after).
 
 ## Stale working copy

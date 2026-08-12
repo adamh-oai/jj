@@ -131,6 +131,17 @@ impl SimpleWorkspaceStore {
         Ok(FileLock::lock(self.lock_file.clone())?)
     }
 
+    /// Acquires the repository-wide workspace lifecycle lock.
+    ///
+    /// Workspace commands hold this separate lock across filesystem effects,
+    /// workspace-store updates, and repo transaction publication. The normal
+    /// index lock remains available to the individual store operations while
+    /// the broader lifecycle transition is serialized.
+    pub fn lock_lifecycle(&self) -> Result<FileLock, WorkspaceStoreError> {
+        let lock_file = self.lock_file.with_file_name("lifecycle.lock");
+        Ok(FileLock::lock(lock_file).map_err(SimpleWorkspaceStoreError::Lock)?)
+    }
+
     fn read_store(&self) -> Result<simple_workspace_store::Workspaces, SimpleWorkspaceStoreError> {
         let workspace_data = fs::read(&self.store_file).context(&self.store_file)?;
 
