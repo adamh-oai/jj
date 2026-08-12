@@ -23,6 +23,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::iter;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -1803,15 +1804,36 @@ impl GitResetHeadError {
     }
 }
 
-/// Sets Git HEAD to the parent of the given working-copy commit and resets
-/// the Git index.
-pub async fn reset_head(
+fn open_git_repo_with_dir(
+    settings: &UserSettings,
+    git_dir: &Path,
+) -> Result<gix::Repository, GitResetHeadError> {
+    // Match options used by the backend when opening a repository.
+    let opts = gix::open::Options::default()
+        // The git_dir path should point the repository, not the working directory.
+        .open_path_as_is(true)
+        // Gitoxide recommends this when correctness is preferred
+        .strict_config(true)
+        .config_overrides([
+            // Committer has to be configured to record reflog. Author isn't
+            // needed, but let's copy the same values.
+            format!("author.name={}", settings.user_name()),
+            format!("author.email={}", settings.user_email()),
+            format!("committer.name={}", settings.user_name()),
+            format!("committer.email={}", settings.user_email()),
+        ]);
+    gix::ThreadSafeRepository::open_opts(git_dir, opts)
+        .map(|repo| repo.to_thread_local())
+        .map_err(|err| GitResetHeadError::Git(Box::new(err)))
+}
+
+async fn reset_head_impl(
     mut_repo: &mut MutableRepo,
     workspace: &WorkspaceName,
     wc_commit: &Commit,
+    git_repo: gix::Repository,
+    should_update_git_head: bool,
 ) -> Result<(), GitResetHeadError> {
-    let git_repo = get_git_repo(mut_repo.store())?;
-
     let first_parent_id = &wc_commit.parent_ids()[0];
     let new_head_target = if first_parent_id != mut_repo.store().root_commit_id() {
         RefTarget::normal(first_parent_id.clone())
@@ -1819,10 +1841,18 @@ pub async fn reset_head(
         RefTarget::absent()
     };
 
-    // If the first parent of the working copy has changed, reset the Git HEAD.
-    let old_head_target = mut_repo.git_head(workspace);
-    if *old_head_target != new_head_target {
-        let expected_ref = if let Some(id) = old_head_target.as_normal() {
+    let old_head_target = if should_update_git_head {
+        mut_repo.git_head(workspace).clone()
+    } else {
+        RefTarget::absent()
+    };
+    let repo_head_target = git_repo
+        .head_id()
+        .ok()
+        .map(|oid| RefTarget::normal(CommitId::from_bytes(oid.as_bytes())))
+        .unwrap_or_else(RefTarget::absent);
+    let expected_ref = match old_head_target.as_normal() {
+        Some(id) => {
             // We have to check the actual HEAD state because we don't record a
             // symbolic ref as such.
             let actual_head = git_repo.head().map_err(GitResetHeadError::from_git)?;
@@ -1834,14 +1864,16 @@ pub async fn reset_head(
                 // maybe we can test the target ref by issuing noop edit.
                 gix::refs::transaction::PreviousValue::MustExist
             }
-        } else {
-            // Just overwrite if unborn (or conflict), which is also unusual.
-            gix::refs::transaction::PreviousValue::MustExist
-        };
+        }
+        None => gix::refs::transaction::PreviousValue::Any,
+    };
+    if repo_head_target != new_head_target {
         let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
         update_git_head(&git_repo, expected_ref, new_oid)
             .map_err(|err| GitResetHeadError::UpdateHeadRef(err.into()))?;
-        mut_repo.set_git_head_target(workspace, new_head_target);
+        if should_update_git_head {
+            mut_repo.set_git_head_target(workspace, new_head_target);
+        }
     }
 
     // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
@@ -1851,6 +1883,41 @@ pub async fn reset_head(
     }
 
     reset_index(mut_repo, &git_repo, wc_commit).await
+}
+
+/// Sets Git HEAD to the parent of the given working-copy commit and resets
+/// the Git index.
+pub async fn reset_head(
+    mut_repo: &mut MutableRepo,
+    workspace: &WorkspaceName,
+    wc_commit: &Commit,
+) -> Result<(), GitResetHeadError> {
+    let git_repo = get_git_repo(mut_repo.store())?;
+
+    reset_head_impl(mut_repo, workspace, wc_commit, git_repo, true).await
+}
+
+/// Resets HEAD and index using the Git worktree located at `git_dir`.
+///
+/// If `update_git_head` is false, the repo view will not be updated, which is
+/// useful for linked worktrees that should not overwrite the main worktree's
+/// cached HEAD target.
+pub async fn reset_head_in_git_dir(
+    mut_repo: &mut MutableRepo,
+    workspace: &WorkspaceName,
+    wc_commit: &Commit,
+    git_dir: &Path,
+    should_update_git_head: bool,
+) -> Result<(), GitResetHeadError> {
+    let git_repo = open_git_repo_with_dir(mut_repo.base_repo().settings(), git_dir)?;
+    reset_head_impl(
+        mut_repo,
+        workspace,
+        wc_commit,
+        git_repo,
+        should_update_git_head,
+    )
+    .await
 }
 
 // TODO: Polish and upstream this to `gix`.

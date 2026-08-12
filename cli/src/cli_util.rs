@@ -611,6 +611,27 @@ impl CommandHelper {
     pub fn get_working_copy_factory(&self) -> Result<&dyn WorkingCopyFactory, CommandError> {
         let loader = self.workspace_loader()?;
 
+        self.get_working_copy_factory_from_loader(loader)
+    }
+
+    /// Returns the working-copy factory used by an existing workspace at
+    /// `workspace_root`.
+    ///
+    /// This is useful for commands which initialize a new workspace from
+    /// outside any existing jj workspace, such as adopting an existing Git
+    /// worktree.
+    pub fn get_working_copy_factory_at(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<&dyn WorkingCopyFactory, CommandError> {
+        let loader = self.new_workspace_loader_at(workspace_root)?;
+        self.get_working_copy_factory_from_loader(loader.as_ref())
+    }
+
+    fn get_working_copy_factory_from_loader(
+        &self,
+        loader: &dyn WorkspaceLoader,
+    ) -> Result<&dyn WorkingCopyFactory, CommandError> {
         // We convert StoreLoadError -> WorkspaceLoadError -> CommandError
         let factory: Result<_, WorkspaceLoadError> =
             get_working_copy_factory(loader, &self.data.working_copy_factories)
@@ -708,9 +729,9 @@ impl CommandHelper {
                 #[cfg_attr(not(feature = "git"), expect(unused_mut))]
                 let mut repo = workspace_command.repo().clone();
                 #[cfg(feature = "git")]
-                let colocated = workspace_command.working_copy_shared_with_git();
-                #[cfg(feature = "git")]
                 let workspace_name = workspace_command.workspace_name().to_owned();
+                #[cfg(feature = "git")]
+                let git_workspace = workspace_command.env.git_workspace.clone();
 
                 let (mut locked_ws, desired_wc_commit) = workspace_command
                     .unchecked_start_working_copy_mutation()
@@ -733,7 +754,9 @@ impl CommandHelper {
                     | WorkingCopyFreshness::SiblingOperation => {
                         // Reset Git HEAD first if the repo is colocated
                         #[cfg(feature = "git")]
-                        if colocated && self.should_commit_transaction() {
+                        if let Some(git_workspace) = git_workspace.as_ref()
+                            && self.should_commit_transaction()
+                        {
                             let mut tx =
                                 start_repo_transaction(&repo, &workspace_name, self.string_args());
                             try_reset_git_head(
@@ -741,6 +764,7 @@ impl CommandHelper {
                                 tx.repo_mut(),
                                 &workspace_name,
                                 &desired_wc_commit,
+                                git_workspace,
                                 git_import_export_lock,
                             )
                             .await?;
@@ -986,6 +1010,12 @@ fn load_advance_bookmarks_matcher(
 }
 
 /// Metadata and configuration loaded for a specific workspace.
+#[derive(Clone, Debug)]
+struct GitWorkspace {
+    git_dir: PathBuf,
+    update_git_head: bool,
+}
+
 pub struct WorkspaceCommandEnvironment {
     command: CommandHelper,
     settings: UserSettings,
@@ -994,7 +1024,7 @@ pub struct WorkspaceCommandEnvironment {
     template_aliases_map: TemplateAliasesMap,
     default_ignored_remote: Option<&'static RemoteName>,
     path_converter: RepoPathUiConverter,
-    working_copy_shared_with_git: bool,
+    git_workspace: Option<GitWorkspace>,
     workspace_name: WorkspaceNameBuf,
     immutable_heads_expression: Arc<UserRevsetExpression>,
     short_prefixes_expression: Option<Arc<UserRevsetExpression>>,
@@ -1014,9 +1044,18 @@ impl WorkspaceCommandEnvironment {
             base: workspace.workspace_root().to_owned(),
         };
         #[cfg(feature = "git")]
-        let working_copy_shared_with_git = crate::git_util::is_colocated_git_workspace(workspace);
+        let git_workspace = crate::git_util::workspace_git_dir(workspace).and_then(|git_dir| {
+            let git_backend = jj_lib::git::get_git_backend(workspace.repo_loader().store()).ok()?;
+            let update_git_head = dunce::canonicalize(git_backend.git_repo_path())
+                .ok()
+                .is_some_and(|repo_git_dir| repo_git_dir == git_dir);
+            Some(GitWorkspace {
+                git_dir,
+                update_git_head,
+            })
+        });
         #[cfg(not(feature = "git"))]
-        let working_copy_shared_with_git = false;
+        let git_workspace = None;
         let mut env = Self {
             command: command.clone(),
             settings: settings.clone(),
@@ -1025,7 +1064,7 @@ impl WorkspaceCommandEnvironment {
             template_aliases_map,
             default_ignored_remote,
             path_converter,
-            working_copy_shared_with_git,
+            git_workspace,
             workspace_name: workspace.workspace_name().to_owned(),
             immutable_heads_expression: RevsetExpression::root(),
             short_prefixes_expression: None,
@@ -1033,6 +1072,16 @@ impl WorkspaceCommandEnvironment {
         };
         env.reload_revset_expressions(ui)?;
         Ok(env)
+    }
+
+    fn syncs_git_refs_automatically(&self) -> bool {
+        self.git_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.update_git_head)
+    }
+
+    fn working_copy_shared_with_git(&self) -> bool {
+        self.git_workspace.is_some()
     }
 
     pub(crate) fn path_converter(&self) -> &RepoPathUiConverter {
@@ -1054,7 +1103,7 @@ impl WorkspaceCommandEnvironment {
         &self,
         workspace: &Workspace,
     ) -> Result<GitImportExportLock, CommandError> {
-        let lock = if self.working_copy_shared_with_git {
+        let lock = if self.syncs_git_refs_automatically() {
             let lock_path = workspace.repo_path().join("git_import_export.lock");
             Some(FileLock::lock(lock_path).map_err(|err| {
                 user_error_with_message("Failed to take lock for Git import/export", err)
@@ -1372,7 +1421,7 @@ impl WorkspaceCommandHelper {
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
         #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git {
+        if self.env.syncs_git_refs_automatically() {
             self.import_git_head(ui, git_import_export_lock)
                 .await
                 .map_err(snapshot_command_error)?;
@@ -1387,7 +1436,7 @@ impl WorkspaceCommandHelper {
 
         // import_git_refs() can rebase the working-copy commit.
         #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git {
+        if self.env.syncs_git_refs_automatically() {
             self.import_git_refs(ui, git_import_export_lock)
                 .await
                 .map_err(snapshot_command_error)?;
@@ -1626,7 +1675,7 @@ to the current parents may contain changes from multiple commits.
     }
 
     pub fn working_copy_shared_with_git(&self) -> bool {
-        self.env.working_copy_shared_with_git
+        self.env.working_copy_shared_with_git()
     }
 
     pub fn format_file_path(&self, file: &RepoPath) -> String {
@@ -2222,7 +2271,9 @@ to the current parents may contain changes from multiple commits.
             }
 
             #[cfg(feature = "git")]
-            if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction()
+            if let Some(git_workspace) = &self.env.git_workspace
+                && git_workspace.update_git_head
+                && self.env.command.should_commit_transaction()
             {
                 if wc_immutable {
                     // New working-copy commit is created on top. Reset Git HEAD and index.
@@ -2231,6 +2282,7 @@ to the current parents may contain changes from multiple commits.
                         mut_repo,
                         &workspace_name,
                         &new_wc_commit,
+                        git_workspace,
                         git_import_export_lock,
                     )
                     .await
@@ -2269,7 +2321,7 @@ to the current parents may contain changes from multiple commits.
         }
 
         #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git
+        if self.env.working_copy_shared_with_git()
             && let Ok(resolved_tree) = new_tree
                 .trees()
                 .await
@@ -2422,19 +2474,24 @@ to the current parents may contain changes from multiple commits.
         };
 
         #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
+        if let Some(git_workspace) = &self.env.git_workspace
+            && self.env.command.should_commit_transaction()
+        {
             if let Some(wc_commit) = &maybe_new_wc_commit {
                 try_reset_git_head(
                     ui,
                     tx.repo_mut(),
                     self.workspace_name(),
                     wc_commit,
+                    git_workspace,
                     git_import_export_lock,
                 )
                 .await?;
             }
-            let stats = jj_lib::git::export_refs(tx.repo_mut())?;
-            crate::git_util::print_git_export_stats(ui, &stats)?;
+            if self.env.syncs_git_refs_automatically() {
+                let stats = jj_lib::git::export_refs(tx.repo_mut())?;
+                crate::git_util::print_git_export_stats(ui, &stats)?;
+            }
         }
 
         self.user_repo = ReadonlyUserRepo::new(
@@ -2758,6 +2815,7 @@ async fn try_reset_git_head(
     mut_repo: &mut MutableRepo,
     workspace_name: &WorkspaceName,
     wc_commit: &Commit,
+    git_workspace: &GitWorkspace,
     _git_import_export_lock: &GitImportExportLock,
 ) -> Result<(), CommandError> {
     use std::error::Error as _;
@@ -2767,7 +2825,15 @@ async fn try_reset_git_head(
     // This can still fail if HEAD was updated concurrently by another JJ process
     // (overlapping transaction) or a non-JJ process (e.g., git checkout). In that
     // case, the actual state will be imported on the next snapshot.
-    match jj_lib::git::reset_head(mut_repo, workspace_name, wc_commit).await {
+    match jj_lib::git::reset_head_in_git_dir(
+        mut_repo,
+        workspace_name,
+        wc_commit,
+        &git_workspace.git_dir,
+        git_workspace.update_git_head,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(err @ jj_lib::git::GitResetHeadError::UpdateHeadRef(_)) => {
             writeln!(ui.warning_default(), "{err}")?;
