@@ -1,5 +1,4 @@
 use crate::btrfs::SubvolumeInfo;
-use crate::compat::project_events;
 use crate::index::{
     apply_manifest, apply_manifest_to_trusted_checkpoint, object_security_digest,
     object_state_digest, reference_state_digest, xor_digest, Event, EventKind, Index, Object,
@@ -19,10 +18,9 @@ use uuid::Uuid;
 
 pub const PERMISSION_READ: u8 = 0x01;
 pub const PERMISSION_CUT: u8 = 0x02;
-pub const PERMISSION_TRIGGER: u8 = 0x08;
 pub const PERMISSION_RETAIN: u8 = 0x10;
 pub const PERMISSION_ADMIN: u8 = 0x20;
-pub const PERMISSION_MASK: u8 = 0x3b;
+pub const PERMISSION_MASK: u8 = 0x33;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Permissions(u8);
@@ -285,16 +283,6 @@ pub struct QueryLeaseReservation {
     pub lease_fence: i64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TriggerRun {
-    pub watch_id: [u8; 16],
-    pub authorization_id: [u8; 16],
-    pub through_sequence: i64,
-    pub run_owner: [u8; 16],
-    pub run_fence: i64,
-    pub command_argv: Vec<u8>,
-}
-
 type WatchGrantIds = ([u8; 16], [u8; 16]);
 type EncodedMutationHint<'a> = (&'a str, Option<&'a [u8]>, Option<[u8; 8]>, Option<[u8; 8]>);
 type GuardBoundaryRow = (i64, Vec<u8>, String, Option<Vec<u8>>, Option<i64>);
@@ -303,7 +291,6 @@ type GuardBoundaryRow = (i64, Vec<u8>, String, Option<Vec<u8>>, Option<i64>);
 pub struct RecoveryReport {
     pub invalidated_facades: usize,
     pub released_queries: usize,
-    pub reclaimed_trigger_runs: usize,
     pub abandoned_historical_comparisons: usize,
     pub boot_changed: bool,
 }
@@ -690,12 +677,6 @@ impl Store {
              WHERE state = 'active'",
             [],
         )?;
-        let reclaimed_trigger_runs = transaction.execute(
-            "UPDATE watchman_triggers \
-                SET run_owner = NULL, run_expires_ns = NULL, run_fence = run_fence + 1 \
-              WHERE run_owner IS NOT NULL",
-            [],
-        )?;
         // These read-only jobs are owned by one manager process.  A restart
         // invalidates their publication fence, but their endpoint pins must
         // also be released so that they cannot leak retained snapshots.
@@ -760,321 +741,9 @@ impl Store {
             invalidated_facades: watch_ids.len(),
             released_queries: usize::try_from(active_queries)
                 .map_err(|_| ManagerError::new("active query count overflow"))?,
-            reclaimed_trigger_runs,
             abandoned_historical_comparisons,
             boot_changed: previous_boot_id != current_boot_id,
         })
-    }
-
-    pub fn register_fixed_jj_trigger(
-        &mut self,
-        watch_id: [u8; 16],
-        authorization_id: [u8; 16],
-        command_argv: &[u8],
-    ) -> Result<bool, ManagerError> {
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let indexed_sequence: Option<i64> = transaction
-            .query_row(
-                r#"SELECT w.indexed_seq
-                     FROM watches w JOIN watch_grants g ON g.watch_id = w.id
-                    WHERE w.id = ?1 AND w.state = 'active'
-                      AND g.id = ?2 AND g.state = 'active'
-                      AND (g.permissions & ?3) = ?3"#,
-                params![
-                    watch_id.as_slice(),
-                    authorization_id.as_slice(),
-                    i64::from(PERMISSION_READ | PERMISSION_CUT | PERMISSION_TRIGGER),
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let indexed_sequence = indexed_sequence
-            .ok_or_else(|| ManagerError::new("trigger authorization is not active"))?;
-        let existed: Option<i64> = transaction
-            .query_row(
-                "SELECT 1 FROM watchman_triggers \
-                 WHERE watch_id = ?1 AND owner_grant_id = ?2 \
-                   AND name = 'jj-background-monitor'",
-                params![watch_id.as_slice(), authorization_id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        transaction.execute(
-            r#"INSERT INTO watchman_triggers(
-                   watch_id, name, owner_grant_id, command_kind, command_argv,
-                   expression_kind, state, last_evaluated_seq,
-                   pending_through_seq, run_owner, run_fence, run_expires_ns
-               ) VALUES (?1, 'jj-background-monitor', ?2, 'argv-v1', ?4,
-                         'exclude-git-jj-v1', 'active', NULL, ?3, NULL, 0, NULL)
-               ON CONFLICT(watch_id, owner_grant_id, name) DO UPDATE SET
-                   command_kind = excluded.command_kind,
-                   command_argv = excluded.command_argv,
-                   expression_kind = excluded.expression_kind,
-                   state = 'active',
-                   pending_through_seq = MAX(
-                       COALESCE(watchman_triggers.pending_through_seq, ?3), ?3
-                   )"#,
-            params![
-                watch_id.as_slice(),
-                authorization_id.as_slice(),
-                indexed_sequence,
-                command_argv,
-            ],
-        )?;
-        transaction.commit()?;
-        Ok(existed == Some(1))
-    }
-
-    pub fn has_fixed_jj_trigger(
-        &self,
-        watch_id: [u8; 16],
-        authorization_id: [u8; 16],
-    ) -> Result<bool, ManagerError> {
-        let present: Option<i64> = self
-            .connection()
-            .query_row(
-                r#"SELECT 1 FROM watchman_triggers t
-                    JOIN watch_grants g
-                      ON g.id = t.owner_grant_id AND g.watch_id = t.watch_id
-                   WHERE t.watch_id = ?1 AND t.owner_grant_id = ?2
-                     AND t.name = 'jj-background-monitor'
-                     AND t.state = 'active' AND g.state = 'active'"#,
-                params![watch_id.as_slice(), authorization_id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(present == Some(1))
-    }
-
-    pub fn active_fixed_jj_trigger_watches(
-        &self,
-        requester_uid: u32,
-    ) -> Result<Vec<[u8; 16]>, ManagerError> {
-        let mut statement = self.connection().prepare(
-            r#"SELECT DISTINCT t.watch_id
-                 FROM watchman_triggers t
-                 JOIN watches w ON w.id = t.watch_id
-                 JOIN watch_grants g
-                   ON g.id = t.owner_grant_id AND g.watch_id = t.watch_id
-                WHERE t.name = 'jj-background-monitor' AND t.state = 'active'
-                  AND w.state = 'active'
-                  AND w.fsmonitor_owner_grant_id = t.owner_grant_id
-                  AND w.fsmonitor_state IN ('snapshot_only', 'guard_arming',
-                                            'guard_active', 'guard_gapped')
-                  AND g.state = 'active' AND g.principal_kind = 'uid'
-                  AND g.principal_id = ?1
-                ORDER BY t.watch_id"#,
-        )?;
-        let principal = encode_u64(u64::from(requester_uid));
-        let rows = statement
-            .query_map([principal.as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|row| {
-                row?.try_into()
-                    .map_err(|_| ManagerError::new("trigger watch ID has invalid length"))
-            })
-            .collect();
-        rows
-    }
-
-    pub fn delete_fixed_jj_trigger(
-        &mut self,
-        watch_id: [u8; 16],
-        authorization_id: [u8; 16],
-    ) -> Result<bool, ManagerError> {
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let authorized: Option<i64> = transaction
-            .query_row(
-                "SELECT 1 FROM watch_grants WHERE id = ?1 AND watch_id = ?2 AND state = 'active'",
-                params![authorization_id.as_slice(), watch_id.as_slice()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if authorized != Some(1) {
-            return Err(ManagerError::new("trigger authorization is not active"));
-        }
-        let deleted = transaction.execute(
-            "DELETE FROM watchman_triggers \
-             WHERE watch_id = ?1 AND owner_grant_id = ?2 \
-               AND name = 'jj-background-monitor'",
-            params![watch_id.as_slice(), authorization_id.as_slice()],
-        )?;
-        transaction.commit()?;
-        Ok(deleted == 1)
-    }
-
-    pub fn claim_fixed_jj_trigger(
-        &mut self,
-        run_owner: [u8; 16],
-        now_ns: i64,
-        run_expires_ns: i64,
-    ) -> Result<Option<TriggerRun>, ManagerError> {
-        if run_expires_ns <= now_ns {
-            return Err(ManagerError::new(
-                "trigger run expiry must follow its claim time",
-            ));
-        }
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let candidate: Option<(Vec<u8>, Vec<u8>, i64, i64, Vec<u8>)> = transaction
-            .query_row(
-                r#"SELECT t.watch_id, t.owner_grant_id, t.pending_through_seq,
-                          t.run_fence, t.command_argv
-                     FROM watchman_triggers t
-                     JOIN watches w ON w.id = t.watch_id
-                     JOIN watch_grants g
-                       ON g.id = t.owner_grant_id AND g.watch_id = t.watch_id
-                    WHERE t.state = 'active' AND w.state = 'active'
-                      AND g.state = 'active'
-                      AND t.pending_through_seq IS NOT NULL
-                      AND (t.last_evaluated_seq IS NULL
-                           OR t.pending_through_seq > t.last_evaluated_seq)
-                      AND (t.run_owner IS NULL OR t.run_expires_ns <= ?1)
-                    ORDER BY t.run_fence, COALESCE(t.run_expires_ns, 0), t.watch_id
-                    LIMIT 1"#,
-                [now_ns],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((watch_id, authorization_id, through_sequence, old_fence, command_argv)) =
-            candidate
-        else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        let watch_id: [u8; 16] = watch_id
-            .try_into()
-            .map_err(|_| ManagerError::new("trigger watch ID has invalid length"))?;
-        let authorization_id: [u8; 16] = authorization_id
-            .try_into()
-            .map_err(|_| ManagerError::new("trigger grant ID has invalid length"))?;
-        let run_fence = old_fence
-            .checked_add(1)
-            .ok_or_else(|| ManagerError::new("trigger run fence overflow"))?;
-        require_one(
-            transaction.execute(
-                r#"UPDATE watchman_triggers
-                      SET run_owner = ?3, run_fence = ?4, run_expires_ns = ?5
-                    WHERE watch_id = ?1 AND owner_grant_id = ?2
-                      AND name = 'jj-background-monitor' AND state = 'active'
-                      AND run_fence = ?6
-                      AND (run_owner IS NULL OR run_expires_ns <= ?7)"#,
-                params![
-                    watch_id.as_slice(),
-                    authorization_id.as_slice(),
-                    run_owner.as_slice(),
-                    run_fence,
-                    run_expires_ns,
-                    old_fence,
-                    now_ns,
-                ],
-            )?,
-            "claim jj trigger run",
-        )?;
-        transaction.commit()?;
-        Ok(Some(TriggerRun {
-            watch_id,
-            authorization_id,
-            through_sequence,
-            run_owner,
-            run_fence,
-            command_argv,
-        }))
-    }
-
-    pub fn finish_fixed_jj_trigger(
-        &mut self,
-        run: &TriggerRun,
-        succeeded: bool,
-    ) -> Result<(), ManagerError> {
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let updated = if succeeded {
-            transaction.execute(
-                r#"UPDATE watchman_triggers
-                      SET last_evaluated_seq = MAX(
-                              COALESCE(last_evaluated_seq, ?6), ?6
-                          ),
-                          run_owner = NULL, run_expires_ns = NULL
-                    WHERE watch_id = ?1 AND owner_grant_id = ?2
-                      AND name = 'jj-background-monitor' AND state = 'active'
-                      AND run_owner = ?3 AND run_fence = ?4
-                      AND pending_through_seq >= ?5"#,
-                params![
-                    run.watch_id.as_slice(),
-                    run.authorization_id.as_slice(),
-                    run.run_owner.as_slice(),
-                    run.run_fence,
-                    run.through_sequence,
-                    run.through_sequence,
-                ],
-            )?
-        } else {
-            transaction.execute(
-                r#"UPDATE watchman_triggers
-                      SET run_owner = NULL, run_expires_ns = NULL
-                    WHERE watch_id = ?1 AND owner_grant_id = ?2
-                      AND name = 'jj-background-monitor' AND state = 'active'
-                      AND run_owner = ?3 AND run_fence = ?4"#,
-                params![
-                    run.watch_id.as_slice(),
-                    run.authorization_id.as_slice(),
-                    run.run_owner.as_slice(),
-                    run.run_fence,
-                ],
-            )?
-        };
-        require_one(updated, "finish jj trigger run")?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn fixed_jj_trigger_root(
-        &self,
-        run: &TriggerRun,
-        requester_uid: u32,
-    ) -> Result<Vec<u8>, ManagerError> {
-        let root: Option<Vec<u8>> = self
-            .connection()
-            .query_row(
-                r#"SELECT w.fsmonitor_root
-                     FROM watchman_triggers t
-                     JOIN watches w ON w.id = t.watch_id
-                     JOIN watch_grants g
-                       ON g.id = t.owner_grant_id AND g.watch_id = t.watch_id
-                    WHERE t.watch_id = ?1 AND t.owner_grant_id = ?2
-                      AND t.name = 'jj-background-monitor' AND t.state = 'active'
-                      AND t.run_owner = ?3 AND t.run_fence = ?4
-                      AND w.state = 'active'
-                      AND w.fsmonitor_owner_grant_id = t.owner_grant_id
-                      AND w.fsmonitor_state IN ('snapshot_only', 'guard_arming',
-                                                'guard_active', 'guard_gapped')
-                      AND g.state = 'active' AND g.principal_kind = 'uid'
-                      AND g.principal_id = ?5"#,
-                params![
-                    run.watch_id.as_slice(),
-                    run.authorization_id.as_slice(),
-                    run.run_owner.as_slice(),
-                    run.run_fence,
-                    encode_u64(u64::from(requester_uid)).as_slice(),
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        root.ok_or_else(|| ManagerError::new("trigger run view or authorization is stale"))
     }
 
     pub fn invalidate_snapshot_facade(
@@ -1245,10 +914,6 @@ impl Store {
         transaction.execute(
             "UPDATE retention_leases SET state = 'revoked', lease_fence = lease_fence + 1 \
              WHERE watch_id = ?1 AND authorization_id = ?2 AND state = 'active'",
-            params![watch_id.as_slice(), authorization_id.as_slice()],
-        )?;
-        transaction.execute(
-            "DELETE FROM watchman_triggers WHERE watch_id = ?1 AND owner_grant_id = ?2",
             params![watch_id.as_slice(), authorization_id.as_slice()],
         )?;
         require_one(
@@ -2368,7 +2033,7 @@ impl Store {
         now_ns: i64,
         expires_ns: i64,
     ) -> Result<Option<CutAdmission>, ManagerError> {
-        if !matches!(request_kind, "clock" | "query" | "trigger") || expires_ns <= now_ns {
+        if !matches!(request_kind, "clock" | "query") || expires_ns <= now_ns {
             return Err(ManagerError::new("invalid cut admission"));
         }
         let transaction = self
@@ -3042,17 +2707,6 @@ impl Store {
                 reservation.watch_id.as_slice(),
             ],
         )?;
-        let trigger_projection = project_events(&applied.events);
-        if trigger_projection.fresh_instance || !trigger_projection.paths.is_empty() {
-            transaction.execute(
-                r#"UPDATE watchman_triggers
-                      SET pending_through_seq = MAX(
-                              COALESCE(pending_through_seq, ?2), ?2
-                          )
-                    WHERE watch_id = ?1 AND state = 'active'"#,
-                params![reservation.watch_id.as_slice(), reservation.sequence],
-            )?;
-        }
         transaction.commit()?;
         // Publication is already durable; failure to reclaim connection-local
         // staging must not turn a committed cut into an apparent failure. The
@@ -3455,12 +3109,6 @@ impl Store {
                 reservation.operation_id.as_slice(),
                 reservation.watch_id.as_slice()
             ],
-        )?;
-        transaction.execute(
-            r#"UPDATE watchman_triggers
-                  SET pending_through_seq = MAX(COALESCE(pending_through_seq, ?2), ?2)
-                WHERE watch_id = ?1 AND state = 'active'"#,
-            params![reservation.watch_id.as_slice(), reservation.sequence],
         )?;
         transaction.commit()?;
         Ok(PublishedCut {
@@ -6467,9 +6115,11 @@ mod tests {
     }
 
     #[test]
-    fn permissions_reject_retired_permission_bit() {
+    fn permissions_reject_retired_permission_bits() {
         assert!(Permissions::new(0x04).is_err());
+        assert!(Permissions::new(0x08).is_err());
         assert!(Permissions::new(PERMISSION_READ | PERMISSION_CUT | 0x04).is_err());
+        assert!(Permissions::new(PERMISSION_READ | PERMISSION_CUT | 0x08).is_err());
         assert!(Permissions::new(PERMISSION_READ | PERMISSION_CUT).is_ok());
     }
 
@@ -7364,150 +7014,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!((head, events), (0, 0));
-    }
-
-    #[test]
-    fn fixed_jj_trigger_is_grant_scoped_and_fenced() {
-        let (_temp, mut store, mut request) = setup();
-        request.permissions =
-            Permissions::new(PERMISSION_READ | PERMISSION_CUT | PERMISSION_TRIGGER).unwrap();
-        let (_initialize, initialized) = initialize_watch(&mut store, &request);
-        assert!(!store
-            .has_fixed_jj_trigger(initialized.watch_id, initialized.grant_id)
-            .unwrap());
-        assert!(!store
-            .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id, b"jj\0")
-            .unwrap());
-        assert!(store
-            .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id, b"jj\0")
-            .unwrap());
-        let binding = ViewBinding {
-            monitor_session_id: [40; 16],
-            root_path: request.source_path.clone(),
-            fs_uuid: request.fs_uuid,
-            subvol_uuid: request.source_subvol_uuid,
-            mount_ns_dev: 1,
-            mount_ns_ino: 2,
-            process_root_dev: 3,
-            process_root_ino: 4,
-            process_root_mnt_id: 5,
-            watched_root_dev: 6,
-            watched_root_ino: 7,
-            watched_root_mnt_id: 8,
-        };
-        store
-            .activate_snapshot_facade(initialized.watch_id, initialized.grant_id, &binding)
-            .unwrap();
-        assert_eq!(
-            store
-                .active_fixed_jj_trigger_watches(request.requester_uid)
-                .unwrap(),
-            vec![initialized.watch_id]
-        );
-        let run = store
-            .claim_fixed_jj_trigger([41; 16], 400, 1_000)
-            .unwrap()
-            .unwrap();
-        assert_eq!(run.through_sequence, 0);
-        assert!(store
-            .claim_fixed_jj_trigger([42; 16], 500, 1_100)
-            .unwrap()
-            .is_none());
-        store.finish_fixed_jj_trigger(&run, true).unwrap();
-        assert!(store
-            .claim_fixed_jj_trigger([42; 16], 600, 1_200)
-            .unwrap()
-            .is_none());
-        assert!(store
-            .delete_fixed_jj_trigger(initialized.watch_id, initialized.grant_id)
-            .unwrap());
-        assert!(!store
-            .delete_fixed_jj_trigger(initialized.watch_id, initialized.grant_id)
-            .unwrap());
-        assert!(store
-            .active_fixed_jj_trigger_watches(request.requester_uid)
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn trigger_claim_prefers_the_least_run_watch_for_failure_fairness() {
-        let (_temp, mut store, mut first_request) = setup();
-        first_request.permissions =
-            Permissions::new(PERMISSION_READ | PERMISSION_CUT | PERMISSION_TRIGGER).unwrap();
-        let (_first_reservation, first) = initialize_watch(&mut store, &first_request);
-
-        let mut second_request = first_request.clone();
-        second_request.source_subvol_uuid = [22; 16];
-        second_request.source_path = b"/source-two".to_vec();
-        second_request.reserved_snapshot_path = b"/store/snapshots/w2/s-0-op".to_vec();
-        second_request.lease_owner = [23; 16];
-        let second_reservation = store.reserve_initialize(&second_request).unwrap();
-        store
-            .start_initialize_filesystem_effect(
-                &second_reservation,
-                second_request.lease_owner,
-                150,
-            )
-            .unwrap();
-        let mut second_snapshot = snapshot(&second_request);
-        second_snapshot.subvol_uuid = [24; 16];
-        second_snapshot.root_id = 902;
-        let second_recorded = store
-            .record_initialize_snapshot(
-                &second_reservation,
-                second_request.lease_owner,
-                &second_snapshot,
-                200,
-            )
-            .unwrap();
-        let second = store
-            .publish_initial_checkpoint(
-                &second_reservation,
-                second_request.lease_owner,
-                &second_recorded,
-                &index(),
-                300,
-            )
-            .unwrap();
-
-        for (initialized, request, session) in [
-            (&first, &first_request, [50; 16]),
-            (&second, &second_request, [51; 16]),
-        ] {
-            let binding = ViewBinding {
-                monitor_session_id: session,
-                root_path: request.source_path.clone(),
-                fs_uuid: request.fs_uuid,
-                subvol_uuid: request.source_subvol_uuid,
-                mount_ns_dev: 1,
-                mount_ns_ino: 2,
-                process_root_dev: 3,
-                process_root_ino: 4,
-                process_root_mnt_id: 5,
-                watched_root_dev: 6,
-                watched_root_ino: 7,
-                watched_root_mnt_id: 8,
-            };
-            store
-                .activate_snapshot_facade(initialized.watch_id, initialized.grant_id, &binding)
-                .unwrap();
-            store
-                .register_fixed_jj_trigger(initialized.watch_id, initialized.grant_id, b"jj\0")
-                .unwrap();
-        }
-        store
-            .connection_mut()
-            .execute(
-                "UPDATE watchman_triggers SET run_fence = 10 WHERE watch_id = ?1",
-                [first.watch_id.as_slice()],
-            )
-            .unwrap();
-        let claimed = store
-            .claim_fixed_jj_trigger([52; 16], 400, 1_000)
-            .unwrap()
-            .unwrap();
-        assert_eq!(claimed.watch_id, second.watch_id);
     }
 
     #[test]

@@ -33,7 +33,6 @@ approximately quadratic cleanup work.
 ---
 
 **P-13 — Install entry points are inconsistent.**
-`install.sh` omits the `btrfs-awacs-watchman` symlink created by
-`packaging/install.sh`. Both install executables under
-`libexec` rather than a normal default `PATH`; direct discovery therefore
-requires deployment-specific `PATH` or `BTRFS_AWACS_COMMAND` configuration.
+Both installers place `btrfs-awacs` under `libexec` rather than a normal
+default `PATH`; direct discovery therefore requires deployment-specific
+`PATH` or `BTRFS_AWACS_COMMAND` configuration.

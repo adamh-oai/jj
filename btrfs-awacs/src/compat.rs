@@ -1,26 +1,26 @@
-//! Shared clock and conservative path-projection primitives for the focused
-//! Watchman and Git transports.
+//! Authenticated direct-scan cursors and conservative path projections.
 
 use crate::index::{Event, EventKind};
-use crate::manager::QueryLeaseReservation;
-use crate::store::{decode_u64, Store};
-use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
 
-const CLOCK_PREFIX: &str = "c:btrfs-awacs:1:";
 const DIRECT_SCAN_CURSOR_PREFIX: &str = "c:btrfs-awacs:scan:1:";
 const DIRECT_SCAN_CURSOR_DOMAIN: &[u8] = b"btrfs-awacs:scan:1\0";
-const CLOCK_PAYLOAD_BYTES: usize = 113;
-const CLOCK_MAC_BYTES: usize = 32;
+const CURSOR_PAYLOAD_BYTES: usize = 113;
+const CURSOR_MAC_BYTES: usize = 32;
 
+/// Claims bound into one opaque direct-scan cursor.
+///
+/// The durable manager still calls the epoch field clock_epoch in its schema.
+/// The cursor authenticates only the immutable boundary needed for the next
+/// scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClockClaims {
+pub struct CursorClaims {
     pub format_version: u32,
     pub store_uuid: [u8; 16],
     pub watch_id: [u8; 16],
-    pub clock_epoch: [u8; 16],
+    pub cursor_epoch: [u8; 16],
     pub cut_sequence: u64,
     pub owner_grant_id: [u8; 16],
     pub monitor_session_id: [u8; 16],
@@ -40,46 +40,13 @@ pub struct Projection {
     pub paths: Vec<Vec<u8>>,
 }
 
-pub fn encode_clock(claims: &ClockClaims, key: &[u8; 32]) -> String {
+/// Encodes exact immutable-boundary claims in the direct-scan cursor domain.
+pub(crate) fn encode_direct_scan_cursor(claims: &CursorClaims, key: &[u8; 32]) -> Vec<u8> {
     let payload = encode_claims(claims);
-    let mac = hmac_sha256(key, &payload);
-    let mut authenticated = payload;
-    authenticated.extend_from_slice(&mac);
-    format!("{CLOCK_PREFIX}{}", base64url_encode(&authenticated))
-}
-
-pub fn decode_clock(token: &str, key: &[u8; 32]) -> Result<ClockClaims, CompatError> {
-    let encoded = token
-        .strip_prefix(CLOCK_PREFIX)
-        .ok_or_else(|| CompatError::new("clock has an invalid prefix"))?;
-    if encoded.is_empty()
-        || !encoded
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err(CompatError::new("clock has invalid base64url characters"));
-    }
-    let authenticated = base64url_decode(encoded)?;
-    if authenticated.len() != CLOCK_PAYLOAD_BYTES + CLOCK_MAC_BYTES {
-        return Err(CompatError::new("clock has an invalid payload length"));
-    }
-    let (payload, supplied_mac) = authenticated.split_at(CLOCK_PAYLOAD_BYTES);
-    if !constant_time_eq(supplied_mac, &hmac_sha256(key, payload)) {
-        return Err(CompatError::new("clock authentication failed"));
-    }
-    decode_claims(payload)
-}
-
-/// Wraps an authenticated facade clock in a separately authenticated direct
-/// scan cursor domain. The inner clock keeps the existing exact-boundary
-/// claims; the outer MAC prevents a token from another protocol domain from
-/// being accepted as a direct scan cursor.
-pub(crate) fn encode_direct_scan_cursor(inner_clock: &str, key: &[u8; 32]) -> Vec<u8> {
-    let payload = inner_clock.as_bytes();
     let mut mac_input = DIRECT_SCAN_CURSOR_DOMAIN.to_vec();
-    mac_input.extend_from_slice(payload);
+    mac_input.extend_from_slice(&payload);
     let mac = hmac_sha256(key, &mac_input);
-    let mut authenticated = payload.to_vec();
+    let mut authenticated = payload;
     authenticated.extend_from_slice(&mac);
     format!(
         "{DIRECT_SCAN_CURSOR_PREFIX}{}",
@@ -88,12 +55,11 @@ pub(crate) fn encode_direct_scan_cursor(inner_clock: &str, key: &[u8; 32]) -> Ve
     .into_bytes()
 }
 
-/// Verifies and unwraps a direct scan cursor to the existing authenticated
-/// facade clock representation.
+/// Verifies and decodes an opaque direct-scan cursor.
 pub(crate) fn decode_direct_scan_cursor(
     token: &[u8],
     key: &[u8; 32],
-) -> Result<String, CompatError> {
+) -> Result<CursorClaims, CompatError> {
     let token = std::str::from_utf8(token)
         .map_err(|_| CompatError::new("direct scan cursor is not UTF-8"))?;
     let encoded = token
@@ -109,47 +75,32 @@ pub(crate) fn decode_direct_scan_cursor(
         ));
     }
     let authenticated = base64url_decode(encoded)?;
-    if authenticated.len() <= CLOCK_MAC_BYTES {
+    if authenticated.len() != CURSOR_PAYLOAD_BYTES + CURSOR_MAC_BYTES {
         return Err(CompatError::new(
             "direct scan cursor has an invalid payload length",
         ));
     }
-    let (payload, supplied_mac) = authenticated.split_at(authenticated.len() - CLOCK_MAC_BYTES);
+    let (payload, supplied_mac) = authenticated.split_at(CURSOR_PAYLOAD_BYTES);
     let mut mac_input = DIRECT_SCAN_CURSOR_DOMAIN.to_vec();
     mac_input.extend_from_slice(payload);
     if !constant_time_eq(supplied_mac, &hmac_sha256(key, &mac_input)) {
         return Err(CompatError::new("direct scan cursor authentication failed"));
     }
-    let inner_clock = std::str::from_utf8(payload)
-        .map_err(|_| CompatError::new("direct scan cursor payload is not UTF-8"))?;
-    if !inner_clock.starts_with(CLOCK_PREFIX) {
-        return Err(CompatError::new(
-            "direct scan cursor payload is not a facade clock",
-        ));
-    }
-    Ok(inner_clock.to_owned())
+    decode_claims(payload)
 }
 
-/// Converts canonical semantic events into endpoint path changes exposed
-/// through Watchman and the Git hook adapter.
+/// Converts canonical snapshot-comparison events into direct-scan
+/// invalidations.
 ///
-/// FIXME: Dropping directory witnesses is unsafe when a client observed a
-/// transient path after receiving its previous clock. Preserve those witnesses
-/// through consumer-specific projection as described in FIXES.md.
+/// Exact path events remain exact. A subtree move needs a full invalidation
+/// until the index can expand every affected descendant path.
 pub fn project_events(events: &[Event]) -> Projection {
     let mut paths = BTreeSet::new();
     let mut fresh = false;
     for event in events {
         match event.kind {
-            EventKind::DirectoryDirtyWitness => {
-                // FIXME: This witness can identify a transient mutation still
-                // present in a client's cached state; see FIXES.md.
-            }
+            EventKind::DirectoryDirtyWitness => {}
             EventKind::SubtreeMoved => {
-                // A directory rename changes descendant paths without
-                // emitting one endpoint event per descendant. Until the
-                // query engine can expand those descendants, a generic
-                // Watchman response must conservatively ask for a crawl.
                 fresh = event.old_path.is_some() || event.new_path.is_some();
             }
             EventKind::PathAdded | EventKind::PathRemoved | EventKind::PathChanged => {
@@ -174,230 +125,12 @@ pub fn project_events(events: &[Event]) -> Projection {
     }
 }
 
-impl Store {
-    /// Projects every committed adjacent comparison in `(from, target]`.
-    /// Missing, expired, future, or non-contiguous ranges become a fresh
-    /// baseline instead of a partial incremental success.
-    pub fn project_ready_cut_range(
-        &self,
-        watch_id: [u8; 16],
-        from_sequence: Option<i64>,
-        target_sequence: i64,
-    ) -> Result<Projection, CompatError> {
-        self.project_ready_cut_range_with_lease(watch_id, from_sequence, target_sequence, None)
-    }
-
-    pub fn project_ready_cut_range_with_lease(
-        &self,
-        watch_id: [u8; 16],
-        from_sequence: Option<i64>,
-        target_sequence: i64,
-        lease: Option<&QueryLeaseReservation>,
-    ) -> Result<Projection, CompatError> {
-        let head: Option<(i64, i64)> = self
-            .connection()
-            .query_row(
-                "SELECT indexed_seq, replay_floor_seq FROM watches \
-                 WHERE id = ?1 AND state = 'active'",
-                [watch_id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| CompatError::context("load watch projection head", error))?;
-        let Some((indexed_head, replay_floor)) = head else {
-            return Err(CompatError::new("watch is absent or inactive"));
-        };
-        if target_sequence > indexed_head || target_sequence < 0 {
-            return Err(CompatError::new("target cut is not a ready indexed head"));
-        }
-        let Some(from_sequence) = from_sequence else {
-            return Ok(fresh_projection());
-        };
-        if from_sequence < replay_floor || from_sequence < 0 || from_sequence > target_sequence {
-            return Ok(fresh_projection());
-        }
-        let expected = target_sequence - from_sequence;
-        let ready_count: i64 = self
-            .connection()
-            .query_row(
-                r#"SELECT count(*) FROM watch_cuts
-                    WHERE watch_id = ?1 AND sequence > ?2 AND sequence <= ?3
-                      AND state = 'ready' AND fresh_instance = 0
-                      AND comparison_id IS NOT NULL"#,
-                rusqlite::params![watch_id.as_slice(), from_sequence, target_sequence],
-                |row| row.get(0),
-            )
-            .map_err(|error| CompatError::context("count ready cut range", error))?;
-        if ready_count != expected {
-            return Ok(fresh_projection());
-        }
-        let mut statement = self
-            .connection()
-            .prepare(
-                r#"SELECT e.event_kind, e.ino, e.old_generation,
-                          e.new_generation, e.change_mask, e.old_path, e.new_path
-                     FROM watch_cuts c
-                     JOIN change_events e ON e.comparison_id = c.comparison_id
-                    WHERE c.watch_id = ?1 AND c.sequence > ?2 AND c.sequence <= ?3
-                      AND c.state = 'ready'
-                    ORDER BY c.sequence, e.ordinal"#,
-            )
-            .map_err(|error| CompatError::context("prepare cut-range events", error))?;
-        let rows = statement
-            .query_map(
-                rusqlite::params![watch_id.as_slice(), from_sequence, target_sequence],
-                |row| {
-                    let kind: String = row.get(0)?;
-                    let decode_optional = |column| -> rusqlite::Result<Option<u64>> {
-                        let bytes: Option<Vec<u8>> = row.get(column)?;
-                        bytes
-                            .as_deref()
-                            .map(|bytes| {
-                                decode_u64(bytes).map_err(|error| {
-                                    rusqlite::Error::FromSqlConversionFailure(
-                                        column,
-                                        rusqlite::types::Type::Blob,
-                                        Box::new(error),
-                                    )
-                                })
-                            })
-                            .transpose()
-                    };
-                    Ok(Event {
-                        kind: decode_event_kind(&kind).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                        ino: decode_optional(1)?.ok_or_else(|| {
-                            rusqlite::Error::InvalidColumnType(
-                                1,
-                                "ino".to_owned(),
-                                rusqlite::types::Type::Null,
-                            )
-                        })?,
-                        old_generation: decode_optional(2)?,
-                        new_generation: decode_optional(3)?,
-                        change_mask: u64::try_from(row.get::<_, i64>(4)?).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                4,
-                                rusqlite::types::Type::Integer,
-                                Box::new(error),
-                            )
-                        })?,
-                        old_path: row.get(5)?,
-                        new_path: row.get(6)?,
-                    })
-                },
-            )
-            .map_err(|error| CompatError::context("read cut-range events", error))?;
-        let mut events = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| CompatError::context("decode cut-range events", error))?;
-        let Some((guard_epoch, from_guard, to_guard)) = lease.and_then(|lease| lease.guard) else {
-            return Ok(project_events(&events));
-        };
-        if lease.is_some_and(|lease| {
-            lease.watch_id != watch_id
-                || lease.from_sequence != Some(from_sequence)
-                || lease.to_sequence != target_sequence
-        }) {
-            return Err(CompatError::new(
-                "query lease does not match projected range",
-            ));
-        }
-
-        // A complete journal interval replaces only the coarse namespace
-        // witnesses. Immutable object/ref events remain authoritative and are
-        // still unioned below.
-        events.retain(|event| event.kind != EventKind::DirectoryDirtyWitness);
-        let mut projection = project_events(&events);
-        let mut statement = self
-            .connection()
-            .prepare(
-                r#"SELECT sequence, event_kind, path FROM mutation_events
-                    WHERE watch_id = ?1 AND guard_epoch = ?2
-                      AND sequence > ?3 AND sequence <= ?4
-                    ORDER BY sequence"#,
-            )
-            .map_err(|error| CompatError::context("prepare precision events", error))?;
-        let rows = statement
-            .query_map(
-                rusqlite::params![
-                    watch_id.as_slice(),
-                    guard_epoch.as_slice(),
-                    from_guard,
-                    to_guard,
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                    ))
-                },
-            )
-            .map_err(|error| CompatError::context("read precision events", error))?;
-        let mut paths = projection.paths.into_iter().collect::<BTreeSet<_>>();
-        let mut expected_sequence = from_guard;
-        for row in rows {
-            let (sequence, kind, path) =
-                row.map_err(|error| CompatError::context("decode precision event", error))?;
-            expected_sequence = expected_sequence
-                .checked_add(1)
-                .ok_or_else(|| CompatError::new("precision sequence overflow"))?;
-            if sequence != expected_sequence {
-                return Ok(fresh_projection());
-            }
-            match (kind.as_str(), path) {
-                ("path" | "object", Some(path)) => {
-                    paths.insert(path);
-                }
-                ("directory-prefix", Some(_)) => projection.fresh_instance = true,
-                ("full-invalidation", None) => projection.fresh_instance = true,
-                _ => return Ok(fresh_projection()),
-            }
-        }
-        if expected_sequence != to_guard {
-            return Ok(fresh_projection());
-        }
-        if projection.fresh_instance {
-            Ok(fresh_projection())
-        } else {
-            Ok(Projection {
-                fresh_instance: false,
-                paths: paths.into_iter().collect(),
-            })
-        }
-    }
-}
-
-fn fresh_projection() -> Projection {
-    Projection {
-        fresh_instance: true,
-        paths: vec![b"/".to_vec()],
-    }
-}
-
-fn decode_event_kind(value: &str) -> Result<EventKind, CompatError> {
-    match value {
-        "path-added" => Ok(EventKind::PathAdded),
-        "path-removed" => Ok(EventKind::PathRemoved),
-        "path-changed" => Ok(EventKind::PathChanged),
-        "subtree-moved" => Ok(EventKind::SubtreeMoved),
-        "directory-dirty-witness" => Ok(EventKind::DirectoryDirtyWitness),
-        _ => Err(CompatError::new(format!("unknown event kind {value:?}"))),
-    }
-}
-
-fn encode_claims(claims: &ClockClaims) -> Vec<u8> {
-    let mut output = Vec::with_capacity(CLOCK_PAYLOAD_BYTES);
+fn encode_claims(claims: &CursorClaims) -> Vec<u8> {
+    let mut output = Vec::with_capacity(CURSOR_PAYLOAD_BYTES);
     output.extend_from_slice(&claims.format_version.to_be_bytes());
     output.extend_from_slice(&claims.store_uuid);
     output.extend_from_slice(&claims.watch_id);
-    output.extend_from_slice(&claims.clock_epoch);
+    output.extend_from_slice(&claims.cursor_epoch);
     output.extend_from_slice(&claims.cut_sequence.to_be_bytes());
     output.extend_from_slice(&claims.owner_grant_id);
     output.extend_from_slice(&claims.monitor_session_id);
@@ -406,11 +139,11 @@ fn encode_claims(claims: &ClockClaims) -> Vec<u8> {
     });
     output.extend_from_slice(&claims.algorithm_version.to_be_bytes());
     output.extend_from_slice(&claims.target_snapshot_uuid);
-    debug_assert_eq!(output.len(), CLOCK_PAYLOAD_BYTES);
+    debug_assert_eq!(output.len(), CURSOR_PAYLOAD_BYTES);
     output
 }
 
-fn decode_claims(payload: &[u8]) -> Result<ClockClaims, CompatError> {
+fn decode_claims(payload: &[u8]) -> Result<CursorClaims, CompatError> {
     let mut offset = 0;
     let mut take = |length: usize| {
         let bytes = &payload[offset..offset + length];
@@ -419,25 +152,25 @@ fn decode_claims(payload: &[u8]) -> Result<ClockClaims, CompatError> {
     };
     let format_version = u32::from_be_bytes(take(4).try_into().expect("fixed field"));
     if format_version != 1 {
-        return Err(CompatError::new("unsupported clock format version"));
+        return Err(CompatError::new("unsupported cursor format version"));
     }
     let store_uuid = take(16).try_into().expect("fixed field");
     let watch_id = take(16).try_into().expect("fixed field");
-    let clock_epoch = take(16).try_into().expect("fixed field");
+    let cursor_epoch = take(16).try_into().expect("fixed field");
     let cut_sequence = u64::from_be_bytes(take(8).try_into().expect("fixed field"));
     let owner_grant_id = take(16).try_into().expect("fixed field");
     let monitor_session_id = take(16).try_into().expect("fixed field");
     let boundary_kind = match take(1)[0] {
         0 => BoundaryKind::Cut,
-        _ => return Err(CompatError::new("unknown clock boundary kind")),
+        _ => return Err(CompatError::new("unknown cursor boundary kind")),
     };
     let algorithm_version = u32::from_be_bytes(take(4).try_into().expect("fixed field"));
     let target_snapshot_uuid = take(16).try_into().expect("fixed field");
-    Ok(ClockClaims {
+    Ok(CursorClaims {
         format_version,
         store_uuid,
         watch_id,
-        clock_epoch,
+        cursor_epoch,
         cut_sequence,
         owner_grant_id,
         monitor_session_id,
@@ -547,10 +280,6 @@ impl CompatError {
             message: message.into(),
         }
     }
-
-    fn context(context: impl fmt::Display, error: impl fmt::Display) -> Self {
-        Self::new(format!("{context}: {error}"))
-    }
 }
 
 impl fmt::Display for CompatError {
@@ -566,6 +295,21 @@ mod tests {
     use super::*;
     use crate::manifest::CHANGE_FILE_DATA;
 
+    fn claims() -> CursorClaims {
+        CursorClaims {
+            format_version: 1,
+            store_uuid: [1; 16],
+            watch_id: [2; 16],
+            cursor_epoch: [3; 16],
+            cut_sequence: 42,
+            owner_grant_id: [4; 16],
+            monitor_session_id: [5; 16],
+            boundary_kind: BoundaryKind::Cut,
+            algorithm_version: 1,
+            target_snapshot_uuid: [6; 16],
+        }
+    }
+
     fn event(kind: EventKind, path: &[u8]) -> Event {
         Event {
             kind,
@@ -579,57 +323,20 @@ mod tests {
     }
 
     #[test]
-    fn clock_round_trips_and_rejects_tampering() {
-        let claims = ClockClaims {
-            format_version: 1,
-            store_uuid: [1; 16],
-            watch_id: [2; 16],
-            clock_epoch: [3; 16],
-            cut_sequence: 42,
-            owner_grant_id: [4; 16],
-            monitor_session_id: [5; 16],
-            boundary_kind: BoundaryKind::Cut,
-            algorithm_version: 1,
-            target_snapshot_uuid: [6; 16],
-        };
+    fn direct_scan_cursor_round_trips_and_rejects_tampering() {
         let key = [7; 32];
-        let token = encode_clock(&claims, &key);
-        assert_eq!(decode_clock(&token, &key).unwrap(), claims);
-        assert!(token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b":._-".contains(&byte)));
-        let mut tampered = token.into_bytes();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(decode_clock(std::str::from_utf8(&tampered).unwrap(), &key).is_err());
-    }
-
-    #[test]
-    fn direct_scan_cursor_has_its_own_authenticated_domain() {
-        let claims = ClockClaims {
-            format_version: 1,
-            store_uuid: [1; 16],
-            watch_id: [2; 16],
-            clock_epoch: [3; 16],
-            cut_sequence: 42,
-            owner_grant_id: [4; 16],
-            monitor_session_id: [5; 16],
-            boundary_kind: BoundaryKind::Cut,
-            algorithm_version: 1,
-            target_snapshot_uuid: [6; 16],
-        };
-        let key = [7; 32];
-        let clock = encode_clock(&claims, &key);
-        let cursor = encode_direct_scan_cursor(&clock, &key);
-        let decoded = decode_direct_scan_cursor(&cursor, &key).unwrap();
-        assert_eq!(decode_clock(&decoded, &key).unwrap(), claims);
-        assert!(decode_direct_scan_cursor(clock.as_bytes(), &key).is_err());
+        let cursor = encode_direct_scan_cursor(&claims(), &key);
+        assert_eq!(decode_direct_scan_cursor(&cursor, &key).unwrap(), claims());
+        assert!(cursor
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":._-".contains(byte)));
         let mut tampered = cursor;
         *tampered.last_mut().unwrap() ^= 1;
         assert!(decode_direct_scan_cursor(&tampered, &key).is_err());
     }
 
     #[test]
-    fn directory_witness_does_not_change_endpoint_projection() {
+    fn directory_witness_does_not_change_direct_projection() {
         let events = vec![
             event(EventKind::PathChanged, b"hardlink"),
             event(EventKind::DirectoryDirtyWitness, b"dir"),
@@ -645,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn subtree_move_requires_a_generic_fresh_projection() {
+    fn subtree_move_requires_a_full_projection() {
         let events = vec![event(EventKind::SubtreeMoved, b".jj/repo/op_store")];
         assert_eq!(
             project_events(&events),

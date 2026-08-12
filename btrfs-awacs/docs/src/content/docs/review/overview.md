@@ -1,11 +1,11 @@
 ---
 title: "Review overview and severity"
-description: "The full 43-finding correctness and performance review, its severity model, stable identifiers, and reproduced regressions."
+description: "The direct-scan review, its severity model, stable identifiers, and reproduced regressions."
 sidebar:
   order: 1
 ---
-The implementation review records **43 independently identified
-findings**: **30 correctness and compatibility issues** and
+The implementation review records **37 independently identified
+findings**: **24 correctness and compatibility issues** and
 **13 performance, capacity, or workflow issues**. Severity is ordered
 by the potential for data loss, permanently incorrect repository state, broad
 stock-behavior regressions, and resource exhaustion.
@@ -16,20 +16,18 @@ stock-behavior regressions, and resource exhaustion.
 | **P1** | Substantial correctness, compatibility, isolation, or scaling defects. | [Read P1 correctness](/review/p1-correctness/) | [Read P1 performance](/review/p1-performance/) |
 | **P2** | Remaining compatibility gaps and recurring avoidable overhead. | [Read P2 correctness](/review/p2-correctness/) | [Read P2 performance](/review/p2-performance/) |
 
-The identifiers are stable across this documentation site and `SPEC.md`:
-`C-01` through `C-30` identify correctness findings, while `P-01` through
-`P-13` identify performance or operational findings.
+The surviving identifiers remain stable across this documentation site and
+`SPEC.md`. Removed compatibility-only findings are intentionally not reused;
+`P-01` through `P-13` identify performance or operational findings.
 
 ## What the review verified
 
 The analysis traces the current AWACS implementation and the companion
 Jujutsu checkout, distinguishes running code from unused scaffolding, and
-compares modified Jujutsu behavior with both stock Jujutsu and Git.
+compares modified Jujutsu behavior with stock Jujutsu.
 
 The [current remediation tracker](/reference/current-fixes/) groups those
-findings into actionable implementation work; the
-[implementation roadmap](/reference/implementation-roadmap/) records the
-broader development plan.
+findings into actionable implementation work.
 
 The most serious reproduced regressions include shared repository deletion,
 automatic-snapshot fallback recording tracked files as deleted, destruction of

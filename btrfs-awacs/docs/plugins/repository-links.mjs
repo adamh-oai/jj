@@ -2,15 +2,10 @@ import { fileURLToPath } from 'node:url';
 
 const importedRepositoryDocuments = new Set([
   fileURLToPath(new URL('../../FIXES.md', import.meta.url)),
-  fileURLToPath(new URL('../../TODO.md', import.meta.url)),
-  fileURLToPath(new URL('../indexed-change-tracking.md', import.meta.url)),
 ]);
 
 const documentationRoutes = new Map([
   ['FIXES.md', '/reference/current-fixes/'],
-  ['TODO.md', '/reference/implementation-roadmap/'],
-  ['indexed-change-tracking.md', '/reference/indexed-change-tracking/'],
-  ['docs/indexed-change-tracking.md', '/reference/indexed-change-tracking/'],
   ['docs', '/'],
   ['docs/', '/'],
 ]);

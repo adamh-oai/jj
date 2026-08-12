@@ -10,17 +10,15 @@ independent writable Jujutsu workspaces backed by one shared repository. Now
 edit a tracked file in the new workspace and run its first `jj status`.
 
 The question is not merely whether the file appears as modified. Correctness
-requires the right **workspace root**, **working-copy commit**, **AWACS watch**,
+requires the right **workspace root**, **working-copy commit**, **AWACS root state**,
 **read-only snapshot**, **external-input fingerprint**, and **persisted cursor**
 to remain paired throughout the operation.
 
-:::danger[Current direct-AWACS behavior]
-The existing namespace daemon binds its direct scanner to the first workspace
-root. If `main/` started that daemon, the first `BeginScan` for `feature/`
-fails with `AWACS scan root does not match the registered live root`. Steps
-describing a successful direct child scan below specify the required lifecycle
-after finding C-10 is fixed; they are not a claim that the present
-multi-workspace direct path already works.
+:::note[On-demand child registration]
+Workspace creation deliberately leaves the child without a direct cursor.
+Its first `BeginScan` resolves the exact child root, adopts retained snapshot
+lineage when available, or initializes an independent root state before
+creating the immutable scan cut.
 :::
 
 ## Initial state after workspace creation
@@ -29,7 +27,7 @@ multi-workspace direct path already works.
 /projects/main/
     live writable Btrfs root UUID A
     private JJ working-copy commit M
-    private tree state and cursor for watch WA, if initialized
+    private tree state and direct cursor for root state A, if initialized
 
 /projects/feature/
     live writable Btrfs root UUID B, parent_uuid A
@@ -39,12 +37,12 @@ multi-workspace direct path already works.
     private Git linked-worktree state, if colocated
 
 /awacs-managed/
-    read-only managed cuts belonging to explicitly identified watches
+    read-only managed cuts belonging to explicitly identified roots
 ```
 
 The source and destination may share Btrfs extents, Jujutsu/Git objects, the
 operation store, and a mount-namespace daemon. They must not share mutable
-working-copy state, Git indexes, watch identities, root authorizations, or
+working-copy state, Git indexes, direct root identities, authorizations, or
 cursor continuity.
 
 For example:
@@ -108,71 +106,48 @@ incremental scans.
 
 **Currently broken — C-08 and C-09:** Relative global-ignore handling is
 missing in some existing snapshot callers and has reversed precedence in
-normal snapshots. These regressions affect `none` and Watchman too, not only
-direct AWACS.
+normal snapshots. These regressions are not limited to the direct AWACS path.
 
-## Step 3: Determine which monitor path owns the initial baseline
+## Step 3: Establish the child's first direct baseline
 
 **Owner:** `lib/src/local_working_copy.rs::TreeState::make_snapshot_scan`.
 
-The new child's saved monitor state depends on the configured backend:
+The new child has no inherited direct cursor. Its first effective scan sends a
+direct `BeginScan` for `/projects/feature` with `previous_cursor: None` and
+traverses the returned read-only `/proc/self/fd/N` root. Workspace creation
+only cleared copied state; it did not register a child root or send `Begin`.
+A later destination checkout or sparsity change clears an incompatible direct
+cursor again.
 
-| Backend | Child's first effective scan | Root that traversal reads |
-| --- | --- | --- |
-| `none` | Full ordinary Jujutsu scan against the child's own recorded tree. | Mutable `/projects/feature`. |
-| `watchman` | Resolve/register the child root and query its own fresh or saved clock. | Mutable `/projects/feature`, filtered by Watchman results. |
-| `awacs` | Send a direct `BeginScan` for the child with no inherited cursor. | Read-only `/proc/self/fd/N` from the child's managed snapshot. |
-
-`mark_fsmonitor_baseline` during workspace creation records a fresh clock for
-Watchman, but for direct AWACS it only clears the old cursor. It does not
-register a child direct watch or send Begin. A later destination checkout or
-sparsity change clears incompatible monitor state again.
-
-**Invariant:** A Watchman clock and direct AWACS token are backend-tagged and
-never interchangeable. A source-root clock or token must never be used as the
-first child-root baseline.
+**Invariant:** A source-root cursor must never be used as the first child-root
+baseline.
 
 ## Step 4: Register or adopt the child root
 
-**Watchman owner:** `src/watchman.rs::watch_project`,
+**Owner:** `src/scan_facade.rs::FacadeScanHandler::ensure_registered_root`,
 `src/service.rs::adopt_snapshot_descendant`, and
 `src/manager.rs::adopt_snapshot_descendant`.
 
-When using the compatibility endpoint, Jujutsu resolves
-`/projects/feature` as a Watchman root. AWACS authenticates the requesting
-principal, opens UUID B, observes B's `parent_uuid = A`, and looks for a
-ready, present retained revision associated with A on the same filesystem.
+The namespace daemon canonicalizes `/projects/feature` and looks up an active
+registration at that exact path for the requesting UID with read and cut
+permissions. If the root is already registered, the handler reuses that
+durable root state and activates its facade binding on demand.
 
-If a usable parent seed exists, AWACS transactionally creates a new child
-watch, child authorization grant, child clock epoch, and two head pins. Its
-index can start from immutable source history without reusing the source's
-watch sequence or cursor. If there is no eligible seed, the Watchman endpoint
-currently falls back to a new read-only initialization snapshot and full
-indexing.
+If no registration exists, AWACS opens UUID B, observes
+`B.parent_uuid = A`, and looks for a ready, present retained revision
+associated with A on the same filesystem. A usable parent seed lets AWACS
+transactionally create a new child root-state ID, authorization grant, cursor
+epoch, and head pins. Its index can start from immutable source history
+without reusing the source sequence or cursor.
 
-**Direct owner:** `src/main.rs` and `src/scan_facade.rs::begin_scan`.
-
-The required direct behavior is to resolve and authorize UUID B independently,
-adopt or initialize its watch using the same safe lineage logic, and bind the
-session to that child watch. The current code instead constructs exactly one
-`FacadeScanHandler` with the daemon's original `expected_live_root` and
-`watch_id`:
-
-```text
-daemon started for /projects/main
-child requests BeginScan(live_root = /projects/feature)
-canonical child root != daemon.expected_live_root
-result: Unauthorized
-```
-
-**Currently broken — C-10:** Namespace-scoped daemon discovery and fixed-root
-direct dispatch disagree. Even a valid sibling snapshot with retained lineage
-cannot obtain its first direct scan. This is a correctness boundary, not a
-missing source cursor or a Btrfs copy-on-write problem.
+If no eligible seed exists, the handler initializes UUID B from a new
+read-only snapshot and full index. Both paths then bind the session to the
+child's exact canonical root. The shared namespace socket multiplexes roots;
+it does not make sibling root identity interchangeable.
 
 ## Step 5: Request the child's first immutable cut
 
-**Owner, once child dispatch is fixed:**
+**Owner:**
 `src/scan_facade.rs::FacadeScanHandler::begin_scan`,
 `src/facade.rs::prepare_scan_query`, and `src/service.rs::changes`.
 
@@ -186,12 +161,12 @@ BeginScan {
 ```
 
 The daemon must validate the requested root, UID/GID, filesystem UUID,
-subvolume UUID, child watch ID, authorization grant, and active mount/view
+subvolume UUID, child root-state ID, authorization grant, and active mount/view
 continuity. Because the child has no prior direct cursor, the response must
-be safely fresh: the child's initial tree comparison cannot rely on the
-source's clock.
+be safely fresh: the child's initial tree comparison cannot rely on a source
+cursor.
 
-The service reserves a fenced child-watch cut, asks the privileged broker to
+The service reserves a fenced child-root cut, asks the privileged broker to
 create a new **read-only** snapshot of UUID B, verifies immutable endpoint
 identities, indexes or compares the cut, and prepares a pinned response. The
 broker's read-only cut is distinct from the writable Btrfs snapshot that
@@ -201,12 +176,12 @@ The response carries:
 
 1. One immutable snapshot-directory descriptor transferred with `SCM_RIGHTS`.
 2. The descriptor's verified filesystem and subvolume identity.
-3. A new opaque child-watch cursor.
+3. A new opaque child-root cursor.
 4. `Invalidation::Full`, `ExactPaths`, or `Prefixes`.
 5. A session identity and lease deadline protecting the pinned cut.
 
 **Invariant:** The returned descriptor must represent a read-only cut of UUID
-B, the token must belong to the child watch and grant, and the pin must remain
+B, the token must belong to the child root state and grant, and the pin must remain
 valid until the child's durable transaction commits or aborts.
 
 ## Step 6: Traverse immutable child contents while live edits continue
@@ -303,7 +278,7 @@ tree computation returns. The final boundary is deliberately ordered:
 3. Atomically save the child's tree IDs, file states, sparse patterns, and
    matching backend-tagged AWACS cursor to its private `tree_state` file.
 4. Send `FinishScan(Committed)` only **after** that save succeeds.
-5. Release the daemon's child-watch query pin and update the child's checkout
+5. Release the daemon's child-root query pin and update the child's checkout
    operation as needed.
 
 If the state save fails, drop/abort the pending session without claiming its
@@ -311,11 +286,12 @@ cursor. If Finish fails after a successful atomic save, the tree/cursor pair
 is already the durable client result; daemon-side expiry must eventually
 release the remaining pin.
 
-**Currently broken — C-11, C-16, and C-25:** Server expiration is calculated
-from a stale wall-clock value while the client receives a fresh boot-time
-deadline; a global handler lock can block child/source lease renewal behind an
-unrelated slow Begin; and failed Begin-response delivery can leak a pin until
-some later request happens to clean up the session.
+After lazy registration and cut preparation, the handler renews the durable
+lease from a fresh wall-clock sample before advertising the boot-time
+deadline. Remaining lifecycle risks tracked by the review are that a global
+handler lock can block child/source lease renewal behind an unrelated slow
+Begin (C-16), and failed Begin-response delivery can leak a pin until some
+later request cleans up the session (C-25).
 
 ## Step 9: Observe the child and source independently
 
@@ -326,13 +302,13 @@ main/
     live root: UUID A
     working-copy commit: M
     tree state: source state
-    monitor cursor: source cursor, unchanged by child status
+    direct cursor: source cursor, unchanged by child status
 
 feature/
     live root: UUID B
     working-copy commit: updated F
     tree state: immutable child-cut tree
-    monitor cursor: child cursor for the same cut and fingerprint
+    direct cursor: child cursor for the same cut and fingerprint
 
 shared repository/
     object store: contains both source and child commit/tree objects
@@ -346,7 +322,7 @@ change to `main/src/app.rs`.
 
 Conversely, a later edit to `main/src/app.rs` does not mutate the child's
 writable Btrfs root or validate a child cursor. Each root needs its own
-subsequent read-only cut and watch continuity.
+subsequent read-only cut and root-state continuity.
 
 ## Step 10: Repeat edits and reason about concurrent sibling commands
 
@@ -368,15 +344,8 @@ the current daemon's global scan-dispatch lock.
 A live child mutation after B2 is cut but before B2 traversal finishes must
 appear in a *later* child cut. It must not alter bytes read from B2 or be
 silently discarded when cursor B2 is saved. This immutable-cut boundary is the
-key distinction from the Watchman compatibility path, which hands Jujutsu
-paths and a clock but then traverses the mutable live child root.
-
-**Current Watchman limitation — C-04 and C-14:** AWACS drops
-directory-dirty-witness information before returning compatibility paths. A
-transient file visible during a mutable Watchman crawl can disappear before a
-later cut, leaving an incorrectly clean incremental result. Immutable direct
-child scans avoid this particular race, but only after the independent-root
-routing bug is fixed.
+reason the direct path can pair one tree with one cursor even while the live
+child continues changing.
 
 ## Step 11: Remove a child without destroying its siblings
 
@@ -386,19 +355,20 @@ A safe removal must first verify the exact child workspace identity without
 following substituted symlinks, lock and preserve any unsnapshotted changes,
 confirm Btrfs deletion capability, and protect the directory containing the
 physical shared `.jj/repo` or Git object store. It must revoke or safely drain
-the child's watch/pins, unregister its Git linked worktree, update the shared
-workspace view/store, and remove only the verified child root.
+the child's direct root registration and pins, unregister its Git linked
+worktree, update the shared workspace view/store, and remove only the verified
+child root.
 
-The current implementation does not meet those invariants:
+The current remediation rejects the C-01 shared-store-owner case before
+deletion. The remaining implementation gaps are tracked separately:
 
-- **C-01:** Removing the primary workspace from the child deletes the shared
-  repository needed by every sibling.
 - **C-18:** Removing a sibling discards its unsnapshotted tracked or untracked
   edits without checking them.
 - **C-19:** A replaced workspace path can resolve through a symlink and delete
   an unrelated directory.
-- **C-20 and C-21:** Failed Btrfs deletion or missing optional tooling can
-  occur after the workspace has already been forgotten.
+- **C-20 status:** The current remediation keeps registration and operation
+  history unchanged until deletion succeeds; keep the finding open until the
+  supported failure matrix passes.
 - **C-30:** Colocated removal leaves stale Git linked-worktree administration.
 
 These hazards are independent of whether the destination started as a Btrfs
@@ -411,7 +381,7 @@ protection.
 flowchart LR
     subgraph Source["Source workspace"]
         RootA["Writable Btrfs root A"]
-        WatchA["Watch A and grant A"]
+        WatchA["Direct root state A and grant A"]
         CutA["Read-only cut A2"]
         StateA["Private tree state and cursor A2"]
         CommitA["Source working-copy commit M"]
@@ -420,7 +390,7 @@ flowchart LR
 
     subgraph Child["Destination workspace"]
         RootB["Writable Btrfs root B"]
-        WatchB["Watch B and grant B"]
+        WatchB["Direct root state B and grant B"]
         CutB["Read-only cut B2"]
         StateB["Private tree state and cursor B2"]
         CommitB["Destination working-copy commit F"]
@@ -438,9 +408,9 @@ flowchart LR
 ## First-worktree-scan invariants
 
 1. Every child request is authorized against the child's exact root UUID,
-   filesystem, workspace name, watch, grant, and mount view.
-2. Child watch initialization may reuse a retained parent revision but must
-   create an independent watch identity, clock epoch, and pin ownership.
+   filesystem, workspace name, root state, grant, and mount view.
+2. Child root initialization may reuse a retained parent revision but must
+   create an independent root-state identity, cursor epoch, and pin ownership.
 3. An initial child scan never inherits a source cursor or assumes an
    uninitialized sequence-zero watch is a client-visible boundary.
 4. The saved cursor backend, fingerprint, tree, sparse matcher, and immutable
@@ -454,7 +424,7 @@ flowchart LR
 8. Successful state persistence precedes `FinishScan(Committed)`; failures
    abort or clear any unsafe cursor and eventually release every pin.
 9. Source and child operations can share objects and locks without sharing
-   mutable Git indexes, working-copy mappings, watch histories, or cursor
+   mutable Git indexes, working-copy mappings, root histories, or cursor
    ranges.
 10. Removal preserves shared stores, sibling edits, verified path ownership,
     linked Git registration, and every active snapshot/session lifetime.

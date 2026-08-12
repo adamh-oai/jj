@@ -1,6 +1,6 @@
 ---
 title: "3. Initialize a snapshot worktree"
-description: "Follow workspace add from the source snapshot through Btrfs copy-on-write, fresh Jujutsu and Git identities, initial checkout, and watch initialization."
+description: "Follow workspace add from the source snapshot through Btrfs copy-on-write, fresh Jujutsu and Git identities, initial checkout, and the first direct scan."
 sidebar:
   order: 3
 ---
@@ -13,10 +13,10 @@ sharing mutable workspace identity, cursors, or indexes is incorrect.
 
 :::caution[Implementation status]
 This walkthrough distinguishes the intended lifecycle from behavior that the
-current source does not implement correctly. Automatic fallback can create a
-mass-deletion working copy, sparse widening can omit tracked files, and direct
-AWACS currently rejects every sibling workspace. Those failures are identified
-at the exact steps where they occur.
+current source does not implement correctly. The unsafe automatic-fallback
+baseline is remediated in the current source, while sparse widening can still
+omit tracked files. Remaining failures are identified at the exact steps where
+they occur.
 :::
 
 ## Starting conditions and names
@@ -66,7 +66,7 @@ sequenceDiagram
     participant Btrfs as "Btrfs writable roots"
     participant Git as "Shared Git repository"
     participant Child as "Destination Jujutsu workspace"
-    participant Watch as "AWACS Watchman registration"
+    participant Scan as "AWACS direct scan service"
 
     User->>Source: "Lock and snapshot source working copy"
     Source-->>User: "Source working-copy commit and shared repository"
@@ -76,12 +76,11 @@ sequenceDiagram
     User->>Git: "Register temporary detached linked worktree"
     Git-->>Child: "Copy .git pointer and repair linked-worktree path"
     User->>Child: "Create private .jj state and shared-repo pointer"
-    User->>Child: "Reset to copied source tree and mark monitor baseline"
-    opt "Watchman backend only"
-        Child->>Watch: "Resolve destination root and obtain fresh clock"
-    end
+    User->>Child: "Reset to copied source tree and clear copied cursor"
     User->>Child: "Apply sparse policy and create independent commit"
     User->>Child: "Check out the chosen parent tree"
+    Note over Child,Scan: "No root registration during workspace add"
+    Child->>Scan: "First later BeginScan registers or adopts child root"
 ```
 
 ## Step 1: Snapshot and lock the source workspace
@@ -122,14 +121,18 @@ source**: directory siblings can have parent/child snapshot lineage without
 creating an unsupported nested subvolume.
 
 **Currently broken — C-22:** The command accepts destinations inside the
-source checkout. A writable child subvolume beneath an already watched root
-violates AWACS's no-nested-subvolume invariant, so a later source cut can fail
-and may permanently wedge that watch as described in C-05.
+source checkout. A writable child subvolume beneath an already registered root
+violates AWACS's no-nested-subvolume invariant, so a later source cut can fail.
+The C-05 remediation must reject that invalid cut without advancing the
+physical head, but workspace add should prevent the unsupported layout in the
+first place.
 
-**Currently broken — C-21, C-28, and C-29:** Optional mode does not preserve
+**C-21, C-28, and C-29 status:** The current lifecycle remediation preserves
 stock behavior for a missing `btrfs` executable, an existing empty
-destination, or an otherwise valid destination on another filesystem.
-Optional optimization must fall back before changing stock semantics.
+destination, or an otherwise valid destination on another filesystem when
+mode is auto. Required `true` mode instead preserves the snapshot error and
+fails workspace creation. Keep these findings open until the supported-host
+acceptance matrix passes.
 
 ## Step 3: Create a writable copy-on-write Btrfs root
 
@@ -145,29 +148,29 @@ root's live file contents.
 The destination is **writable**, has its own subvolume/root identifier and UUID,
 and reports the source subvolume UUID as its Btrfs snapshot `parent_uuid`.
 The parent's UUID proves filesystem ancestry; it is not a Jujutsu commit ID,
-an AWACS watch ID, or a directory-parent relationship.
+an AWACS root-state ID, or a directory-parent relationship.
 
 **Invariant:** An optimization may share immutable objects and copy-on-write
 extents. It must never give two active workspaces the same mutable checkout
-state, Git index, AWACS watch, authorization grant, or persisted cursor.
+state, Git index, AWACS root state, authorization grant, or persisted cursor.
 
-### The dangerous optional-fallback branch
+### The optional-fallback boundary
 
-The current code captures `snapshot_source_commit` **before** attempting its
-optional snapshot. If the attempt returns the ordinary-workspace fallback, it
-sets `snapshot = false` but leaves that source commit populated. The
-destination is then an empty normal directory, yet later initialization still
-uses the snapshot-only baseline path.
+The current code assigns `snapshot_source_commit` only after
+`create_btrfs_snapshot` confirms a physical snapshot. If optional auto mode
+falls back, `snapshot` becomes false while the snapshot-only baseline remains
+absent, so ordinary workspace initialization and checkout materialization run.
+Required snapshot mode still returns the snapshot failure instead of creating a
+workspace.
 
 `TreeState::reset` creates tracked file-state entries without writing missing
-files. The first full destination scan therefore records inherited tracked
-paths as deletions; a fresh Watchman clock can instead make the fabricated
-tree appear clean.
+files. That remains valid only after a successful Btrfs snapshot has already
+copied the expected files; an ordinary fallback must never use that path or
+fabricate a direct cursor for it.
 
-**Currently broken — C-02:** This is a reproduced, release-blocking data-loss
-path. When optional Btrfs creation does not actually produce a writable
-snapshot, every snapshot-only baseline and monitor action must be discarded
-and ordinary Jujutsu materialization must run unchanged.
+**C-02 status:** The unsafe fallback baseline is remediated in the current
+source. Keep the finding open until the non-Btrfs, cross-filesystem,
+absent-tooling, and existing-empty-destination acceptance matrix passes.
 
 ## Step 4: Remove copied workspace identities
 
@@ -179,7 +182,7 @@ actual directories, and unlinks files or symbolic links without following
 them.
 
 The copied `.jj` otherwise contains the source workspace name, operation,
-working-copy tree, locks, and monitor cursor. The copied `.git` otherwise
+working-copy tree, locks, and direct-scan cursor. The copied `.git` otherwise
 contains or points at the source's mutable Git worktree identity. Neither copy
 is a valid independent workspace.
 
@@ -255,18 +258,18 @@ The resulting physical topology is asymmetric:
 
 **Invariant:** Every workspace must resolve the same shared Jujutsu repository
 and operation store while retaining its own name, working-copy commit,
-checkout operation, tree/file-state cache, sparse policy, and monitor cursor.
+checkout operation, tree/file-state cache, sparse policy, and direct-scan
+cursor.
 
-**Currently dangerous — C-01:** `jj workspace remove default` from a secondary
-workspace currently deletes the primary directory containing the physical
-`.jj/repo` and possibly Git object database. The surviving child's pointer
-then resolves to nothing. The primary store owner must be protected or
-relocated before its directory can ever be deleted.
+**C-01 status:** The current remediation preflights and revalidates removal,
+rejecting a target that contains shared Jujutsu or Git storage before deletion.
+The primary store owner must remain protected or relocated before its directory
+can ever be deleted; keep the finding open until the supported acceptance
+matrix passes.
 
 ## Step 7: Record the copied source tree as a temporary baseline
 
-**Owner:** `cmd_workspace_add`, `LockedLocalWorkingCopy::reset`, and
-`LockedLocalWorkingCopy::mark_fsmonitor_baseline`.
+**Owner:** `cmd_workspace_add` and `LockedLocalWorkingCopy::reset`.
 
 For an actual writable snapshot, Jujutsu temporarily associates the child with
 the source working-copy commit in the shared repository view. It then locks
@@ -275,16 +278,13 @@ the source tree and synthetic file-state entries; it does not materialize
 files. That is valid only because a successful Btrfs snapshot already copied
 the expected files.
 
-Next it invokes `mark_fsmonitor_baseline`:
+Next it clears any copied direct-scan cursor. Workspace creation does not send
+`BeginScan`, register the child root, or initialize a child cursor. The first
+later command that scans the child establishes its own immutable direct
+baseline.
 
-| Backend | What actually happens during workspace creation |
-| --- | --- |
-| `none` | The child cursor is cleared; there is no monitor registration. |
-| `watchman` | The child cursor is cleared, its own root is resolved, and a new child-specific Watchman clock is requested. AWACS compatibility may adopt the child's Btrfs snapshot lineage at this point. |
-| `awacs` | The child cursor is cleared and no direct `BeginScan`, watch registration, or cursor initialization occurs. The first later command must establish its own direct baseline. |
-
-Finally the child's lock is finished against the new shared operation ID.
-Under no backend may the copied source cursor survive this transition.
+Finally the child's lock is finished against the new shared operation ID. The
+copied source cursor must not survive this transition.
 
 ## Step 8: Select sparsity and the destination working-copy commit
 
@@ -306,9 +306,9 @@ commit:
   out the resulting tree in the child.
 
 The source workspace keeps its own working-copy commit. Any child checkout or
-sparse-policy change that changes the tree clears the child's earlier monitor
-cursor; ignored files not targeted by the checkout can remain in the writable
-snapshot.
+sparse-policy change that changes the tree clears the child's earlier
+direct-scan cursor; ignored files not targeted by the checkout can remain in
+the writable snapshot.
 
 **Currently broken — C-17:** A sparse source physically lacks files outside its
 sparse matcher. When the destination requests `--sparse-patterns=full`, the
@@ -319,35 +319,32 @@ destination baseline.
 
 ## Step 9: Understand when AWACS can adopt the child
 
-**Owner:** `src/watchman.rs::watch_project`,
+**Owner:** `src/scan_facade.rs::FacadeScanHandler::ensure_registered_root`,
 `src/service.rs::adopt_snapshot_descendant`, and
 `src/manager.rs::adopt_snapshot_descendant`.
 
-The Watchman compatibility route can dynamically register the new root. It
-opens the child's Btrfs subvolume, reads its `parent_uuid`, and looks for a
-ready, retained parent revision on the same filesystem. A successful adoption
-transaction creates:
+The first later direct `BeginScan` canonicalizes the requested child path and
+looks for an active root registration that grants the requesting UID read and
+cut permissions. If none exists, the handler opens the child's Btrfs
+subvolume, reads its `parent_uuid`, and first tries to adopt a ready, retained
+parent revision on the same filesystem. A successful adoption transaction
+creates:
 
-- A new child watch ID and authorization grant.
-- A new child clock epoch and child live-root UUID.
+- A new child root-state ID and authorization grant.
+- A new child cursor epoch and child live-root UUID.
 - Child indexed-head and last-cut pins referencing the retained parent seed.
 - An independent watch sequence initialized at zero.
 
-The source revision may be reused as immutable seed data; the source's clock,
+The source revision may be reused as immutable seed data; the source's epoch,
 grant, live root, and cursor are never copied. Sequence zero is internal watch
 initialization, not proof that the child already has a client-visible direct
 scan boundary.
 
-If no eligible seed exists, current Watchman handling performs a full
-initialization. The code does not distinguish a genuinely unrelated root from
-a known descendant whose retained seed unexpectedly disappeared, so lineage
-loss can silently become an expensive full crawl.
-
-**Currently broken — C-10:** This adoption path exists only for Watchman root
-registration. Direct `scan.sock` handling is permanently bound to the daemon's
-first live root and rejects the child's first direct `BeginScan` as
-unauthorized. Creating a valid Jujutsu workspace does not repair that routing
-bug.
+If no eligible seed exists, the handler initializes an independent root from a
+new read-only cut and full index. After either path, it activates a facade
+binding for the exact canonical child path. One namespace scan socket can
+therefore serve `main/` and `feature/` while each request remains bound to its
+own root, grant, durable history, and cursor domain.
 
 ## The four independent parent relationships
 
@@ -367,10 +364,10 @@ flowchart TB
         BaseCommit --> ChildCommit
     end
 
-    subgraph Watches["Independent AWACS watch histories"]
-        SourceWatch["Main watch and clock epoch"]
+    subgraph DirectScan["Independent AWACS direct-scan histories"]
+        SourceWatch["Main root state and cursor epoch"]
         Seed["Retained immutable parent revision"]
-        ChildWatch["Feature watch and new clock epoch"]
+        ChildWatch["Feature root state and new cursor epoch"]
         SourceWatch --> Seed
         Seed -->|"immutable seed reuse"| ChildWatch
     end
@@ -392,7 +389,7 @@ a directory parent are not interchangeable. In the example, `main/` and
    snapshot-only baseline.
 3. Destination and source subvolumes must have distinct writable-root UUIDs on
    the same filesystem, with a verifiable snapshot lineage when claimed.
-4. A watched workspace must not gain a nested descendant subvolume.
+4. A registered workspace root must not gain a nested descendant subvolume.
 5. The copied `.jj` identity and copied mutable Git identity must be replaced.
 6. The destination must have an independent JJ name, working-copy commit,
    checkout operation, lock, tree cache, sparse matcher, and cursor.
@@ -400,11 +397,11 @@ a directory parent are not interchangeable. In the example, `main/` and
    references them.
 8. Sparse widening must create missing tracked files before recording a full
    baseline.
-9. A destination AWACS watch must have its own root, grant, clock epoch,
-   cursor, and authorization even when its immutable index is seeded from its
-   parent's history.
+9. A destination direct registration must have its own root, grant, cursor
+   epoch, cursor, and authorization even when its immutable index is seeded
+   from its parent's history.
 10. The source workspace must remain usable if destination setup, Git repair,
-    registration, or monitoring fails.
+    registration, or direct-scan setup fails.
 
 Continue with [the new worktree's first changes and snapshots](/walkthroughs/first-worktree-changes/),
 or compare the [Btrfs workspace integration reference](/integrations/btrfs-workspaces/)

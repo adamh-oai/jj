@@ -2,16 +2,19 @@
 
 use crate::btrfs::{filesystem_info, subvolume_info};
 use crate::facade::{FacadeService, PreparedQueryResult};
+use crate::manager::{Permissions, Principal, PERMISSION_CUT, PERMISSION_READ};
 use crate::scan::{
     BeginScanRequest, Invalidation, ScanError, ScanErrorKind, ScanOutcome, ScanRequestHandler,
     ServerScanLease, SnapshotIdentity,
 };
+use crate::service::InitializeOptions;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::AsFd;
+use std::os::unix::ffi::OsStrExt;
 #[cfg(debug_assertions)]
 use std::path::Component;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -20,15 +23,14 @@ const SCAN_TTL_NS: i64 = 300_000_000_000;
 #[cfg(debug_assertions)]
 const TEST_SHORT_SCAN_TTL_NS: i64 = 300_000_000;
 
-/// Durable direct-scan handler sharing one already-registered facade.
+/// Durable direct-scan handler sharing one root-aware snapshot facade.
 ///
 /// Direct cursors wrap the existing authenticated cut claims under a distinct
 /// authenticated scan domain. Exact replay is accepted only when the facade
 /// can retain that same cut sequence and target snapshot UUID.
 pub struct FacadeScanHandler {
     facade: Arc<Mutex<FacadeService>>,
-    expected_live_root: PathBuf,
-    watch_id: [u8; 16],
+    precision_marker_directory: Option<PathBuf>,
     requester_uid: u32,
     requester_gid: u32,
     sessions: HashMap<Vec<u8>, ActiveScanSession>,
@@ -43,18 +45,17 @@ struct ActiveScanSession {
 }
 
 impl FacadeScanHandler {
-    /// Creates a direct handler for one registered live root.
+    /// Creates a direct handler which registers each exact requested root on
+    /// demand in the namespace daemon's shared facade.
     pub fn new(
         facade: Arc<Mutex<FacadeService>>,
-        expected_live_root: PathBuf,
-        watch_id: [u8; 16],
+        precision_marker_directory: Option<PathBuf>,
         requester_uid: u32,
         requester_gid: u32,
     ) -> Self {
         Self {
             facade,
-            expected_live_root,
-            watch_id,
+            precision_marker_directory,
             requester_uid,
             requester_gid,
             sessions: HashMap::new(),
@@ -65,11 +66,86 @@ impl FacadeScanHandler {
         }
     }
 
+    /// Canonicalizes, authorizes, and activates one requested root for this
+    /// daemon lifetime. Durable watch state remains in the manager store; the
+    /// in-memory facade view is rebuilt lazily when a root is first scanned.
+    fn ensure_registered_root(
+        &self,
+        facade: &mut FacadeService,
+        requested_root: &Path,
+        now_ns: i64,
+    ) -> Result<(PathBuf, [u8; 16]), ScanError> {
+        let root = std::fs::canonicalize(requested_root)
+            .map_err(|err| unavailable(format!("canonicalize AWACS scan root: {err}")))?;
+        let root_bytes = root.as_os_str().as_bytes();
+        let existing = facade
+            .service()
+            .store()
+            .active_uid_watch_at_path(
+                root_bytes,
+                self.requester_uid,
+                PERMISSION_READ | PERMISSION_CUT,
+            )
+            .map_err(|err| other(format!("find existing AWACS scan root: {err}")))?;
+        let (watch_id, grant_id) = match existing {
+            Some(existing) => existing,
+            None => {
+                let options = InitializeOptions {
+                    principal: Principal::Uid(u64::from(self.requester_uid)),
+                    permissions: Permissions::new(PERMISSION_READ | PERMISSION_CUT)
+                        .map_err(|err| other(format!("build AWACS scan grant: {err}")))?,
+                    requester_uid: self.requester_uid,
+                    requester_gid: self.requester_gid,
+                    now_ns,
+                };
+                let initialized = match facade
+                    .service_mut()
+                    .adopt_snapshot_descendant(&root, &options)
+                    .map_err(|err| other(format!("adopt AWACS scan lineage: {err}")))?
+                {
+                    Some(initialized) => initialized,
+                    None => facade
+                        .service_mut()
+                        .initialize(&root, &options)
+                        .map_err(|err| other(format!("initialize AWACS scan root: {err}")))?,
+                };
+                (initialized.watch_id, initialized.grant_id)
+            }
+        };
+        match facade.view_binding(watch_id) {
+            Some(binding) if binding.root_path.as_slice() == root_bytes => {}
+            Some(_) => {
+                return Err(ScanError::new(
+                    ScanErrorKind::Unauthorized,
+                    "AWACS scan root conflicts with its active facade binding",
+                ));
+            }
+            None => facade
+                .activate(watch_id, grant_id, &root)
+                .map_err(|err| other(format!("activate AWACS scan root: {err}")))?,
+        }
+        if let Some(marker_directory) = &self.precision_marker_directory {
+            if !facade.has_precision_guard(watch_id) {
+                if let Err(err) =
+                    facade.activate_precision_guard(watch_id, marker_directory, now_ns)
+                {
+                    // The optional journal may improve invalidation precision,
+                    // but snapshot-correct full invalidation remains available.
+                    eprintln!(
+                        "btrfs-awacs: precision guard unavailable for {}: {err}; using snapshot-only invalidation",
+                        root.display()
+                    );
+                }
+            }
+        }
+        Ok((root, watch_id))
+    }
+
     /// Debug-build integration hook used to prove the client traverses the
     /// immutable scan root after the live root changes. The hook is inert
     /// unless an explicit control directory and one-shot arm file exist.
     #[cfg(debug_assertions)]
-    fn maybe_mutate_live_after_begin(&self) -> Result<(), ScanError> {
+    fn maybe_mutate_live_after_begin(&self, live_root: &std::path::Path) -> Result<(), ScanError> {
         let Some(control_dir) = &self.test_control_dir else {
             return Ok(());
         };
@@ -90,7 +166,7 @@ impl FacadeScanHandler {
             ));
         }
         std::fs::write(
-            self.expected_live_root.join(&relative),
+            live_root.join(&relative),
             b"live mutation after BeginScan\n",
         )
         .map_err(|err| other(format!("apply AWACS scan test hook: {err}")))?;
@@ -147,9 +223,8 @@ impl FacadeScanHandler {
         let expired = self
             .sessions
             .iter()
-            .filter_map(|(session_id, session)| {
-                (session.expires_ns <= now_ns).then(|| session_id.clone())
-            })
+            .filter(|(_, session)| session.expires_ns <= now_ns)
+            .map(|(session_id, _)| session_id.clone())
             .collect::<Vec<_>>();
         if expired.is_empty() {
             return Ok(());
@@ -172,14 +247,6 @@ impl FacadeScanHandler {
 
 impl ScanRequestHandler for FacadeScanHandler {
     fn begin_scan(&mut self, request: BeginScanRequest) -> Result<ServerScanLease, ScanError> {
-        let requested_root = std::fs::canonicalize(&request.live_root)
-            .map_err(|err| unavailable(format!("canonicalize AWACS scan root: {err}")))?;
-        if requested_root != self.expected_live_root {
-            return Err(ScanError::new(
-                ScanErrorKind::Unauthorized,
-                "AWACS scan root does not match the registered live root",
-            ));
-        }
         let now_ns = unix_time_ns()?;
         let ttl_ns = self.scan_ttl_ns();
         self.expire_sessions(now_ns)?;
@@ -187,9 +254,13 @@ impl ScanRequestHandler for FacadeScanHandler {
             .facade
             .lock()
             .map_err(|_| other("AWACS facade lock poisoned"))?;
+        // The socket is shared by one mount namespace, but each direct scan
+        // remains bound to the caller's exact canonical root.
+        let (_requested_root, watch_id) =
+            self.ensure_registered_root(&mut facade, &request.live_root, now_ns)?;
         let prepared = facade
             .prepare_scan_query(
-                self.watch_id,
+                watch_id,
                 request.previous_cursor.as_deref(),
                 self.requester_uid,
                 self.requester_gid,
@@ -217,7 +288,18 @@ impl ScanRequestHandler for FacadeScanHandler {
                 return Err(err);
             }
         };
-        if let Err(err) = facade.renew_query_response(&prepared, now_ns, ttl_ns) {
+        // Lazy root registration and the first immutable cut can be
+        // expensive. Renew from a fresh wall-clock sample so the durable
+        // fence and the boot-clock deadline advertised below cover the same
+        // full TTL after Begin has finished preparing its response.
+        let lease_now_ns = match unix_time_ns() {
+            Ok(now_ns) => now_ns,
+            Err(err) => {
+                let _ = facade.finish_query_response(prepared);
+                return Err(err);
+            }
+        };
+        if let Err(err) = facade.renew_query_response(&prepared, lease_now_ns, ttl_ns) {
             let _ = facade.finish_query_response(prepared);
             return Err(other(format!("extend AWACS scan lease: {err}")));
         }
@@ -231,11 +313,11 @@ impl ScanRequestHandler for FacadeScanHandler {
             }
         };
         #[cfg(debug_assertions)]
-        if let Err(err) = self.maybe_mutate_live_after_begin() {
+        if let Err(err) = self.maybe_mutate_live_after_begin(&_requested_root) {
             let _ = facade.finish_query_response(prepared);
             return Err(err);
         }
-        let expires_ns = now_ns
+        let expires_ns = lease_now_ns
             .checked_add(ttl_ns)
             .ok_or_else(|| other("AWACS scan lease expiration overflow"))?;
         self.sessions.insert(

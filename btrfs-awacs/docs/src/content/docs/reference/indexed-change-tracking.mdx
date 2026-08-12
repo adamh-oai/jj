@@ -1,17 +1,18 @@
 ---
-title: "Indexed change-tracking design"
-description: "The complete normative Btrfs change-tracking architecture, kernel contract, transaction protocols, and embedded SQLite schema."
+title: "Embedded schema source"
+description: "Why the retained indexed-change document remains in the repository and which docs describe the supported direct path."
 sidebar:
   order: 2
 ---
 
-import { Content as IndexedChangeTrackingDesign } from '../../../../indexed-change-tracking.md';
-
-:::note[Normative source]
-This page renders the existing `docs/indexed-change-tracking.md` directly.
-The Rust implementation also embeds that exact file with `include_str!` when
-initializing its SQLite stores, so the document must remain at its original
-repository path.
+:::caution[Internal schema source]
+`docs/indexed-change-tracking.md` remains at its original repository path
+because `src/store.rs` embeds fenced SQL blocks from that file with
+`include_str!` when initializing SQLite stores. It is retained as an internal
+schema input, not published here as current integration guidance.
 :::
 
-<IndexedChangeTrackingDesign />
+For the supported behavior, start with the
+[system overview](/architecture/system-overview/), then follow the
+[direct immutable-snapshot API](/integrations/direct-scan-api/) and
+[Jujutsu snapshot transaction](/integrations/jujutsu-transaction/).

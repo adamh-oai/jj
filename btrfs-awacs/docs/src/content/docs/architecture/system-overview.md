@@ -1,6 +1,6 @@
 ---
 title: "System overview"
-description: "What AWACS implements, its runtime requirements, and why immutable direct scans differ from live Watchman monitoring."
+description: "What AWACS implements, its runtime requirements, and why direct scans use immutable snapshots."
 sidebar:
   order: 1
 ---
@@ -31,22 +31,16 @@ Jujutsu backend additionally requires a Jujutsu binary built with its optional
 `awacs` Cargo feature. The ordinary Jujutsu default remains
 `fsmonitor.backend = "none"` and `btrfs.enabled = false`.
 
-## The problem and the two different answers
+## The direct immutable-scan answer
 
 Ordinary Jujutsu snapshots read files from the live working-copy directory.
-Without a monitor, Jujutsu traverses the selected repository paths. With
-Watchman, it requests changed paths and a clock, narrows the traversal, and
-still reads the live directory.
+Without AWACS, Jujutsu traverses selected repository paths in that mutable
+directory. The direct AWACS backend instead receives a pinned read-only
+snapshot directory fd, authenticated cursor, invalidation, and lease, then
+reads the immutable snapshot through `/proc/self/fd/N`.
 
-AWACS offers two materially different integrations:
-
-| Integration | What the client receives | Where Jujutsu/Git reads files | Main correctness obligation |
-| --- | --- | --- | --- |
-| Focused Watchman compatibility | Changed names and an authenticated clock | Mutable live checkout | Report every path the client might have cached after its previous clock, including transient namespace changes. |
-| Native Git hook v2 | An authenticated token and NUL-delimited changed names | Mutable live checkout/index refresh | Conservatively invalidate Git's tracked/untracked/index state, including directory and transient changes. |
-| Direct Jujutsu backend | A pinned read-only snapshot directory fd, authenticated cursor, invalidation, and lease | Immutable snapshot via `/proc/self/fd/N` | Read one exact immutable snapshot; persist its cursor only with the tree state derived from that same snapshot. |
-
-The direct backend is **not** an alternate encoding of the Watchman protocol.
-Its immutable scan root eliminates a class of live-crawl races, but introduces
-descriptor identity, lease lifetime, transaction, and external-input
-fingerprint requirements.
+The core correctness obligation is simple to state and strict to implement:
+Jujutsu must read one exact immutable snapshot and persist its cursor only with
+the tree state derived from that same snapshot. Descriptor identity, lease
+lifetime, transaction ordering, and external-input fingerprints are therefore
+part of correctness rather than optional optimizations.

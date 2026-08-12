@@ -8,7 +8,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SPEC: &str = include_str!("../docs/indexed-change-tracking.md");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MANAGER_APPLICATION_ID: i64 = 0x4241_5731; // BAW1
 const BROKER_APPLICATION_ID: i64 = 0x4241_5742; // BAWB
 
@@ -302,6 +302,11 @@ fn install_manager_schema(
          VALUES (4, 'generic-watchman-trigger-argv-v4', ?1)",
         [metadata.created_ns],
     )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, name, applied_ns) \
+         VALUES (5, 'remove-watchman-triggers-v5', ?1)",
+        [metadata.created_ns],
+    )?;
     transaction.pragma_update(None, "application_id", MANAGER_APPLICATION_ID)?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
@@ -327,6 +332,10 @@ fn install_broker_schema(connection: &mut Connection) -> Result<(), StoreError> 
     )?;
     transaction.execute(
         "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (4, 'schema-parity-v4', 0)",
+        [],
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (5, 'schema-parity-v5', 0)",
         [],
     )?;
     transaction.pragma_update(None, "application_id", BROKER_APPLICATION_ID)?;
@@ -423,36 +432,27 @@ fn migrate_manager_schema(connection: &mut Connection) -> Result<(), StoreError>
         version = 3;
     }
     if version == 3 {
-        // Trigger registrations are replayable by clients. Recreate this
-        // small table rather than trying to preserve the old JJ-only marker
-        // rows while widening it to exact argv payloads.
+        // Version 4 previously widened a dormant trigger table. The table is
+        // gone in version 5, so an older database only needs to discard any
+        // legacy copy before recording the historical version-4 step.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(
-            r#"DROP TABLE watchman_triggers;
-               CREATE TABLE watchman_triggers (
-                   watch_id BLOB NOT NULL REFERENCES watches(id),
-                   name BLOB NOT NULL,
-                   owner_grant_id BLOB NOT NULL CHECK (length(owner_grant_id) = 16),
-                   command_kind TEXT NOT NULL CHECK (command_kind = 'argv-v1'),
-                   command_argv BLOB NOT NULL CHECK (length(command_argv) > 1),
-                   expression_kind TEXT NOT NULL CHECK (expression_kind = 'exclude-git-jj-v1'),
-                   state TEXT NOT NULL CHECK (state IN ('active', 'deleting')),
-                   last_evaluated_seq INTEGER,
-                   pending_through_seq INTEGER,
-                   run_owner BLOB,
-                   run_fence INTEGER NOT NULL DEFAULT 0,
-                   run_expires_ns INTEGER,
-                   PRIMARY KEY (watch_id, owner_grant_id, name),
-                   FOREIGN KEY (owner_grant_id, watch_id) REFERENCES watch_grants(id, watch_id),
-                   CHECK (last_evaluated_seq IS NULL OR pending_through_seq IS NULL OR last_evaluated_seq <= pending_through_seq),
-                   CHECK ((run_owner IS NULL) = (run_expires_ns IS NULL))
-               );"#,
-        )?;
+        transaction.execute_batch("DROP TABLE IF EXISTS watchman_triggers;")?;
         transaction.execute(
             "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (4, 'generic-watchman-trigger-argv-v4', 0)",
             [],
         )?;
         transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+        version = 4;
+    }
+    if version == 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch("DROP TABLE IF EXISTS watchman_triggers;")?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (5, 'remove-watchman-triggers-v5', 0)",
+            [],
+        )?;
+        transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit()?;
     }
     Ok(())
@@ -515,6 +515,16 @@ fn migrate_broker_schema(connection: &mut Connection) -> Result<(), StoreError> 
             [],
         )?;
         transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+        version = 4;
+    }
+    if version == 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, name, applied_ns) VALUES (5, 'schema-parity-v5', 0)",
+            [],
+        )?;
+        transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit()?;
     }
     Ok(())
@@ -638,6 +648,16 @@ mod tests {
             )
             .unwrap();
         assert!(table_count >= 25);
+        let legacy_trigger_tables: i64 = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema \
+                 WHERE type = 'table' AND name = 'watchman_triggers'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_trigger_tables, 0);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -710,6 +730,11 @@ mod tests {
             .unwrap();
         drop(broker);
         let broker = BrokerJournal::open(&broker_path).unwrap();
+        let broker_version: i64 = broker
+            .connection()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(broker_version, SCHEMA_VERSION);
         let payload_table: i64 = broker
             .connection()
             .query_row(
@@ -720,6 +745,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(payload_table, 1);
+    }
+
+    #[test]
+    fn migrates_v4_manager_by_dropping_legacy_trigger_table() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manager.sqlite3");
+        let store = Store::create(&path, &metadata()).unwrap();
+        store
+            .connection()
+            .execute("CREATE TABLE watchman_triggers (legacy INTEGER)", [])
+            .unwrap();
+        store
+            .connection()
+            .execute("DELETE FROM schema_migrations WHERE version = 5", [])
+            .unwrap();
+        store
+            .connection()
+            .pragma_update(None, "user_version", 4)
+            .unwrap();
+        drop(store);
+
+        let migrated = Store::open(&path).unwrap();
+        let legacy_trigger_tables: i64 = migrated
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema \
+                 WHERE type = 'table' AND name = 'watchman_triggers'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_trigger_tables, 0);
     }
 
     #[test]

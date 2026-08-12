@@ -4,7 +4,7 @@ description: "P1 correctness review findings, affected components, failure mecha
 sidebar:
   order: 4
 ---
-This page contains **20 P1 correctness findings**. Identifiers correspond to the reviewed source specification.
+This page contains **16 P1 correctness findings**. Identifiers correspond to the reviewed source specification.
 
 **C-06 — History maintenance violates its own retained-boundary foreign keys.**
 `src/manager.rs` deliberately retains the oldest and newest
@@ -46,20 +46,10 @@ AWACS is disabled.
 later appends that relative global file on top. Since Jujutsu's ignore matcher
 uses the newest applicable rule, the lower-priority global ignore incorrectly
 overrides the higher-priority repository exclude. This changes tracking or
-silently includes/excludes private files under `none`, Watchman, and AWACS. A
+silently includes/excludes private files under `none` and AWACS. A
 live `fsmonitor.backend = "none"` comparison showed that Git and the installed
 Jujutsu both reported an unignored candidate, while the current implementation
 incorrectly reported a clean working copy.
-
----
-
-**C-10 — Direct AWACS works only for the daemon's first workspace root.**
-`src/main.rs` discovers one daemon/socket per mount namespace,
-but constructs a `FacadeScanHandler` permanently bound to the first root and
-watch. `src/scan_facade.rs` rejects every other requested
-root. A second independent repository or a sibling `jj workspace add` Btrfs
-workspace cannot snapshot through the existing daemon, despite the Watchman
-endpoint supporting dynamic root registration.
 
 ---
 
@@ -73,38 +63,20 @@ Jujutsu's advertised renewal deadline.
 ---
 
 **C-12 — A connected descriptor can carry the wrong namespace authority.**
-`src/watchman_transport.rs` and
-`src/main.rs` authenticate the original socket connector rather
-than each later sending process. An inherited or transferred connected
-descriptor can therefore be reused by a same-UID process with a different mount
-namespace or chroot. The direct endpoint can additionally transfer a private
-managed snapshot fd under the original connector's authority.
+`src/main.rs` authenticates the original socket connector rather than each
+later sending process. An inherited or transferred connected descriptor can
+therefore be reused by a same-UID process with a different mount namespace or
+chroot. The direct endpoint can additionally transfer a private managed
+snapshot fd under the original connector's authority.
 
 ---
 
-**C-13 — Fresh fallback is lost for Watchman and Git.**
-`src/manager.rs` records a full-fresh cut in SQLite, but
-`PublishedCut` does not propagate its freshness. The facade retries a
-historical comparison that can fail for exactly the kernel capability that
-required the fresh checkpoint, returning an error instead of `/`. The direct
-backend has a separate safe `Full` fallback for this case.
-
----
-
-**C-14 — The optional precision journal is recorded but not used by clients.**
+**C-14 — The optional precision journal is recorded but not used by direct invalidation.**
 `src/facade.rs` certifies and pins guard cursors, but projects
 direct `historical_changes` using `project_events` rather than the existing
 lease-aware precision-range projector in `src/compat.rs`.
-Consequently the recursive inotify overhead does not repair the live-client
-directory-witness false negative.
-
----
-
-**C-15 — Invalid Watchman expressions can leak durable response pins.**
-`src/watchman.rs` validates expressions against an empty
-path, but short-circuiting can hide a malformed name operand until a nonempty
-changed path is evaluated after a prepared response has been allocated. The
-error path returns without releasing that response's query lease/pins.
+Consequently the recursive inotify overhead does not improve direct
+invalidation precision.
 
 ---
 
@@ -193,14 +165,6 @@ transaction fields with the actual descriptors.
 `src/broker.rs` also fails to reconcile all ioctl-reported
 record/byte totals with the persisted stream. A malformed or mismatched custom
 kernel stream can cross the trust boundary without the intended proof.
-
----
-
-**C-24 — Trigger compatibility does not match ordinary Watchman features.**
-`src/watchman.rs` always returns a synthetic
-`deleted: false` for `trigger-del` and explicitly rejects `trigger-list` and
-`trigger`. Jujutsu trigger registration and certain diagnostics are unsupported;
-configuration must keep `register-snapshot-trigger = false`.
 
 ---
 

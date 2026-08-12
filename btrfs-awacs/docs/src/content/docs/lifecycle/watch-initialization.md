@@ -19,11 +19,11 @@ The first registration of an unindexed root proceeds as follows:
 7. Publish revision zero, independent indexed-head and physical-head pins, the
    active watch, and its initial grant.
 8. Arm the mandatory root-path and mount-topology monitors before exposing any
-   client clock.
+   client cursor.
 
 Sequence zero initializes the **core watch**. It is not, by itself, a
-Watchman/direct-scan clock boundary. The first client-visible clock is created
-by a subsequent synchronized cut and facade finalization.
+direct-scan cursor boundary. The first client-visible cursor is created by a
+subsequent synchronized cut and facade finalization.
 
 An already-created Btrfs snapshot descendant can sometimes adopt a retained
 parent revision. This reuses index data but still creates an independent watch,

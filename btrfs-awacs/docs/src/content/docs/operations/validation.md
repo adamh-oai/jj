@@ -16,8 +16,8 @@ Before any meaningful integration claim:
    AWACS implementation.
 4. Supply a declared, runnable Linux end-to-end binary or replace the broken
    `run_e2e.sh` target with the actual supported harness.
-5. Confirm installed `btrfs-awacs`, Watchman discovery, daemon, Git hook, and
-   broker entry points are discoverable in the real deployment environment.
+5. Confirm installed `btrfs-awacs`, direct-scan discovery, daemon, and broker
+   entry points are discoverable in the real deployment environment.
 
 ## Review-time verification
 
@@ -75,7 +75,7 @@ Snapshot a source with a nontrivial sparse profile, request
 materialized before the destination tree or monitor baseline is committed.
 
 Test relative and absolute global ignore files against conflicting
-`info/exclude` rules for `none`, Watchman, and AWACS. Run the same checks
+`info/exclude` rules for `none` and AWACS. Run the same checks
 through ordinary snapshots, `jj run`, and external diff editors.
 
 ## Core filesystem correctness
@@ -90,19 +90,6 @@ Inject crashes before/after broker intents, snapshot creation, receipt
 completion, physical-head publication, comparison publication, and snapshot
 deletion. Assert that restart either resumes a valid fenced operation or
 terminally fails/quarantines an invalid one without wedging the watch.
-
-## Live Watchman and Git compatibility
-
-Run real Jujutsu and Git clients rather than only fabricated frame fixtures.
-Pause a client after receiving clock B, create/delete or rename/restore files
-and subtrees, then complete the live crawl before cut C. Compare monitored
-results with fsmonitor-disabled full scans. Repeat with precision disabled,
-enabled, gapped, overflowed, and restarted.
-
-Cover hardlinks, `.gitignore` changes, directory moves, root/ancestor
-rename-and-restore, mount-over/restore, clock copying across roots, malformed
-expressions, response-write failure, trigger-disabled startup, and unsupported
-trigger-enabled configurations.
 
 ## Direct Jujutsu scans
 
@@ -123,8 +110,8 @@ Use a real read-only Btrfs snapshot fd to verify:
   independent watches, grants, leases, and cursors from the same daemon.
 - Invalid descriptor identity, malformed paths, cross-root cursors, and
   transferred/inherited connections fail closed.
-- Alternating upstream/custom Jujutsu binaries preserves ordinary Watchman
-  cursor compatibility.
+- Older or feature-disabled Jujutsu binaries safely perform a full live
+  traversal instead of accepting an unsupported AWACS cursor.
 
 ## Performance and resource limits
 

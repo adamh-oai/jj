@@ -6,25 +6,19 @@ use btrfs_awacs::broker::{
     SnapshotDeleteExecution,
 };
 use btrfs_awacs::broker_protocol::BrokerDispatcher;
-use btrfs_awacs::bser::{encode_frame, Limits as BserLimits, Value as BserValue};
 use btrfs_awacs::btrfs::{send_changed_objects, OpenedSubvolume};
 use btrfs_awacs::facade::FacadeService;
-use btrfs_awacs::git_fsmonitor::run_hook_over_socket;
-use btrfs_awacs::manager::{
-    Permissions, Principal, PERMISSION_CUT, PERMISSION_READ, PERMISSION_TRIGGER,
-};
+use btrfs_awacs::manager::{Permissions, Principal, PERMISSION_CUT, PERMISSION_READ};
 use btrfs_awacs::manifest::{
     parse_changed_objects, parse_changed_objects_v2, CHANGED_OBJECTS_V2_MAGIC,
 };
 use btrfs_awacs::namespace::NamespaceMonitor;
-use btrfs_awacs::scan::{ScanSocket, ScanSocketListener, SocketScanDispatcher};
+use btrfs_awacs::scan::{ScanSocket, ScanSocketListener, SocketScanClient, SocketScanDispatcher};
 use btrfs_awacs::scan_facade::FacadeScanHandler;
 use btrfs_awacs::service::{ChangesOptions, InitializeOptions, Service, ServiceConfig};
 use btrfs_awacs::store::{BrokerJournal, ServiceMetadata, Store};
-use btrfs_awacs::watchman::WatchmanEndpoint;
-use btrfs_awacs::watchman_transport::CredentialedStream;
 use clap::{Parser, Subcommand as ClapSubcommand, ValueEnum};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -33,20 +27,17 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, info_span, warn};
+use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 const SNAPSHOT_DIR: &str = ".btrfs-awacs";
 const SNAPSHOT_PREFIX: &str = "snapshot-";
 const CHANGED_OBJECTS_HELPER: &str = "__changed-objects-send";
-const WATCHMAN_SERVER: &str = "watchman-serve";
-const WATCHMAN_SERVER_PROGRAM: &str = "btrfs-awacs-watchman";
-const GIT_FSMONITOR_PROGRAM: &str = "git-fsmonitor-hook";
+const SCAN_SERVER: &str = "scan-serve";
 const SEND_HELPER_UNSUPPORTED_EXIT_CODE: i32 = 2;
 const EOPNOTSUPP: i32 = 95;
 
@@ -54,8 +45,7 @@ const EOPNOTSUPP: i32 = 95;
 #[command(
     name = "btrfs-awacs",
     version,
-    about = "Btrfs snapshot change index, focused Watchman service, and benchmark tools",
-    after_help = "Installed multicall entry points:\n  watchman              Watchman discovery shim\n  btrfs-awacs-watchman  Focused Watchman server\n  git-fsmonitor-hook    Git fsmonitor hook protocol v2"
+    about = "Btrfs snapshot change index, direct scan service, and benchmark tools"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -81,8 +71,8 @@ enum CliCommand {
         manager_uid: u32,
         manager_gid: u32,
     },
-    /// Run the focused Watchman-compatible per-user service.
-    WatchmanServe(WatchmanServeArgs),
+    /// Run the direct immutable-snapshot scan service.
+    ScanServe(ScanServeArgs),
     /// Discover or activate the namespace daemon and print its scan socket.
     ScanSockname {
         #[arg(value_name = "LIVE_ROOT")]
@@ -145,15 +135,12 @@ enum SnapshotMode {
 }
 
 #[derive(Debug, clap::Args)]
-struct WatchmanServeArgs {
+struct ScanServeArgs {
     socket: PathBuf,
-    root: PathBuf,
     managed_dir: PathBuf,
     spool_dir: PathBuf,
     manager_db: PathBuf,
     broker_socket: PathBuf,
-    watch_id: OsString,
-    grant_id: OsString,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -182,42 +169,13 @@ impl SendHelperError {
 }
 
 fn main() {
-    let invoked_name = env::args_os()
-        .next()
-        .as_deref()
-        .and_then(|name| Path::new(name).file_name())
-        .map(OsStr::to_owned);
     let explicit_command = env::args_os().nth(1);
-    let invoked_as_git_hook = invoked_name.as_deref() == Some(OsStr::new(GIT_FSMONITOR_PROGRAM));
-    let component = match invoked_name.as_deref() {
-        Some(name) if name == OsStr::new(GIT_FSMONITOR_PROGRAM) => "git-fsmonitor-hook",
-        Some(name) if name == OsStr::new("watchman") => "watchman-discovery",
-        Some(name) if name == OsStr::new(WATCHMAN_SERVER_PROGRAM) => "watchman-serve",
-        _ if explicit_command.as_deref() == Some(OsStr::new(WATCHMAN_SERVER)) => "watchman-serve",
-        _ if explicit_command.as_deref() == Some(OsStr::new("broker-serve")) => "broker-serve",
+    let component = match explicit_command.as_deref() {
+        Some(command) if command == OsStr::new(SCAN_SERVER) => "scan-serve",
+        Some(command) if command == OsStr::new("broker-serve") => "broker-serve",
         _ => "btrfs-awacs",
     };
     let _tracing_guard = init_tracing(component);
-    if invoked_as_git_hook {
-        if let Err(error) = run_git_fsmonitor_program() {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if invoked_name.as_deref() == Some(OsStr::new("watchman")) {
-        if let Err(error) = run_watchman_discovery_shim() {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if invoked_name.as_deref() == Some(OsStr::new(WATCHMAN_SERVER_PROGRAM)) {
-        let mut arguments = env::args_os().collect::<Vec<_>>();
-        arguments.insert(1, OsString::from(WATCHMAN_SERVER));
-        run_cli(Cli::parse_from(arguments));
-        return;
-    }
     run_cli(Cli::parse());
 }
 
@@ -293,7 +251,7 @@ fn awacs_log_path() -> Result<PathBuf, String> {
             })?)
             .join(".local/state"),
         };
-    Ok(state_home.join("btrfs-awacs/watchman.log"))
+    Ok(state_home.join("btrfs-awacs/awacs.log"))
 }
 
 fn run_cli(cli: Cli) {
@@ -311,7 +269,7 @@ fn run_cli(cli: Cli) {
             manager_uid,
             manager_gid,
         )),
-        CliCommand::WatchmanServe(arguments) => finish(run_watchman_server(arguments)),
+        CliCommand::ScanServe(arguments) => finish(run_scan_server(arguments)),
         CliCommand::ScanSockname { root } => finish(run_scan_sockname(&root)),
         CliCommand::ChangedObjectsSend {
             snapshot,
@@ -370,11 +328,7 @@ fn run_cli(cli: Cli) {
 }
 
 fn run_scan_sockname(root: &Path) -> Result<(), String> {
-    let watchman_socket = ensure_watchman_daemon(root)?;
-    let scan_socket = watchman_socket
-        .parent()
-        .ok_or_else(|| "Watchman socket has no parent directory".to_owned())?
-        .join("scan.sock");
+    let scan_socket = ensure_scan_daemon(root)?;
     validate_user_socket(&scan_socket)?;
     io::stdout()
         .write_all(scan_socket.as_os_str().as_bytes())
@@ -411,112 +365,9 @@ fn finish_send_helper(result: Result<(), SendHelperError>) {
     }
 }
 
-fn run_git_fsmonitor_program() -> Result<(), String> {
-    let started = Instant::now();
-    let caller_directory =
-        env::current_dir().map_err(|error| format!("read Git worktree directory: {error}"))?;
-    let root = automatic_watch_root(&caller_directory)?;
-    let socket = match env::var_os("BTRFS_AWACS_SOCKET") {
-        Some(socket) => PathBuf::from(socket),
-        None => ensure_watchman_daemon(&root)?,
-    };
-    let argv = env::args_os()
-        .skip(1)
-        .map(|value| value.as_bytes().to_vec())
-        .collect::<Vec<_>>();
-    let token_kind = argv
-        .get(1)
-        .map(|token| {
-            if token.is_empty() || token.iter().all(u8::is_ascii_digit) {
-                "fresh"
-            } else {
-                "incremental"
-            }
-        })
-        .unwrap_or("invalid");
-    let span = info_span!(
-        "git_fsmonitor_hook",
-        root = %root.display(),
-        socket = %socket.display(),
-        token_kind,
-    );
-    let _entered = span.enter();
-    let response = run_hook_over_socket(&socket, &root, &argv).map_err(|error| {
-        warn!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            error = %error,
-            "git fsmonitor hook failed"
-        );
-        error.to_string()
-    })?;
-    info!(
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        response_bytes = response.len(),
-        "git fsmonitor hook completed"
-    );
-    io::stdout()
-        .write_all(&response)
-        .and_then(|()| io::stdout().flush())
-        .map_err(|error| format!("write Git fsmonitor response: {error}"))
-}
-
-fn run_watchman_discovery_shim() -> Result<(), String> {
-    let started = Instant::now();
-    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.as_slice()
-        != [
-            OsString::from("--output-encoding"),
-            OsString::from("bser-v2"),
-            OsString::from("get-sockname"),
-        ]
-        && arguments.as_slice()
-            != [
-                OsString::from("--output-encoding=bser-v2"),
-                OsString::from("get-sockname"),
-            ]
-    {
-        return Err(
-            "focused watchman shim supports only --output-encoding bser-v2 get-sockname".to_owned(),
-        );
-    }
-    let root =
-        env::current_dir().map_err(|error| format!("read Watchman caller directory: {error}"))?;
-    let socket = ensure_watchman_daemon(&root)?;
-    let response = BserValue::Object(BTreeMap::from([
-        (
-            b"version".to_vec(),
-            BserValue::Bytes(b"btrfs-awacs-0.1".to_vec()),
-        ),
-        (
-            b"sockname".to_vec(),
-            BserValue::Bytes(socket.as_os_str().as_bytes().to_vec()),
-        ),
-    ]));
-    let frame = encode_frame(&response, BserLimits::default())
-        .map_err(|error| format!("encode Watchman discovery response: {error}"))?;
-    let result = io::stdout()
-        .write_all(&frame)
-        .and_then(|()| io::stdout().flush())
-        .map_err(|error| format!("write Watchman discovery response: {error}"));
-    match &result {
-        Ok(()) => info!(
-            socket = %socket.display(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "watchman discovery completed"
-        ),
-        Err(error) => warn!(
-            socket = %socket.display(),
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            error = %error,
-            "watchman discovery failed"
-        ),
-    }
-    result
-}
-
-fn ensure_watchman_daemon(caller_directory: &Path) -> Result<PathBuf, String> {
-    let socket = namespace_watchman_socket()?;
-    if socket.exists() && existing_watchman_socket_is_live(&socket)? {
+fn ensure_scan_daemon(caller_directory: &Path) -> Result<PathBuf, String> {
+    let socket = namespace_scan_socket()?;
+    if socket.exists() && existing_scan_socket_is_live(&socket)? {
         return Ok(socket);
     }
     let namespace_directory = socket
@@ -538,35 +389,30 @@ fn ensure_watchman_daemon(caller_directory: &Path) -> Result<PathBuf, String> {
             io::Error::last_os_error()
         ));
     }
-    if socket.exists() && existing_watchman_socket_is_live(&socket)? {
+    if socket.exists() && existing_scan_socket_is_live(&socket)? {
         return Ok(socket);
     }
-    let root = automatic_watch_root(caller_directory)?;
-    let paths = automatic_watchman_paths(&root)?;
+    let root = automatic_scan_root(caller_directory)?;
+    let paths = automatic_scan_paths(&root)?;
     let executable = env::current_exe().map_err(|error| format!("locate btrfs-awacs: {error}"))?;
     let daemon_stderr = automatic_daemon_stderr()?;
     let mut child = Command::new(executable)
-        .arg(WATCHMAN_SERVER)
+        .arg(SCAN_SERVER)
         .arg(&socket)
-        .arg(&root)
         .arg(&paths.managed_dir)
         .arg(&paths.spool_dir)
         .arg(&paths.manager_db)
         .arg(&paths.broker_socket)
-        .arg(env::var_os("BTRFS_AWACS_WATCH_ID").unwrap_or_else(|| OsString::from("auto")))
-        .arg(env::var_os("BTRFS_AWACS_GRANT_ID").unwrap_or_else(|| OsString::from("auto")))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        // The discovery shim is invoked with stderr captured by callers such as jj.
-        // A long-lived daemon must not inherit that pipe, or the caller waits
-        // forever for EOF after the shim itself exits.
+        // Discovery is invoked with stderr captured by callers such as jj. A
+        // long-lived daemon must not inherit that pipe, or the caller waits
+        // forever for EOF after discovery itself exits.
         .stderr(daemon_stderr)
         .spawn()
-        .map_err(|error| format!("start focused Watchman daemon: {error}"))?;
-    // The first root can require a complete index build before the daemon can
-    // publish its socket. Keep the activation lock until that finishes so
-    // concurrent shims cannot spawn competing daemons and replace each
-    // other's public socket.
+        .map_err(|error| format!("start AWACS scan daemon: {error}"))?;
+    // Keep the activation lock until the daemon publishes its socket so
+    // concurrent discovery calls cannot spawn competing daemons.
     for _ in 0..12_000 {
         if socket.exists() {
             validate_user_socket(&socket)?;
@@ -574,29 +420,29 @@ fn ensure_watchman_daemon(caller_directory: &Path) -> Result<PathBuf, String> {
         }
         if let Some(status) = child
             .try_wait()
-            .map_err(|error| format!("inspect focused Watchman daemon: {error}"))?
+            .map_err(|error| format!("inspect AWACS scan daemon: {error}"))?
         {
-            return Err(format!("focused Watchman daemon exited with {status}"));
+            return Err(format!("AWACS scan daemon exited with {status}"));
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Err("timed out waiting for focused Watchman daemon socket".to_owned())
+    Err("timed out waiting for AWACS scan daemon socket".to_owned())
 }
 
 #[derive(Debug)]
-struct AutomaticWatchmanPaths {
+struct AutomaticScanPaths {
     managed_dir: PathBuf,
     spool_dir: PathBuf,
     manager_db: PathBuf,
     broker_socket: PathBuf,
 }
 
-fn automatic_watch_root(caller_directory: &Path) -> Result<PathBuf, String> {
+fn automatic_scan_root(caller_directory: &Path) -> Result<PathBuf, String> {
     let canonical = fs::canonicalize(caller_directory)
-        .map_err(|error| format!("canonicalize Watchman caller directory: {error}"))?;
-    // Watchman clients normally invoke discovery from somewhere inside the
-    // working copy. Prefer the nearest repository root so snapshots cover the
-    // whole tree rather than only the caller's current subdirectory.
+        .map_err(|error| format!("canonicalize AWACS caller directory: {error}"))?;
+    // Discovery may be invoked from somewhere inside a working copy. Prefer
+    // the nearest repository root so snapshots cover the whole tree rather
+    // than only the caller's current subdirectory.
     for candidate in canonical.ancestors() {
         if candidate.join(".jj").exists() || candidate.join(".git").exists() {
             return Ok(candidate.to_path_buf());
@@ -605,7 +451,7 @@ fn automatic_watch_root(caller_directory: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn automatic_watchman_paths(root: &Path) -> Result<AutomaticWatchmanPaths, String> {
+fn automatic_scan_paths(root: &Path) -> Result<AutomaticScanPaths, String> {
     let state_home = match env::var_os("XDG_STATE_HOME") {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(
@@ -623,7 +469,7 @@ fn automatic_watchman_paths(root: &Path) -> Result<AutomaticWatchmanPaths, Strin
     })?;
     let root_parent = root
         .parent()
-        .ok_or_else(|| format!("Watchman root {} has no parent", root.display()))?;
+        .ok_or_else(|| format!("AWACS root {} has no parent", root.display()))?;
     let managed_dir = env::var_os("BTRFS_AWACS_MANAGED_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root_parent.join(".btrfs-awacs-managed"));
@@ -652,7 +498,15 @@ fn automatic_watchman_paths(root: &Path) -> Result<AutomaticWatchmanPaths, Strin
         })?;
     let manager_db = env::var_os("BTRFS_AWACS_MANAGER_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| state_dir.join("watchman.sqlite3"));
+        .unwrap_or_else(|| {
+            let current = state_dir.join("manager.sqlite3");
+            let legacy = state_dir.join("watchman.sqlite3");
+            if !current.exists() && legacy.exists() {
+                legacy
+            } else {
+                current
+            }
+        });
     if let Some(parent) = manager_db.parent() {
         fs::DirBuilder::new()
             .recursive(true)
@@ -665,8 +519,8 @@ fn automatic_watchman_paths(root: &Path) -> Result<AutomaticWatchmanPaths, Strin
                 )
             })?;
     }
-    Ok(AutomaticWatchmanPaths {
-        // Snapshot clones must stay on the watched root's Btrfs filesystem.
+    Ok(AutomaticScanPaths {
+        // Snapshot clones must stay on the live root's Btrfs filesystem.
         managed_dir,
         spool_dir,
         manager_db,
@@ -692,7 +546,7 @@ fn automatic_daemon_stderr() -> Result<Stdio, String> {
     Ok(Stdio::from(file))
 }
 
-fn namespace_watchman_socket() -> Result<PathBuf, String> {
+fn namespace_scan_socket() -> Result<PathBuf, String> {
     let runtime = PathBuf::from(
         env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| "XDG_RUNTIME_DIR is required".to_owned())?,
     );
@@ -703,7 +557,7 @@ fn namespace_watchman_socket() -> Result<PathBuf, String> {
     create_private_directory(&base)?;
     let directory = base.join(format!("mnt-{}-{}", namespace.dev(), namespace.ino()));
     create_private_directory(&directory)?;
-    Ok(directory.join("watchman.sock"))
+    Ok(directory.join("scan.sock"))
 }
 
 fn create_private_directory(path: &Path) -> Result<(), String> {
@@ -735,36 +589,34 @@ fn validate_private_runtime(path: &Path) -> Result<(), String> {
 
 fn validate_user_socket(path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("stat Watchman socket {}: {error}", path.display()))?;
+        .map_err(|error| format!("stat AWACS socket {}: {error}", path.display()))?;
     let uid = unsafe { libc::geteuid() };
     if !metadata.file_type().is_socket()
         || metadata.uid() != uid
         || metadata.permissions().mode() & 0o077 != 0
     {
         return Err(format!(
-            "Watchman socket {} has unsafe type, owner, or mode",
+            "AWACS socket {} has unsafe type, owner, or mode",
             path.display()
         ));
     }
     Ok(())
 }
 
-fn existing_watchman_socket_is_live(path: &Path) -> Result<bool, String> {
+fn existing_scan_socket_is_live(path: &Path) -> Result<bool, String> {
     validate_user_socket(path)?;
-    match UnixStream::connect(path) {
+    match SocketScanClient::connect(path) {
         Ok(_) => Ok(true),
         Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-            ) =>
+            if error.message().contains("Connection refused")
+                || error.message().contains("No such file or directory") =>
         {
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(format!(
-                        "remove stale Watchman socket {}: {error}",
+                        "remove stale AWACS scan socket {}: {error}",
                         path.display()
                     ));
                 }
@@ -772,7 +624,7 @@ fn existing_watchman_socket_is_live(path: &Path) -> Result<bool, String> {
             Ok(false)
         }
         Err(error) => Err(format!(
-            "connect to existing Watchman socket {}: {error}",
+            "connect to existing AWACS scan socket {}: {error}",
             path.display()
         )),
     }
@@ -1295,20 +1147,17 @@ fn validate_root_broker_directory(path: &Path, private: bool) -> Result<(), Stri
     Ok(())
 }
 
-fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
-    let WatchmanServeArgs {
+fn run_scan_server(arguments: ScanServeArgs) -> Result<(), String> {
+    let ScanServeArgs {
         socket: socket_path,
-        root,
         managed_dir: managed,
         spool_dir: spool,
         manager_db: store_path,
         broker_socket,
-        watch_id: watch_argument,
-        grant_id: grant_argument,
     } = arguments;
     let runtime = socket_path
         .parent()
-        .ok_or_else(|| "Watchman socket has no parent directory".to_owned())?;
+        .ok_or_else(|| "AWACS scan socket has no parent directory".to_owned())?;
     let runtime_metadata = fs::symlink_metadata(runtime)
         .map_err(|error| format!("stat runtime directory {}: {error}", runtime.display()))?;
     let uid = unsafe { libc::geteuid() };
@@ -1324,7 +1173,7 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
     }
     if socket_path.exists() {
         return Err(format!(
-            "refusing to replace existing Watchman socket {}",
+            "refusing to replace existing AWACS scan socket {}",
             socket_path.display()
         ));
     }
@@ -1338,374 +1187,34 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
             .map_err(|error| format!("create manager store: {error}"))?
     };
     let config = ServiceConfig::new(managed, spool, boot_id).with_broker_socket(broker_socket);
-    let reconnect_config = config.clone();
-    let mut service = Service::new_external(store, config).map_err(|error| error.to_string())?;
-    let automatic = watch_argument == OsStr::new("auto") && grant_argument == OsStr::new("auto");
-    if (watch_argument == OsStr::new("auto")) != (grant_argument == OsStr::new("auto")) {
-        return Err(
-            "watch-id and grant-id must either both be auto or both be explicit".to_owned(),
-        );
-    }
-    let (watch_id, grant_id) = if automatic {
-        let canonical_root = fs::canonicalize(&root)
-            .map_err(|error| format!("canonicalize automatic watch root: {error}"))?;
-        let existing = service
-            .store()
-            .active_uid_watch_at_path(
-                canonical_root.as_os_str().as_bytes(),
-                uid,
-                PERMISSION_READ | PERMISSION_CUT,
-            )
-            .map_err(|error| format!("resolve automatic watch registration: {error}"))?;
-        match existing {
-            Some(existing) => existing,
-            None => {
-                let initialized = service
-                    .initialize(
-                        &canonical_root,
-                        &InitializeOptions {
-                            principal: Principal::Uid(u64::from(uid)),
-                            permissions: Permissions::new(
-                                PERMISSION_READ | PERMISSION_CUT | PERMISSION_TRIGGER,
-                            )
-                            .map_err(|error| error.to_string())?,
-                            requester_uid: uid,
-                            requester_gid: gid,
-                            now_ns: current_time_ns()?,
-                        },
-                    )
-                    .map_err(|error| format!("initialize automatic watch: {error}"))?;
-                (initialized.watch_id, initialized.grant_id)
-            }
-        }
-    } else {
-        (
-            parse_hex_id(&watch_argument)?,
-            parse_hex_id(&grant_argument)?,
-        )
-    };
-    let mut facade = FacadeService::new(service);
-    let mut endpoint = WatchmanEndpoint::default();
-    if env::var_os("BTRFS_AWACS_PRECISION_GUARD").as_deref() == Some(OsStr::new("1")) {
-        endpoint.enable_precision_guard(runtime.to_path_buf());
-    }
-    endpoint
-        .register(&mut facade, &root, watch_id, grant_id, uid, gid)
-        .map_err(|error| error.to_string())?;
-    let canonical_root = fs::canonicalize(&root)
-        .map_err(|error| format!("canonicalize direct scan root: {error}"))?;
-    // Publish the socket only after it is ready to authenticate clients. A
-    // client can write immediately after connect(), so binding the public path
-    // before arming credential delivery races the first BSER frame.
-    let staged_socket_path = runtime.join(format!(".watchman.sock.{}.staging", std::process::id()));
-    if staged_socket_path.exists() {
-        return Err(format!(
-            "refusing to replace staged Watchman socket {}",
-            staged_socket_path.display()
-        ));
-    }
-    let listener = UnixListener::bind(&staged_socket_path).map_err(|error| {
-        format!(
-            "bind staged Watchman socket {}: {error}",
-            staged_socket_path.display()
-        )
-    })?;
-    fs::set_permissions(&staged_socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("set staged Watchman socket mode: {error}"))?;
-    let endpoint = std::sync::Arc::new(endpoint);
-    let facade = std::sync::Arc::new(std::sync::Mutex::new(facade));
-    let scan_socket_path = runtime.join("scan.sock");
-    if scan_socket_path.exists() {
-        // Activation is serialized by daemon.lock and the public Watchman
-        // socket has not been published yet. An owned private scan socket at
-        // this point can only be debris from a daemon that failed between
-        // binding scan.sock and publishing readiness; remove that exact safe
-        // socket, but never replace an arbitrary path.
-        validate_user_socket(&scan_socket_path).map_err(|error| {
-            format!(
-                "refusing to replace existing AWACS scan socket {}: {error}",
-                scan_socket_path.display()
-            )
-        })?;
-        fs::remove_file(&scan_socket_path).map_err(|error| {
-            format!(
-                "remove stale AWACS scan socket {}: {error}",
-                scan_socket_path.display()
-            )
-        })?;
-    }
-    let scan_listener = ScanSocketListener::bind(&scan_socket_path, 0o600)
+    let service = Service::new_external(store, config).map_err(|error| error.to_string())?;
+    let facade = std::sync::Arc::new(std::sync::Mutex::new(FacadeService::new(service)));
+    let precision_marker_directory = (env::var_os("BTRFS_AWACS_PRECISION_GUARD").as_deref()
+        == Some(OsStr::new("1")))
+    .then(|| runtime.to_path_buf());
+    let listener = ScanSocketListener::bind(&socket_path, 0o600)
         .map_err(|error| format!("bind AWACS scan listener: {error}"))?;
-    let scan_dispatcher = std::sync::Arc::new(SocketScanDispatcher::new(FacadeScanHandler::new(
+    let dispatcher = std::sync::Arc::new(SocketScanDispatcher::new(FacadeScanHandler::new(
         std::sync::Arc::clone(&facade),
-        canonical_root,
-        watch_id,
+        precision_marker_directory,
         uid,
         gid,
     )));
-    std::thread::Builder::new()
-        .name("btrfs-awacs-scan-listener".to_owned())
-        .spawn(move || loop {
-            let connection = match scan_listener.accept() {
-                Ok(connection) => connection,
-                Err(error) => {
-                    warn!(error = %error, "AWACS scan listener failed");
-                    return;
-                }
-            };
-            if let Err(error) = validate_scan_peer_view(&connection, uid) {
-                warn!(error = %error, "reject AWACS scan peer");
-                continue;
-            }
-            let dispatcher = std::sync::Arc::clone(&scan_dispatcher);
-            if let Err(error) = std::thread::Builder::new()
-                .name("btrfs-awacs-scan-client".to_owned())
-                .spawn(move || while dispatcher.serve_one(&connection).is_ok() {})
-            {
-                warn!(error = %error, "start AWACS scan client worker failed");
-            }
-        })
-        .map_err(|error| format!("start AWACS scan listener: {error}"))?;
-    // Discovery treats publication of the compatibility socket as daemon
-    // readiness. Keep it staged until the sibling direct scan listener is
-    // already bound and accepting authenticated clients.
-    fs::rename(&staged_socket_path, &socket_path)
-        .map_err(|error| format!("publish Watchman socket {}: {error}", socket_path.display()))?;
-    let reconnect_config = std::sync::Arc::new(reconnect_config);
-    let reconnect_store_path = std::sync::Arc::new(store_path);
-    let refresh_generation = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
     loop {
-        let (stream, _) = listener
+        let connection = listener
             .accept()
-            .map_err(|error| format!("accept Watchman connection: {error}"))?;
-        let endpoint = std::sync::Arc::clone(&endpoint);
-        let facade = std::sync::Arc::clone(&facade);
-        let reconnect_config = std::sync::Arc::clone(&reconnect_config);
-        let reconnect_store_path = std::sync::Arc::clone(&reconnect_store_path);
-        let refresh_generation = std::sync::Arc::clone(&refresh_generation);
+            .map_err(|error| format!("accept AWACS scan connection: {error}"))?;
+        if let Err(error) = validate_scan_peer_view(&connection, uid) {
+            warn!(error = %error, "reject AWACS scan peer");
+            continue;
+        }
+        let dispatcher = std::sync::Arc::clone(&dispatcher);
         std::thread::Builder::new()
-            .name("btrfs-awacs-watchman-client".to_owned())
-            .spawn(move || {
-                let mut transport = match CredentialedStream::new(stream) {
-                    Ok(transport) => transport,
-                    Err(error) => {
-                        warn!(error = %error, "watchman client setup failed");
-                        return;
-                    }
-                };
-                loop {
-                    let frame = match transport.receive_frame(BserLimits::default()) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            debug!(error = %error, "watchman client disconnected");
-                            return;
-                        }
-                    };
-                    let Ok(now_ns) = current_time_ns() else {
-                        return;
-                    };
-                    let request_started = Instant::now();
-                    let request = match facade.lock() {
-                        Ok(facade) => match transport.decode_and_authorize(
-                            &endpoint,
-                            &facade,
-                            &frame,
-                            BserLimits::default(),
-                        ) {
-                            Ok(request) => request,
-                            Err(error) => {
-                                warn!(error = %error, "watchman transport failed");
-                                return;
-                            }
-                        },
-                        Err(_) => return,
-                    };
-                    let (command, root) = watchman_request_summary(&request);
-                    let observed_refresh_generation = match refresh_generation.lock() {
-                        Ok(generation) => *generation,
-                        Err(_) => return,
-                    };
-                    let span = info_span!(
-                        "watchman_request",
-                        command = %command,
-                        root = %root,
-                        uid = frame.identity.uid,
-                        gid = frame.identity.gid,
-                    );
-                    let _entered = span.enter();
-                    debug!("watchman request received");
-                    let mut concurrent = match facade.lock() {
-                        Ok(mut facade) => endpoint.begin_concurrent_frame(
-                            &mut facade,
-                            &request,
-                            frame.identity.uid,
-                            frame.identity.gid,
-                            now_ns,
-                            BserLimits::default(),
-                        ),
-                        Err(_) => return,
-                    };
-                    if let Err(error) = &concurrent {
-                        if broker_session_was_fenced(&error.to_string()) {
-                            warn!(
-                                error = %error,
-                                "watchman broker session fenced during request preparation; reconnecting"
-                            );
-                            if let Err(refresh_error) = refresh_watchman_facade(
-                                &endpoint,
-                                &facade,
-                                &refresh_generation,
-                                observed_refresh_generation,
-                                &reconnect_store_path,
-                                &reconnect_config,
-                            ) {
-                                warn!(
-                                    error = %refresh_error,
-                                    "watchman broker reconnect failed"
-                                );
-                                return;
-                            }
-                            concurrent = match facade.lock() {
-                                Ok(mut facade) => endpoint.begin_concurrent_frame(
-                                    &mut facade,
-                                    &request,
-                                    frame.identity.uid,
-                                    frame.identity.gid,
-                                    now_ns,
-                                    BserLimits::default(),
-                                ),
-                                Err(_) => return,
-                            };
-                        }
-                    }
-                    let prepared = match concurrent {
-                        Ok(Some(pending)) => {
-                            let cut_started = Instant::now();
-                            let completed = match pending.execute() {
-                                Ok(completed) => completed,
-                                Err(error) if broker_session_was_fenced(&error.to_string()) => {
-                                    warn!(
-                                        elapsed_ms = cut_started.elapsed().as_millis() as u64,
-                                        error = %error,
-                                        "watchman broker session fenced; reconnecting"
-                                    );
-                                    if let Err(refresh_error) = refresh_watchman_facade(
-                                        &endpoint,
-                                        &facade,
-                                        &refresh_generation,
-                                        observed_refresh_generation,
-                                        &reconnect_store_path,
-                                        &reconnect_config,
-                                    ) {
-                                        warn!(
-                                            error = %refresh_error,
-                                            "watchman broker reconnect failed"
-                                        );
-                                        return;
-                                    }
-                                    let retry = match facade.lock() {
-                                        Ok(mut facade) => endpoint.begin_concurrent_frame(
-                                            &mut facade,
-                                            &request,
-                                            frame.identity.uid,
-                                            frame.identity.gid,
-                                            now_ns,
-                                            BserLimits::default(),
-                                        ),
-                                        Err(_) => return,
-                                    };
-                                    let retry = match retry {
-                                        Ok(Some(retry)) => retry,
-                                        Ok(None) => {
-                                            warn!(
-                                                "watchman reconnect retry lost concurrent request"
-                                            );
-                                            return;
-                                        }
-                                        Err(retry_error) => {
-                                            warn!(
-                                                error = %retry_error,
-                                                "watchman reconnect retry preparation failed"
-                                            );
-                                            return;
-                                        }
-                                    };
-                                    match retry.execute() {
-                                        Ok(completed) => completed,
-                                        Err(retry_error) => {
-                                            warn!(
-                                                error = %retry_error,
-                                                "watchman reconnect retry cut failed"
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        elapsed_ms = cut_started.elapsed().as_millis() as u64,
-                                        error = %error,
-                                        "watchman concurrent cut failed"
-                                    );
-                                    return;
-                                }
-                            };
-                            info!(
-                                elapsed_ms = cut_started.elapsed().as_millis() as u64,
-                                "watchman synchronized cut completed"
-                            );
-                            match facade.lock() {
-                                Ok(mut facade) => endpoint
-                                    .finish_concurrent_frame(&mut facade, completed)
-                                    .map_err(|error| error.to_string()),
-                                Err(_) => return,
-                            }
-                        }
-                        Ok(None) => match facade.lock() {
-                            Ok(mut facade) => transport
-                                .prepare_authenticated_frame(
-                                    &endpoint,
-                                    &mut facade,
-                                    frame,
-                                    now_ns,
-                                    BserLimits::default(),
-                                )
-                                .map_err(|error| error.to_string()),
-                            Err(_) => return,
-                        },
-                        Err(error) => endpoint
-                            .prepare_error_frame(error, BserLimits::default())
-                            .map_err(|error| error.to_string()),
-                    };
-                    let prepared = match prepared {
-                        Ok(prepared) => prepared,
-                        Err(error) => {
-                            warn!(error = %error, "watchman request preparation failed");
-                            return;
-                        }
-                    };
-                    let response_bytes = prepared.encoded_len();
-                    let write = transport.send_prepared_frame(&prepared, BserLimits::default());
-                    let release = match facade.lock() {
-                        Ok(mut facade) => {
-                            transport.finish_prepared_frame(&endpoint, &mut facade, prepared)
-                        }
-                        Err(_) => return,
-                    };
-                    if let Err(error) = combine_daemon_response(write, release) {
-                        warn!(error = %error, "watchman response failed");
-                        return;
-                    }
-                    info!(
-                        elapsed_ms = request_started.elapsed().as_millis() as u64,
-                        response_bytes, "watchman request completed"
-                    );
-                }
-            })
-            .map_err(|error| format!("start Watchman client worker: {error}"))?;
+            .name("btrfs-awacs-scan-client".to_owned())
+            .spawn(move || while dispatcher.serve_one(&connection).is_ok() {})
+            .map_err(|error| format!("start AWACS scan client worker: {error}"))?;
     }
 }
-
 fn validate_scan_peer_view(socket: &ScanSocket, expected_uid: u32) -> Result<(), String> {
     let peer = socket
         .peer_credentials()
@@ -1733,76 +1242,6 @@ fn validate_scan_peer_view(socket: &ScanSocket, expected_uid: u32) -> Result<(),
         return Err("AWACS scan peer has a different process root".to_owned());
     }
     Ok(())
-}
-
-fn broker_session_was_fenced(error: &str) -> bool {
-    error.contains("manager session has been fenced")
-}
-
-fn refresh_watchman_facade(
-    endpoint: &WatchmanEndpoint,
-    facade: &std::sync::Mutex<FacadeService>,
-    generation: &std::sync::Mutex<u64>,
-    observed_generation: u64,
-    store_path: &Path,
-    config: &ServiceConfig,
-) -> Result<(), String> {
-    let mut generation = generation
-        .lock()
-        .map_err(|_| "watchman refresh generation lock is poisoned".to_owned())?;
-    if *generation != observed_generation {
-        return Ok(());
-    }
-    let store = Store::open(store_path)
-        .map_err(|error| format!("reopen manager store after broker restart: {error}"))?;
-    let service =
-        Service::new_external(store, config.clone()).map_err(|error| error.to_string())?;
-    let rebuilt = endpoint
-        .rebuild_facade(service)
-        .map_err(|error| format!("rebuild Watchman facade after broker restart: {error}"))?;
-    let mut facade = facade
-        .lock()
-        .map_err(|_| "watchman facade lock is poisoned".to_owned())?;
-    *facade = rebuilt;
-    *generation = generation.saturating_add(1);
-    info!(
-        refresh_generation = *generation,
-        "watchman broker session reconnected"
-    );
-    Ok(())
-}
-
-fn watchman_request_summary(request: &BserValue) -> (String, String) {
-    let BserValue::Array(command) = request else {
-        return ("<non-array>".to_owned(), "<none>".to_owned());
-    };
-    let name = command
-        .first()
-        .and_then(|value| match value {
-            BserValue::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "<unknown>".to_owned());
-    let root = command
-        .get(1)
-        .and_then(|value| match value {
-            BserValue::Bytes(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "<none>".to_owned());
-    (name, root)
-}
-
-fn combine_daemon_response(
-    write: Result<(), btrfs_awacs::watchman_transport::TransportError>,
-    release: Result<(), btrfs_awacs::watchman_transport::TransportError>,
-) -> Result<(), String> {
-    match (write, release) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(write), Ok(())) => Err(write.to_string()),
-        (Ok(()), Err(release)) => Err(release.to_string()),
-        (Err(write), Err(release)) => Err(format!("{write}; {release}")),
-    }
 }
 
 fn parse_hex_id(value: &OsStr) -> Result<[u8; 16], String> {
@@ -2288,9 +1727,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_accepts_only_an_owned_unix_socket() {
+    fn discovery_accepts_only_an_owned_scan_socket() {
         let temp = tempdir().unwrap();
-        let socket = temp.path().join("watchman.sock");
+        let socket = temp.path().join("scan.sock");
         let _listener = match UnixListener::bind(&socket) {
             Ok(listener) => listener,
             Err(error) if error.raw_os_error() == Some(libc::EPERM) => return,
@@ -2332,13 +1771,14 @@ mod tests {
     }
 
     #[test]
-    fn default_help_lists_every_subcommand_and_multicall_entrypoint() {
+    fn default_help_lists_every_subcommand() {
         let help = Cli::command().render_long_help().to_string();
         for command in [
             "snap",
             "compare",
             "broker-serve",
-            "watchman-serve",
+            "scan-serve",
+            "scan-sockname",
             "__changed-objects-send",
             "__btrfs-inspect",
             "__broker-changed-objects",
@@ -2347,8 +1787,6 @@ mod tests {
             "__broker-full-index",
             "__nested-boundary-smoke",
             "__namespace-view-smoke",
-            "git-fsmonitor-hook",
-            "btrfs-awacs-watchman",
         ] {
             assert!(help.contains(command), "help omitted {command:?}\n{help}");
         }

@@ -44,6 +44,6 @@ npm run --prefix docs build
 
 The existing `docs/indexed-change-tracking.md` file remains in its original
 location because the Rust implementation embeds it with `include_str!` to
-extract the normative SQLite schema. The documentation site imports that exact
-source in the [indexed change-tracking reference](/reference/indexed-change-tracking/)
-instead of maintaining a second copy.
+extract the normative SQLite schema. The site keeps an
+[embedded schema source](/reference/indexed-change-tracking/) note instead of
+rendering that internal source as current integration guidance.

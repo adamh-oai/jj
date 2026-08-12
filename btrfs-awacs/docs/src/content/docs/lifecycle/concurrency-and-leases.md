@@ -21,8 +21,7 @@ The intended ownership rules are:
 - Connection workers, queued frames, packet buffers, active sessions, and
   completed-session tombstones require bounded resource policies.
 
-The current daemon has a per-connection OS-thread model. Its Watchman path has
-some split begin/execute/finish machinery for concurrent cuts; the direct scan
-path serializes every operation behind one handler mutex and also holds the
-shared facade mutex during `Service::changes`. Neither direct socket operation
-currently has a read/write deadline.
+The current daemon has a per-connection OS-thread model. The direct scan path
+serializes every operation behind one handler mutex and also holds the shared
+facade mutex during `Service::changes`. Direct socket operations currently
+have no read/write deadline.

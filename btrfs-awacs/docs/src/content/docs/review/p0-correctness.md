@@ -4,7 +4,7 @@ description: "P0 correctness review findings, affected components, failure mecha
 sidebar:
   order: 2
 ---
-This page contains **5 P0 correctness findings**. Identifiers correspond to the reviewed source specification.
+This page contains **4 P0 correctness findings**. Identifiers correspond to the reviewed source specification.
 
 **C-01 — Removing the primary workspace can delete the entire shared
 repository.**
@@ -32,8 +32,8 @@ boolean but retains that snapshot-only source baseline. It then resets the new
 working-copy tree to the source commit without writing its files.
 `../jj/lib/src/local_working_copy.rs`
 confirms that `TreeState::reset` updates state without materializing content.
-The next full scan sees missing tracked files as deletions; Watchman can even
-record a fresh clock against the fabricated baseline and hide the mismatch.
+The next full scan sees missing tracked files as deletions, and a newly
+recorded direct baseline can hide the mismatch.
 The existing fallback test uses an empty source tree, masking the defect. In a
 live non-Btrfs fallback reproduction, workspace creation succeeded while an
 inherited tracked file was absent; its first `jj status` recorded that file as
@@ -47,16 +47,6 @@ nonexistent `../bsend-watch` instead of this actual `../btrfs-awacs` sibling.
 Cargo resolves workspace path dependencies even when AWACS is optional or
 disabled. `cargo metadata --no-deps --format-version 1` fails before any
 Jujutsu build or test can begin.
-
----
-
-**C-04 — Watchman/Git can report a falsely clean working copy.**
-`src/compat.rs` drops every `DirectoryDirtyWitness` in
-`project_events`. A client can cache a transient file after clock B and before
-its live crawl completes; the file can disappear before cut C, leaving equal
-endpoint names and an empty incremental result. The client then advances its
-clock while retaining incorrect state. This specific transient-crawl race does
-not apply to Jujutsu's direct immutable-snapshot read path.
 
 ---
 

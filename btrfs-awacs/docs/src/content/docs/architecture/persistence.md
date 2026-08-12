@@ -16,7 +16,7 @@ erDiagram
     WATCH ||--o{ WATCH_GRANT : "authorizes"
     WATCH ||--o{ OPERATION : "reserves"
     WATCH ||--o{ WATCH_CUT : "orders"
-    WATCH ||--o{ FSMONITOR_BOUNDARY : "publishes"
+    WATCH ||--o{ CLIENT_BOUNDARY : "publishes"
     WATCH ||--o{ QUERY_LEASE : "serves"
     FILESYSTEM ||--o{ SNAPSHOT : "contains"
     SNAPSHOT ||--o{ SNAPSHOT_PIN : "retains"
@@ -24,7 +24,7 @@ erDiagram
     REVISION ||--o| REVISION_CHECKPOINT : "materializes"
     REVISION ||--o{ OBJECT_OVERRIDE : "overlays"
     REVISION ||--o{ REF_OVERRIDE : "overlays"
-    WATCH_CUT ||--o| FSMONITOR_BOUNDARY : "authenticates"
+    WATCH_CUT ||--o| CLIENT_BOUNDARY : "authenticates"
     WATCH_CUT }o--|| SNAPSHOT : "targets"
     COMPARISON ||--o{ CHANGE_EVENT : "publishes"
     QUERY_LEASE ||--o{ QUERY_REVISION_PIN : "protects"
@@ -39,8 +39,8 @@ Key distinctions:
 - A **revision** describes one immutable inode/reference graph. Initial
   revisions can be complete checkpoints; subsequent revisions can be overlays.
 - A **cut** orders snapshot transitions for one watch.
-- A **filesystem-monitor boundary** authorizes a particular published cut,
-  clock epoch, grant, monitor session, and target snapshot.
+- A **client boundary** authorizes a particular published cut, cursor epoch,
+  grant, monitor session, and target snapshot.
 - A **pin** prevents physical snapshot reclamation while a head, operation,
   comparison, response, scan, or explicit retention lease requires it.
 - A **broker receipt** persists the intent and outcome of a privileged
@@ -58,11 +58,10 @@ The current automatic activation uses:
 ```text
 ${XDG_RUNTIME_DIR}/btrfs-awacs/mnt-<device>-<inode>/
     daemon.lock
-    watchman.sock
     scan.sock
 
 ${XDG_STATE_HOME:-$HOME/.local/state}/btrfs-awacs/
-    watchman.sqlite3
+    <manager database>
     spool/
 
 <watch-root-parent>/.btrfs-awacs-managed/

@@ -2,9 +2,9 @@
 
 Status: normative v1 design plus an experimental implementation. The
 `btrfs-awacs` binary retains its `snap` and `compare` benchmark commands and
-also implements the manager, privileged broker, persistent index, focused
-jj-vcs Watchman endpoint, and native Git fsmonitor adapter described below.
-Production garbage collection and Watchman trigger execution are unavailable.
+also implements the manager, privileged broker, persistent index, and direct
+immutable-snapshot scan endpoint described below.
+Production garbage collection is unavailable.
 Section 12 distinguishes implemented behavior from remaining stabilization
 and performance work.
 
@@ -32,15 +32,9 @@ When a separately created Btrfs snapshot descendant is registered, the service
 can adopt its retained parent snapshot revision without copying all index rows.
 The service does not create, publish, or manage writable descendants.
 
-The service also exposes the narrow filesystem-monitor compatibility surface
-used by jj and Git. jj talks to a focused Watchman-compatible BSER endpoint;
-Git uses a native fsmonitor hook-v2 adapter. A hardened JSON adapter over a
-focused CLI shim is a later optional compatibility layer, not part of the v1
-correctness boundary. The unmodified stock `fsmonitor-watchman` sample is only
-a future restricted conformance target because it constructs shell and JSON
-strings unsafely. The required adapters project the durable comparison stream
-into conservative "paths which may have changed" sets. They are not a general
-Watchman replacement.
+The supported client boundary is a private direct-scan protocol. It projects
+the durable comparison stream into conservative invalidations and transfers a
+leased descriptor for the exact immutable snapshot the client must read.
 
 This design does not transfer file data, support snapshots across filesystems,
 or recursively track nested subvolumes in v1. "Arbitrary subvolume" therefore
@@ -186,7 +180,7 @@ event. A caller that requires one event per descendant can request expansion,
 which walks the parent index and costs O(subtree size). An adapter for an API
 that cannot express subtree moves must expand it or return a fresh-instance
 notification; it must not omit the descendants while claiming a complete
-Watchman-style result.
+direct invalidation result.
 
 A direct historical comparison A -> B reports semantic endpoint differences
 plus the required persistent object/directory dirty witnesses between those
@@ -258,7 +252,7 @@ recovery.
     receipts.sqlite3                    # privileged-execution journal
 ```
 
-The privileged broker and each user's compatibility daemon use different
+The privileged broker and each user's scan daemon use different
 sockets and different trust domains:
 
 ```text
@@ -268,42 +262,37 @@ sockets and different trust domains:
 
 $XDG_RUNTIME_DIR/btrfs-awacs/           # mode 0700, owned by one user
     mnt-<namespace-dev>-<namespace-ino>/
-        watchman.sock                   # mode 0600, focused BSER-v2 endpoint
+        scan.sock                       # mode 0600, private seqpacket endpoint
         daemon.lock
 ```
 
 The per-user daemon runs in one mount namespace, interprets working-tree
-paths, and serves Git/jj. It sends
+paths, and serves direct-scan clients. It sends
 fd-anchored, grant-checked requests to the unprivileged index manager, which
 owns SQLite, snapshots, spool files, clocks, and cut coordination. Only that manager
-can request fixed Btrfs operations from the root broker. The broker neither
-speaks Watchman nor executes client commands. A system-wide compatibility
-socket would need fd-passing root registration and a real user/process sandbox;
-v1 does not provide one.
+can request fixed Btrfs operations from the root broker. The broker does not
+parse client scan packets or execute client commands. A system-wide scan socket
+would need fd-passing root registration and a real user/process sandbox; v1
+does not provide one.
 
 A UID may have processes in several mount namespaces. Discovery keys the socket
 by the caller's mount-namespace identity, and the daemon independently compares
-its namespace with the connecting peer's namespace using a pidfd plus
-`/proc/<pid>/ns/mnt`. A shared mount namespace is still insufficient because a
-process may have a different `fs_struct` root after `chroot`: registration
-opens `/proc/<pid>/root`, records its device/inode/mount ID, and resolves the
-client's absolute root beneath that fd. The daemon enables `SO_PASSCRED` and
-`SO_PASSPIDFD`, and every `recvmsg` span contributing bytes to one request
-frame must carry matching kernel-supplied `SCM_CREDENTIALS` and `SCM_PIDFD`.
-Mixed/missing credentials reject the frame. The already-bound pidfd—not a
-racy later `pidfd_open()` of a potentially recycled numeric PID—anchors
-`/proc/<pid>/root` and `ns/mnt` checks before the process exits or changes view.
-The daemon then rechecks the sender's current UID, mount namespace, and
-process-root identity. This catches post-connect `setns`/`chroot` changes and makes socket
-passing attributable to the actual sender rather than treating connection
-setup as permanent authority. It does **not** preserve a same-UID process's
+its namespace with the connecting peer's namespace and process root using
+kernel-supplied Unix peer credentials plus `/proc/<pid>/ns/mnt` and
+`/proc/<pid>/root`. A shared mount namespace is still insufficient because a
+process may have a different `fs_struct` root after `chroot`. The daemon
+rechecks the sender's current UID, mount namespace, and process-root identity
+before serving the private scan connection. This catches post-connect
+`setns`/`chroot` changes and makes socket passing attributable to the actual
+sender rather than treating connection setup as permanent authority. It does
+**not** preserve a same-UID process's
 narrower Landlock, seccomp, chroot, or LSM policy: v1 deliberately treats all
 same-UID processes in the recorded namespace/view as one trusted principal,
 and the socket fd is delegable within that principal. A deployment which must
 isolate same-UID sandboxes needs separate service principals or a kernel/MAC
-capability bound to the narrower security domain; mode `0600`, `SO_PEERCRED`,
-and `SCM_CREDENTIALS` are not such a boundary. An explicit `WATCHMAN_SOCK`
-does not bypass the UID/view checks.
+capability bound to the narrower security domain; mode `0600` and
+`SO_PEERCRED` are not such a boundary. An explicit scan socket does not bypass
+the UID/view checks.
 
 The database UUID is authoritative; sequence numbers in names are for
 operators. Before creation, an intent records the source UUID, FSID, requested
@@ -510,19 +499,19 @@ provisioning handles. The broker:
 | Exact initial `TREE_SEARCH_V2` index | Requires `CAP_SYS_ADMIN`; invoke through the broker. A normal directory crawl is permission-filtered and lacks the exact Btrfs generation data required by the durable model. |
 | Managed snapshot deletion | Normally `CAP_SYS_ADMIN`. Unprivileged removal is possible only with the `user_subvol_rm_allowed` mount option plus the relevant directory permissions. Use the broker by default. |
 | SQLite reads/writes and path derivation | No kernel capability; Unix permissions on the manager store apply. |
-| Mandatory root-path-binding monitor | No capability when the per-user daemon can read/watch every ancestor directory in its own view. V1 disables the fsmonitor facade if any component cannot be watched or inotify coherence is not trusted; the core snapshot API remains available. A privileged notification-only replacement would need a separately constrained broker protocol. |
-| Optional recursive inotify precision guard | No capability when the per-user daemon can traverse/watch the whole working tree. If it cannot establish and retain complete coverage, queries remain available through conservative snapshot-only invalidation, but exact transient names are unavailable. |
+| Mandatory root-path-binding monitor | No capability when the per-user daemon can read/watch every ancestor directory in its own view. V1 disables the scan facade if any component cannot be watched or inotify coherence is not trusted; the core snapshot API remains available. A privileged notification-only replacement would need a separately constrained broker protocol. |
+| Optional recursive inotify precision guard | No capability when the per-user daemon can traverse/watch the whole working tree. If it cannot establish and retain complete coverage, scans remain available through conservative snapshot-only invalidation, but exact transient names are unavailable. |
 | Mount-topology continuity monitor | Polling an already-open `/proc/self/mountinfo` fd requires no capability and observes the daemon's mount namespace. If the optional `FAN_MARK_MNTNS` interface is used instead, it requires `CAP_SYS_ADMIN` in the fanotify group's user namespace and the broker supplies only a notification-class, mount-event-only fd. |
-| Watchman-compatible query / Git hook | Runs in the per-user daemon without capabilities. It checks each frame's actual sender and passes a rooted fd plus view binding to the manager; the manager authenticates that daemon as its service peer and checks the watch grant before asking the broker for a cut. Query expressions are presentation filters, not authorization. |
+| Direct immutable scan | Runs in the per-user daemon without capabilities. It checks each connection's actual sender and passes a rooted fd plus view binding to the manager; the manager authenticates that daemon as its service peer and checks the watch grant before asking the broker for a cut. |
 
 The per-user runtime directory is opened without following symlinks and checked
 for the expected owner and mode. Stale-socket replacement verifies the existing
 entry's type, owner, and inode before unlinking it. The daemon obtains peer
-credentials from the connected Unix socket; a clock or root path is not a
-bearer capability. BSER/JSON nesting, PDU bytes, result paths, result
-bytes, waiters, cuts, and comparisons all have explicit limits. A semantic
-result which exceeds its path budget becomes a conservative fresh result; a
-malformed or oversized transport request is rejected.
+credentials from the connected Unix socket; a cursor or root path is not a
+bearer capability. Packet bytes, result paths, waiters, cuts, and comparisons
+all have explicit limits. A semantic result which exceeds its path budget
+becomes a conservative full invalidation; a malformed or oversized transport
+request is rejected.
 
 Each grant has one ordering gate for response and privileged dispatch.
 Ordinary projection runs without it; the query takes a shared response phase
@@ -573,10 +562,7 @@ diagnostics and are never compared for correctness.
 
 The following is the normative logical schema; migrations may add surrogate
 columns and indexes without changing the invariants. `src/store.rs` extracts
-the SQL blocks directly from this document. The reserved `watchman_triggers`
-table, trigger admission value, and trigger permission bit remain inactive
-database scaffolding; Watchman trigger registration, listing, scheduling, and
-execution are unsupported.
+the SQL blocks directly from this document.
 
 ```sql
 CREATE TABLE service_metadata (
@@ -911,10 +897,10 @@ CREATE TABLE watch_grants (
     principal_kind  TEXT NOT NULL CHECK
                     (principal_kind IN ('uid', 'service')),
     principal_id    BLOB NOT NULL,
-    -- 0x01 READ, 0x02 CUT, 0x08 reserved TRIGGER,
-    -- 0x10 RETAIN, 0x20 ADMIN. Unknown bits are rejected.
+    -- 0x01 READ, 0x02 CUT, 0x10 RETAIN, 0x20 ADMIN.
+    -- Unknown bits are rejected.
     permissions     INTEGER NOT NULL CHECK
-                    (permissions > 0 AND (permissions & ~59) = 0),
+                    (permissions > 0 AND (permissions & ~51) = 0),
     state           TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
     created_ns      INTEGER NOT NULL,
     revoked_ns      INTEGER,
@@ -945,30 +931,6 @@ CREATE TABLE mutation_events (
     CHECK ((event_kind = 'full-invalidation' AND path IS NULL)
         OR (event_kind != 'full-invalidation' AND path IS NOT NULL))
 ) WITHOUT ROWID;
-
--- Reserved compatibility scaffolding only. Watchman trigger commands,
--- scheduling, and execution are unsupported and no public endpoint uses it.
-CREATE TABLE watchman_triggers (
-    watch_id        BLOB NOT NULL REFERENCES watches(id),
-    name            BLOB NOT NULL,
-    owner_grant_id  BLOB NOT NULL CHECK (length(owner_grant_id) = 16),
-    command_kind    TEXT NOT NULL CHECK (command_kind = 'argv-v1'),
-    command_argv    BLOB NOT NULL CHECK (length(command_argv) > 1),
-    expression_kind TEXT NOT NULL CHECK (expression_kind = 'exclude-git-jj-v1'),
-    state           TEXT NOT NULL CHECK (state IN ('active', 'deleting')),
-    last_evaluated_seq INTEGER,
-    pending_through_seq INTEGER,
-    run_owner       BLOB,
-    run_fence       INTEGER NOT NULL DEFAULT 0,
-    run_expires_ns  INTEGER,
-    PRIMARY KEY (watch_id, owner_grant_id, name),
-    FOREIGN KEY (owner_grant_id, watch_id)
-        REFERENCES watch_grants(id, watch_id),
-    CHECK (last_evaluated_seq IS NULL
-        OR pending_through_seq IS NULL
-        OR last_evaluated_seq <= pending_through_seq),
-    CHECK ((run_owner IS NULL) = (run_expires_ns IS NULL))
-);
 
 CREATE TABLE operations (
     id              BLOB NOT NULL PRIMARY KEY CHECK (length(id) = 16),
@@ -1019,7 +981,7 @@ CREATE TABLE cut_admissions (
     requester_session_id BLOB NOT NULL
                     CHECK (length(requester_session_id) = 16),
     request_kind    TEXT NOT NULL CHECK
-                    (request_kind IN ('clock', 'query', 'trigger')),
+                    (request_kind IN ('clock', 'query')),
     state           TEXT NOT NULL CHECK
                     (state IN ('waiting', 'fulfilled', 'abandoned')),
     admitted_ns     INTEGER NOT NULL,
@@ -1285,8 +1247,7 @@ authenticated into an opaque ASCII clock. The HMAC prevents token tampering
 but grants remain the authorization boundary.
 
 Grant permission bits are normative: `READ=0x01`, `CUT=0x02`,
-`RETAIN=0x10`, and `ADMIN=0x20`. `TRIGGER=0x08` is reserved inactive schema
-scaffolding and does not authorize a supported trigger operation. Historical
+`RETAIN=0x10`, and `ADMIN=0x20`. Historical
 read/replay requires `READ`; `Changes`, `clock`, and `query` require
 `READ|CUT`; caller-controlled retention requires `RETAIN`; and watch deletion
 or caller-directed GC requires `ADMIN`. Automatic policy GC runs as the
@@ -1354,9 +1315,6 @@ may retain immutable heads for later reauthorization but serves no caller and
 has no active facade. Installing a new explicit grant may revalidate identities
 and return it to `active`. Revocation is never rejected merely to preserve the
 active-watch invariant.
-
-The `watchman_triggers` table is reserved inactive scaffolding. Its presence
-does not register, schedule, or execute Watchman triggers.
 
 For an ordinary adjacent cut, `watch_cuts.comparison_from_snapshot_id` equals
 `base_snapshot_id`. They differ only for the explicitly fenced Gap recovery
@@ -1766,921 +1724,51 @@ snapshot or nonterminal operation are renamed into the manager's mode-0700
 Fencing tokens, not lease time alone, prevent a paused worker from publishing
 after recovery assigned its operation to another worker.
 
-## 10. jj-vcs and Git filesystem-monitor compatibility
+## 10. Direct immutable-snapshot client boundary
 
-### 10.1 Compatibility boundary
+The supported client boundary is the private direct-scan API. A client asks the
+per-user namespace daemon for one immutable read-only snapshot and receives an
+opaque authenticated cursor, conservative invalidation, a bounded lease, and an
+open directory descriptor for that exact snapshot. The client reads through the
+descriptor rather than through a mutable live checkout.
 
-V1 targets the behavior actually used by:
+Discovery is intentionally small:
 
-- jj revision `6258a85e4b62cea5c81dc5d0687ea4597762c069` with
-  `watchman_client` 0.9.0; and
-- Git revision `13c7afec212fc97ce257d15601659314c6673d6c`
-  (`v2.55.0-424-g13c7afec21`) and its fsmonitor hook-v2 contract.
+```text
+btrfs-awacs scan-sockname <absolute-live-root>
+```
 
-Those source revisions define the intended compatibility contract. There is
-currently no checked-in runnable modified-kernel/UML end-to-end acceptance
-harness establishing that contract against real jj and Git binaries. Pinned
-source revisions and proposed fixtures are not passing interoperability tests.
+The command starts or reuses the daemon scoped to the caller's mount namespace
+and prints one NUL-terminated absolute path to `scan.sock`. An explicit socket
+override may bypass discovery, but it does not bypass peer-credential,
+mount-namespace, process-root, grant, or snapshot-identity checks.
 
-Upgrading either client requires rerunning recorded request/response fixtures.
-This is deliberately a compatibility facade over snapshot cuts, not a claim to
-implement Watchman subscriptions, SCM-aware clocks, saved state, globbing,
-content hashes, unilateral messages, or a semantic filesystem-operation audit
-log. Correctness comes from transaction-bracketed persistent dirty witnesses
-plus mandatory root-path-binding and mount-topology continuity; an optional
-namespace journal adds precise transient names for client projection and
-diagnostics.
+The private `SOCK_SEQPACKET` protocol has three lifecycle operations:
 
-There are three front ends over one internal query API:
-
-| Consumer | Front end | V1 status |
+| Operation | Result | Correctness boundary |
 | --- | --- | --- |
-| jj | Focused Watchman BSER-v2 Unix socket | Required |
-| Git | Direct `core.fsmonitor` hook-v2 executable | Required and preferred |
-| Git | Bundled hardened Watchman-style JSON adapter plus focused CLI shim | Planned optional compatibility path for UTF-8 roots and names; not required for v1 |
-| Git's unmodified stock `fsmonitor-watchman` Perl hook | Focused JSON CLI shim | Future conformance target only under a restricted safe root/name policy; not a supported security boundary |
-
-Git sees only the native hook-v2 protocol, but the current hook internally
-connects to the same focused Watchman BSER endpoint used by jj. It sends
-`watch-project` followed by `query` and converts the response into Git's hook
-format. A dedicated single-request Git daemon protocol is future performance
-work; both clients currently depend on the focused Watchman endpoint.
-
-The complete client-visible surface required for v1 is:
-
-| Caller phase | Accepted request | Response consumed by the client | Primitive implementation |
-| --- | --- | --- | --- |
-| jj socket discovery | `watchman --output-encoding bser-v2 get-sockname` | `version`, namespace-specific `sockname` | Select/start the per-UID namespace daemon; no cut |
-| jj repository registration | `watch-project(ROOT)` | exact `watch`, `watcher`, no `relative_path` | Revalidate an exact-root watch or run **Initialize** |
-| jj working-copy snapshot | `query(ROOT, {since?, expression, fields:["name"], sync_timeout?})` | `clock`, `is_fresh_instance`, bare relative names | Run/join **Changes**, pin `(A,B]`, project exact names or fresh `/` |
-| jj explicit baseline/debug path | `clock(ROOT, {sync_timeout:60000})` | `clock` | Run/join **Changes**; safe use is restricted by Section 10.8 |
-| jj trigger disabled | `trigger-del(ROOT, "jj-background-monitor")` | idempotent deletion result | Compatibility-only no-op; no trigger is stored, scheduled, or executed |
-| Git index refresh | `git-fsmonitor-hook 2 OLD_TOKEN` | `NEW_TOKEN\0PATH\0...` | Run/join **Changes**, project Git prefixes or `/`; no Watchman command |
-
-Everything else is outside the contract. In particular v1 has no
-subscriptions, `watch-list`, `watch-del`, `watch-del-all`, glob or suffix
-generators, `relative_root`, SCM-aware clocks, saved state, content hashes,
-unilateral messages, trigger registration or listing, arbitrary trigger
-programs, or JSON query CLI. `trigger` and `trigger-list` explicitly fail;
-`trigger-del` is only the compatibility no-op described above. Unknown commands
-and unsupported query keys are hard errors, never ignored options.
-
-All front ends call one byte-oriented internal operation; they do not maintain
-independent watcher state:
-
-```text
-FsmonitorQuery {
-    watch_id,
-    authorization_id,
-    old_clock?,
-    consumer: JjExactPaths | GitPrefixes,
-    filter: ExcludeGitAndJj | ExcludeGit,
-}
-
-FsmonitorResult {
-    target_clock,
-    fresh,
-    exact_paths[],
-    recursive_prefixes[],
-}
-```
-
-`exact_paths` and `recursive_prefixes` are raw relative path bytes. The jj
-adapter may return only exact paths, so any relevant recursive prefix which
-cannot be expanded within its budget changes its result to `fresh`. The direct
-Git adapter can encode a recursive prefix with a trailing slash and can encode
-a whole-tree invalidation as `/`. The common query engine filters and
-deduplicates first, then the required wire adapter performs BSER or NUL framing;
-no adapter is allowed to reinterpret a partial result as complete.
-
-The compatibility calls map to the core primitives as follows:
-
-| Client operation | Core operation and durable effect |
-| --- | --- |
-| Discovery / connect | Select or start the per-UID, per-mount-namespace daemon. No snapshot or index mutation. |
-| `watch-project(ROOT)` | Resolve the exact subvolume identity and grant. If absent, adopt an existing Btrfs snapshot descendant with a retained parent revision or run **Initialize** and publish sequence 0; if present, revalidate the root binding. Never choose an ancestor watch. |
-| `query(ROOT, since=A)` and the native Git hook | Run or join **Changes** to create target cut B, then pin and union every adjacent comparison in `(A, B]`. Project the union into exact paths, Git prefixes, or a fresh result and return B's clock. |
-| `query(ROOT)` without `since` or with an unusable token | Run or join **Changes** for B and return a fresh/full-invalidation result carrying B's clock. This establishes a future incremental baseline; it does not enumerate a supposedly complete current tree. |
-| `clock(ROOT)` | Run or join **Changes** for B and return B's clock without projecting paths. This is safe only for the baseline cases in Section 10.8. |
-| jj disabled-trigger cleanup | Accept the fixed `trigger-del` request as an idempotent compatibility-only no-op. No trigger registration, listing, scheduler, or execution exists. |
-| History removed by future **Garbage collection** | Advance the replay floor atomically with deletion. An older client token becomes fresh; it is never answered from a net endpoint comparison which omits intervening witnesses. |
-
-Thus a compatibility query always has a newly committed immutable target cut
-(possibly shared with concurrently admitted callers). It never answers from a
-mutable in-memory event cache or from "the most recent cut" merely because the
-cut is recent. Snapshot creation is the synchronization barrier; the indexed
-change stream is the durable replay record; SQLite clocks, boundaries, floors,
-and leases make that record safe under concurrency and GC.
-
-The installed entry points are deliberately small:
-
-- `btrfs-awacs-watchman` is the per-user namespace daemon and BSER endpoint;
-- `watchman` implements only BSER-v2 `get-sockname` discovery in v1. It
-  activates that daemon but never becomes a second watcher; and
-- `git-fsmonitor-hook` speaks hook protocol v2 to Git and currently reaches
-  the daemon through the focused Watchman `watch-project` and `query` commands.
-
-The daemon translates client frames and owns the mandatory namespace-view
-monitors. The unprivileged manager owns cut coordination, SQLite, index lookup,
-projection, and clocks; planned GC will also belong to the manager. The
-privileged broker is used only for the fixed
-Btrfs operations described in Sections 5 and 6; it never parses BSER,
-stores client clocks, or evaluates expressions.
-
-V1 registers only an exact canonical managed subvolume root. `watch-project`
-returns that same path as `watch`, with no `relative_path`; it never coalesces a
-project under an ancestor watch. This matches the service's exact-subvolume
-model. A future logical subdirectory watch must add an explicit raw-byte prefix
-to the schema and use it consistently for queries and clocks.
-
-V1 permits one fsmonitor owner grant and one mount namespace per watch. Other
-grants may use the core snapshot/index APIs, but cannot obtain clocks for that
-watch. The owner also has one pinned process-root
-identity; a different chroot is a different view even in the same mount
-namespace. Supporting multiple fsmonitor principals or views requires a
-separate root locator, clock epoch, and precision guard per
-`(watch, grant, mount namespace, process root)` rather than sharing the fields
-on `watches`.
-
-#### 10.1.1 Client setup and call sequences
-
-The package installs one binary under three names. The `watchman` name is
-discovery-only, `btrfs-awacs-watchman` is the namespace daemon, and
-`git-fsmonitor-hook` is the direct Git adapter. The manager database, managed
-snapshot directory, private spool, broker socket, and automatic-registration
-root are deployment configuration; clients never supply those authorities in
-their requests.
-
-For jj, enable exactly the supported backend:
-
-```toml
-fsmonitor.backend = "watchman"
-fsmonitor.watchman.register-snapshot-trigger = false
-```
-
-The connector discovers the socket, sends `watch-project`, and sends
-`trigger-del` when the trigger setting is false. The service accepts that
-disabled-trigger cleanup as an idempotent no-op. Enabling the setting is
-unsupported: `trigger-list` and `trigger` explicitly fail. Working-copy
-snapshotting then sends one name-only `query`; the
-saved opaque string clock from a successful prior snapshot becomes `since`.
-No saved clock means a fresh query and full crawl. A query failure also causes
-jj to crawl and prevents it from advancing to an unproved service clock.
-
-For Git, configure the direct executable and pin hook protocol v2:
-
-```sh
-git config core.fsmonitor /usr/libexec/btrfs-awacs/git-fsmonitor-hook
-git config core.fsmonitorHookVersion 2
-```
-
-Git invokes the helper in the exact worktree root with `2 OLD_TOKEN`. The
-helper uses the same namespace discovery path, sends `watch-project` and a
-focused Watchman `query`, and converts the result to hook-v2 NUL framing.
-A linked Git worktree is supported only
-when its root is itself an exact Btrfs subvolume root; each such root receives
-a different watch, and copying a token between worktrees yields the `/`
-full-invalidation result.
-
-Automatic registration is a daemon policy, not a Watchman protocol feature.
-Activation preconfigures one exact seed root whose mandatory binding proves the
-daemon's process-root and mount view. An unknown `watch-project` is admitted
-only after the transport proves that the caller has the seed registration's
-UID/GID and exact process-root/mount view. The daemon then canonicalizes the
-requested path in that shared view, reuses an active exact-path UID grant when
-one exists, adopts an already-existing Btrfs snapshot descendant with a retained
-parent revision, or runs **Initialize** under the same UID policy. It arms that
-root's own mandatory monitor and inserts it in the concurrent registration
-table. It never resolves an unknown path merely because it shares a textual
-ancestor with an existing watch.
-
-#### 10.1.2 Normative compatibility subset
-
-The following is the complete v1 compatibility contract. Every row is built
-from a synchronized **Changes** cut and the retained comparison stream; none is
-implemented by independently crawling the mutable worktree inside the daemon.
-
-| Surface | Required by | Implementation on the snapshot/index primitives |
-| --- | --- | --- |
-| `watchman --output-encoding bser-v2 get-sockname` | jj socket discovery | Select the caller's mount-namespace daemon, activate it under a per-namespace lock, and return its mode-0600 socket. This is a discovery shim, not another watcher. |
-| `watch-project(ROOT)` | jj registration | Resolve one exact subvolume root in the authenticated view. Reuse its active watch, adopt an existing snapshot descendant with a retained parent revision, or run **Initialize** for an authorized root. Return no `relative_path`. |
-| `query(ROOT, {since, expression, fields:["name"]})` | jj working-copy snapshot and the internal Git adapter | Coalesce a new RO cut B, transactionally pin every retained comparison from the authenticated old clock A through B, project all changed aliases/names, apply the fixed client expression, and return B's clock. Missing continuity returns the fresh `/` sentinel. |
-| `clock(ROOT, {sync_timeout})` | jj baseline/debug APIs | Take and publish the same synchronized cut as `query`, but return only its clock. It is safe only for the proved-baseline cases in Section 10.8; it is not a crawl-then-clock primitive. |
-| Fixed `trigger-del` | jj with snapshot-trigger registration disabled | Return an idempotent compatibility-only deletion result without storing, scheduling, or executing any trigger. |
-| Hook-v2 `git-fsmonitor-hook 2 OLD_TOKEN` | Git index and untracked-cache refresh | Query the same facade with Git's `.git` exclusion, then encode `NEW_TOKEN NUL PATH NUL ...`. Empty/numeric/foreign/expired tokens return `NEW_TOKEN NUL / NUL`; failures exit nonzero. |
-
-The daemon intentionally does **not** implement subscriptions, unilateral
-Watchman recrawls, cookies, SCM clocks, glob/suffix/type/exists expressions,
-content hashes, file-stat fields, project coalescing, trigger registration or
-listing, JSON query mode, or Git hook protocol v1. `trigger` and
-`trigger-list` are unsupported; fixed `trigger-del` is only a no-op for
-disabled-trigger clients. An unsupported command or option is an error. This
-closed subset is what lets clocks remain exact capabilities for immutable
-indexed cuts instead of inheriting general Watchman state semantics.
-
-For a previously unindexed subvolume, the first `watch-project` normally pays
-the O(namespace) **Initialize** cost. An already-existing Btrfs snapshot
-descendant whose parent revision is retained can instead adopt that revision
-without copying index rows; registration is then O(1) in namespace size, but
-the first fsmonitor clock still requires a fresh Changes cut. A directory
-rename can still require O(subtree size) output for jj because its matcher
-needs leaf names, as specified in Section 10.4.
-
-### 10.2 Focused Watchman wire and commands
-
-The per-user daemon accepts BSER-v2 framed values on
-`$XDG_RUNTIME_DIR/btrfs-awacs/mnt-<namespace-dev>-<namespace-ino>/watchman.sock`.
-Each frame begins with the BSER-v2 and zero-capability bytes
-`00 02 00 00 00 00`, followed by a BSER integer payload length and the payload.
-It applies PDU length, nesting, array, and string limits before allocating
-result-sized structures.
-It accepts both BSER byte strings (`0x02`) and BSER-v2 UTF-8 strings (`0x0d`),
-validates the latter, emits `0x0d` for valid text, and retains `0x02` for
-arbitrary non-UTF-8 Unix path bytes. Object keys follow the same rule. This is
-part of the required jj interoperability contract, not an optional extension.
-Facade activation also requires kernel-supplied `SCM_PIDFD` support; v1 has no
-numeric-PID fallback because PID reuse would make process-root and mount-view
-checks racy.
-
-When `WATCHMAN_SOCK` is unset, `watchman_client` discovers the socket by running:
-
-```text
-watchman --output-encoding bser-v2 get-sockname
-```
-
-The installed `watchman` shim returns a BSER object containing `version` and
-the namespace-specific `sockname`. It first activates the per-user daemon
-(preferably through a namespace-aware user socket unit; otherwise under that
-namespace's `daemon.lock`) and verifies that the resulting socket has the
-expected type and owner. Setting `WATCHMAN_SOCK` bypasses the shim and connects
-jj directly, so that deployment must arrange activation before jj starts; the
-daemon still validates the connecting process's mount namespace.
-
-The prototype activation fallback is environment-configured: root, managed
-snapshot directory, private spool, manager database, and broker socket are
-supplied through `BTRFS_AWACS_*`. Explicit watch/grant IDs select an existing
-registration; when both are omitted, the daemon reuses the active canonical
-root/UID grant or transactionally creates the manager store and runs
-**Initialize** before binding the socket. The namespace lock prevents two
-discovery calls from racing that choice. A future distribution may replace
-these variables with a credentialed registration service without changing the
-socket or clock contracts.
-
-The socket implements only these semantic command arrays:
-
-```text
-["watch-project", CANONICAL_ROOT]
-["clock", WATCH_ROOT, {"sync_timeout": 60000}]
-["query", WATCH_ROOT, QUERY]
-["trigger-del", WATCH_ROOT, "jj-background-monitor"]
-```
-
-`watch-project` resolves an active watch, adopts an already-existing snapshot
-descendant with a retained parent revision, or synchronously runs Initialize
-when policy authorizes automatic registration. Its response contains
-`version`, the exact `watch` root, `watcher: "btrfs-index"`, and no relative
-path. Querying or clocking an unregistered root is an error; a path string
-never implicitly selects a different managed root. The fixed `trigger-del`
-request is an idempotent compatibility no-op; `trigger` and `trigger-list`
-explicitly fail.
-
-`clock` performs the same synchronized cut and mandatory view checks as a query but
-returns only `{ "version": VERSION, "clock": NEW_CLOCK }`. It does not mean
-that an earlier independent crawl describes that cut; Section 10.8 defines the
-only safe baseline uses.
-
-`query` accepts only:
-
-- an omitted `since` or a plain string/integer clock;
-- `fields: ["name"]` exactly;
-- the default synchronized-query timeout behavior;
-- no `relative_root` in v1; and
-- the expression subset `true`, `false`, `not`, `allof`, `anyof`,
-  `name(..., "wholename")`, and `dirname` needed by the two clients.
-
-Unsupported fields, generators, clock forms, expression terms, or options are
-errors, never silently ignored or approximated. In particular, SCM-aware
-clocks and `empty_on_fresh_instance` are not accepted. Results contain bare
-relative byte-string names, not `{name: ...}` objects:
-
-```text
-{
-  "version": VERSION,
-  "clock": NEW_CLOCK,
-  "is_fresh_instance": BOOLEAN,
-  "files": ["path", ...]
-}
-```
-
-The v1 `watchman` executable deliberately has no JSON command mode. A future
-optional hardened adapter may add three JSON CLI behaviors: one `query` on
-`watchman -j --no-pretty`, `watch ROOT`, and `clock ROOT`. That addition must
-return the Watchman-style "directory is not watched" error for unknown-root
-queries, perform authorized Initialize only for `watch`, begin every JSON
-response with `{` at byte zero, keep diagnostics on stderr, serialize with a
-real encoder, and invoke subprocesses without a shell. It must not change the
-BSER daemon or direct Git hook contracts.
-
-The unmodified Git sample interpolates the worktree root into both raw JSON and
-shell command strings, and interpolates a `c...` token into JSON without
-escaping. Quotes and backslashes can corrupt the request, while shell syntax in
-a legal pathname can be executed during its unregistered-root fallback. It is
-therefore not a supported front end for arbitrary roots. A deployment using it
-must pre-register roots and enforce a documented restricted alphabet for both
-roots and UTF-8 names; the v1 service's security and correctness contract uses
-the direct helper instead. A future bundled hardened adapter must meet the same
-boundary.
-
-The internal index, mutation journal, and direct Git hook preserve arbitrary
-non-NUL Unix path bytes. The pinned `watchman_client` 0.9.0 `NameOnly` path
-deserializes through `PathBuf` and rejects non-UTF-8 BSER strings, so current jj
-does not. If a jj query result contains such a path, the focused endpoint
-returns an error. The pinned jj then attempts its full-crawl fallback, but that
-crawler also rejects the non-UTF-8 `DirEntry`; the snapshot fails before a
-cleared clock is persisted. Such repositories are unsupported by the jj facade
-until both `watchman_client`/`NameOnly` and jj's crawler expose raw byte paths.
-Any future JSON front end will likewise support UTF-8 only. Embedded NUL is impossible in a
-filesystem component; `/`, empty components, leading slash, `.` and `..` are
-rejected from normal internal paths.
-
-### 10.3 Clocks are authenticated snapshot cuts
-
-An external clock is an opaque ASCII string beginning with `c:`. Its entire
-alphabet is normatively `[A-Za-z0-9:._-]+`; quotes, backslashes, whitespace,
-control bytes, and padding are forbidden. V1 encodes it as
-`c:btrfs-awacs:1:<base64url-no-padding(payload || HMAC)>`. This is safe even for the
-stock adapter's unescaped `since` interpolation. Its authenticated payload
-binds at least:
-
-```text
-clock-format-version
-store UUID
-watch ID
-watch clock epoch
-cut sequence
-fsmonitor owner grant ID
-view-monitor session ID
-boundary kind (`cut`)
-optional precision-guard epoch and sequence
-comparison algorithm version
-target snapshot UUID
-```
-
-The binary payload layout remains private and versioned. Decoding a clock never
-authorizes a watch, and no caller-supplied sequence or Btrfs root ID reaches the
-broker. A structurally invalid or merely foreign old token is a request for a
-fresh baseline, not broker input.
-
-Before minting the first clock, the namespace daemon activates the facade. It
-canonicalizes and opens the exact root with `openat2` relative to the
-authenticated peer's process-root fd using
-`RESOLVE_IN_ROOT|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_SYMLINKS`. V1 rejects both
-ordinary symlink and procfs-style magic-link components rather than pretending
-their retargeting is covered by a directory watch. On a dedicated mandatory inotify fd it
-watches each parent before resolving the next raw component, records that
-component's inode/mount identity, drains a private marker, then re-resolves and
-verifies the entire chain and live subvolume UUID. `IN_CREATE`, `IN_DELETE`,
-`IN_MOVED_FROM`, `IN_MOVED_TO`, or relevant `IN_ATTRIB` for the next component,
-self move/delete,
-`IN_IGNORED`, queue overflow, unmount, an unknown event, or failed re-resolution
-rotates that watch's clock epoch. This catches a root or ancestor which is
-renamed/replaced and restored between cuts; simply reopening the final path
-would not. If any ancestor cannot be watched, the facade is unavailable.
-The same is true if a component filesystem does not provide trusted inotify
-coherence; the core snapshot API remains available.
-
-The manager rejects current descendant mounts and records the active grant,
-raw client-view path, mount namespace, and process-root device/inode/mount ID.
-It also records the daemon's random in-memory monitor-session ID; a reconnect
-with a different ID rotates the clock even in the same boot. The daemon keeps
-that namespace's `/proc/self/mountinfo` open. One
-serialized monitor owner polls the fd; whenever
-`POLLERR|POLLPRI` is observed it rotates the clock epoch of **every** watch
-bound to that monitor durably before unlocking or allowing boundary
-finalization. Plain mountinfo polling reports that the namespace changed, not
-which subtree changed; reparsing afterward can reject mounts which still
-exist, but cannot scope a transient attach+detach. Loss of the fd or owner is
-the same all-watches continuity gap. A short writer transaction claims the
-watch's single owner slot and sets `fsmonitor_state='snapshot_only'`; the first
-query can now mint a coarse but correct clock. A future mount-event API with
-stable affected mount IDs may safely narrow the rotation.
-
-The optional precision guard arms separately. The daemon installs recursive
-inotify coverage top-down. Before certifying **every** precision boundary, not
-just initial arming, it emits a marker in its private runtime directory watched
-by the same inotify fd and waits until all events through that marker are
-durable. New/moved-in directory coverage remains imprecise until its watches
-and another marker complete. Failure, overflow, or watch loss changes the state
-to `guard_gapped`; the cut still gets a snapshot-only boundary. No other grant
-may steal either owner slot without terminal revocation and epoch rotation.
-
-Both `clock` and `query` are synchronization barriers:
-
-1. Authenticate the frame's pidfd/credentials and grant, resolve the exact
-   watch, and admit the request to that live source's cut coordinator. Under
-   the binding and mount-monitor locks, drain a binding marker, poll the
-   already-open mountinfo fd, durably rotate on any relevant event, re-resolve
-   the full raw component chain, verify its exact inode/mount/subvolume UUID,
-   reparse to reject a currently mounted descendant, and only then admit the
-   request. The freshly resolved root fd is the source of the cut; a stale fd
-   which still opens an unlinked/moved subvolume is never substituted.
-2. In one short writer transaction close the admitted batch with
-   `planned -> fs_started`, and commit before issuing the snapshot ioctl.
-   Requests queued before one cut starts may share it; requests arriving after
-   batch close use a later cut. A pre-request indexed head is never returned
-   merely because it is recent.
-3. Create the RO cut, then—if the precision guard is active—drain its private
-   marker and copy the resulting durable `(guard_epoch, guard_sequence)` onto
-   the operation. Events between the snapshot and marker are harmlessly
-   reported early in this interval; events after the marker belong to the next
-   one. If the marker cannot be certified, omit the cursor and use coarse
-   projection.
-4. Run the normal Changes protocol through durable index/event publication.
-   Physical snapshot creation is serialized per live source, while comparison,
-   path derivation, and SQLite staging for immutable cuts may run concurrently.
-   After the cut is ready, boundary finalization again drains the mandatory
-   binding marker, polls the mountinfo monitor, re-resolves the exact root
-   chain, verifies no descendant mount and the same clock epoch, then inserts
-   B's fsmonitor boundary. It includes the optional cursor only if both its
-   separate precision marker and guard epoch remain complete.
-5. Return a clock only after its target revision, cut, and boundary are
-   committed. Immediately before writing bytes, renew and validate the query
-   fence under the grant response gate and repeat the binding-marker,
-   root-resolution, mount-monitor, monitor-session, and epoch checks, including reopening the
-   frame sender's current `/proc/<pid>/root` and mount namespace through the
-   same live pidfd identity. An intervening binding/mount event rotates the
-   epoch; a changed/exited sender rejects the request. Either case discards this
-   response and retries, when appropriate, from a fresh boundary. A response
-   never combines B's clock with paths
-   derived only through A or with an uncommitted comparison.
-
-Disconnecting a waiter does not cancel a shared cut. The request timeout may
-stop waiting and return an error, but the fenced operation can finish for other
-waiters. No Btrfs ioctl, path expansion, or client write occurs
-inside a long SQLite write transaction.
-
-For `query(since=A)` targeting B, the service returns endpoint path changes
-between the exact baseline named by A and the target cut B, together with
-conservative invalidation for every surviving directory dirty witness. Git can
-receive recursive prefixes; jj requires bounded exact expansion, a retained
-complete precision-journal interval, or a fresh response. When A and B carry
-complete cursors in the same precision epoch, exact mutation names can refine
-that invalidation. The VCS result is byte-sorted for reproducibility;
-consumers must not attach meaning to order.
-
-External clocks are soft state and do not pin history forever. Future GC must
-maintain a count/time retention window and advance `replay_floor_seq`
-atomically with removing the history needed before that floor. A clock below
-the cut floor
-becomes fresh. Guard history has its own floor, advanced only after protected
-query ranges are gone; a cursor below that floor merely loses precision and
-uses coarse projection. Clean same-boot restarts preserve clocks when
-snapshot/source continuity is proven and the original binding/mount monitors
-remain live. Namespace-daemon restart, boot change, unclean manager handoff,
-binding/mount-monitor loss or events, remount/rollback, or source ambiguity
-rotates clock epochs. Restart of only a separable optional precision producer
-rotates its guard epoch.
-
-### 10.4 Projecting object changes to dirty paths
-
-The adapters expose a conservative re-stat set, not the semantic ChangeSet.
-False positives are acceptable; a false negative can make jj or Git report a
-falsely clean working copy.
-
-| Indexed evidence | Exact names always available | Snapshot-only fallback |
-| --- | --- | --- |
-| create/delete/ref add/ref remove | Every target/source name represented by endpoint refs | Coarse-invalidate each changed surviving ancestor when a client could have cached an endpoint-equal transient |
-| file data, xattr, mode, type, or other object change | Every target alias, plus any removed/renamed source alias in the range | Invalidate the affected parent or root whenever exact alias coverage is uncertain |
-| hardlinked object change | Every surviving target alias; explicit ref changes add old/new names | Invalidate the affected parent or root whenever surviving-alias coverage is incomplete |
-| file/symlink rename | Both old and new names | Also apply both changed parents' directory witnesses |
-| directory subtree move | Old and new prefixes plus the client-specific handling below | Coarse-invalidate every old/current changed-directory prefix |
-| surviving changed directory inode | Its old/current directory aliases | Coarse-invalidate the entire old/current subtree; root means the whole tree |
-
-For each adjacent comparison, old names are resolved against its source
-revision and new/current names against its target revision. This is why the
-inode-to-reference index, rather than one arbitrary parent, is required for
-hardlinks. Names from excluded directories remain in the canonical index and
-history; expressions filter only the final presentation set.
-
-The directory rule is normative. If an interval lacks two retained, complete
-precision cursors in the same guard epoch, surviving directory inode changes
-must produce conservative client invalidation rather than remain internal.
-Git can receive the affected old/current directory prefixes; jj must receive
-a bounded exact subtree enumeration or a fresh/full invalidation. For example,
-creating and deleting `d/transient` while retaining `d/persistent` must not
-return only `d/persistent` if the client could still cache the transient name.
-
-A complete precision interval can contribute exact create/delete/move names
-and avoid unnecessary coarse invalidation when all affected names are known.
-Indexed object/reference evidence must still supply changes not fully covered
-by inotify, including writable `mmap` and hardlink aliases. Guard absence or
-loss is a performance degradation, never permission to drop a dirty witness.
-
-Recursive inotify is armed top-down with parent watches installed before
-enumerating children, then drained through a marker in the daemon's private
-runtime directory watched by the same inotify fd before the guard becomes
-active and after every cut. Creating or moving in a directory first records a
-`directory-prefix` event for that known prefix, because activity may occur
-before recursive coverage completes; after its watches and another marker are
-certified, later events can be exact. Queue overflow, `IN_IGNORED`, unmount, permission
-loss, an unexpected watch disappearance, or an event whose affected prefix is
-unknown gaps the guard and restores snapshot-only projection; it never turns a
-partial event set into an empty success.
-
-jj sends this exact expression and asks only for names:
-
-```json
-["not", ["anyof",
-  ["name", [".git", ".jj"], "wholename"],
-  ["dirname", ".git"],
-  ["dirname", ".jj"]
-]]
-```
-
-Git's stock adapter uses:
-
-```json
-["not", ["dirname", ".git"]]
-```
-
-Deleted names are evaluated lexically; the service does not require the path
-to exist in B. There is no ignore-file or `exists` filter. jj applies its own
-sparse and ignore matchers; a changed `.gitignore` is returned and jj expands
-its parent subtree itself.
-
-A compact `subtree-moved` event needs special treatment:
-
-- Git's direct hook emits both old and new directory prefixes with trailing
-  `/`; Git invalidates the indexed cone and corresponding untracked cache.
-- The common Watchman query emits those prefixes and also expands old and new
-  descendant leaf names from the two immutable indexes. The prefixes cover
-  Git's sparse-index/directory invalidation; jj's exact-file matcher does not
-  recurse merely because it receives a directory name, so its correctness
-  comes from the expanded leaves.
-- If expansion exceeds the configured path, byte, or time budget, the result
-  is fresh rather than partial. The cut remains valid and is returned as the
-  new baseline.
-
-This expansion is the honest non-O(1) corner. Snapshot creation remains O(1)
-in namespace size, but a client demanding one dirty name per moved descendant
-has O(subtree size) output.
-
-### 10.5 Fresh instances and failures
-
-The internal query result is fresh when `since` is omitted, malformed,
-unauthenticated, foreign to the watch/store/epoch, below the replay floor,
-bound to a missing logical cut/revision or reclaimed event chain, incompatible
-with the algorithm, or separated from the target by a failed/lost/full-fresh
-cut. A physically deleted snapshot is not by itself fresh when its immutable
-revision and every required event remain replayable. Corruption, recovery
-ambiguity, or a path-expansion limit has the same result. The daemon still
-completes a new cut B first, so the returned clock is a valid future baseline.
-A subtree move whose changed descendants cannot be expanded, a scoped/unscoped
-precision invalidation, or a result-size budget also makes the common Watchman
-result fresh. The direct Git adapter consumes the same endpoint path result.
-
-A successful fresh result requires a committed B boundary, the verified
-persistent dirty-witness ABI, and continuous source, root-path-binding, mount,
-boot, and authorization epochs. It does **not** require the optional precision
-guard. The client crawls after B; every later in-root mutation persists into a
-B -> next-cut object or directory witness, while an external path/mount view
-change rotates the clock. If the dirty-witness property is not available on
-the running kernel, or the mandatory namespace-view monitors cannot be armed,
-the facade returns no service clock. Loss of only precision coverage degrades
-directory changes to coarse projection; it does not invalidate an otherwise
-sound file-only interval.
-
-This focused endpoint returns:
-
-```text
-is_fresh_instance = true
-clock = clock(B)
-files = ["/"]
-```
-
-The `/` value is intentionally outside normal relative-path syntax. Current jj
-discards `files` whenever `is_fresh_instance` is true and performs a full crawl.
-Git's stock Perl adapter ignores `is_fresh_instance`, but copies `/` to Git,
-where it is the hook-v2 "invalidate everything" sentinel. Returning a normal
-fresh inventory would be unsafe for that adapter: a tracked path deleted during
-lost history is absent from the inventory and could retain a valid bit. This
-targeted behavior is another reason the endpoint is not advertised as general
-Watchman. The sentinel is a control result emitted after query evaluation; it
-bypasses normal path validation and expressions and can never arise from an
-indexed basename.
-
-The direct Git hook likewise returns `clock(B)\0/\0`. An unknown token is not an
-error if a fresh baseline can be established. Invalid requests and transport,
-authorization, snapshot, database, or broker failures produce no success
-payload:
-
-- jj warns and full-crawls after an ordinary query error; explicit debug and
-  baseline-clock commands propagate the error; and
-- the Git hook exits nonzero, causing Git to invalidate and verify everything.
-
-The service must never return a successful non-fresh response with a partial or
-truncated path set. On a real continuity loss, publication also advances the
-replay floor or rotates the watch epoch so other old clocks cannot claim an
-incremental result. A merely malformed/foreign clock makes only that request
-fresh and does not invalidate valid clients; it still requires the mandatory
-view monitors and a new synchronized target boundary.
-
-### 10.6 jj behavior
-
-jj's normal request is:
-
-```json
-["query", "WATCH_ROOT", {
-  "since": "PREVIOUS_CLOCK",
-  "expression": ["not", ["anyof",
-    ["name", [".git", ".jj"], "wholename"],
-    ["dirname", ".git"],
-    ["dirname", ".jj"]
-  ]],
-  "fields": ["name"]
-}]
-```
-
-`since` is omitted when jj has no saved clock. For a non-fresh response jj
-converts each bare name to an exact path matcher; for a fresh response it
-ignores the names and crawls the full working copy. It saves the returned plain
-string clock only after a successful snapshot with no refused or untracked
-paths. If such paths remain, it deliberately keeps the old clock so they are
-reported again. An ordinary query error warns, full-crawls, and clears the
-saved clock; explicit debug and baseline-clock commands propagate the error.
-A changed path must therefore include deletes, both sides of renames, every
-hardlink alias affected by object content, and expanded directory moves, and
-the server must support repeated queries from the same older clock.
-
-
-Configure `fsmonitor.watchman.register-snapshot-trigger = false`. jj sends a
-fixed `trigger-del` request even when registration is disabled; the service
-accepts it as an idempotent compatibility-only no-op. Watchman `trigger` and
-`trigger-list` explicitly fail. Trigger registration, listing, scheduling,
-and execution are future work only; reserved database tables and permission
-bits do not provide a supported trigger API.
-
-### 10.7 Native Git hook-v2 adapter
-
-Install a standalone helper and force protocol v2:
-
-```sh
-git config core.fsmonitor /usr/libexec/btrfs-awacs/git-fsmonitor-hook
-git config core.fsmonitorHookVersion 2
-```
-
-Git invokes it from the worktree root as:
-
-```text
-git-fsmonitor-hook 2 OLD_TOKEN
-```
-
-The helper rejects other versions. It authenticates to the per-user daemon,
-resolves or initializes the exact worktree watch, performs a synchronized
-query, and writes only this byte protocol to stdout:
-
-```text
-NEW_TOKEN NUL PATH NUL PATH NUL ...
-```
-
-`NEW_TOKEN` is nonempty. Normal names are nonempty, relative, NUL-free byte
-strings. A no-change response is only `NEW_TOKEN NUL`; a trailing NUL after the
-last path is allowed. Rename returns both names. Directory moves use trailing
-slash prefixes as described above. The helper logs diagnostics only to stderr.
-
-When fsmonitor is first enabled, Git supplies a decimal nanosecond token even
-for protocol v2 and has already invalidated all index entries. After a failed
-explicit-v2 invocation, Git can supply an empty old token on the next call.
-The helper treats numeric, empty, foreign, expired, and otherwise unusable old
-tokens as recoverable baseline requests, creates B, and returns
-`clock(B) NUL / NUL`. An absent second argv is still malformed invocation
-syntax. Returning a valid new token is preferable to an error because Git will
-save it while conservatively scanning all paths. If no valid synchronized cut
-can be established under the mandatory namespace-view monitors, the helper exits
-nonzero and Git performs full verification
-without advancing to a service clock.
-
-Each linked Git worktree is a distinct exact-root watch and receives a
-watch-scoped token. Copying an index extension from another worktree therefore
-produces `/`, not a cross-root incremental answer. Ignored and untracked names
-may be over-reported; Git filters tracked entries and invalidates its untracked
-directory cache.
-
-The planned optional hardened adapter will use the stock adapter's semantic
-query: ask for `fields:["name"]`, exclude only `.git`, and read only `clock`,
-`files`, and `error`. On a previously unwatched root it may safely run
-`watch`, then a synchronized fresh query, and emit `/`. It must use structured
-JSON, list-form process execution, and the normative service-clock alphabet.
-The service's fresh `files:["/"]` rule closes the Watchman sample's failure to
-inspect `is_fresh_instance`.
-
-The unmodified Perl sample is only a future restricted compatibility test
-target for the reasons in Section 10.2. If enabled under that policy, query JSON must
-start with `{` at byte zero, diagnostics must remain on stderr, and the
-unknown-root error must byte-match the sample's expected expression before it
-attempts its `watch` fallback. The direct helper remains preferred because it
-avoids two extra processes and JSON/Perl Unicode conversion, supports raw path
-bytes, and can use compact Git directory-prefix invalidation.
-
-### 10.8 Baseline and client invalidation rules
-
-A synchronized query takes cut B **before** the client scans returned paths or
-performs a fresh crawl. A comparison of only semantic endpoint contents would
-not make that ordering safe: after B, a client can remember temporary path `p`,
-then `p` can disappear before C and the visible trees can again be equal.
-
-The persistent dirty witness closes baseline-establishment races only when it
-is projected as conservative subtree invalidation or refined by a proven
-complete precision-journal interval. Snapshot creation commits B as an
-ordering barrier, but it does not freeze the client's subsequent crawl.
-Endpoint-equal changes can therefore be omitted only when external mutation
-exclusion or another explicit proof establishes that the client could not have
-cached their transient state. Root-path-binding and mount-topology guards
-separately rotate the clock for client-view changes outside the subvolume.
-
-By contrast, calling `clock()` after independently scanning a mutable tree can
-still miss a change which lands between the scan and B: that mutation is
-already included in B, is absent from the client's older baseline, and need not
-appear in B -> C.
-
-Accordingly:
-
-- a general client establishes a baseline with a fresh query followed by its
-  crawl, not by crawling and then calling `clock`;
-- registering an already-existing snapshot descendant may reuse its retained
-  parent index revision, but sequence 0 is never an fsmonitor clock; its first
-  client still establishes a baseline with a fresh query; and
-- `clock`-after-baseline is allowed only while an external mutation exclusion
-  is held or when the caller can prove its baseline is exactly the returned
-  cut. The current jj `mark_fsmonitor_baseline()` integration must use the
-  fresh-query protocol.
-
-**Prototype compatibility note.** The current experimental `CHANGED_OBJECTS`
-ABI reports a root-directory dirty witness between a retained parent snapshot
-and the first cut of an adopted writable descendant, even if no later
-namespace mutation occurred. Adoption still requires a fresh validation cut
-and never mints a sequence-0 clock. The compatibility facade is disabled by
-default and requires explicit experimental dirty-witness enablement until
-that conformance suite passes.
-
-Client-side expected-tree changes also require invalidation. In particular,
-jj excludes `.git` and `.jj`, so the service cannot infer that a colocated Git
-operation caused jj to replace `TreeState` without touching every worktree
-file. Every jj `TreeState::reset`, recovery/import path, and interrupted
-checkout which changes the expected baseline must clear its saved Watchman
-clock and establish a fresh baseline.
-The currently pinned jj does not clear that clock in every `TreeState::reset`
-path, so the integration patch is required before enabling this optimization.
-No server projection can repair a stale client baseline while truthfully
-returning an empty filesystem delta.
-
-Git owns analogous invalidation of its fsmonitor-valid bitmap when the index is
-replaced or fsmonitor is enabled. The provider's watch/store/epoch scoping is a
-second guard: a copied, stale, or foreign opaque token yields `/`.
-
-### 10.9 Compatibility transaction and concurrency rules
-
-A normal incremental query is implemented entirely in terms of the existing
-transactions:
-
-1. After the mandatory binding/mount checks in Section 10.3, use
-   `BEGIN IMMEDIATE` to authorize the exact active fsmonitor-owner grant and
-   required permission mask, decode `since`, create or select a `planned` cut
-   operation, and insert `cut_admissions(state='waiting')` with the joining
-   authorization generation, session, and expiry. The cut worker closes the
-   batch in a competing short writer transaction which rechecks the same
-   owner/epoch and changes `planned -> fs_started` before the snapshot ioctl.
-   An admission can join only while that conditional update has not committed;
-   this eliminates the read/check race. The optional precision cursor is not
-   captured here; its marker is drained after the snapshot.
-2. Changes creates and publishes target cut B and its fsmonitor boundary. All
-   admitted waiters receive the same B; later admissions use a later cut. The
-   publication transaction fulfills the batch admission rows, but a disconnect
-   may merely abandon its own waiter.
-3. For each waiter, another short `BEGIN IMMEDIATE` validates its unexpired
-   admission/session, exact authorization generation, watch owner, B boundary,
-   clock epoch, and replay floor; resolves every immutable adjacent revision
-   and comparison; inserts one active `query_leases` row plus all
-   `query_revision_pins` and `query_comparison_pins`; and commits. If A was
-   reclaimed between admission and this handoff, select a fresh result instead
-   of failing correctness. Only when A and B also retain complete cursors in
-   one guard epoch above its separate floor does the lease record a precision
-   range. GC cannot remove selected history after this transaction, and a
-   replacement grant cannot complete work admitted under a revoked UUID.
-4. Outside a write transaction, project every pinned adjacent-cut event into
-   an immutable per-query result, preserving all directory dirty witnesses,
-   expanding aliases and directory moves, and applying the expression. Union
-   precision events only for the complete optional range selected in step 3.
-   Missing precision history uses coarse projection; missing core history,
-   failed/fresh cuts, a relevant coarse witness jj cannot represent, an
-   unscoped invalidation, or a budget limit produces the fresh sentinel. Mint
-   B's clock only if B is itself a valid boundary under the mandatory view
-   monitors and dirty-witness ABI; if it is invalid, produce no success payload
-   and retry or fail. If it is valid, encode either the fresh sentinel or the
-   filtered, deduplicated paths with B's clock. Long work renews the query lease
-   before expiry; failed renewal or a stolen fence discards the private result.
-5. Under the grant's shared response phase, drain/recheck the mandatory
-   binding and mount monitors and then use a short transaction to verify the
-   same active authorization UUID, clock epoch, B boundary, query-lease fence,
-   and unexpired lease. Reserve enough renewed lease time for the bounded socket
-   write, send the already encoded result, then release the lease and pins in a
-   short fenced transaction. Revocation and facade invalidation take the
-   exclusive side of this gate: either operation must observe zero active
-   response leases or roll back and retry after they drain. They never delete a
-   live response's pins or rotate its epoch underneath an in-progress write.
-   The transport has a write deadline shorter than the reserved lease, and
-   releases the lease on success, timeout, disconnect, or encoding failure. If
-   any final check fails, send no stale bytes and restart with a fresh boundary.
-
-Concurrent callers with different old clocks can therefore share a target cut
-without sharing mutable result state. SQLite still has one short writer at a
-time; WAL readers, kernel comparisons, path projection, and client encoding
-run concurrently. A failed caller cannot roll back a cut
-already shared or published for another caller. Writer contention serializes
-only admission, publication, pin, and release metadata, not the expensive
-filesystem or projection work.
-
-### 10.10 Compatibility acceptance tests
-
-In addition to the core index tests, record byte-exact fixtures for jj's BSER
-discovery and the supported commands, including bare `NameOnly` values and the initial
-fresh `/` result. Run jj status/snapshot tests for create, delete, rename,
-hardlinks, `.gitignore`, `.git`/`.jj` exclusion, sparse matches, directory
-subtree moves, daemon restart, expired clocks, query failure, and existing
-snapshot-descendant adoption with a fresh first query. Include repeated
-old-clock queries when refused/untracked
-paths prevent persistence; a regression where jj resets its expected tree
-without ordinary file events; and non-UTF-8 results which must cause the pinned
-client's query error followed by its currently failing full crawl until both
-byte-path patches land. No cleared clock may be persisted after that failure.
-
-Run Git's fsmonitor tests against the direct hook for its initial numeric token,
-empty token after a fail-once/index-write cycle, empty delta, create/delete,
-both rename names, non-UTF-8 bytes, directory prefix, linked worktrees,
-copied/foreign tokens, restart, GC expiration, `/` fallback, and hook failure.
-Run the bundled hardened adapter against the JSON shim. Separately use the
-unmodified Perl sample only under its restricted policy, with byte-exact tests
-that query output starts with `{`, activation diagnostics are stderr-only, the
-error contains `unable to resolve root ... directory ... is not watched`, and
-`watch`/`clock` output and every service token satisfy the required JSON-safe
-alphabet. Include a lost-history deletion proving `files:["/"]` is required.
-
-The critical dirty-witness suite runs first with the optional precision guard
-disabled. Pause clients after B's clock, then create/delete a file or whole
-subtree, modify/restore data and metadata (including writable `mmap`), mutate
-through one hardlink while another alias is cached, and perform root-level and
-nested namespace operations before C. Every case must retain its object or
-surviving-directory witness and conservatively invalidate every state the
-client could have cached: Git receives an affected directory prefix or `/`,
-and jj receives a bounded complete exact-path set or a fresh result. Include
-the mixed `d/transient` create/delete plus `d/persistent` net-create case and
-prove the transient name cannot remain cached merely because the persistent
-name appears in the response. Run each mutation around the snapshot
-ioctl/transaction barrier. Kernel versions which fail any witness test must
-refuse to mint facade clocks.
-
-Then enable the optional precision guard and prove exact root-level and nested
-transient names are available only between two post-snapshot marker boundaries
-in one retained epoch. Exercise directory create/move-in scoped
-prefixes, queue overflow, producer restart, watch-install races, permission
-loss, unresolved/reused inodes, and hardlink alias-expansion failure. Each
-failure must gap precision, restore conservative witness invalidation, and
-never expose a partial exact event history.
-
-The mandatory namespace-view suite renames/replaces and restores the watched
-root and each ancestor component between queries; attaches/detaches bind, FUSE,
-and moved mounts; loses each monitor fd; restarts the namespace daemon; and
-changes `chroot`/mount namespaces on passed sockets. Binding markers must catch
-path operations, a mountinfo event must rotate every watch using that namespace
-monitor even if its text returns identical, and persistent replacements must
-also fail exact UUID/mount re-resolution. Include PID exit/reuse and mixed or
-missing `SCM_CREDENTIALS`/`SCM_PIDFD` spans. Confirm explicitly that a same-UID,
-same-view process can use a passed socket under v1's trust model rather than
-mistaking Landlock/seccomp restrictions for delegated authorization.
-
-Stress tests coalesce simultaneous `clock`/`query` callers, kill workers before
-and after snapshot and SQLite publication, reclaim expired query leases, overflow
-every output limit, race admission against `fs_started`, revoke/regrant during
-each operation phase, race GC against projected queries, connect a same-UID
-client from another mount namespace, expire/steal query leases during encoding,
-and race revocation against final response and broker dispatch. Verify that
-admission history reclaimed before pin handoff becomes fresh, a running broker
-receipt is reconciled before revocation completes, and every uncertainty is
-either a complete incremental set or a full invalidation—never a partial
-successful result. Compatibility tests prove that fixed `trigger-del` is an
-idempotent no-op and that `trigger` and `trigger-list` fail explicitly.
-Snapshot-descendant tests prove adoption reuses only an exact retained parent
-revision and never creates a sequence-0 clock. Attempt dedupe
-against managed RO cuts, force boot/unclean-restart boundaries, and verify
-transaction-metadata or epoch checks prevent stale publication.
-
-As a minimum proposed real-client smoke gate, first build a runnable
-modified-kernel/UML harness, record `jj --version` and `git --version`, run an
-unmodified jj working-copy status through socket discovery, `watch-project`,
-and the name-only query, and run an unmodified Git status through the direct v2
-hook before and after editing a tracked file, with jj trigger registration
-disabled. Confirm its fixed `trigger-del` request is accepted without creating
-a trigger. No existing passing real-client smoke pair is established.
+| `Begin(live_root, previous_cursor?)` | session ID, new cursor, invalidation, deadline, snapshot identity, one directory fd | Canonicalize and authorize the exact root, publish one cut, pin its immutable inputs, and transfer only the verified read-only snapshot fd. |
+| `Renew(session_id)` | extended deadline | Extend the durable query lease while the client still owns the scan root. |
+| `Finish(session_id, Committed|Aborted)` | acknowledgment | Release the pinned response only after the caller has durably accepted or rejected the cursor. |
+
+A missing, foreign, expired, or unverifiable previous cursor produces a full
+invalidation against the newly selected immutable snapshot. Exact paths are
+returned only when retained comparison history proves the interval; subtree
+moves, continuity loss, guard gaps, or missing history conservatively become a
+full scan. The cursor is bound to store UUID, watch/grant, namespace-monitor
+session, epoch, cut sequence, algorithm version, and target snapshot UUID.
+
+The daemon lazily registers each requested canonical root. It first reuses an
+active grant at that exact path, then tries to adopt a retained Btrfs snapshot
+descendant, and otherwise initializes a new watch. One root never authorizes an
+ancestor or sibling. The optional recursive precision journal can narrow
+invalidations, but its absence or failure cannot weaken snapshot correctness.
+
+This direct API does not expose a general filesystem-monitor protocol, command
+execution, subscriptions, hooks, legacy compatibility framing, or mutable-checkout
+incremental promises. The supported client must validate the received
+filesystem/subvolume identity, scan only the leased descriptor, renew before
+expiry, and persist the cursor only with state derived from that same snapshot.
 
 ## 11. Implementation plan
 
@@ -2721,41 +1809,33 @@ a trigger. No existing passing real-client smoke pair is established.
    deduplication, ordered publication, deterministic retry/replay, direct
    same-branch historical A -> B comparisons, and the full-checkpoint
    gap/fresh-instance transaction.
-8. **Prove the dirty-witness foundation before exposing clocks.** Make every
+8. **Prove the dirty-witness foundation before exposing cursors.** Make every
    inode-item change, especially directory witnesses, survive normalization and
-   projection. Add the snapshot-only post-clock race/xfstest matrix for every
+   projection. Add the snapshot-only post-cursor race/xfstest matrix for every
    supported mutation mechanism and refuse facade activation on a kernel/ABI
    which fails it. Implement exact aliases for file changes and conservative
-   Git-prefix/jj-fresh projection for every changed directory.
-9. **Add namespace continuity, clocks, and query transactions.** Build the
-   per-user daemon with pidfd-bound per-frame credentials, mandatory top-down
+   full invalidation for every changed directory.
+9. **Add namespace continuity, cursors, and scan transactions.** Build the
+   per-user daemon with peer credentials, mandatory top-down
    root-path-binding watches, the persistent mountinfo monitor, component/UUID
    re-resolution, and epoch rotation. Then implement authenticated
-   watch/grant/view-scoped clocks, writer-serialized cut admission/coalescing,
+   watch/grant/view-scoped cursors, writer-serialized cut admission/coalescing,
    the cut replay floor, renewable query leases/pins, adjacent-cut witness
-   aggregation, client-specific fresh results, final response fencing, and
-   byte-oriented limits. Property-test that every result is a conservative
-   superset of state a client could have cached after its previous clock.
+   aggregation, conservative invalidations, final response fencing, and
+   byte-oriented limits. Property-test that every result is safe for the exact
+   immutable snapshot descriptor paired with its cursor.
 10. **Add the optional precision journal.** Implement recursive inotify on a
     separate fd, top-down arming, post-snapshot private markers, durable cursor
     assignment, exact create/delete/rename names, scoped directory-create and
     move-in prefixes, guard retention/floors, and coarse fallback on every gap.
-    Benchmark how often this converts jj fresh crawls into exact incremental
+    Benchmark how often this converts full scans into exact incremental
     matches; correctness must continue to pass with it disabled.
-11. **Add jj's focused Watchman endpoint.** Implement bounded BSER-v2 framing,
-   `watch-project`, `clock`, name-only `query`, exact expressions, fresh `/`
-   semantics, namespace-specific discovery, peer namespace/grant checks, and
-   byte-exact fixtures captured from `watchman_client` 0.9.0. Patch jj to
-   expose raw byte paths in both Watchman and crawl paths, preserve its
-   refused/untracked clock behavior, clear clocks on every expected-tree reset,
-   consume only fresh-query baselines, accept the fixed disabled-trigger
-   cleanup as a no-op, and explicitly reject trigger registration/listing.
-12. **Add Git fsmonitor.** Implement the direct hook-v2 helper first, including
-    numeric/empty/foreign-token initialization, NUL-safe names, compact
-    directory invalidation, and nonzero failure fallback. Add the structured,
-    no-shell hardened JSON adapter and focused three-command CLI shim. Treat the
-    unmodified Perl sample only as a restricted conformance target and run
-    Git's hook/fsmonitor suite plus the lost-history deletion regression.
+11. **Add the direct scan endpoint.** Implement bounded seqpacket framing,
+    namespace-specific `scan-sockname` discovery, peer namespace/grant checks,
+    exact snapshot descriptor transfer, renewal and completion fencing, and
+    byte-exact fixtures for Begin/Renew/Finish. Patch the client to scan only
+    the leased descriptor, validate its identity, and persist a cursor only
+    with state derived from that same snapshot.
 13. **Implement GC/recovery.** Add physical pins, two-phase snapshot deletion,
    filesystem commit barriers, revision/event retention, checkpoint compaction,
    independent cut/precision-floor advancement, query/admission lease
@@ -2775,11 +1855,11 @@ a trigger. No existing passing real-client smoke pair is established.
    inotify only after the kernel journal passes the same post-clock race suite.
 15. **Validate performance and correctness.** Benchmark initialization,
     snapshot latency, kernel comparison, SQLite application, precision ingestion,
-    path/alias expansion, BSER/hook projection, and GC
+    path/alias expansion, direct invalidation projection, and GC
     separately. Test direct A -> C final state against A -> B -> C and test
-    post-clock transient activity with precision disabled and enabled.
+    post-cursor transient activity with precision disabled and enabled.
     Exercise simultaneous callers, killed workers, disk-full SQLite, truncated
-    manifests, snapshot deletion races, large hardlink sets, clock expiration,
+    manifests, snapshot deletion races, large hardlink sets, cursor expiration,
     namespace/grant changes, and every full-invalidation path.
 
 ## 12. Current prototype mapping
@@ -2794,12 +1874,9 @@ establishes the following current implementation boundaries:
 - Watch registration can adopt an already-existing Btrfs snapshot descendant
   whose exact parent identity resolves to a retained indexed revision. This
   reuses existing index rows but does not create or manage the descendant and
-  never creates a sequence-0 filesystem-monitor clock.
-- A focused Watchman BSER endpoint provides `watch-project`, `clock`, and
-  name-only `query`. The fixed `trigger-del` request is accepted only as an
-  idempotent compatibility no-op; `trigger`, `trigger-list`, trigger
-  registration, scheduling, and execution are unsupported. Git has a native
-  hook-v2 adapter over the same core service.
+  never creates a sequence-0 direct-scan cursor.
+- A private direct-scan endpoint provides `scan-sockname`, Begin, Renew, and
+  Finish over a namespace-scoped `scan.sock`.
 - The code and schema include clock boundaries, cut admissions, query leases,
   retention/delete intents, broker receipts, recovery, namespace continuity,
   and optional precision-journal scaffolding. Their presence does not prove
@@ -2821,16 +1898,13 @@ represented as established behavior:
 - Proven concurrent query/cut coalescing, lock behavior, and daemon discovery
   or automatic activation across the actual installed client entry points.
 - A checked-in runnable modified-kernel/UML end-to-end harness exercising
-  real jj and Git versions, their wire protocols, failure cases, and adversarial
+  real direct-scan clients, their wire protocol, failure cases, and adversarial
   mutation timing. Existing proposed acceptance matrices are tests to run, not
   passing test results.
 
-[FIXES.md](../FIXES.md) records the known correctness and performance findings;
-[TODO.md](../TODO.md) tracks deferred implementation work, including
-unsupported trigger support.
+[FIXES.md](../FIXES.md) records the known correctness and performance findings.
 Until those issues are resolved and the real-client matrix passes, the service
-must not be described as a verified drop-in replacement for Watchman or Git
-filesystem monitoring.
+must not be described as a verified production direct-scan backend.
 
 ## References
 
@@ -2838,6 +1912,3 @@ filesystem monitoring.
 - [Btrfs ioctl documentation](https://btrfs.readthedocs.io/en/stable/btrfs-ioctl.html)
 - [Btrfs mount options (`user_subvol_rm_allowed`)](https://btrfs.readthedocs.io/en/latest/ch-mount-options.html)
 - [SQLite write-ahead logging](https://sqlite.org/wal.html)
-- [Watchman `query`](https://facebook.github.io/watchman/docs/cmd/query)
-- [Watchman clocks](https://facebook.github.io/watchman/docs/clockspec)
-- [Git `fsmonitor-watchman` hook](https://git-scm.com/docs/githooks#_fsmonitor_watchman)

@@ -14,15 +14,13 @@ Facade continuity is separate from snapshot identity:
 - The root-path monitor watches every relevant ancestor/component.
 - The mount monitor retains and polls `/proc/self/mountinfo`.
 - Root replacement, rename/restore, mount-over, monitor loss, grant revocation,
-  or epoch/session replacement invalidate existing clocks.
+  or epoch/session replacement invalidate existing cursors.
 - The optional recursive precision guard is a separate optimization. Its
   overflow or absence must not weaken the mandatory root/mount monitors.
 
-Opaque clocks are HMAC-authenticated capabilities. Their claims identify the
-store, watch, clock epoch, owner grant, monitor session, exact cut sequence,
-boundary kind, algorithm version, and target snapshot UUID. A direct cursor
-wraps the same clock in a separate authenticated domain, preventing accidental
-interchange between direct and Watchman cursors.
+Opaque direct cursors are HMAC-authenticated capabilities. Their claims
+identify the store, watch, cursor epoch, owner grant, monitor session, exact
+cut sequence, boundary kind, algorithm version, and target snapshot UUID.
 
 Historical replay currently verifies the **exact retained cut sequence and
 snapshot UUID**. The older claim in FIXES.md (`FIXES.md`) that replay accepts an

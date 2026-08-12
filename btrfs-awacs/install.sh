@@ -23,9 +23,6 @@ cargo build --release
 run_as_root install -d -m 0755 "$binary_dir"
 run_as_root install -m 0755 target/release/btrfs-awacs \
   "$binary_dir/btrfs-awacs"
-for entry in watchman git-fsmonitor-hook; do
-  run_as_root ln -sfn btrfs-awacs "$binary_dir/$entry"
-done
 
 unit_file=$(mktemp)
 trap 'rm -f "$unit_file"' EXIT HUP INT TERM

@@ -49,7 +49,7 @@ flowchart LR
     SNAPSHOT["Writable Btrfs snapshot of materialized files"]
     JJSTATE["Fresh destination .jj workspace identity"]
     GITSTATE["Independent linked Git worktree identity"]
-    BASELINE["Destination tree and fsmonitor baseline"]
+    BASELINE["Destination tree and direct-scan baseline"]
     AWACSWATCH["Independent AWACS root, grant, cut, and cursor"]
 
     SOURCE --> SNAPSHOT
@@ -93,8 +93,7 @@ The lifecycle has several required safety invariants:
 The current lifecycle violates several of these invariants, including two
 repository-wide data-loss paths described in findings C-01 and C-02.
 
-AWACS Watchman registration can dynamically adopt/register a destination
-snapshot descendant when the parent revision is retained. The current direct
-AWACS handler does **not** perform this per-root registration, so the first
-command in a sibling workspace fails even though the namespace daemon already
-serves the source root.
+The direct AWACS handler registers each requested canonical root on demand.
+When a destination snapshot descendant is first scanned, it adopts the known
+lineage when possible, creates an independent grant/cut/cursor, and activates
+its own namespace view in the already-running namespace daemon.

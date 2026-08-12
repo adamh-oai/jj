@@ -1,10 +1,8 @@
 pub mod broker;
 pub mod broker_protocol;
-pub mod bser;
 pub mod btrfs;
 pub mod compat;
 pub mod facade;
-pub mod git_fsmonitor;
 pub mod index;
 pub mod manager;
 pub mod manifest;
@@ -15,5 +13,3 @@ pub mod scan_facade;
 pub mod service;
 pub mod store;
 pub mod tree_index;
-pub mod watchman;
-pub mod watchman_transport;

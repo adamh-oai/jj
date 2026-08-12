@@ -4,7 +4,7 @@ description: "P2 correctness review findings, affected components, failure mecha
 sidebar:
   order: 6
 ---
-This page contains **5 P2 correctness findings**. Identifiers correspond to the reviewed source specification.
+This page contains **4 P2 correctness findings**. Identifiers correspond to the reviewed source specification.
 
 **C-26 — Malformed direct invalidations are silently dropped.**
 `../jj/lib/src/local_working_copy.rs`
@@ -12,14 +12,6 @@ uses `filter_map` when converting raw direct invalidation paths to Jujutsu
 repository paths. A malformed/nonrepresentable entry can become an empty
 matcher while its new cursor is still committed. Direct responses must reject
 invalid paths or conservatively force `Full`.
-
----
-
-**C-27 — Stock Jujutsu cannot reuse migrated Watchman cursors.**
-`../jj/lib/src/local_working_copy.rs`
-writes the new backend-tagged protobuf field without also writing deprecated
-Watchman tag 4. Older/stock Jujutsu ignores the unknown new field, sees no
-clock, and performs a fresh crawl when binaries are alternated.
 
 ---
 

@@ -10,9 +10,6 @@ The defaults are:
 [fsmonitor]
 backend = "none"
 
-[fsmonitor.watchman]
-register-snapshot-trigger = false
-
 [fsmonitor.awacs]
 socket = ""
 
@@ -20,9 +17,8 @@ socket = ""
 enabled = false
 ```
 
-The `jj-cli` default features are `watchman` and `git`; `awacs` is an explicit
-additional feature that forwards to `jj-lib/awacs`. On Linux, a binary built
-with that feature accepts:
+`awacs` is an explicit feature that forwards to `jj-lib/awacs`. On Linux, a
+binary built with that feature accepts:
 
 ```toml
 [fsmonitor]

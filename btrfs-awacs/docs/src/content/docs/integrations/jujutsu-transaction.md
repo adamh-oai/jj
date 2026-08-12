@@ -28,8 +28,8 @@ sequenceDiagram
 
 `TreeState` constructs a `SnapshotScan` with a selected scan root, optional
 changed-path matcher, backend-tagged cursor, and optional pending completion.
-The `none` and Watchman branches use the normal live working-copy path. The
-direct AWACS branch:
+The `none` branch uses the normal live working-copy path. The direct AWACS
+branch:
 
 1. Connects an injected test client or discovers/connects `SocketScanClient`.
 2. Requires the versioned external-input fingerprint.
@@ -65,13 +65,11 @@ The working-copy protobuf now contains:
 
 ```text
 TreeState {
-    legacy watchman_clock: deprecated tag 4,
     fsmonitor_cursor: tag 8,
 }
 
 FsmonitorCursor {
     oneof {
-        watchman: WatchmanClock,
         awacs: {
             opaque_token,
             input_fingerprint_version,
@@ -81,9 +79,9 @@ FsmonitorCursor {
 }
 ```
 
-Existing legacy Watchman clocks can be read and migrated into the new field.
-The current writer does not also populate deprecated tag 4, so an older/stock
-Jujutsu binary cannot reuse a clock written by this checkout.
+The direct cursor is valid only with the matching backend and external-input
+fingerprint. Older binaries that do not understand the AWACS cursor safely
+fall back to a full live traversal.
 
 ## Matcher and invalidation contract
 

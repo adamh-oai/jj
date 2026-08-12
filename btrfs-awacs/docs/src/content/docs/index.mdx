@@ -9,17 +9,16 @@ hero:
     - text: Start the repository walkthrough
       link: /walkthroughs/single-workspace-serial/
       icon: right-arrow
-    - text: Read the 43 review findings
+    - text: Read the 37 review findings
       link: /review/overview/
       variant: minimal
 ---
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-AWACS builds a persistent change index from immutable Btrfs snapshots. Git and
-Watchman-compatible clients consume authenticated path invalidations; Jujutsu
-can also lease the actual immutable snapshot and derive its working-copy tree
-without racing the live checkout.
+AWACS builds a persistent change index from immutable Btrfs snapshots.
+Jujutsu leases the actual immutable snapshot and derives its working-copy tree
+from that exact cut instead of racing the live checkout.
 
 ## Follow one repository through four scenarios
 
@@ -51,17 +50,9 @@ invariants must hold** before a client can safely advance its cursor.
   />
 </CardGrid>
 
-## Three client contracts
+## Direct-scan contract
 
 <CardGrid>
-  <Card title="Focused Watchman">
-    Changed names and authenticated clocks narrow a crawl of the **live**,
-    mutable checkout. Transient directory changes must remain visible.
-  </Card>
-  <Card title="Native Git fsmonitor">
-    Hook-v2 tokens and NUL-delimited invalidations conservatively refresh Git's
-    tracked, untracked, and index state.
-  </Card>
   <Card title="Direct Jujutsu scans">
     A leased read-only snapshot descriptor, authenticated cursor, and external
     input fingerprint bind a tree state to one **immutable** filesystem cut.
@@ -82,13 +73,13 @@ invariants must hold** before a client can safely advance its cursor.
     href="/lifecycle/watch-initialization/"
   />
   <LinkCard
-    title="Jujutsu, Watchman, and Git integrations"
-    description="Compare mutable live-tree monitoring with descriptor-based immutable scans and backend-tagged cursor persistence."
+    title="Direct Jujutsu integration"
+    description="Inspect descriptor-based immutable scans, input fingerprints, and backend-tagged cursor persistence."
     href="/integrations/direct-scan-api/"
   />
   <LinkCard
     title="Correctness and performance review"
-    description="Trace 30 correctness findings and 13 performance findings back to the invariants they violate."
+    description="Trace 24 correctness findings and 13 performance findings back to the invariants they violate."
     href="/review/overview/"
   />
 </CardGrid>

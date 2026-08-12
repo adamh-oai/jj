@@ -78,6 +78,7 @@ Renew extends the prepared query lease. Finish releases it and records a short
 idempotence tombstone. Invalid/expired cursors currently become safe full scans
 when the selected target snapshot can still be leased.
 
-The present direct handler is incorrectly bound to only the daemon's initial
-root/watch; additional Watchman registrations are not visible to it. The
-requested root-multiplexing contract is consequently not implemented.
+The handler resolves, authorizes, initializes or adopts, and activates each
+requested canonical root on demand. Multiple repositories and snapshot
+workspaces on the daemon's configured Btrfs filesystem can therefore share one
+mount-namespace daemon without sharing cursor or grant authority.

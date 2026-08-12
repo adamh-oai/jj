@@ -3,7 +3,7 @@ name = "btrfs-awacs"
 version = "0.1.0"
 edition = "2021"
 autobins = false
-description = "Btrfs snapshot change index with focused Watchman and Git integrations"
+description = "Btrfs snapshot change index with immutable direct-scan integration"
 license = "MIT"
 
 [[bin]]
