@@ -117,13 +117,29 @@ case "$send_mode" in
     as_client git -C /source/client-live config user.email uml@example.invalid
     as_client git -C /source/client-live add tracked
     as_client git -C /source/client-live commit -m initial
-    as_client git -C /source/client-live config core.fsmonitor /usr/bin/git-fsmonitor-hook
+    cat > /tmp/git-fsmonitor-hook-wrapper <<'EOF'
+#!/bin/sh
+/usr/bin/git-fsmonitor-hook "$@"
+status=$?
+printf '%s\n' "$status" > /tmp/git-fsmonitor-hook-status
+exit "$status"
+EOF
+    chmod 0755 /tmp/git-fsmonitor-hook-wrapper
+    chown 1000:1000 /tmp/git-fsmonitor-hook-wrapper
+    as_client git -C /source/client-live config core.fsmonitor /tmp/git-fsmonitor-hook-wrapper
     as_client git -C /source/client-live config core.fsmonitorHookVersion 2
-    as_client git -C /source/client-live status --porcelain \
-      > "$results/git-fsmonitor-initial.txt"
+    as_client git -C /source/client-live status --porcelain > "$results/git-fsmonitor-initial.txt"
+    if [ "$(cat /tmp/git-fsmonitor-hook-status)" != 0 ]; then
+      echo "real Git fsmonitor hook failed during baseline status" >&2
+      exit 1
+    fi
     rm -f /tmp/btrfs-awacs-jj-trigger-ran
-    as_client jj -R /source/client-live status \
-      > "$results/jj-watchman-status.txt"
+    as_client jj -R /source/client-live status > "$results/jj-watchman-baseline.txt" 2> "$results/jj-watchman-baseline.stderr"
+    if grep -q 'Failed to query filesystem monitor' "$results/jj-watchman-baseline.stderr"; then
+      echo "real jj Watchman baseline fell back to a filesystem crawl" >&2
+      cat "$results/jj-watchman-baseline.stderr" >&2
+      exit 1
+    fi
     for _attempt in $(seq 1 140); do
       [ -s /tmp/btrfs-awacs-jj-trigger-ran ] && break
       sleep 0.05
@@ -137,7 +153,7 @@ case "$send_mode" in
     # its poll, then require the precision event to beat the five-second
     # periodic correctness interval by a wide margin.
     sleep 0.2
-    as_client sh -c 'printf "modified\n" > /source/client-live/tracked'
+    as_client sh -c 'printf "modified\n" > /source/client-live/tracked; printf "new\n" > /source/client-live/untracked'
     for _attempt in $(seq 1 40); do
       [ -s /tmp/btrfs-awacs-jj-trigger-ran ] && break
       sleep 0.05
@@ -146,14 +162,40 @@ case "$send_mode" in
       echo "jj trigger did not finish after a precision-guard early wake" >&2
       exit 1
     fi
-    as_client git -C /source/client-live status --porcelain \
-      > "$results/git-fsmonitor-modified.txt"
+    as_client git -C /source/client-live status --porcelain > "$results/git-fsmonitor-modified.txt"
+    if [ "$(cat /tmp/git-fsmonitor-hook-status)" != 0 ]; then
+      echo "real Git fsmonitor hook failed after mutation" >&2
+      exit 1
+    fi
     if ! grep -q '^ M tracked$' "$results/git-fsmonitor-modified.txt"; then
       echo "real Git fsmonitor did not report the tracked modification" >&2
       cat "$results/git-fsmonitor-modified.txt" >&2
       exit 1
     fi
-    printf 'jj_watchman=true git_fsmonitor=true trigger_precision_wakeup=true\n' |
+    if ! grep -q '^?? untracked$' "$results/git-fsmonitor-modified.txt"; then
+      echo "real Git fsmonitor did not report the untracked file" >&2
+      cat "$results/git-fsmonitor-modified.txt" >&2
+      exit 1
+    fi
+    as_client git -C /source/client-live -c core.fsmonitor= status --porcelain > "$results/git-full-status.txt"
+    if ! cmp -s "$results/git-fsmonitor-modified.txt" "$results/git-full-status.txt"; then
+      echo "real Git fsmonitor status differs from a full scan" >&2
+      diff -u "$results/git-full-status.txt" "$results/git-fsmonitor-modified.txt" >&2 || true
+      exit 1
+    fi
+    as_client jj -R /source/client-live status > "$results/jj-watchman-modified.txt" 2> "$results/jj-watchman-modified.stderr"
+    if grep -q 'Failed to query filesystem monitor' "$results/jj-watchman-modified.stderr"; then
+      echo "real jj Watchman query fell back to a filesystem crawl" >&2
+      cat "$results/jj-watchman-modified.stderr" >&2
+      exit 1
+    fi
+    if ! grep -q 'tracked' "$results/jj-watchman-modified.txt" ||
+       ! grep -q 'untracked' "$results/jj-watchman-modified.txt"; then
+      echo "real jj Watchman status missed tracked or untracked changes" >&2
+      cat "$results/jj-watchman-modified.txt" >&2
+      exit 1
+    fi
+    printf 'jj_watchman=true git_fsmonitor=true git_full_scan_parity=true trigger_precision_wakeup=true\n' |
       tee "$results/real-client-summary.txt"
     if as_client /usr/bin/btrfs-awacs __broker-changed-objects \
       "$parent" "$current" /tmp/client-spool/unprivileged.objects \

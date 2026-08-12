@@ -49,7 +49,6 @@ struct ParsedKernelChangedObjects {
 
 struct FullIndexResult {
     index: Index,
-    dirty_witness_contract: bool,
 }
 
 const DEFAULT_LEASE_NS: i64 = 300_000_000_000;
@@ -361,7 +360,6 @@ pub struct Service {
     lease_owner: [u8; 16],
     config: ServiceConfig,
     worktree_view_handoffs: BTreeMap<[u8; 16], WorktreeViewHandoff>,
-    dirty_witness_contract_seen: bool,
 }
 
 impl Service {
@@ -415,7 +413,6 @@ impl Service {
             lease_owner,
             config,
             worktree_view_handoffs: BTreeMap::new(),
-            dirty_witness_contract_seen: false,
         };
         let recovery_now = current_unix_time_ns()?;
         service
@@ -479,7 +476,6 @@ impl Service {
             lease_owner,
             config,
             worktree_view_handoffs: BTreeMap::new(),
-            dirty_witness_contract_seen: false,
         };
         let recovery_now = current_unix_time_ns()?;
         service
@@ -586,7 +582,6 @@ impl Service {
                 ExpectedSubvolume::from_observed(&snapshot_fd.filesystem, &snapshot_fd.subvolume);
             verify_recorded_snapshot(&recorded.identity, &expected)?;
             let full_index = self.broker_full_index(&expected, snapshot_fd.as_fd())?;
-            self.dirty_witness_contract_seen |= full_index.dirty_witness_contract;
             self.store
                 .publish_initial_checkpoint(
                     &operation.reservation,
@@ -1209,54 +1204,19 @@ impl Service {
     }
 
     pub fn snapshot_facade_is_enabled(&self) -> bool {
-        self.config.experimental_dirty_witness_verified && self.dirty_witness_contract_seen
+        self.config.experimental_dirty_witness_verified
     }
 
-    /// Fail-closed facade gate. A process restart or kernel downgrade clears
-    /// the in-memory capability observation, so revalidate the immutable head
-    /// through the same v2 full-index ABI before minting another clock.
+    /// Bootstrap has no changed-objects stream and therefore cannot prove the
+    /// output-only dirty-witness capability. The operator's explicit opt-in
+    /// enables fresh-baseline clocks; every later changed-objects comparison
+    /// must independently advertise the capability before it can be
+    /// published.
     pub fn ensure_snapshot_facade_is_enabled(
-        &mut self,
-        watch_id: [u8; 16],
+        &self,
+        _watch_id: [u8; 16],
     ) -> Result<bool, ServiceError> {
-        if !self.config.experimental_dirty_witness_verified {
-            return Ok(false);
-        }
-        if self.dirty_witness_contract_seen {
-            return Ok(true);
-        }
-        let (revision_id, path): (i64, Vec<u8>) = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT w.indexed_revision_id, s.path \
-                   FROM watches w \
-                   JOIN revisions r ON r.id = w.indexed_revision_id \
-                   JOIN snapshots s ON s.id = r.snapshot_id \
-                  WHERE w.id = ?1 AND w.state = 'active'",
-                [watch_id.as_slice()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(|error| ServiceError::context("load facade ABI probe head", error))?;
-        let path = PathBuf::from(OsString::from_vec(path));
-        let snapshot = OpenedSubvolume::open(&path)
-            .map_err(|error| ServiceError::context("open facade ABI probe head", error))?;
-        let expected = ExpectedSubvolume::from_observed(&snapshot.filesystem, &snapshot.subvolume);
-        let full_index = self.broker_full_index(&expected, snapshot.as_fd())?;
-        if !full_index.dirty_witness_contract {
-            return Ok(false);
-        }
-        let indexed = self
-            .store
-            .load_revision(revision_id)
-            .map_err(|error| ServiceError::context("load facade ABI probe revision", error))?;
-        if indexed != full_index.index {
-            return Err(ServiceError::new(
-                "facade ABI probe full index differs from the committed revision",
-            ));
-        }
-        self.dirty_witness_contract_seen = true;
-        Ok(true)
+        Ok(self.snapshot_facade_is_enabled())
     }
 
     pub fn query_worker(&self) -> Result<Self, ServiceError> {
@@ -1281,7 +1241,6 @@ impl Service {
             manager_session_id: self.manager_session_id,
             lease_owner: random_id(),
             config: self.config.clone(),
-            dirty_witness_contract_seen: self.dirty_witness_contract_seen,
             worktree_view_handoffs: BTreeMap::new(),
         })
     }
@@ -1360,7 +1319,6 @@ impl Service {
             ));
         }
         let full_index = self.broker_full_index(&expected, snapshot_fd.as_fd())?;
-        self.dirty_witness_contract_seen |= full_index.dirty_witness_contract;
         self.store
             .publish_initial_checkpoint(
                 &reservation,
@@ -1582,7 +1540,10 @@ impl Service {
         }
         let parsed = parse_kernel_changed_objects(&bytes)
             .map_err(|error| ServiceError::context("parse historical manifest", error))?;
-        self.dirty_witness_contract_seen |= parsed.dirty_witness_contract;
+        require_dirty_witness_contract(
+            self.config.experimental_dirty_witness_verified,
+            parsed.dirty_witness_contract,
+        )?;
         let required: BTreeSet<_> = parsed
             .manifest
             .objects
@@ -1749,7 +1710,10 @@ impl Service {
             if parsed.target_objects.is_none() {
                 reject_nested_subvolumes(&completion.destination_path)?;
             }
-            self.dirty_witness_contract_seen |= parsed.dirty_witness_contract;
+            require_dirty_witness_contract(
+                self.config.experimental_dirty_witness_verified,
+                parsed.dirty_witness_contract,
+            )?;
             let required: BTreeSet<_> = parsed
                 .manifest
                 .objects
@@ -1805,7 +1769,6 @@ impl Service {
                             "incremental cut failed: {incremental_error}; full-index fallback failed: {fallback}"
                         ))
                     })?;
-                self.dirty_witness_contract_seen |= full_index.dirty_witness_contract;
                 self.store
                     .publish_full_fresh_checkpoint(
                         reservation,
@@ -2348,10 +2311,7 @@ impl Service {
         let index = decode_index(&bytes)
             .map_err(|error| ServiceError::context("decode full index", error))?;
         reject_fscrypt_index(&index)?;
-        Ok(FullIndexResult {
-            index,
-            dirty_witness_contract: false,
-        })
+        Ok(FullIndexResult { index })
     }
 
     fn broker_target_objects(
@@ -3081,6 +3041,18 @@ fn parse_kernel_changed_objects(bytes: &[u8]) -> Result<ParsedKernelChangedObjec
     }
 }
 
+fn require_dirty_witness_contract(
+    experimental_dirty_witness_verified: bool,
+    observed: bool,
+) -> Result<(), ServiceError> {
+    if experimental_dirty_witness_verified && !observed {
+        return Err(ServiceError::new(
+            "changed-objects stream does not advertise the dirty-witness capability",
+        ));
+    }
+    Ok(())
+}
+
 fn create_private_spool(path: &Path) -> Result<File, ServiceError> {
     OpenOptions::new()
         .read(true)
@@ -3389,6 +3361,17 @@ mod tests {
     use crate::manifest::{CHANGED_OBJECTS_MAGIC, CHANGED_OBJECTS_VERSION};
     use crate::store::ServiceMetadata;
     use tempfile::tempdir;
+
+    #[test]
+    fn dirty_witness_capability_is_required_only_for_opted_in_incremental_streams() {
+        assert!(require_dirty_witness_contract(false, false).is_ok());
+        assert!(require_dirty_witness_contract(true, true).is_ok());
+        let error = require_dirty_witness_contract(true, false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "changed-objects stream does not advertise the dirty-witness capability"
+        );
+    }
 
     #[test]
     fn immutable_index_rejects_fscrypt_before_publication() {

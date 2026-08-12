@@ -1773,7 +1773,7 @@ fn run_service_smoke_helper(
         ));
     }
     println!(
-        "watch={} sequence={} events={} objects={} refs={} worktree={} gc_deleted={} worktree_seed_fresh={} worktree_incremental={} facade_sequence={} facade_aliases={} facade_restart_probe=true snapshot_only_dirty_witness=true precision_transient=true watchman_fresh=true dynamic_worktree_watch=true git_aliases={} response_fence_released=true incremental_equals_full=true",
+        "watch={} sequence={} events={} objects={} refs={} worktree={} gc_deleted={} worktree_seed_fresh={} worktree_incremental={} facade_sequence={} facade_aliases={} facade_restart_activation=true snapshot_only_dirty_witness=true precision_transient=true watchman_fresh=true dynamic_worktree_watch=true git_aliases={} response_fence_released=true incremental_equals_full=true",
         hex_bytes(&initialized.watch_id),
         published.sequence,
         published.events.len(),
