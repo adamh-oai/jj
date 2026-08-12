@@ -10,6 +10,8 @@ pub mod manager;
 pub mod manifest;
 pub mod namespace;
 pub mod precision;
+pub mod scan;
+pub mod scan_facade;
 pub mod service;
 pub mod store;
 pub mod tree_index;

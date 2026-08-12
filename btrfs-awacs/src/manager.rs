@@ -1878,6 +1878,57 @@ impl Store {
         Ok(())
     }
 
+    pub fn renew_query_lease(
+        &mut self,
+        lease: &QueryLeaseReservation,
+        activation: &FacadeActivation,
+        now_ns: i64,
+        lease_expires_ns: i64,
+    ) -> Result<(), ManagerError> {
+        if lease_expires_ns <= now_ns {
+            return Err(ManagerError::new(
+                "renewed query lease must expire after renewal",
+            ));
+        }
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_one(
+            transaction.execute(
+                r#"UPDATE query_leases
+                      SET lease_expires_ns = ?8
+                    WHERE id = ?1 AND watch_id = ?2
+                      AND authorization_id = ?3 AND clock_epoch = ?4
+                      AND lease_owner = ?5 AND lease_fence = ?6
+                      AND state = 'active' AND lease_expires_ns > ?9
+                      AND EXISTS (
+                          SELECT 1 FROM watches w JOIN watch_grants g
+                            ON g.id = query_leases.authorization_id
+                           AND g.watch_id = query_leases.watch_id
+                           AND g.state = 'active'
+                           WHERE w.id = query_leases.watch_id
+                             AND w.state = 'active'
+                             AND w.clock_epoch = query_leases.clock_epoch
+                             AND w.view_monitor_session_id = ?7
+                      )"#,
+                params![
+                    lease.id.as_slice(),
+                    lease.watch_id.as_slice(),
+                    lease.authorization_id.as_slice(),
+                    lease.clock_epoch.as_slice(),
+                    lease.lease_owner.as_slice(),
+                    lease.lease_fence,
+                    activation.monitor_session_id.as_slice(),
+                    lease_expires_ns,
+                    now_ns,
+                ],
+            )?,
+            "renew query lease",
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn reserve_initialize(
         &mut self,
         request: &InitializeRequest,

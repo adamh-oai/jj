@@ -10,7 +10,7 @@ use crate::broker::{
     MAX_CHANGED_OBJECT_OUTPUT,
 };
 use crate::broker_protocol::{decode_index, decode_objects, BrokerClient, BrokerDispatcher};
-use crate::btrfs::OpenedSubvolume;
+use crate::btrfs::{OpenedSubvolume, ROOT_INODE};
 use crate::index::{Index, Object};
 use crate::manager::{
     CutAdmission, CutRequest, CutReservation, HistoricalChanges, HistoricalComparisonAdmission,
@@ -261,6 +261,52 @@ pub struct Service {
 }
 
 impl Service {
+    /// Opens a subvolume through the unprivileged fast path when available,
+    /// or asks the already-authenticated broker to inspect identity on kernels
+    /// that restrict `BTRFS_IOC_GET_SUBVOL_INFO` for the manager user.
+    fn open_subvolume(&self, path: &Path) -> Result<OpenedSubvolume, ServiceError> {
+        match OpenedSubvolume::open(path) {
+            Ok(opened) => Ok(opened),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::EINVAL) | Some(libc::EPERM) | Some(libc::EACCES)
+                ) =>
+            {
+                let file = File::open(path).map_err(|err| {
+                    ServiceError::context(format!("open {}", path.display()), err)
+                })?;
+                let metadata = file.metadata().map_err(|err| {
+                    ServiceError::context(format!("stat {}", path.display()), err)
+                })?;
+                if !metadata.is_dir() || metadata.ino() != ROOT_INODE {
+                    return Err(ServiceError::new(format!(
+                        "{} is not a Btrfs subvolume root (directory inode {})",
+                        path.display(),
+                        ROOT_INODE
+                    )));
+                }
+                let expected = self
+                    .broker
+                    .inspect_subvolume(file.as_fd())
+                    .map_err(|err| ServiceError::context("broker-inspect subvolume", err))?;
+                Ok(OpenedSubvolume::from_broker_identity(
+                    file,
+                    expected.filesystem_uuid,
+                    expected.subvolume_uuid,
+                    expected.root_id,
+                    expected.generation,
+                    expected.ctransid,
+                    expected.otransid,
+                    expected.parent_uuid,
+                    expected.received_uuid,
+                    expected.readonly,
+                ))
+            }
+            Err(error) => Err(ServiceError::context("open subvolume", error)),
+        }
+    }
+
     pub fn new(
         mut store: Store,
         journal: BrokerJournal,
@@ -402,7 +448,8 @@ impl Service {
             let recorded = if let Some(recorded) = operation.recorded {
                 recorded
             } else {
-                let source = OpenedSubvolume::open(&operation.live_path)
+                let source = self
+                    .open_subvolume(&operation.live_path)
                     .map_err(|error| ServiceError::context("open recovery source", error))?;
                 if source.subvolume.uuid
                     != self.initialize_source_uuid(operation.reservation.operation_id)?
@@ -470,7 +517,8 @@ impl Service {
                     })?
             };
             reject_nested_subvolumes(&operation.reserved_path)?;
-            let snapshot_fd = OpenedSubvolume::open(&operation.reserved_path)
+            let snapshot_fd = self
+                .open_subvolume(&operation.reserved_path)
                 .map_err(|error| ServiceError::context("open recovered snapshot", error))?;
             let expected =
                 ExpectedSubvolume::from_observed(&snapshot_fd.filesystem, &snapshot_fd.subvolume);
@@ -561,7 +609,8 @@ impl Service {
     fn recover_cut_operations(&mut self) -> Result<(), ServiceError> {
         for mut operation in self.load_recovering_cuts()? {
             if let Some(recorded) = operation.completion.recorded.as_ref() {
-                let target = OpenedSubvolume::open(&operation.completion.destination_path)
+                let target = self
+                    .open_subvolume(&operation.completion.destination_path)
                     .map_err(|error| ServiceError::context("open recorded cut snapshot", error))?;
                 operation.completion.target = Some(ExpectedSubvolume::from_observed(
                     &target.filesystem,
@@ -576,7 +625,8 @@ impl Service {
                         .expect("recovery target populated above"),
                 )?;
             } else {
-                let source = OpenedSubvolume::open(&operation.live_path)
+                let source = self
+                    .open_subvolume(&operation.live_path)
                     .map_err(|error| ServiceError::context("open cut recovery source", error))?;
                 if source.subvolume.uuid != operation.completion.reservation.source_subvol_uuid {
                     return Err(ServiceError::new("cut recovery source subvolume changed"));
@@ -816,7 +866,8 @@ impl Service {
         let canonical_source = fs::canonicalize(source_path)
             .map_err(|error| ServiceError::context("canonicalize initialize source", error))?;
         reject_managed_descendant(&canonical_source, &self.config.managed_snapshot_directory)?;
-        let source = OpenedSubvolume::open(&canonical_source)
+        let source = self
+            .open_subvolume(&canonical_source)
             .map_err(|error| ServiceError::context("open initialize source", error))?;
         if source.subvolume.is_top_level() {
             return Err(ServiceError::new(
@@ -872,7 +923,8 @@ impl Service {
             .record_initialize_snapshot(&reservation, self.lease_owner, &identity, options.now_ns)
             .map_err(|error| ServiceError::context("record initialize snapshot", error))?;
         reject_nested_subvolumes(&destination_path)?;
-        let snapshot_fd = OpenedSubvolume::open(&destination_path)
+        let snapshot_fd = self
+            .open_subvolume(&destination_path)
             .map_err(|error| ServiceError::context("reopen initialize snapshot", error))?;
         let expected =
             ExpectedSubvolume::from_observed(&snapshot_fd.filesystem, &snapshot_fd.subvolume);
@@ -915,7 +967,8 @@ impl Service {
             "descendant adoption checked managed path"
         );
         let open_started = std::time::Instant::now();
-        let source = OpenedSubvolume::open(&canonical_source)
+        let source = self
+            .open_subvolume(&canonical_source)
             .map_err(|error| ServiceError::context("open descendant source", error))?;
         tracing::info!(
             elapsed_ms = open_started.elapsed().as_millis() as u64,
@@ -975,7 +1028,8 @@ impl Service {
             return self.wait_for_cut_admission(&admission, options.now_ns, admission_expiry);
         }
         let (live_path, _base_path) = self.watch_paths(options.watch_id)?;
-        let live = OpenedSubvolume::open(&live_path)
+        let live = self
+            .open_subvolume(&live_path)
             .map_err(|error| ServiceError::context("open watched subvolume", error))?;
         let destination_name = operation_name(b"cut-");
         let destination_path = self
@@ -1110,9 +1164,11 @@ impl Service {
         };
         let source_path = self.snapshot_path(claim.from_snapshot_id)?;
         let target_path = self.snapshot_path(claim.to_snapshot_id)?;
-        let source = OpenedSubvolume::open(&source_path)
+        let source = self
+            .open_subvolume(&source_path)
             .map_err(|error| ServiceError::context("open historical source", error))?;
-        let target = OpenedSubvolume::open(&target_path)
+        let target = self
+            .open_subvolume(&target_path)
             .map_err(|error| ServiceError::context("open historical target", error))?;
         let source_expected =
             ExpectedSubvolume::from_observed(&source.filesystem, &source.subvolume);
@@ -1243,9 +1299,11 @@ impl Service {
                 .map_err(|error| ServiceError::context("publish physical cut", error))?;
         }
         let base_path = self.snapshot_path(reservation.base_snapshot_id)?;
-        let base = OpenedSubvolume::open(&base_path)
+        let base = self
+            .open_subvolume(&base_path)
             .map_err(|error| ServiceError::context("open base snapshot", error))?;
-        let target_fd = OpenedSubvolume::open(&completion.destination_path)
+        let target_fd = self
+            .open_subvolume(&completion.destination_path)
             .map_err(|error| ServiceError::context("reopen target snapshot", error))?;
         let parent_expected = ExpectedSubvolume::from_observed(&base.filesystem, &base.subvolume);
         let target_expected =
@@ -1560,7 +1618,8 @@ impl Service {
                 .ok_or_else(|| ServiceError::new("snapshot GC path has no basename"))?
                 .as_bytes()
                 .to_vec();
-            let target = OpenedSubvolume::open(&path)
+            let target = self
+                .open_subvolume(&path)
                 .map_err(|error| ServiceError::context("open snapshot GC target", error))?;
             let expected = ExpectedSubvolume::from_observed(&target.filesystem, &target.subvolume);
             verify_recorded_snapshot(&reservation.identity, &expected)?;
@@ -1785,7 +1844,7 @@ impl Service {
             .map_err(|_| ServiceError::new("stored snapshot UUID has invalid length"))
     }
 
-    fn snapshot_path(&self, snapshot_id: i64) -> Result<PathBuf, ServiceError> {
+    pub(crate) fn snapshot_path(&self, snapshot_id: i64) -> Result<PathBuf, ServiceError> {
         let bytes: Vec<u8> = self
             .store
             .connection()

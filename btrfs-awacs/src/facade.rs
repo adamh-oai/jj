@@ -1,7 +1,8 @@
 //! Synchronized snapshot/query facade shared by Watchman and Git transports.
 
 use crate::compat::{
-    decode_clock, encode_clock, project_events, BoundaryKind, ClockClaims, Projection,
+    decode_clock, decode_direct_scan_cursor, encode_clock, encode_direct_scan_cursor,
+    project_events, BoundaryKind, ClockClaims, Projection,
 };
 use crate::manager::{FacadeActivation, QueryLeaseReservation};
 use crate::namespace::NamespaceMonitor;
@@ -34,6 +35,7 @@ pub struct PreparedQueryResult {
     pub result: QueryResult,
     lease: QueryLeaseReservation,
     activation: FacadeActivation,
+    snapshot_id: i64,
 }
 
 pub struct PendingQueryCut {
@@ -323,7 +325,71 @@ impl FacadeService {
             old_clock,
             requester_uid,
             now_ns,
+            true,
         )
+    }
+
+    /// Builds a direct-scan response whose durable lease pins only its target
+    /// snapshot.
+    ///
+    /// The replay comparison still uses the exact retained prior boundary,
+    /// but `historical_changes()` owns the short-lived pins needed while that
+    /// comparison runs. The longer-lived scan lease must not retain the whole
+    /// interval between the prior and selected snapshots.
+    pub fn prepare_scan_query(
+        &mut self,
+        watch_id: [u8; 16],
+        previous_cursor: Option<&[u8]>,
+        requester_uid: u32,
+        requester_gid: u32,
+        now_ns: i64,
+    ) -> Result<PreparedQueryResult, FacadeError> {
+        self.check_continuity_or_invalidate(watch_id, "pre-cut namespace check")?;
+        let view = self.views.get(&watch_id).expect("checked active view");
+        let authorization_id = view.authorization_id;
+        let activation = view.activation.clone();
+        let published = self
+            .service
+            .changes(&ChangesOptions {
+                watch_id,
+                authorization_id,
+                requester_uid,
+                requester_gid,
+                now_ns,
+            })
+            .map_err(|error| FacadeError::context("take synchronized scan cut", error))?;
+        let metadata = self
+            .service
+            .store()
+            .metadata()
+            .map_err(|error| FacadeError::context("load direct cursor metadata", error))?;
+        let old_clock = previous_cursor
+            .and_then(|cursor| decode_direct_scan_cursor(cursor, &metadata.clock_hmac_key).ok());
+        self.prepare_query_after_cut(
+            activation,
+            authorization_id,
+            published,
+            old_clock.as_deref(),
+            requester_uid,
+            now_ns,
+            false,
+        )
+    }
+
+    /// Encodes the opaque cursor returned by the direct scan API.
+    pub fn direct_scan_cursor(
+        &self,
+        prepared: &PreparedQueryResult,
+    ) -> Result<Vec<u8>, FacadeError> {
+        let metadata = self
+            .service
+            .store()
+            .metadata()
+            .map_err(|error| FacadeError::context("load direct cursor metadata", error))?;
+        Ok(encode_direct_scan_cursor(
+            &prepared.result.clock,
+            &metadata.clock_hmac_key,
+        ))
     }
 
     pub fn begin_concurrent_query(
@@ -365,6 +431,7 @@ impl FacadeService {
             completed.old_clock.as_deref(),
             completed.requester_uid,
             completed.now_ns,
+            true,
         )
     }
 
@@ -376,6 +443,7 @@ impl FacadeService {
         old_clock: Option<&str>,
         requester_uid: u32,
         now_ns: i64,
+        pin_history: bool,
     ) -> Result<PreparedQueryResult, FacadeError> {
         let watch_id = activation.watch_id;
         let guard_cursor = {
@@ -431,7 +499,7 @@ impl FacadeService {
             .store_mut()
             .begin_query_lease(
                 &activation,
-                from_sequence,
+                if pin_history { from_sequence } else { None },
                 published.sequence,
                 self.query_lease_owner,
                 lease_expires_ns,
@@ -448,6 +516,15 @@ impl FacadeService {
             ) {
                 Ok(changes) if !changes.fresh_instance => project_events(&changes.events),
                 Ok(_) => Projection {
+                    fresh_instance: true,
+                    paths: vec![b"/".to_vec()],
+                },
+                // Direct scans can still be snapshot-correct without an
+                // incremental proof: retain the selected target lease and
+                // ask JJ to scan all sparse paths from that immutable root.
+                // The Watchman compatibility path keeps its historical error
+                // behavior because it cannot hand the client a snapshot fd.
+                Err(_) if !pin_history => Projection {
                     fresh_instance: true,
                     paths: vec![b"/".to_vec()],
                 },
@@ -507,6 +584,7 @@ impl FacadeService {
             },
             lease,
             activation,
+            snapshot_id: published.snapshot_id,
         })
     }
 
@@ -519,6 +597,36 @@ impl FacadeService {
             .release_query_lease(&prepared.lease, &prepared.activation)
             .map_err(|error| FacadeError::context("release query response fence", error))?;
         Ok(prepared.result)
+    }
+
+    /// Renews the durable pins held by a prepared immutable query response.
+    ///
+    /// Direct snapshot scans retain the prepared response beyond a bounded
+    /// socket write, so they renew this fence until the caller commits or
+    /// aborts its cursor.
+    pub fn renew_query_response(
+        &mut self,
+        prepared: &PreparedQueryResult,
+        now_ns: i64,
+        ttl_ns: i64,
+    ) -> Result<(), FacadeError> {
+        let expires_ns = now_ns
+            .checked_add(ttl_ns)
+            .ok_or_else(|| FacadeError::new("query lease renewal expiration overflow"))?;
+        self.service
+            .store_mut()
+            .renew_query_lease(&prepared.lease, &prepared.activation, now_ns, expires_ns)
+            .map_err(|error| FacadeError::context("renew query response fence", error))
+    }
+
+    /// Returns the still-pinned target snapshot path for a prepared response.
+    pub fn prepared_snapshot_path(
+        &self,
+        prepared: &PreparedQueryResult,
+    ) -> Result<PathBuf, FacadeError> {
+        self.service
+            .snapshot_path(prepared.snapshot_id)
+            .map_err(|error| FacadeError::context("load prepared query snapshot path", error))
     }
 
     fn check_continuity_or_invalidate(
@@ -574,9 +682,6 @@ impl FacadeService {
         }
         let old_sequence = i64::try_from(old.cut_sequence)
             .map_err(|_| FacadeError::new("old clock sequence overflow"))?;
-        // FIXME: Substituting an older retained boundary can omit names present
-        // only in the client's exact baseline. Require the exact sequence and
-        // snapshot UUID or return fresh, as described in FIXES.md.
         let retained: Option<(i64, Vec<u8>)> = self
             .service
             .store()
@@ -585,9 +690,9 @@ impl FacadeService {
                 r#"SELECT b.cut_sequence, s.subvol_uuid
                      FROM fsmonitor_boundaries b
                      JOIN snapshots s ON s.id = b.target_snapshot_id
-                    WHERE b.watch_id = ?1 AND b.cut_sequence <= ?2
+                    WHERE b.watch_id = ?1 AND b.cut_sequence = ?2
                       AND b.clock_epoch = ?3 AND s.physical_state = 'present'
-                    ORDER BY b.cut_sequence DESC LIMIT 1"#,
+                    LIMIT 1"#,
                 rusqlite::params![
                     old.watch_id.as_slice(),
                     old_sequence,
@@ -605,6 +710,11 @@ impl FacadeService {
                 Ok((sequence, uuid))
             })
             .transpose()
+            .map(|retained| {
+                retained.filter(|(sequence, uuid)| {
+                    *sequence == old_sequence && *uuid == old.target_snapshot_uuid
+                })
+            })
     }
 
     fn snapshot_uuid(&self, snapshot_id: i64) -> Result<[u8; 16], FacadeError> {

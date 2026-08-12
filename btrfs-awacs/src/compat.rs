@@ -10,6 +10,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 const CLOCK_PREFIX: &str = "c:btrfs-awacs:1:";
+const DIRECT_SCAN_CURSOR_PREFIX: &str = "c:btrfs-awacs:scan:1:";
+const DIRECT_SCAN_CURSOR_DOMAIN: &[u8] = b"btrfs-awacs:scan:1\0";
 const CLOCK_PAYLOAD_BYTES: usize = 113;
 const CLOCK_MAC_BYTES: usize = 32;
 
@@ -66,6 +68,66 @@ pub fn decode_clock(token: &str, key: &[u8; 32]) -> Result<ClockClaims, CompatEr
         return Err(CompatError::new("clock authentication failed"));
     }
     decode_claims(payload)
+}
+
+/// Wraps an authenticated facade clock in a separately authenticated direct
+/// scan cursor domain. The inner clock keeps the existing exact-boundary
+/// claims; the outer MAC prevents a token from another protocol domain from
+/// being accepted as a direct scan cursor.
+pub(crate) fn encode_direct_scan_cursor(inner_clock: &str, key: &[u8; 32]) -> Vec<u8> {
+    let payload = inner_clock.as_bytes();
+    let mut mac_input = DIRECT_SCAN_CURSOR_DOMAIN.to_vec();
+    mac_input.extend_from_slice(payload);
+    let mac = hmac_sha256(key, &mac_input);
+    let mut authenticated = payload.to_vec();
+    authenticated.extend_from_slice(&mac);
+    format!(
+        "{DIRECT_SCAN_CURSOR_PREFIX}{}",
+        base64url_encode(&authenticated)
+    )
+    .into_bytes()
+}
+
+/// Verifies and unwraps a direct scan cursor to the existing authenticated
+/// facade clock representation.
+pub(crate) fn decode_direct_scan_cursor(
+    token: &[u8],
+    key: &[u8; 32],
+) -> Result<String, CompatError> {
+    let token = std::str::from_utf8(token)
+        .map_err(|_| CompatError::new("direct scan cursor is not UTF-8"))?;
+    let encoded = token
+        .strip_prefix(DIRECT_SCAN_CURSOR_PREFIX)
+        .ok_or_else(|| CompatError::new("direct scan cursor has an invalid prefix"))?;
+    if encoded.is_empty()
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(CompatError::new(
+            "direct scan cursor has invalid base64url characters",
+        ));
+    }
+    let authenticated = base64url_decode(encoded)?;
+    if authenticated.len() <= CLOCK_MAC_BYTES {
+        return Err(CompatError::new(
+            "direct scan cursor has an invalid payload length",
+        ));
+    }
+    let (payload, supplied_mac) = authenticated.split_at(authenticated.len() - CLOCK_MAC_BYTES);
+    let mut mac_input = DIRECT_SCAN_CURSOR_DOMAIN.to_vec();
+    mac_input.extend_from_slice(payload);
+    if !constant_time_eq(supplied_mac, &hmac_sha256(key, &mac_input)) {
+        return Err(CompatError::new("direct scan cursor authentication failed"));
+    }
+    let inner_clock = std::str::from_utf8(payload)
+        .map_err(|_| CompatError::new("direct scan cursor payload is not UTF-8"))?;
+    if !inner_clock.starts_with(CLOCK_PREFIX) {
+        return Err(CompatError::new(
+            "direct scan cursor payload is not a facade clock",
+        ));
+    }
+    Ok(inner_clock.to_owned())
 }
 
 /// Converts canonical semantic events into endpoint path changes exposed
@@ -539,6 +601,31 @@ mod tests {
         let mut tampered = token.into_bytes();
         *tampered.last_mut().unwrap() ^= 1;
         assert!(decode_clock(std::str::from_utf8(&tampered).unwrap(), &key).is_err());
+    }
+
+    #[test]
+    fn direct_scan_cursor_has_its_own_authenticated_domain() {
+        let claims = ClockClaims {
+            format_version: 1,
+            store_uuid: [1; 16],
+            watch_id: [2; 16],
+            clock_epoch: [3; 16],
+            cut_sequence: 42,
+            owner_grant_id: [4; 16],
+            monitor_session_id: [5; 16],
+            boundary_kind: BoundaryKind::Cut,
+            algorithm_version: 1,
+            target_snapshot_uuid: [6; 16],
+        };
+        let key = [7; 32];
+        let clock = encode_clock(&claims, &key);
+        let cursor = encode_direct_scan_cursor(&clock, &key);
+        let decoded = decode_direct_scan_cursor(&cursor, &key).unwrap();
+        assert_eq!(decode_clock(&decoded, &key).unwrap(), claims);
+        assert!(decode_direct_scan_cursor(clock.as_bytes(), &key).is_err());
+        let mut tampered = cursor;
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(decode_direct_scan_cursor(&tampered, &key).is_err());
     }
 
     #[test]

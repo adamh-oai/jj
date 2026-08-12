@@ -17,6 +17,8 @@ use btrfs_awacs::manifest::{
     parse_changed_objects, parse_changed_objects_v2, CHANGED_OBJECTS_V2_MAGIC,
 };
 use btrfs_awacs::namespace::NamespaceMonitor;
+use btrfs_awacs::scan::{ScanSocket, ScanSocketListener, SocketScanDispatcher};
+use btrfs_awacs::scan_facade::FacadeScanHandler;
 use btrfs_awacs::service::{ChangesOptions, InitializeOptions, Service, ServiceConfig};
 use btrfs_awacs::store::{BrokerJournal, ServiceMetadata, Store};
 use btrfs_awacs::watchman::WatchmanEndpoint;
@@ -81,6 +83,11 @@ enum CliCommand {
     },
     /// Run the focused Watchman-compatible per-user service.
     WatchmanServe(WatchmanServeArgs),
+    /// Discover or activate the namespace daemon and print its scan socket.
+    ScanSockname {
+        #[arg(value_name = "LIVE_ROOT")]
+        root: PathBuf,
+    },
     /// Diagnostic: emit the legacy changed-object stream.
     #[command(name = "__changed-objects-send")]
     ChangedObjectsSend {
@@ -305,6 +312,7 @@ fn run_cli(cli: Cli) {
             manager_gid,
         )),
         CliCommand::WatchmanServe(arguments) => finish(run_watchman_server(arguments)),
+        CliCommand::ScanSockname { root } => finish(run_scan_sockname(&root)),
         CliCommand::ChangedObjectsSend {
             snapshot,
             parent_root_id,
@@ -359,6 +367,19 @@ fn run_cli(cli: Cli) {
             finish(run_namespace_view_smoke_helper(&source))
         }
     }
+}
+
+fn run_scan_sockname(root: &Path) -> Result<(), String> {
+    let watchman_socket = ensure_watchman_daemon(root)?;
+    let scan_socket = watchman_socket
+        .parent()
+        .ok_or_else(|| "Watchman socket has no parent directory".to_owned())?
+        .join("scan.sock");
+    validate_user_socket(&scan_socket)?;
+    io::stdout()
+        .write_all(scan_socket.as_os_str().as_bytes())
+        .and_then(|()| io::stdout().write_all(&[0]))
+        .map_err(|error| format!("write AWACS scan socket discovery response: {error}"))
 }
 
 fn finish(result: Result<(), String>) {
@@ -616,15 +637,39 @@ fn automatic_watchman_paths(root: &Path) -> Result<AutomaticWatchmanPaths, Strin
                 managed_dir.display()
             )
         })?;
+    let spool_dir = env::var_os("BTRFS_AWACS_SPOOL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("spool"));
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&spool_dir)
+        .map_err(|error| {
+            format!(
+                "create AWACS spool directory {}: {error}",
+                spool_dir.display()
+            )
+        })?;
+    let manager_db = env::var_os("BTRFS_AWACS_MANAGER_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("watchman.sqlite3"));
+    if let Some(parent) = manager_db.parent() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .map_err(|error| {
+                format!(
+                    "create AWACS manager directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+    }
     Ok(AutomaticWatchmanPaths {
         // Snapshot clones must stay on the watched root's Btrfs filesystem.
         managed_dir,
-        spool_dir: env::var_os("BTRFS_AWACS_SPOOL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| state_dir.join("spool")),
-        manager_db: env::var_os("BTRFS_AWACS_MANAGER_DB")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| state_dir.join("watchman.sqlite3")),
+        spool_dir,
+        manager_db,
         broker_socket: env::var_os("BTRFS_AWACS_BROKER_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/run/btrfs-awacs/broker.sock")),
@@ -1347,6 +1392,8 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
     endpoint
         .register(&mut facade, &root, watch_id, grant_id, uid, gid)
         .map_err(|error| error.to_string())?;
+    let canonical_root = fs::canonicalize(&root)
+        .map_err(|error| format!("canonicalize direct scan root: {error}"))?;
     // Publish the socket only after it is ready to authenticate clients. A
     // client can write immediately after connect(), so binding the public path
     // before arming credential delivery races the first BSER frame.
@@ -1365,10 +1412,65 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
     })?;
     fs::set_permissions(&staged_socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("set staged Watchman socket mode: {error}"))?;
-    fs::rename(&staged_socket_path, &socket_path)
-        .map_err(|error| format!("publish Watchman socket {}: {error}", socket_path.display()))?;
     let endpoint = std::sync::Arc::new(endpoint);
     let facade = std::sync::Arc::new(std::sync::Mutex::new(facade));
+    let scan_socket_path = runtime.join("scan.sock");
+    if scan_socket_path.exists() {
+        // Activation is serialized by daemon.lock and the public Watchman
+        // socket has not been published yet. An owned private scan socket at
+        // this point can only be debris from a daemon that failed between
+        // binding scan.sock and publishing readiness; remove that exact safe
+        // socket, but never replace an arbitrary path.
+        validate_user_socket(&scan_socket_path).map_err(|error| {
+            format!(
+                "refusing to replace existing AWACS scan socket {}: {error}",
+                scan_socket_path.display()
+            )
+        })?;
+        fs::remove_file(&scan_socket_path).map_err(|error| {
+            format!(
+                "remove stale AWACS scan socket {}: {error}",
+                scan_socket_path.display()
+            )
+        })?;
+    }
+    let scan_listener = ScanSocketListener::bind(&scan_socket_path, 0o600)
+        .map_err(|error| format!("bind AWACS scan listener: {error}"))?;
+    let scan_dispatcher = std::sync::Arc::new(SocketScanDispatcher::new(FacadeScanHandler::new(
+        std::sync::Arc::clone(&facade),
+        canonical_root,
+        watch_id,
+        uid,
+        gid,
+    )));
+    std::thread::Builder::new()
+        .name("btrfs-awacs-scan-listener".to_owned())
+        .spawn(move || loop {
+            let connection = match scan_listener.accept() {
+                Ok(connection) => connection,
+                Err(error) => {
+                    warn!(error = %error, "AWACS scan listener failed");
+                    return;
+                }
+            };
+            if let Err(error) = validate_scan_peer_view(&connection, uid) {
+                warn!(error = %error, "reject AWACS scan peer");
+                continue;
+            }
+            let dispatcher = std::sync::Arc::clone(&scan_dispatcher);
+            if let Err(error) = std::thread::Builder::new()
+                .name("btrfs-awacs-scan-client".to_owned())
+                .spawn(move || while dispatcher.serve_one(&connection).is_ok() {})
+            {
+                warn!(error = %error, "start AWACS scan client worker failed");
+            }
+        })
+        .map_err(|error| format!("start AWACS scan listener: {error}"))?;
+    // Discovery treats publication of the compatibility socket as daemon
+    // readiness. Keep it staged until the sibling direct scan listener is
+    // already bound and accepting authenticated clients.
+    fs::rename(&staged_socket_path, &socket_path)
+        .map_err(|error| format!("publish Watchman socket {}: {error}", socket_path.display()))?;
     let reconnect_config = std::sync::Arc::new(reconnect_config);
     let reconnect_store_path = std::sync::Arc::new(store_path);
     let refresh_generation = std::sync::Arc::new(std::sync::Mutex::new(0_u64));
@@ -1602,6 +1704,35 @@ fn run_watchman_server(arguments: WatchmanServeArgs) -> Result<(), String> {
             })
             .map_err(|error| format!("start Watchman client worker: {error}"))?;
     }
+}
+
+fn validate_scan_peer_view(socket: &ScanSocket, expected_uid: u32) -> Result<(), String> {
+    let peer = socket
+        .peer_credentials()
+        .map_err(|error| format!("read AWACS scan peer credentials: {error}"))?;
+    if peer.uid != expected_uid {
+        return Err(format!(
+            "AWACS scan peer uid {} does not match daemon uid {expected_uid}",
+            peer.uid
+        ));
+    }
+    let peer_mount_namespace = fs::metadata(format!("/proc/{}/ns/mnt", peer.pid))
+        .map_err(|error| format!("stat AWACS peer mount namespace: {error}"))?;
+    let own_mount_namespace = fs::metadata("/proc/self/ns/mnt")
+        .map_err(|error| format!("stat AWACS daemon mount namespace: {error}"))?;
+    if peer_mount_namespace.dev() != own_mount_namespace.dev()
+        || peer_mount_namespace.ino() != own_mount_namespace.ino()
+    {
+        return Err("AWACS scan peer is in a different mount namespace".to_owned());
+    }
+    let peer_root = fs::metadata(format!("/proc/{}/root", peer.pid))
+        .map_err(|error| format!("stat AWACS peer process root: {error}"))?;
+    let own_root = fs::metadata("/proc/self/root")
+        .map_err(|error| format!("stat AWACS daemon process root: {error}"))?;
+    if peer_root.dev() != own_root.dev() || peer_root.ino() != own_root.ino() {
+        return Err("AWACS scan peer has a different process root".to_owned());
+    }
+    Ok(())
 }
 
 fn broker_session_was_fenced(error: &str) -> bool {

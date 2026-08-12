@@ -219,6 +219,51 @@ impl OpenedSubvolume {
         self.file.as_fd()
     }
 
+    /// Reconstructs the subset of observed identity returned by the
+    /// privileged broker when the local manager cannot issue the identity
+    /// ioctl itself. Callers must validate `file` as a subvolume-root
+    /// directory before using this constructor.
+    pub(crate) fn from_broker_identity(
+        file: File,
+        filesystem_uuid: [u8; 16],
+        subvolume_uuid: [u8; 16],
+        root_id: u64,
+        generation: u64,
+        ctransid: u64,
+        otransid: u64,
+        parent_uuid: Option<[u8; 16]>,
+        received_uuid: Option<[u8; 16]>,
+        readonly: bool,
+    ) -> Self {
+        Self {
+            file,
+            filesystem: FilesystemInfo {
+                fs_uuid: filesystem_uuid,
+                metadata_uuid: [0; 16],
+                generation: 0,
+                max_device_id: 0,
+                device_count: 0,
+                node_size: 0,
+                sector_size: 0,
+                clone_alignment: 0,
+            },
+            subvolume: SubvolumeInfo {
+                root_id,
+                parent_root_id: None,
+                containing_dir_ino: None,
+                generation,
+                flags: if readonly { ROOT_SUBVOL_RDONLY } else { 0 },
+                uuid: subvolume_uuid,
+                parent_uuid,
+                received_uuid,
+                ctransid,
+                otransid,
+                stransid: 0,
+                rtransid: 0,
+            },
+        }
+    }
+
     pub fn revalidate(&self) -> Result<(), BtrfsError> {
         let filesystem = filesystem_info(self.file.as_fd())?;
         let subvolume = subvolume_info(self.file.as_fd())?;
@@ -518,7 +563,11 @@ fn ioctl<T>(
     // argument points to an initialized repr(C) UAPI structure for the entire
     // call and fd remains borrowed for the call.
     let result = unsafe { libc::ioctl(fd.as_raw_fd(), request, argument) };
-    if result == 0 {
+    // ioctl(2) reports failure as -1 with errno. Most Btrfs ioctls return 0
+    // on success, but kernels may return a positive success value for
+    // metadata queries such as GET_SUBVOL_INFO; do not turn that into a stale
+    // errno error.
+    if result >= 0 {
         Ok(())
     } else {
         Err(BtrfsError::context(name, io::Error::last_os_error()))
