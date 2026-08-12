@@ -21,6 +21,8 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(all(feature = "awacs", unix))]
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -41,7 +43,10 @@ use jj_lib::file_util::check_symlink_support;
 use jj_lib::file_util::symlink_dir;
 use jj_lib::file_util::symlink_file;
 use jj_lib::files::FileMergeHunkLevel;
+#[cfg(all(feature = "awacs", unix))]
+use jj_lib::fsmonitor::AwacsConfig;
 use jj_lib::fsmonitor::FsmonitorSettings;
+use jj_lib::fsmonitor::WatchmanConfig;
 use jj_lib::git::get_git_backend;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::local_working_copy::LocalWorkingCopy;
@@ -52,6 +57,7 @@ use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
+use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::OperationId;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::ReadonlyRepo;
@@ -69,6 +75,7 @@ use jj_lib::working_copy::UntrackedReason;
 use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
 use pollster::FutureExt as _;
+use prost::Message as _;
 use test_case::test_case;
 use testutils::CommitBuilderExt as _;
 use testutils::TestRepo;
@@ -109,6 +116,75 @@ fn check_hfs_plus(dir: &Path) -> bool {
     dir.join(stripped_name).try_exists().unwrap()
 }
 
+#[cfg(all(feature = "awacs", unix))]
+struct FakeAwacsSession {
+    outcomes: Arc<Mutex<Vec<btrfs_awacs::scan::ScanOutcome>>>,
+}
+
+#[cfg(all(feature = "awacs", unix))]
+impl btrfs_awacs::scan::ScanSession for FakeAwacsSession {
+    fn renew(&mut self) -> Result<(), btrfs_awacs::scan::ScanError> {
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        outcome: btrfs_awacs::scan::ScanOutcome,
+    ) -> Result<(), btrfs_awacs::scan::ScanError> {
+        self.outcomes.lock().unwrap().push(outcome);
+        Ok(())
+    }
+}
+
+#[cfg(all(feature = "awacs", unix))]
+struct FakeAwacsClient {
+    scan_root: PathBuf,
+    outcomes: Arc<Mutex<Vec<btrfs_awacs::scan::ScanOutcome>>>,
+    requests: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+    valid_scan_root: bool,
+}
+
+#[cfg(all(feature = "awacs", unix))]
+impl btrfs_awacs::scan::ScanClient for FakeAwacsClient {
+    fn begin_scan(
+        &mut self,
+        request: &btrfs_awacs::scan::BeginScanRequest,
+    ) -> Result<btrfs_awacs::scan::ScanLease, btrfs_awacs::scan::ScanError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(request.previous_cursor.clone());
+        Ok(btrfs_awacs::scan::ScanLease::new(
+            b"cursor".to_vec(),
+            btrfs_awacs::scan::Invalidation::Prefixes(vec![b"dir".to_vec()]),
+            btrfs_awacs::scan::SnapshotIdentity {
+                filesystem_uuid: [1; 16],
+                subvolume_uuid: [2; 16],
+                read_only: true,
+            },
+            u64::MAX,
+            File::open(&self.scan_root).unwrap(),
+            Box::new(FakeAwacsSession {
+                outcomes: self.outcomes.clone(),
+            }),
+        ))
+    }
+
+    fn validate_scan_root(
+        &self,
+        _lease: &btrfs_awacs::scan::ScanLease,
+    ) -> Result<(), btrfs_awacs::scan::ScanError> {
+        if self.valid_scan_root {
+            Ok(())
+        } else {
+            Err(btrfs_awacs::scan::ScanError::new(
+                btrfs_awacs::scan::ScanErrorKind::MalformedResponse,
+                "rejected synthetic scan root",
+            ))
+        }
+    }
+}
+
 /// Returns true if the directory appears to support Windows short file names.
 fn check_vfat(dir: &Path) -> bool {
     let _test_file = tempfile::Builder::new()
@@ -121,6 +197,87 @@ fn check_vfat(dir: &Path) -> bool {
 
 fn to_owned_path_vec(paths: &[&RepoPath]) -> Vec<RepoPathBuf> {
     paths.iter().map(|&path| path.to_owned()).collect()
+}
+
+fn write_legacy_tree_state(
+    state_path: &Path,
+    tree: &MergedTree,
+    update: impl FnOnce(&mut jj_lib::protos::local_working_copy::TreeState),
+) -> io::Result<()> {
+    let mut proto = jj_lib::protos::local_working_copy::TreeState {
+        tree_ids: tree.tree_ids().iter().map(|id| id.to_bytes()).collect(),
+        conflict_labels: tree.labels().as_slice().to_owned(),
+        sparse_patterns: Some(jj_lib::protos::local_working_copy::SparsePatterns {
+            prefixes: vec![String::new()],
+        }),
+        ..Default::default()
+    };
+    update(&mut proto);
+    std::fs::write(state_path.join("tree_state"), proto.encode_to_vec())
+}
+
+fn read_compact_working_copy_state(
+    state_path: &Path,
+) -> io::Result<jj_lib::protos::local_working_copy::WorkingCopyState> {
+    const STATE_MAGIC: &[u8] = b"\0JJ-WORKING-COPY-STATE\0v1\n";
+    let path = ["checkout", "working_copy_state"]
+        .into_iter()
+        .map(|name| state_path.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "compact working-copy state is missing",
+            )
+        })?;
+    let bytes = std::fs::read(path)?;
+    let payload = bytes.strip_prefix(STATE_MAGIC).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "working-copy state has no compact-journal marker",
+        )
+    })?;
+    jj_lib::protos::local_working_copy::WorkingCopyState::decode(payload)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn write_compact_working_copy_state(
+    state_path: &Path,
+    state: &jj_lib::protos::local_working_copy::WorkingCopyState,
+) -> io::Result<()> {
+    const STATE_MAGIC: &[u8] = b"\0JJ-WORKING-COPY-STATE\0v1\n";
+    let mut bytes = STATE_MAGIC.to_vec();
+    bytes.extend_from_slice(&state.encode_to_vec());
+    std::fs::write(state_path.join("working_copy_state"), bytes)
+}
+
+fn seed_test_awacs_baseline(
+    state_path: &Path,
+    cursor: &[u8],
+    input_fingerprint: [u8; 32],
+) -> io::Result<()> {
+    let mut journal = read_compact_working_copy_state(state_path)?;
+    journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
+    journal.baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
+        backend_kind: "test-awacs".to_owned(),
+        snapshot_identity: cursor.to_vec(),
+        lineage_token: cursor.to_vec(),
+        retention_token: cursor.to_vec(),
+        root_identity: Vec::new(),
+        interpretation_input_fingerprint: input_fingerprint.to_vec(),
+    });
+    journal.fsmonitor_cursor = Some(jj_lib::protos::local_working_copy::FsmonitorCursor {
+        cursor: Some(
+            jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Awacs(
+                jj_lib::protos::local_working_copy::AwacsCursor {
+                    opaque_token: cursor.to_vec(),
+                    input_fingerprint_version: 1,
+                    input_fingerprint: input_fingerprint.to_vec(),
+                },
+            ),
+        ),
+    });
+    write_compact_working_copy_state(state_path, &journal)
 }
 
 #[test]
@@ -411,18 +568,23 @@ fn test_checkout_no_op() -> TestResult {
     ws.check_out(repo.op_id().clone(), None, &commit1)
         .block_on()?;
 
-    // Test the setup: the file should exist on in the tree state.
+    // Test the setup: the file should exist on disk and in the semantic tree.
+    assert!(
+        file_path
+            .to_fs_path_unchecked(ws.workspace_root())
+            .is_file()
+    );
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert!(wc.file_states()?.contains_path(file_path));
+    assert_tree_eq!(*wc.tree()?, commit1.tree());
 
     // Update to commit2 (same tree as commit1)
     let new_op_id = OperationId::from_bytes(b"whatever");
     let stats = ws.check_out(new_op_id.clone(), None, &commit2).block_on()?;
     assert_eq!(stats, CheckoutStats::default());
 
-    // The tree state is unchanged but the recorded operation id is updated.
+    // The semantic tree is unchanged but the recorded operation id is updated.
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert!(wc.file_states()?.contains_path(file_path));
+    assert_tree_eq!(*wc.tree()?, commit2.tree());
     assert_eq!(*wc.operation_id(), new_op_id);
     Ok(())
 }
@@ -729,14 +891,14 @@ fn test_reset() -> TestResult {
     ws.check_out(repo.op_id().clone(), None, &commit)
         .block_on()?;
 
-    // Test the setup: the file should exist on disk and in the tree state.
+    // Test the setup: the file should exist on disk and in the semantic tree.
     assert!(ignored_path.to_fs_path_unchecked(&workspace_root).is_file());
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert!(wc.file_states()?.contains_path(ignored_path));
+    assert_tree_eq!(*wc.tree()?, tree_with_file);
 
     // After we reset to the commit without the file, it should still exist on disk,
-    // but it should not be in the tree state, and it should not get added when we
-    // commit the working copy (because it's ignored).
+    // but it should not be in the semantic tree, and it should not get added
+    // when we commit the working copy (because it's ignored).
     let mut locked_ws = ws.start_working_copy_mutation().block_on()?;
     locked_ws
         .locked_wc()
@@ -745,7 +907,7 @@ fn test_reset() -> TestResult {
     locked_ws.finish(op_id.clone()).block_on()?;
     assert!(ignored_path.to_fs_path_unchecked(&workspace_root).is_file());
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert!(!wc.file_states()?.contains_path(ignored_path));
+    assert_tree_eq!(*wc.tree()?, tree_without_file);
     let new_tree = test_workspace.snapshot()?;
     assert_tree_eq!(new_tree, tree_without_file);
 
@@ -757,7 +919,7 @@ fn test_reset() -> TestResult {
     locked_ws.finish(op_id.clone()).block_on()?;
     assert!(ignored_path.to_fs_path_unchecked(&workspace_root).is_file());
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert!(wc.file_states()?.contains_path(ignored_path));
+    assert_tree_eq!(*wc.tree()?, tree_with_file);
     let new_tree = test_workspace.snapshot()?;
     assert_tree_eq!(new_tree, tree_with_file);
     Ok(())
@@ -787,15 +949,17 @@ fn test_checkout_discard() -> TestResult {
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
     let state_path = wc.state_path().to_path_buf();
 
-    // Test the setup: the file should exist on disk and in the tree state.
+    // Test the setup: the file should exist on disk and in the semantic tree.
     assert!(file1_path.to_fs_path_unchecked(&workspace_root).is_file());
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert!(wc.file_states()?.contains_path(file1_path));
+    assert_tree_eq!(*wc.tree()?, commit1.tree());
 
     // Start a checkout
     let mut locked_ws = ws.start_working_copy_mutation().block_on()?;
     locked_ws.locked_wc().check_out(&commit2).block_on()?;
-    // The change should be reflected in the working copy but not saved
+    // The live files change immediately. The pending journal also records the
+    // intended semantic tree before those writes, so a reload fails safe to
+    // the intended tree and forces a later full reconciliation.
     assert!(!file1_path.to_fs_path_unchecked(&workspace_root).is_file());
     assert!(file2_path.to_fs_path_unchecked(&workspace_root).is_file());
     let reloaded_wc = LocalWorkingCopy::load(
@@ -804,20 +968,18 @@ fn test_checkout_discard() -> TestResult {
         state_path.clone(),
         repo.settings(),
     )?;
-    assert!(reloaded_wc.file_states()?.contains_path(file1_path));
-    assert!(!reloaded_wc.file_states()?.contains_path(file2_path));
+    assert_tree_eq!(*reloaded_wc.tree()?, commit2.tree());
     drop(locked_ws);
 
-    // The change should remain in the working copy, but not in memory and not saved
+    // The original in-memory object was not finished, but the durable pending
+    // journal still makes a reload recover the intended semantic tree.
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert!(wc.file_states()?.contains_path(file1_path));
-    assert!(!wc.file_states()?.contains_path(file2_path));
+    assert_tree_eq!(*wc.tree()?, commit1.tree());
     assert!(!file1_path.to_fs_path_unchecked(&workspace_root).is_file());
     assert!(file2_path.to_fs_path_unchecked(&workspace_root).is_file());
     let reloaded_wc =
         LocalWorkingCopy::load(store.clone(), workspace_root, state_path, repo.settings())?;
-    assert!(reloaded_wc.file_states()?.contains_path(file1_path));
-    assert!(!reloaded_wc.file_states()?.contains_path(file2_path));
+    assert_tree_eq!(*reloaded_wc.tree()?, commit2.tree());
     Ok(())
 }
 
@@ -1461,12 +1623,6 @@ fn test_snapshot_special_file() -> TestResult {
         tree.entries().map(|(path, _value)| path).collect_vec(),
         to_owned_path_vec(&[file1_path, file2_path])
     );
-    let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert_eq!(
-        wc.file_states()?.paths().collect_vec(),
-        vec![file1_path, file2_path]
-    );
-
     // Replace a regular file by a socket and snapshot the working copy again
     std::fs::remove_file(&file1_disk_path)?;
     nix::unistd::mkfifo(&file1_disk_path, nix::sys::stat::Mode::S_IRWXU)?;
@@ -1476,65 +1632,6 @@ fn test_snapshot_special_file() -> TestResult {
         tree.entries().map(|(path, _value)| path).collect_vec(),
         to_owned_path_vec(&[file2_path])
     );
-    let ws = &mut test_workspace.workspace;
-    let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert_eq!(wc.file_states()?.paths().collect_vec(), vec![file2_path]);
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn test_snapshot_non_utf8_path() -> TestResult {
-    // Tests that paths that can't be represented as RepoPaths are skipped
-    // instead of failing the whole snapshot. #9774
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let mut test_workspace = TestWorkspace::init();
-    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
-
-    if testutils::check_strict_utf8_fs(&workspace_root) {
-        eprintln!(
-            "Skipping test \"test_snapshot_non_utf8_path\" due to strict UTF-8 filesystem for \
-             path {workspace_root:?}"
-        );
-        return Ok(());
-    }
-
-    let file_path = repo_path("file");
-    std::fs::write(file_path.to_fs_path_unchecked(&workspace_root), "contents")?;
-    let bad_file_name = OsStr::from_bytes(b"file\xe0");
-    std::fs::write(workspace_root.join(bad_file_name), "contents")?;
-    let bad_dir_name = OsStr::from_bytes(b"dir\xe0");
-    let bad_dir_disk_path = workspace_root.join(bad_dir_name);
-    std::fs::create_dir(&bad_dir_disk_path)?;
-    std::fs::write(bad_dir_disk_path.join("file"), "contents")?;
-
-    let ws = &mut test_workspace.workspace;
-    let mut locked_ws = ws.start_working_copy_mutation().block_on()?;
-    let (tree, stats) = locked_ws
-        .locked_wc()
-        .snapshot(&empty_snapshot_options())
-        .block_on()?;
-    locked_ws
-        .finish(OperationId::from_hex("abc123"))
-        .block_on()?;
-
-    // Only the path with a valid UTF-8 name should be in the tree. The
-    // directory isn't descended into, so it's reported as a single path.
-    assert_eq!(
-        tree.entries().map(|(path, _value)| path).collect_vec(),
-        to_owned_path_vec(&[file_path])
-    );
-    assert_eq!(
-        stats.invalid_utf8_paths,
-        [
-            (RepoPathBuf::root(), bad_dir_name.to_owned()),
-            (RepoPathBuf::root(), bad_file_name.to_owned()),
-        ]
-        .into()
-    );
-    assert!(stats.untracked_paths.is_empty());
     Ok(())
 }
 
@@ -2725,7 +2822,10 @@ fn test_fsmonitor() -> TestResult {
             .map(|p| p.to_fs_path_unchecked(Path::new("")))
             .collect();
         let settings = TreeStateSettings {
-            fsmonitor_settings: FsmonitorSettings::Test { changed_files },
+            fsmonitor_settings: FsmonitorSettings::Test {
+                changed_files,
+                scan_root: None,
+            },
             ..tree_state_settings.clone()
         };
         let mut tree_state = TreeState::load(
@@ -2742,46 +2842,1291 @@ fn test_fsmonitor() -> TestResult {
         tree_state
     };
 
+    // Test is an advisory mutable-root monitor. Without per-path rows its
+    // changed names cannot prove unchanged paths, so it conservatively scans
+    // the whole working copy.
     let tree_state = snapshot(&[]);
-    assert_tree_eq!(*tree_state.current_tree(), repo.store().empty_merged_tree());
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (foo_path, "foo\n"),
+            (bar_path, "bar\n"),
+            (nested_path, "nested\n"),
+            (gitignore_path, "to/ignored\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
 
     let tree_state = snapshot(&[foo_path]);
-    insta::assert_snapshot!(testutils::dump_tree(tree_state.current_tree()), @r#"
-    merged tree (sides: 1)
-      tree 2a5341b103917cfdb48a
-        file "foo" (e99c2057c15160add351): "foo\n"
-    "#);
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
 
     let mut tree_state = snapshot(&[foo_path, bar_path, nested_path, ignored_path]);
-    insta::assert_snapshot!(testutils::dump_tree(tree_state.current_tree()), @r#"
-    merged tree (sides: 1)
-      tree 1c5c336421714b1df7bb
-        file "bar" (94cc973e7e1aefb7eff6): "bar\n"
-        file "foo" (e99c2057c15160add351): "foo\n"
-        file "path/to/nested" (6209060941cd770c8d46): "nested\n"
-    "#);
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
     tree_state.save()?;
 
     testutils::write_working_copy_file(&workspace_root, foo_path, "updated foo\n");
     testutils::write_working_copy_file(&workspace_root, bar_path, "updated bar\n");
     let tree_state = snapshot(&[foo_path]);
-    insta::assert_snapshot!(testutils::dump_tree(tree_state.current_tree()), @r#"
-    merged tree (sides: 1)
-      tree f653dfa18d0b025bdb9e
-        file "bar" (94cc973e7e1aefb7eff6): "bar\n"
-        file "foo" (e0fbd106147cc04ccd05): "updated foo\n"
-        file "path/to/nested" (6209060941cd770c8d46): "nested\n"
-    "#);
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (foo_path, "updated foo\n"),
+            (bar_path, "updated bar\n"),
+            (nested_path, "nested\n"),
+            (gitignore_path, "to/ignored\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
 
     std::fs::remove_file(foo_path.to_fs_path_unchecked(&workspace_root))?;
     let mut tree_state = snapshot(&[foo_path]);
-    insta::assert_snapshot!(testutils::dump_tree(tree_state.current_tree()), @r#"
-    merged tree (sides: 1)
-      tree b7416fc248a038b920c3
-        file "bar" (94cc973e7e1aefb7eff6): "bar\n"
-        file "path/to/nested" (6209060941cd770c8d46): "nested\n"
-    "#);
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (bar_path, "updated bar\n"),
+            (nested_path, "nested\n"),
+            (gitignore_path, "to/ignored\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
     tree_state.save()?;
+    Ok(())
+}
+
+#[test]
+fn test_fsmonitor_scan_root_is_used_for_snapshot_reads() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    let gitignore_path = repo_path(".gitignore");
+    let plain_path = repo_path("plain");
+    let tracked_ignored_path = repo_path("ignored/tracked");
+    let globally_ignored_path = repo_path("candidate.ignored");
+    let changed_paths = [
+        gitignore_path,
+        plain_path,
+        tracked_ignored_path,
+        globally_ignored_path,
+    ];
+    let snapshot = |options: &SnapshotOptions<'_>| {
+        let changed_files = changed_paths
+            .iter()
+            .map(|path| path.to_fs_path_unchecked(Path::new("")))
+            .collect();
+        let settings = TreeStateSettings {
+            fsmonitor_settings: FsmonitorSettings::Test {
+                changed_files,
+                scan_root: Some(scan_root.clone()),
+            },
+            ..tree_state_settings.clone()
+        };
+        let mut tree_state = TreeState::load(
+            repo.store().clone(),
+            workspace_root.clone(),
+            state_path.clone(),
+            &settings,
+        )
+        .unwrap();
+        tree_state.snapshot(options).block_on().unwrap();
+        tree_state.save().unwrap();
+        tree_state
+    };
+
+    // Establish tracked file state from the synthetic scan root. The live root
+    // deliberately contains different data so reading from it would fail the
+    // assertions below.
+    testutils::write_working_copy_file(&scan_root, gitignore_path, "");
+    testutils::write_working_copy_file(&scan_root, plain_path, "scan plain one\n");
+    testutils::write_working_copy_file(&scan_root, tracked_ignored_path, "scan tracked one\n");
+    testutils::write_working_copy_file(&workspace_root, gitignore_path, "");
+    testutils::write_working_copy_file(&workspace_root, plain_path, "live plain one\n");
+    testutils::write_working_copy_file(&workspace_root, tracked_ignored_path, "live tracked one\n");
+    let tree_state = snapshot(&empty_snapshot_options());
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (gitignore_path, ""),
+            (plain_path, "scan plain one\n"),
+            (tracked_ignored_path, "scan tracked one\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+
+    // Ignoring the directory exercises the tracked-file fast path, which must
+    // resolve tracked paths relative to scan_root as well.
+    testutils::write_working_copy_file(&scan_root, gitignore_path, "ignored/\n");
+    testutils::write_working_copy_file(&scan_root, plain_path, "scan plain two longer\n");
+    testutils::write_working_copy_file(
+        &scan_root,
+        tracked_ignored_path,
+        "scan tracked two longer\n",
+    );
+    testutils::write_working_copy_file(&workspace_root, gitignore_path, "");
+    testutils::write_working_copy_file(&workspace_root, plain_path, "live plain two\n");
+    testutils::write_working_copy_file(&workspace_root, tracked_ignored_path, "live tracked two\n");
+    let tree_state = snapshot(&empty_snapshot_options());
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (gitignore_path, "ignored/\n"),
+            (plain_path, "scan plain two longer\n"),
+            (tracked_ignored_path, "scan tracked two longer\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+
+    // Worktree-relative global excludes are part of the snapshot contents,
+    // rather than external mutable configuration read from the live root.
+    std::fs::write(scan_root.join("global-ignore"), "*.ignored\n")?;
+    std::fs::write(workspace_root.join("global-ignore"), "")?;
+    testutils::write_working_copy_file(&scan_root, globally_ignored_path, "scan ignored\n");
+    testutils::write_working_copy_file(&workspace_root, globally_ignored_path, "live visible\n");
+    let options = SnapshotOptions {
+        scan_root_ignores: vec![PathBuf::from("global-ignore")],
+        ..empty_snapshot_options()
+    };
+    let tree_state = snapshot(&options);
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (gitignore_path, "ignored/\n"),
+            (plain_path, "scan plain two longer\n"),
+            (tracked_ignored_path, "scan tracked two longer\n"),
+            (repo_path("global-ignore"), "*.ignored\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+
+    assert!(state_path.join("working_copy_state").is_file());
+    assert!(!scan_root.join("working_copy_state").exists());
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn test_fsmonitor_scan_root_is_used_for_metadata_sensitive_reads() -> TestResult {
+    if !file_util::check_symlink_support()? {
+        eprintln!("Symlink not supported. Skip the test.");
+        return Ok(());
+    }
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    let executable_path = repo_path("executable");
+    let symlink_path = repo_path("link");
+    let deleted_path = repo_path("deleted");
+    let large_path = repo_path("large");
+    let changed_paths = [executable_path, symlink_path, deleted_path, large_path];
+    let snapshot = |options: &SnapshotOptions<'_>| {
+        let settings = TreeStateSettings {
+            fsmonitor_settings: FsmonitorSettings::Test {
+                changed_files: changed_paths
+                    .iter()
+                    .map(|path| path.to_fs_path_unchecked(Path::new("")))
+                    .collect(),
+                scan_root: Some(scan_root.clone()),
+            },
+            ..tree_state_settings.clone()
+        };
+        let mut tree_state = TreeState::load(
+            repo.store().clone(),
+            workspace_root.clone(),
+            state_path.clone(),
+            &settings,
+        )
+        .unwrap();
+        let (_dirty, stats) = tree_state.snapshot(options).block_on().unwrap();
+        tree_state.save().unwrap();
+        (tree_state, stats)
+    };
+
+    testutils::write_working_copy_file(&scan_root, executable_path, "scan executable\n");
+    testutils::write_working_copy_file(&workspace_root, executable_path, "live executable\n");
+    std::fs::set_permissions(
+        executable_path.to_fs_path_unchecked(&scan_root),
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    std::fs::set_permissions(
+        executable_path.to_fs_path_unchecked(&workspace_root),
+        std::fs::Permissions::from_mode(0o644),
+    )?;
+    symlink_file("scan-target", symlink_path.to_fs_path_unchecked(&scan_root))?;
+    symlink_file(
+        "live-target",
+        symlink_path.to_fs_path_unchecked(&workspace_root),
+    )?;
+    testutils::write_working_copy_file(&scan_root, deleted_path, "scan deleted\n");
+    testutils::write_working_copy_file(&workspace_root, deleted_path, "live deleted\n");
+
+    let (tree_state, _stats) = snapshot(&empty_snapshot_options());
+    let expected_tree = create_tree_with(repo, |builder| {
+        builder
+            .file(executable_path, "scan executable\n")
+            .executable(true);
+        builder.symlink(symlink_path, "scan-target");
+        builder.file(deleted_path, "scan deleted\n");
+    });
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+
+    // Leave conflicting live-root state behind while changing only the scan
+    // root. The second snapshot must observe scan-root metadata and deletion,
+    // and classify the scan-root large file as untracked even though the live
+    // counterpart is small enough to track.
+    std::fs::set_permissions(
+        executable_path.to_fs_path_unchecked(&scan_root),
+        std::fs::Permissions::from_mode(0o644),
+    )?;
+    std::fs::set_permissions(
+        executable_path.to_fs_path_unchecked(&workspace_root),
+        std::fs::Permissions::from_mode(0o755),
+    )?;
+    std::fs::remove_file(symlink_path.to_fs_path_unchecked(&scan_root))?;
+    symlink_file(
+        "scan-target-two",
+        symlink_path.to_fs_path_unchecked(&scan_root),
+    )?;
+    std::fs::remove_file(deleted_path.to_fs_path_unchecked(&scan_root))?;
+    std::fs::write(large_path.to_fs_path_unchecked(&scan_root), vec![0; 17])?;
+    std::fs::write(large_path.to_fs_path_unchecked(&workspace_root), vec![0; 1])?;
+    let options = SnapshotOptions {
+        max_new_file_size: 16,
+        ..empty_snapshot_options()
+    };
+    let (tree_state, stats) = snapshot(&options);
+    let expected_tree = create_tree_with(repo, |builder| {
+        builder.file(executable_path, "scan executable\n");
+        builder.symlink(symlink_path, "scan-target-two");
+    });
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    assert_eq!(
+        stats
+            .untracked_paths
+            .keys()
+            .map(AsRef::as_ref)
+            .collect_vec(),
+        [large_path]
+    );
+    Ok(())
+}
+
+#[test]
+fn test_fsmonitor_cursor_migrates_legacy_watchman_clock() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    let empty_tree = repo.store().empty_merged_tree();
+    write_legacy_tree_state(&state_path, &empty_tree, |proto| {
+        #[expect(deprecated)]
+        {
+            proto.watchman_clock = Some(jj_lib::protos::local_working_copy::WatchmanClock {
+                watchman_clock: Some(
+                    jj_lib::protos::local_working_copy::watchman_clock::WatchmanClock::StringClock(
+                        "legacy-clock".to_owned(),
+                    ),
+                ),
+            });
+        }
+    })?;
+
+    let watchman_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::Watchman(WatchmanConfig {
+            register_trigger: false,
+        }),
+        ..tree_state_settings.clone()
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &watchman_settings,
+    )?;
+    tree_state.save()?;
+
+    // Legacy monitor cursors migrate as NoBaseline because they are not a
+    // retained immutable snapshot identity.
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+    let (is_dirty, _stats) = tree_state.snapshot(&empty_snapshot_options()).block_on()?;
+    assert!(!is_dirty);
+    tree_state.save()?;
+
+    // The clearing above is durable: a second load under the same backend has
+    // no cursor left to invalidate.
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root,
+        state_path,
+        &tree_state_settings,
+    )?;
+    let (is_dirty, _stats) = tree_state.snapshot(&empty_snapshot_options()).block_on()?;
+    assert!(!is_dirty);
+    Ok(())
+}
+
+#[test]
+fn test_compact_working_copy_state_migrates_legacy_tree_state() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    let semantic_tree = create_tree(repo, &[(repo_path("dir/tracked"), "tracked\n")]);
+    write_legacy_tree_state(&state_path, &semantic_tree, |proto| {
+        proto.sparse_patterns = Some(jj_lib::protos::local_working_copy::SparsePatterns {
+            prefixes: vec!["dir".to_owned()],
+        });
+    })?;
+
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+    assert_tree_eq!(*tree_state.current_tree(), semantic_tree);
+    tree_state.save()?;
+
+    let journal = read_compact_working_copy_state(&state_path)?;
+    assert_eq!(journal.format_version, 1);
+    assert_eq!(
+        journal.tree_ids,
+        semantic_tree
+            .tree_ids()
+            .iter()
+            .map(|id| id.to_bytes())
+            .collect_vec()
+    );
+    assert_eq!(
+        journal.sparse_patterns.as_ref().unwrap().prefixes,
+        vec!["dir".to_owned()]
+    );
+    assert_eq!(
+        journal.phase(),
+        jj_lib::protos::local_working_copy::WorkingCopyStatePhase::NoBaseline
+    );
+    assert!(journal.fsmonitor_cursor.is_none());
+
+    let reloaded = TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
+    assert_tree_eq!(*reloaded.current_tree(), semantic_tree);
+    Ok(())
+}
+
+#[test]
+fn test_compact_working_copy_state_tracks_semantic_tree_without_sqlite() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    let mut tree_state = TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+    testutils::write_working_copy_file(&workspace_root, repo_path("drop"), "drop\n");
+    testutils::write_working_copy_file(&workspace_root, repo_path("keep"), "keep\n");
+    testutils::write_working_copy_file(&workspace_root, repo_path("update"), "old\n");
+    tree_state.snapshot(&empty_snapshot_options()).block_on()?;
+    tree_state.save()?;
+    let first_journal = read_compact_working_copy_state(&state_path)?;
+    assert!(!state_path.join("tree_state").exists());
+    assert!(
+        std::fs::read_dir(&state_path)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".sqlite3")
+        }),
+        "compact state must not create a per-path SQLite database"
+    );
+
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+    std::fs::remove_file(repo_path("drop").to_fs_path_unchecked(&workspace_root))?;
+    testutils::write_working_copy_file(&workspace_root, repo_path("insert"), "inserted\n");
+    testutils::write_working_copy_file(&workspace_root, repo_path("update"), "new contents\n");
+    tree_state.snapshot(&empty_snapshot_options()).block_on()?;
+    tree_state.save()?;
+
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (repo_path("insert"), "inserted\n"),
+            (repo_path("keep"), "keep\n"),
+            (repo_path("update"), "new contents\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    let second_journal = read_compact_working_copy_state(&state_path)?;
+    assert!(second_journal.generation > first_journal.generation);
+    assert_eq!(
+        second_journal.tree_ids,
+        expected_tree
+            .tree_ids()
+            .iter()
+            .map(|id| id.to_bytes())
+            .collect_vec()
+    );
+    assert!(!state_path.join("tree_state").exists());
+    assert!(
+        std::fs::read_dir(&state_path)?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".sqlite3")
+        }),
+        "compact state must remain free of per-path SQLite files"
+    );
+
+    let reloaded = TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
+    assert_tree_eq!(*reloaded.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_compact_working_copy_state_rejects_invalid_phase_and_sparse_prefix() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+
+    let mut journal = read_compact_working_copy_state(&state_path)?;
+    journal.phase = 99;
+    write_compact_working_copy_state(&state_path, &journal)?;
+    let err = match TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    ) {
+        Ok(_) => panic!("unknown compact-journal phase must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("unsupported journal phase 99"),
+        "unexpected error: {err}"
+    );
+
+    journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::NoBaseline as i32;
+    journal.sparse_patterns = Some(jj_lib::protos::local_working_copy::SparsePatterns {
+        prefixes: vec!["bad//prefix".to_owned()],
+    });
+    write_compact_working_copy_state(&state_path, &journal)?;
+    let err = match TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    ) {
+        Ok(_) => panic!("invalid compact-journal sparse prefix must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("invalid sparse prefix"),
+        "unexpected error: {err}"
+    );
+
+    journal.sparse_patterns = Some(jj_lib::protos::local_working_copy::SparsePatterns {
+        prefixes: vec!["".to_owned()],
+    });
+    journal.tree_ids = vec![vec![1], vec![2]];
+    write_compact_working_copy_state(&state_path, &journal)?;
+    let err = match TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    ) {
+        Ok(_) => panic!("even compact-journal tree-ID merge shape must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("odd, non-empty merge shape"),
+        "unexpected error: {err}"
+    );
+
+    journal.tree_ids = repo
+        .store()
+        .empty_merged_tree()
+        .tree_ids()
+        .iter()
+        .map(|id| id.to_bytes())
+        .collect();
+    journal.conflict_labels = vec!["invalid label".to_owned()];
+    write_compact_working_copy_state(&state_path, &journal)?;
+    let err = match TreeState::load(repo.store().clone(), workspace_root, state_path, &settings) {
+        Ok(_) => panic!("resolved compact-journal tree labels must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("conflict labels do not match"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_compact_working_copy_state_recovers_pending_materialization() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+
+    let old_tree = create_tree(repo, &[(repo_path("old/file"), "old\n")]);
+    let intended_tree = create_tree(repo, &[(repo_path("new/file"), "new\n")]);
+    let mut journal = read_compact_working_copy_state(&state_path)?;
+    journal.tree_ids = old_tree.tree_ids().iter().map(|id| id.to_bytes()).collect();
+    journal.conflict_labels = old_tree.labels().as_slice().to_owned();
+    journal.sparse_patterns = Some(jj_lib::protos::local_working_copy::SparsePatterns {
+        prefixes: vec!["old".to_owned()],
+    });
+    journal.phase =
+        jj_lib::protos::local_working_copy::WorkingCopyStatePhase::PendingMaterialization as i32;
+    journal.pending_tree_ids = intended_tree
+        .tree_ids()
+        .iter()
+        .map(|id| id.to_bytes())
+        .collect();
+    journal.pending_conflict_labels = intended_tree.labels().as_slice().to_owned();
+    journal.pending_sparse_patterns = vec!["new".to_owned()];
+    journal.fsmonitor_cursor = Some(jj_lib::protos::local_working_copy::FsmonitorCursor {
+        cursor: Some(
+            jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Awacs(
+                jj_lib::protos::local_working_copy::AwacsCursor {
+                    opaque_token: b"old-baseline".to_vec(),
+                    input_fingerprint_version: 1,
+                    input_fingerprint: vec![3; 32],
+                },
+            ),
+        ),
+    });
+    journal.baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
+        backend_kind: "test-awacs".to_owned(),
+        snapshot_identity: b"old-baseline".to_vec(),
+        ..Default::default()
+    });
+    journal.pending_baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
+        backend_kind: "test-awacs".to_owned(),
+        snapshot_identity: b"candidate".to_vec(),
+        ..Default::default()
+    });
+    journal.transition_id = b"interrupted-transition".to_vec();
+    journal.mutation_kind = "checkout".to_owned();
+    write_compact_working_copy_state(&state_path, &journal)?;
+
+    let mut recovered = TreeState::load(
+        repo.store().clone(),
+        workspace_root,
+        state_path.clone(),
+        &settings,
+    )?;
+    assert_tree_eq!(*recovered.current_tree(), intended_tree);
+    assert_eq!(recovered.sparse_patterns(), &vec![repo_path_buf("new")]);
+    recovered.save()?;
+
+    let recovered_journal = read_compact_working_copy_state(&state_path)?;
+    assert_eq!(
+        recovered_journal.phase(),
+        jj_lib::protos::local_working_copy::WorkingCopyStatePhase::NoBaseline
+    );
+    assert_eq!(
+        recovered_journal.tree_ids,
+        intended_tree
+            .tree_ids()
+            .iter()
+            .map(|id| id.to_bytes())
+            .collect_vec()
+    );
+    assert_eq!(
+        recovered_journal.sparse_patterns.as_ref().unwrap().prefixes,
+        vec!["new".to_owned()]
+    );
+    assert!(recovered_journal.fsmonitor_cursor.is_none());
+    assert!(recovered_journal.baseline.is_none());
+    assert!(recovered_journal.pending_baseline.is_none());
+    assert!(recovered_journal.pending_tree_ids.is_empty());
+    assert!(recovered_journal.pending_sparse_patterns.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_legacy_checkout_missing_tree_state_fails_closed() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let checkout = jj_lib::protos::local_working_copy::Checkout {
+        operation_id: repo.op_id().to_bytes(),
+        workspace_name: WorkspaceName::DEFAULT.as_str().to_owned(),
+    };
+    std::fs::write(state_path.join("checkout"), checkout.encode_to_vec())?;
+
+    let err = match LocalWorkingCopy::load(
+        repo.store().clone(),
+        workspace_root,
+        state_path,
+        repo.settings(),
+    ) {
+        Ok(_) => panic!("a legacy checkout without tree_state must fail closed"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("Failed to read working copy state"),
+        "unexpected error: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_direct_tree_state_does_not_persist_awacs_cursor() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    let settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root,
+            changed_files: None,
+            cursor: b"cursor".to_vec(),
+        },
+        ..tree_state_settings.clone()
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    tree_state.snapshot(&options).block_on()?;
+    tree_state.save()?;
+
+    // Direct TreeState callers have no commit boundary for the accepted scan,
+    // so the cursor must not survive a reload. Switching to no fsmonitor
+    // would make the snapshot dirty if a cursor had been persisted.
+    let mut reloaded_tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root,
+        state_path,
+        &tree_state_settings,
+    )?;
+    let (is_dirty, _stats) = reloaded_tree_state
+        .snapshot(&empty_snapshot_options())
+        .block_on()?;
+    assert!(!is_dirty);
+    Ok(())
+}
+
+#[test]
+fn test_test_awacs_exact_delta_uses_retained_semantic_baseline() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let base_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root,
+        state_path.clone(),
+        &base_settings,
+    )?;
+
+    let changed_path = repo_path("dir/changed");
+    let untouched_path = repo_path("dir/untouched");
+    let dir_to_file_path = repo_path("transition");
+    let old_child_path = repo_path("transition/child");
+    testutils::write_working_copy_file(&scan_root, changed_path, "before\n");
+    testutils::write_working_copy_file(&scan_root, untouched_path, "untouched\n");
+    testutils::write_working_copy_file(&scan_root, old_child_path, "child\n");
+    let full_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root: scan_root.clone(),
+            changed_files: None,
+            cursor: b"baseline-a".to_vec(),
+        },
+        ..base_settings.clone()
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path.clone(),
+        &full_settings,
+    )?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    tree_state.snapshot(&options).block_on()?;
+    tree_state.save()?;
+
+    // Direct TreeState snapshots intentionally abort their lease. Seed the
+    // compact test journal with the retained A binding that a locked working
+    // copy would publish after a successful synthetic promotion.
+    seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
+
+    testutils::write_working_copy_file(&scan_root, changed_path, "after\n");
+    std::fs::remove_file(old_child_path.to_fs_path_unchecked(&scan_root))?;
+    std::fs::remove_dir(dir_to_file_path.to_fs_path_unchecked(&scan_root))?;
+    testutils::write_working_copy_file(&scan_root, dir_to_file_path, "replacement\n");
+    // If the exact delta accidentally scans siblings, this special path would
+    // either be observed or fail the scan. The unchanged semantic value from A
+    // must instead survive untouched.
+    std::fs::remove_file(untouched_path.to_fs_path_unchecked(&scan_root))?;
+    let exact_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root: scan_root.clone(),
+            changed_files: Some(vec![
+                changed_path.to_fs_path_unchecked(Path::new("")),
+                dir_to_file_path.to_fs_path_unchecked(Path::new("")),
+            ]),
+            cursor: b"baseline-b".to_vec(),
+        },
+        ..base_settings
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path,
+        &exact_settings,
+    )?;
+    tree_state.snapshot(&options).block_on()?;
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (changed_path, "after\n"),
+            (untouched_path, "untouched\n"),
+            (dir_to_file_path, "replacement\n"),
+        ],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+fn test_test_awacs_exact_delta_respects_sparse_patterns() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let base_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root,
+        state_path.clone(),
+        &base_settings,
+    )?;
+
+    let included_path = repo_path("included/keep");
+    let outside_path = repo_path("outside/file");
+    testutils::write_working_copy_file(&scan_root, included_path, "included\n");
+    testutils::write_working_copy_file(&scan_root, outside_path, "before\n");
+    let full_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root: scan_root.clone(),
+            changed_files: None,
+            cursor: b"baseline-a".to_vec(),
+        },
+        ..base_settings.clone()
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path.clone(),
+        &full_settings,
+    )?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    tree_state.snapshot(&options).block_on()?;
+    tree_state.save()?;
+
+    let mut journal = read_compact_working_copy_state(&state_path)?;
+    journal.sparse_patterns = Some(jj_lib::protos::local_working_copy::SparsePatterns {
+        prefixes: vec!["included".to_owned()],
+    });
+    write_compact_working_copy_state(&state_path, &journal)?;
+    seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
+
+    testutils::write_working_copy_file(&scan_root, outside_path, "after\n");
+    let exact_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root,
+            changed_files: Some(vec![outside_path.to_fs_path_unchecked(Path::new(""))]),
+            cursor: b"baseline-b".to_vec(),
+        },
+        ..base_settings
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path,
+        &exact_settings,
+    )?;
+    tree_state.snapshot(&options).block_on()?;
+    let expected_tree = create_tree(
+        repo,
+        &[(included_path, "included\n"), (outside_path, "before\n")],
+    );
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn test_test_awacs_exact_delta_rejects_symlink_ancestor() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let escaped_root = test_repo.env.root().join("escaped-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&escaped_root)?;
+    std::fs::create_dir(&state_path)?;
+    let base_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root,
+        state_path.clone(),
+        &base_settings,
+    )?;
+
+    let path = repo_path("dir/file");
+    testutils::write_working_copy_file(&scan_root, path, "before\n");
+    let full_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root: scan_root.clone(),
+            changed_files: None,
+            cursor: b"baseline-a".to_vec(),
+        },
+        ..base_settings.clone()
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path.clone(),
+        &full_settings,
+    )?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    tree_state.snapshot(&options).block_on()?;
+    tree_state.save()?;
+    seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
+
+    std::fs::remove_file(path.to_fs_path_unchecked(&scan_root))?;
+    std::fs::remove_dir(scan_root.join("dir"))?;
+    testutils::write_working_copy_file(&escaped_root, repo_path("file"), "escaped\n");
+    std::os::unix::fs::symlink(&escaped_root, scan_root.join("dir"))?;
+    let exact_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root,
+            changed_files: Some(vec![path.to_fs_path_unchecked(Path::new(""))]),
+            cursor: b"baseline-b".to_vec(),
+        },
+        ..base_settings
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path,
+        &exact_settings,
+    )?;
+    let err = tree_state.snapshot(&options).block_on().unwrap_err();
+    assert!(
+        err.to_string().contains("non-directory ancestor"),
+        "unexpected error: {err}"
+    );
+    let expected_tree = create_tree(repo, &[(path, "before\n")]);
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
+#[cfg(all(feature = "awacs", unix))]
+fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_snapshot()
+-> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+
+    let path = repo_path("dir/file");
+    let untouched_path = repo_path("untouched");
+    testutils::write_working_copy_file(&workspace_root, path, "live\n");
+    testutils::write_working_copy_file(&scan_root, path, "leased\n");
+    testutils::write_working_copy_file(&scan_root, untouched_path, "untouched\n");
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
+            socket: None,
+            client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
+                scan_root: scan_root.clone(),
+                outcomes: outcomes.clone(),
+                requests: requests.clone(),
+                valid_scan_root: true,
+            })))),
+        }),
+        ..tree_state_settings
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    tree_state.snapshot(&options).block_on()?;
+    tree_state.save()?;
+
+    // No durable A is paired with X yet, so the first Prefixes response must
+    // be widened to a full scan despite the synthetic backend's hint.
+    let expected_tree = create_tree(repo, &[(path, "leased\n"), (untouched_path, "untouched\n")]);
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    assert_eq!(
+        outcomes.lock().unwrap().as_slice(),
+        &[btrfs_awacs::scan::ScanOutcome::Aborted]
+    );
+    assert_eq!(requests.lock().unwrap().as_slice(), &[None]);
+
+    // Seed the clean A binding a locked working-copy finish would publish,
+    // then prove the next production adapter scan accepts only the returned
+    // prefix. Removing an unchanged sibling from B must not delete its X
+    // value.
+    let mut journal = read_compact_working_copy_state(&state_path)?;
+    journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
+    journal.baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
+        backend_kind: "awacs".to_owned(),
+        snapshot_identity: vec![2; 16],
+        lineage_token: b"cursor".to_vec(),
+        // Production AWACS v1 is prove-or-Full, not hard-pinned.
+        retention_token: Vec::new(),
+        root_identity: vec![1; 16],
+        interpretation_input_fingerprint: vec![3; 32],
+    });
+    journal.fsmonitor_cursor = Some(jj_lib::protos::local_working_copy::FsmonitorCursor {
+        cursor: Some(
+            jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Awacs(
+                jj_lib::protos::local_working_copy::AwacsCursor {
+                    opaque_token: b"cursor".to_vec(),
+                    input_fingerprint_version: 1,
+                    input_fingerprint: vec![3; 32],
+                },
+            ),
+        ),
+    });
+    write_compact_working_copy_state(&state_path, &journal)?;
+    testutils::write_working_copy_file(&scan_root, path, "leased again\n");
+    std::fs::remove_file(untouched_path.to_fs_path_unchecked(&scan_root))?;
+
+    // A direct TreeState caller still aborts B after scanning, but it may use
+    // an already-published A binding for this one directed scan.
+    let mut reloaded_tree_state =
+        TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
+    reloaded_tree_state.snapshot(&options).block_on()?;
+    let expected_tree = create_tree(
+        repo,
+        &[(path, "leased again\n"), (untouched_path, "untouched\n")],
+    );
+    assert_tree_eq!(*reloaded_tree_state.current_tree(), expected_tree);
+    assert_eq!(
+        requests.lock().unwrap().as_slice(),
+        &[None, Some(b"cursor".to_vec())]
+    );
+    assert_eq!(
+        outcomes.lock().unwrap().as_slice(),
+        &[
+            btrfs_awacs::scan::ScanOutcome::Aborted,
+            btrfs_awacs::scan::ScanOutcome::Aborted,
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(all(feature = "awacs", unix))]
+fn test_awacs_rejected_scan_root_aborts_accepted_lease() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
+            socket: None,
+            client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
+                scan_root,
+                outcomes: outcomes.clone(),
+                requests: Arc::new(Mutex::new(Vec::new())),
+                valid_scan_root: false,
+            })))),
+        }),
+        ..tree_state_settings
+    };
+    let mut tree_state =
+        TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    let error = tree_state.snapshot(&options).block_on().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("Failed to validate AWACS scan root")
+    );
+    assert_eq!(
+        outcomes.lock().unwrap().as_slice(),
+        &[btrfs_awacs::scan::ScanOutcome::Aborted]
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(all(feature = "awacs", unix))]
+fn test_awacs_cursor_input_mismatch_forces_full_begin() -> TestResult {
+    use jj_lib::protos::local_working_copy::AwacsCursor;
+    use jj_lib::protos::local_working_copy::FsmonitorCursor;
+    use jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor;
+
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    let empty_tree = repo.store().empty_merged_tree();
+    write_legacy_tree_state(&state_path, &empty_tree, |proto| {
+        proto.fsmonitor_cursor = Some(FsmonitorCursor {
+            cursor: Some(Cursor::Awacs(AwacsCursor {
+                opaque_token: b"stale-cursor".to_vec(),
+                input_fingerprint_version: 1,
+                input_fingerprint: vec![9; 32],
+            })),
+        });
+    })?;
+
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
+            socket: None,
+            client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
+                scan_root,
+                outcomes,
+                requests: requests.clone(),
+                valid_scan_root: true,
+            })))),
+        }),
+        ..tree_state_settings
+    };
+    let mut tree_state =
+        TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    let (is_dirty, _stats) = tree_state.snapshot(&options).block_on()?;
+
+    assert!(is_dirty);
+    assert_eq!(requests.lock().unwrap().as_slice(), &[None]);
+    Ok(())
+}
+
+#[test]
+fn test_fsmonitor_cursor_cleared_by_sparse_change() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    let empty_tree = repo.store().empty_merged_tree();
+    write_legacy_tree_state(&state_path, &empty_tree, |proto| {
+        proto.fsmonitor_cursor = Some(jj_lib::protos::local_working_copy::FsmonitorCursor {
+            cursor: Some(
+                jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Watchman(
+                    jj_lib::protos::local_working_copy::WatchmanClock {
+                        watchman_clock: Some(
+                            jj_lib::protos::local_working_copy::watchman_clock::WatchmanClock::StringClock(
+                                "cursor".to_owned(),
+                            ),
+                        ),
+                    },
+                ),
+            ),
+        });
+    })?;
+
+    let watchman_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::Watchman(WatchmanConfig {
+            register_trigger: false,
+        }),
+        ..tree_state_settings.clone()
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &watchman_settings,
+    )?;
+
+    // A no-op sparse update keeps the cursor paired with the same tree state.
+    tree_state.set_sparse_patterns(vec![RepoPathBuf::root()])?;
+    tree_state.save()?;
+
+    // Watchman clocks are not retained immutable baselines, so migration
+    // already writes NoBaseline and a backend switch has nothing to clear.
+    let mut probe = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+    let (is_dirty, _stats) = probe.snapshot(&empty_snapshot_options()).block_on()?;
+    assert!(!is_dirty);
+
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &watchman_settings,
+    )?;
+    tree_state.set_sparse_patterns(vec![repo_path_buf("dir")])?;
+    tree_state.save()?;
+
+    // A changed sparse vector clears the cursor durably, so the same public
+    // backend-mismatch probe is now clean.
+    let mut probe = TreeState::load(
+        repo.store().clone(),
+        workspace_root,
+        state_path,
+        &tree_state_settings,
+    )?;
+    let (is_dirty, _stats) = probe.snapshot(&empty_snapshot_options()).block_on()?;
+    assert!(!is_dirty);
     Ok(())
 }
 
@@ -2812,7 +4157,10 @@ fn track_ignored_with_flag_and_fsmonitor() -> TestResult {
             .map(|p| p.to_fs_path_unchecked(Path::new("")))
             .collect();
         let settings = TreeStateSettings {
-            fsmonitor_settings: FsmonitorSettings::Test { changed_files },
+            fsmonitor_settings: FsmonitorSettings::Test {
+                changed_files,
+                scan_root: None,
+            },
             ..tree_state_settings.clone()
         };
         let mut tree_state = TreeState::load(
@@ -2832,16 +4180,23 @@ fn track_ignored_with_flag_and_fsmonitor() -> TestResult {
     };
 
     let tree_state = snapshot(&[], None);
-    assert_tree_eq!(*tree_state.current_tree(), repo.store().empty_merged_tree());
+    let expected_tree = create_tree(repo, &[(gitignore_path, "*.ignored\n")]);
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
 
     let tree_state = snapshot(&[ignored_path], None);
-    assert_tree_eq!(*tree_state.current_tree(), repo.store().empty_merged_tree());
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
 
     // Simulate `jj file track --include-ignored`.
     let force_tracking_matcher = FilesMatcher::new([ignored_path]);
     let tree_state = snapshot(&[], Some(&force_tracking_matcher));
 
-    let expected_tree = create_tree(repo, &[(ignored_path, "contents\n")]);
+    let expected_tree = create_tree(
+        repo,
+        &[
+            (gitignore_path, "*.ignored\n"),
+            (ignored_path, "contents\n"),
+        ],
+    );
     assert_tree_eq!(*tree_state.current_tree(), expected_tree);
     Ok(())
 }
@@ -2873,7 +4228,10 @@ fn fsmonitor_gitignore_rescan_subtree() -> TestResult {
             .map(|p| p.to_fs_path_unchecked(Path::new("")))
             .collect();
         let settings = TreeStateSettings {
-            fsmonitor_settings: FsmonitorSettings::Test { changed_files },
+            fsmonitor_settings: FsmonitorSettings::Test {
+                changed_files,
+                scan_root: None,
+            },
             ..tree_state_settings.clone()
         };
         let mut tree_state = TreeState::load(

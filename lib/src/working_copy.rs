@@ -133,6 +133,12 @@ pub trait LockedWorkingCopy: Any + Send {
     /// Update to another commit without touching the files in the working copy.
     async fn reset(&mut self, commit: &Commit) -> Result<(), ResetError>;
 
+    /// Records a filesystem-monitor clock after the caller has independently
+    /// established that the current tree matches the files on disk.
+    async fn mark_fsmonitor_baseline(&mut self) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
     /// Update to another commit without touching the files in the working copy,
     /// without assuming that the previous tree exists.
     async fn recover(&mut self, commit: &Commit) -> Result<(), ResetError>;
@@ -177,6 +183,12 @@ pub enum SnapshotError {
     /// A tracked path contained invalid component such as `..`.
     #[error(transparent)]
     InvalidRepoPath(#[from] InvalidRepoPathError),
+    /// A filesystem entry name was not valid UTF-8.
+    #[error("Path component {path:?} is not valid UTF-8")]
+    InvalidUtf8Path {
+        /// The path component that could not be represented as a repository path.
+        path: OsString,
+    },
     /// A symlink target in the working copy was not valid UTF-8.
     #[error("Symlink {path} target is not valid UTF-8")]
     InvalidUtf8SymlinkTarget {
@@ -214,6 +226,9 @@ pub struct SnapshotOptions<'a> {
     // because the TreeState may be long-lived if the library is used in a
     // long-lived process.
     pub base_ignores: Arc<GitIgnoreFile>,
+    /// Ignore files whose paths are relative to the worktree. These are read
+    /// after a backend selects its scan root.
+    pub scan_root_ignores: Vec<PathBuf>,
     /// A callback for the UI to display progress.
     pub progress: Option<&'a SnapshotProgress<'a>>,
     /// For new files that are not already tracked, start tracking them if they
@@ -228,14 +243,30 @@ pub struct SnapshotOptions<'a> {
     /// (depending on implementation)
     /// return `SnapshotError::NewFileTooLarge`.
     pub max_new_file_size: u64,
+    /// Canonical external-input fingerprint required when an immutable AWACS
+    /// cursor is persisted. Other backends ignore it.
+    pub awacs_input_fingerprint: Option<[u8; 32]>,
 }
 
 /// A callback for getting progress updates.
 pub type SnapshotProgress<'a> = dyn Fn(&RepoPath) + 'a + Sync;
 
+/// User-visible warnings produced while snapshotting the working copy.
+#[derive(Clone, Debug)]
+pub enum SnapshotWarning {
+    /// The configured filesystem monitor could not be queried and snapshotting
+    /// fell back to a full scan.
+    FileSystemMonitor {
+        /// The user-facing detail from the filesystem monitor failure.
+        message: String,
+    },
+}
+
 /// Stats about a snapshot operation on a working copy.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotStats {
+    /// User-visible warnings produced while snapshotting.
+    pub warnings: Vec<SnapshotWarning>,
     /// List of new (previously untracked) files which are still untracked.
     pub untracked_paths: BTreeMap<RepoPathBuf, UntrackedReason>,
     /// Paths that were skipped because their file names aren't valid UTF-8,

@@ -16,32 +16,6 @@ syntax = "proto3";
 
 package local_working_copy;
 
-enum FileType {
-  Normal = 0;
-  Symlink = 1;
-  Executable = 2;
-  Conflict = 3 [deprecated = true];
-  GitSubmodule = 4;
-}
-
-message MaterializedConflictData {
-  // TODO: maybe we should store num_sides here as well
-  uint32 conflict_marker_len = 1;
-}
-
-message FileState {
-  int64 mtime_millis_since_epoch = 1;
-  uint64 size = 2;
-  FileType file_type = 3;
-  MaterializedConflictData materialized_conflict_data = 5;
-  reserved 4;
-}
-
-message FileStateEntry {
-  string path = 1;
-  FileState state = 2;
-}
-
 message SparsePatterns {
   repeated string prefixes = 1;
 }
@@ -53,10 +27,15 @@ message TreeState {
   repeated bytes tree_ids = 5;
   // Labels for the terms of a conflict.
   repeated string conflict_labels = 7;
-  repeated FileStateEntry file_states = 2;
-  bool is_file_states_sorted = 6;
+  // Legacy per-path file states are intentionally not decoded. Reserving the
+  // field numbers makes old payloads metadata-only migrations: protobuf skips
+  // the row bytes while retaining the semantic tree and sparse metadata.
+  reserved 2, 6;
   SparsePatterns sparse_patterns = 3;
-  WatchmanClock watchman_clock = 4;
+  // Legacy Watchman-only cursor. Read for migration, but new state is written
+  // to fsmonitor_cursor instead.
+  WatchmanClock watchman_clock = 4 [deprecated = true];
+  FsmonitorCursor fsmonitor_cursor = 8;
 }
 
 message WatchmanClock {
@@ -64,6 +43,19 @@ message WatchmanClock {
     string string_clock = 1;
     int64 unix_timestamp = 2;
   }
+}
+
+message FsmonitorCursor {
+  oneof cursor {
+    WatchmanClock watchman = 1;
+    AwacsCursor awacs = 2;
+  }
+}
+
+message AwacsCursor {
+  bytes opaque_token = 1;
+  uint32 input_fingerprint_version = 2;
+  bytes input_fingerprint = 3;
 }
 
 message Checkout {
@@ -77,10 +69,59 @@ message Checkout {
   reserved 1;
 }
 
-// Durable intent written before a checkout starts. If this file survives a
-// process failure, the next load treats this tree as the semantic target but
-// forces a full filesystem reconciliation before trusting it as clean.
-message PendingCheckout {
-  repeated bytes tree_ids = 1;
-  repeated string conflict_labels = 2;
+// Compact durable state for a local working copy. This replaces the legacy
+// split checkout/tree_state files. It intentionally contains no per-path file
+// state: the semantic tree is paired with an optional authoritative filesystem
+// baseline instead.
+message WorkingCopyState {
+  uint32 format_version = 1;
+  // The operation at which the working copy was updated.
+  bytes operation_id = 2;
+  // The workspace name used to look up the working-copy commit in the view.
+  string workspace_name = 3;
+  // Alternating positive and negative terms if there's a conflict, otherwise a
+  // single positive value.
+  repeated bytes tree_ids = 4;
+  repeated string conflict_labels = 5;
+  SparsePatterns sparse_patterns = 6;
+  // Present only for a backend that can prove an authoritative physical
+  // baseline, or force Full when that baseline was pruned. Ordinary
+  // mutable-filesystem scans leave this unset. A best-effort backend may use
+  // this together with a lineage token even when it cannot hard-pin the
+  // baseline.
+  FsmonitorCursor fsmonitor_cursor = 7;
+  uint64 generation = 8;
+  WorkingCopyStatePhase phase = 9;
+  // The intended semantic tree during an interrupted materialization. These
+  // are populated only for PendingMaterialization.
+  repeated bytes pending_tree_ids = 10;
+  repeated string pending_conflict_labels = 11;
+  // Immutable snapshot identity for CleanBaseline. This is absent for
+  // NoBaseline and for backends without an authoritative delta contract.
+  BaselineSnapshot baseline = 12;
+  // Candidate retained snapshot while a baseline promotion is in flight.
+  BaselineSnapshot pending_baseline = 13;
+  bytes transition_id = 14;
+  string no_baseline_reason = 15;
+  string mutation_kind = 16;
+  repeated string pending_sparse_patterns = 17;
+}
+
+message BaselineSnapshot {
+  string backend_kind = 1;
+  bytes snapshot_identity = 2;
+  // Token used to ask the backend to prove continuity from this baseline.
+  bytes lineage_token = 3;
+  // Non-empty only when the backend has durably hard-pinned this baseline.
+  // Best-effort prove-or-Full baselines leave this empty.
+  bytes retention_token = 4;
+  bytes root_identity = 5;
+  bytes interpretation_input_fingerprint = 6;
+}
+
+enum WorkingCopyStatePhase {
+  NoBaseline = 0;
+  CleanBaseline = 1;
+  PendingMaterialization = 2;
+  PendingBaselineCommit = 3;
 }

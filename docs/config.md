@@ -882,7 +882,7 @@ show-cryptographic-signatures = true
 ## Pager
 
 By default, jj will paginate output that would scroll off the screen. It does
-this by passing output through `less -FRXK` on most platforms (on Windows it uses
+this by passing output through `less -FRX` on most platforms (on Windows it uses
 [the pager](#builtin-pager) that is built-in to jj).
 
 Which pager to use can be customized by setting `ui.pager`. When choosing a
@@ -896,14 +896,14 @@ tool-specific environments that should not affect other programs. The generic
 Examples:
 
 ```shell
-# Pipe output through `less -FRXK` (default on non-Windows platforms)
-$ jj config set --user ui.pager "less -FRXK"
+# Pipe output through `less -FRX` (default on non-Windows platforms)
+$ jj config set --user ui.pager "less -FRX"
 
 # Use the built-in pager (default on Windows)
 $ jj config set --user ui.pager :builtin
 
 # Use `$PAGER` environment variable if set (on non-Windows platforms)
-$ jj config set --user ui.pager '["sh", "-c", "exec ${PAGER:-less -FRXK}"]'
+$ jj config set --user ui.pager '["sh", "-c", "exec ${PAGER:-less -FRX}"]'
 ```
 
 Additionally, paging behavior can be toggled via `ui.paginate` like so:
@@ -2031,12 +2031,15 @@ same-change = "accept"
 
 ## Filesystem monitor
 
-In large repositories, it may be beneficial to use a "filesystem monitor" to
-track changes to the working copy. This allows `jj` to take working copy
-snapshots without having to rescan the entire working copy.
+In large repositories, an authoritative immutable filesystem monitor can let
+`jj` take working-copy snapshots without rescanning the entire working copy.
+The `awacs` backend provides that model. The ordinary `watchman` backend
+still integrates with Watchman, but with compact no-row working-copy state it
+conservatively full-scans the mutable working copy rather than treating changed
+names as a durable physical baseline.
 
 This is governed by the `fsmonitor.backend` option. Currently, the valid values
-are `"none"` or `"watchman"`.
+are `"none"`, `"watchman"`, or `"awacs"`.
 
 ### Watchman
 
@@ -2065,6 +2068,35 @@ Note: `watchman` heavily uses `inotify` and sets up a user watch per-file. On
 large repositories, this may cause `watchman` to fail and commands like
 `jj status` to take longer than expected. If you experience this run
 `jj debug watchman status` and tune your `inotify` limits.
+
+### AWACS
+
+On Linux Btrfs working copies, `fsmonitor.backend = "awacs"` uses the optional
+`btrfs-awacs` library integration to scan a leased read-only snapshot instead
+of crawling a changing live directory. AWACS discovery is used by default; an
+absolute socket override is available for deployments that need one:
+
+```toml
+[fsmonitor]
+backend = "awacs"
+
+[fsmonitor.awacs]
+socket = "/run/user/1000/btrfs-awacs/scan.sock"
+```
+
+Without `socket`, JJ asks the AWACS-owned
+`btrfs-awacs scan-sockname <live-root>` command for the current mount
+namespace's `scan.sock`; it does not reuse Watchman socket environment
+variables.
+
+AWACS is fail-closed by default. If the service, lease, or snapshot identity
+cannot be validated, `jj` does not persist a new AWACS cursor or silently fall
+back to a live crawl.
+
+The current AWACS cursor is a best-effort prove-or-full baseline: JJ reuses it
+only when AWACS can prove continuity from the matching immutable snapshot. If
+that boundary was pruned, AWACS returns `Full` and JJ scans the new immutable
+snapshot instead of trusting a partial delta.
 
 ## Snapshot settings
 
@@ -2239,27 +2271,21 @@ with the `JJ_CONFIG` environment variable. If the environment variable is set
 the default locations. It can be a path to a TOML file or a directory of TOML
 files, which will be loaded in lexicographic order and merged. Multiple paths
 can be specified by separating them with a platform-specific path separator (`:`
-on Unix-like systems, `;` on Windows). Note that this variable only affects
-user-level and system-level config files; repo and workspace configs are
-unaffected and will continue to be loaded from their respective locations.
-(There is no environment variable to disable repo or workspace configs.)
+on Unix-like systems, `;` on Windows).
 
-For example, the following could be used to run `jj` without loading any user or
-system configs:
+For example, the following could be used to run `jj` without loading any user
+configs:
 
 ```bash
-# Ignores any settings specified in `{PLATFORM,/etc}/jj/{config.toml,conf.d/*.toml}`,
-# but still loads repo and workspace configs.
-JJ_CONFIG= jj log
+JJ_CONFIG= jj log       # Ignores any settings specified in any config files.
 ```
 
 There are also the `--config-file <PATH>` and `--config <NAME=VALUE>`
-[global options](#specifying-config-on-the-command-line) which work with any
-`jj` command.
+[global options](./cli-reference.md#options) which work with any `jj` command.
 
 ### System config files
 
-On Unix-like platforms, system-wide `jj` configurations are by default loaded in
+On unix-like platforms, system-wide `jj` configurations are by default loaded in
 the following precedence order (with later configs overriding earlier ones).
 
 - `/etc/jj/config.toml`
@@ -2314,12 +2340,12 @@ config files or environment variables. For example,
 jj --config ui.color=always --config ui.diff-editor=meld split
 ```
 
-The config value should be specified as a TOML expression. If it is a string
-value and isn't enclosed by any TOML constructs (such as array notation), quotes
-can be omitted. Here is an example with more advanced TOML constructs:
+Config value should be specified as a TOML expression. If string value isn't
+enclosed by any TOML constructs (such as array notation), quotes can be omitted.
+Here is an example with more advanced TOML constructs:
 
 ```shell
-# Single quotes and the '\' are interpreted by the shell (assuming a POSIX shell)
+# Single quotes and the '\' are interpreted by the shell and assume a Unix shell
 # Double quotes are passed to jj and are parsed as TOML syntax
 jj log --config \
   'template-aliases."format_timestamp(timestamp)"="""timestamp.format("%Y-%m-%d %H:%M %:::z")"""'

@@ -9,6 +9,10 @@ backend = "none"
 [fsmonitor.watchman]
 register-snapshot-trigger = false
 
+[fsmonitor.awacs]
+# Empty uses btrfs-awacs discovery for the current mount namespace.
+socket = ""
+
 [git]
 abandon-unreachable-commits = true
 executable-path = "git"
