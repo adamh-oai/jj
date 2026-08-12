@@ -16,6 +16,7 @@ use btrfs_awacs::manager::{
 use btrfs_awacs::manifest::{
     parse_changed_objects, parse_changed_objects_v2, CHANGED_OBJECTS_V2_MAGIC,
 };
+use btrfs_awacs::namespace::NamespaceMonitor;
 use btrfs_awacs::service::{ChangesOptions, InitializeOptions, Service, ServiceConfig};
 use btrfs_awacs::store::{BrokerJournal, ServiceMetadata, Store};
 use btrfs_awacs::watchman::WatchmanEndpoint;
@@ -125,6 +126,9 @@ enum CliCommand {
         spool_dir: PathBuf,
         manager_db: PathBuf,
     },
+    /// Acceptance helper: prove root-path and mount-topology ABA detection.
+    #[command(name = "__namespace-view-smoke")]
+    NamespaceViewSmoke { source: PathBuf },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -351,6 +355,9 @@ fn run_cli(cli: Cli) {
             spool_dir,
             manager_db,
         )),
+        CliCommand::NamespaceViewSmoke { source } => {
+            finish(run_namespace_view_smoke_helper(&source))
+        }
     }
 }
 
@@ -959,6 +966,103 @@ fn run_broker_full_index_helper(snapshot_path: &Path) -> Result<(), String> {
             .map_or_else(|| "mixed".to_owned(), |uid| uid.to_string()),
         safety.privileged_metadata_count,
     );
+    Ok(())
+}
+
+fn run_namespace_view_smoke_helper(source_path: &Path) -> Result<(), String> {
+    let source_path =
+        fs::canonicalize(source_path).map_err(|error| format!("canonicalize source: {error}"))?;
+    let parent = source_path
+        .parent()
+        .ok_or_else(|| "source has no parent directory".to_owned())?;
+    let moved = parent.join(format!(".btrfs-awacs-namespace-aba-{}", std::process::id()));
+    if moved.exists() {
+        return Err(format!(
+            "temporary ABA path already exists: {}",
+            moved.display()
+        ));
+    }
+
+    let root_monitor = NamespaceMonitor::arm(&source_path)
+        .map_err(|error| format!("arm root monitor: {error}"))?;
+    fs::rename(&source_path, &moved)
+        .map_err(|error| format!("rename watched root away: {error}"))?;
+    if let Err(error) = fs::rename(&moved, &source_path) {
+        let _ = fs::rename(&moved, &source_path);
+        return Err(format!("restore watched root: {error}"));
+    }
+    if root_monitor.check_continuity().is_ok() {
+        return Err("root rename/restore ABA was not detected".to_owned());
+    }
+
+    let ancestor = source_path
+        .parent()
+        .ok_or_else(|| "source has no ancestor to exercise".to_owned())?;
+    let ancestor_parent = ancestor
+        .parent()
+        .ok_or_else(|| "source ancestor has no parent to exercise".to_owned())?;
+    let moved_ancestor =
+        ancestor_parent.join(format!(".btrfs-awacs-ancestor-aba-{}", std::process::id()));
+    if moved_ancestor.exists() {
+        return Err(format!(
+            "temporary ancestor ABA path already exists: {}",
+            moved_ancestor.display()
+        ));
+    }
+    let ancestor_monitor = NamespaceMonitor::arm(&source_path)
+        .map_err(|error| format!("re-arm ancestor monitor: {error}"))?;
+    fs::rename(ancestor, &moved_ancestor)
+        .map_err(|error| format!("rename watched ancestor away: {error}"))?;
+    if let Err(error) = fs::rename(&moved_ancestor, ancestor) {
+        let _ = fs::rename(&moved_ancestor, ancestor);
+        return Err(format!("restore watched ancestor: {error}"));
+    }
+    if ancestor_monitor.check_continuity().is_ok() {
+        return Err("ancestor rename/restore ABA was not detected".to_owned());
+    }
+
+    let mount_monitor = NamespaceMonitor::arm(&source_path)
+        .map_err(|error| format!("re-arm mount monitor: {error}"))?;
+    let mount_target = source_path.join(format!(".btrfs-awacs-mount-aba-{}", std::process::id()));
+    fs::create_dir(&mount_target)
+        .map_err(|error| format!("create temporary mount target: {error}"))?;
+    let source_c = std::ffi::CString::new(source_path.as_os_str().as_bytes())
+        .map_err(|_| "source path contains NUL".to_owned())?;
+    let target_c = std::ffi::CString::new(mount_target.as_os_str().as_bytes())
+        .map_err(|_| "mount target contains NUL".to_owned())?;
+    // SAFETY: both C strings remain live for the syscall and MS_BIND ignores
+    // filesystem type and data pointers.
+    let mounted = unsafe {
+        libc::mount(
+            source_c.as_ptr(),
+            target_c.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if mounted != 0 {
+        let error = io::Error::last_os_error();
+        let _ = fs::remove_dir(&mount_target);
+        return Err(format!("attach temporary bind mount: {error}"));
+    }
+    // SAFETY: target_c remains live and names the mount just created.
+    let unmounted = unsafe { libc::umount2(target_c.as_ptr(), 0) };
+    if unmounted != 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: best-effort cleanup of the mount created above.
+        unsafe {
+            libc::umount2(target_c.as_ptr(), libc::MNT_DETACH);
+        }
+        let _ = fs::remove_dir(&mount_target);
+        return Err(format!("detach temporary bind mount: {error}"));
+    }
+    fs::remove_dir(&mount_target)
+        .map_err(|error| format!("remove temporary mount target: {error}"))?;
+    if mount_monitor.check_continuity().is_ok() {
+        return Err("mount attach/detach ABA was not detected".to_owned());
+    }
+    println!("root_aba=detected ancestor_aba=detected mount_aba=detected");
     Ok(())
 }
 
@@ -2111,6 +2215,7 @@ mod tests {
             "__broker-delete-snapshot",
             "__broker-full-index",
             "__nested-boundary-smoke",
+            "__namespace-view-smoke",
             "git-fsmonitor-hook",
             "btrfs-awacs-watchman",
         ] {
