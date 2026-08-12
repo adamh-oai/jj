@@ -1,0 +1,60 @@
+# List the available documentation workflows.
+default:
+    @just --list
+
+# Run the focused AWACS tests with deterministic terminal settings.
+test:
+    env -u NO_COLOR TERM=xterm-256color cargo test -p btrfs-awacs
+
+# Run the whole JJ workspace suite when changes extend beyond btrfs-awacs.
+test-workspace:
+    env -u NO_COLOR TERM=xterm-256color cargo test --workspace
+
+# Run the real-Btrfs Git worktree/JJ adoption smoke test against the installed broker.
+test-e2e:
+    @set -eu; \
+        test_root="${JJ_TEST_BTRFS_ROOT:-{{justfile_directory()}}/target/btrfs-awacs-e2e}"; \
+        awacs_command="${BTRFS_AWACS_COMMAND:-/usr/local/bin/awacs}"; \
+        broker_socket="${BTRFS_AWACS_BROKER_SOCKET:-/run/btrfs-awacs/broker.sock}"; \
+        mkdir -p "$test_root"; \
+        env -u NO_COLOR TERM=xterm-256color \
+            JJ_TEST_BTRFS_ROOT="$test_root" \
+            BTRFS_AWACS_COMMAND="$awacs_command" \
+            BTRFS_AWACS_BROKER_SOCKET="$broker_socket" \
+            cargo test -p jj-cli --features awacs \
+                test_util_subvolume_enable_disable_real_btrfs_awacs \
+                -- --ignored --test-threads=1
+
+# Build and install the normal live-testing binaries with the fast dev-opt profile.
+install:
+    ./install.sh dev-opt
+
+# Build and install release binaries for final packaging or release-only checks.
+install-release:
+    ./install.sh release
+
+# Install the exact documentation dependencies recorded in docs/package-lock.json.
+docs-install:
+    npm ci --prefix docs --no-audit --no-fund
+
+# Check the documentation site's Astro configuration, content, and types.
+docs-check:
+    npm run --prefix docs check
+
+# Build the static Starlight site into docs/dist/.
+docs-build:
+    npm run --prefix docs build
+
+# Rebuild the complete documentation site from a clean, locked installation.
+docs-rebuild: docs-install docs-check docs-build
+
+# Rebuild the complete documentation site.
+docs: docs-rebuild
+
+# Run the local documentation development server.
+docs-dev:
+    npm run --prefix docs dev
+
+# Preview the built static documentation site locally.
+docs-preview:
+    npm run --prefix docs preview
