@@ -20,13 +20,31 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Durable identity for one committed immutable snapshot baseline.
+///
+/// Consumers persist this value between scans. The continuity token remains
+/// opaque because the daemon authenticates its claims, but it is no longer a
+/// generic filesystem-monitor cursor: it is paired with the exact snapshot
+/// identity it proves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotBaseline {
+    /// Identity of the immutable snapshot paired with the consumer's tree.
+    pub identity: SnapshotIdentity,
+    /// Authenticated capability used to prove continuity from this snapshot.
+    pub continuity_token: Vec<u8>,
+    /// Durable retention capability, once the service supports hard pins.
+    ///
+    /// AWACS v1 leaves this empty and proves the baseline on demand.
+    pub retention_token: Vec<u8>,
+}
+
 /// A request to cut or reuse one immutable scan snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BeginScanRequest {
     /// Absolute live working-copy root whose identity AWACS must validate.
     pub live_root: PathBuf,
-    /// Opaque cursor persisted after a previously committed scan, if any.
-    pub previous_cursor: Option<Vec<u8>>,
+    /// Exact snapshot baseline paired with the consumer's previous tree.
+    pub previous_baseline: Option<SnapshotBaseline>,
 }
 
 /// The paths which a client may scan incrementally inside the leased root.
@@ -54,9 +72,9 @@ pub struct SnapshotIdentity {
 /// How a client completed work derived from a scan lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScanOutcome {
-    /// The client durably persisted state paired with this lease's cursor.
+    /// The client durably persisted state paired with this lease's baseline.
     Committed,
-    /// The client did not persist this lease's cursor.
+    /// The client did not persist this lease's baseline.
     Aborted,
 }
 
@@ -67,8 +85,8 @@ pub enum ScanErrorKind {
     UnsupportedFilesystem,
     /// No AWACS service could be reached or activated.
     Unavailable,
-    /// The previous cursor cannot be reused; callers may retry from `Full`.
-    InvalidPreviousCursor,
+    /// The previous snapshot baseline cannot be reused; callers may retry from `Full`.
+    InvalidPreviousBaseline,
     /// Continuity was lost and the next valid lease must be a full scan.
     FullScanRequired,
     /// The active lease expired or could not be renewed.
@@ -118,7 +136,7 @@ impl fmt::Display for ScanError {
 
 impl Error for ScanError {}
 
-/// Private lifecycle operations retained by a [`ScanLease`].
+/// Private lifecycle operations retained by a [`SnapshotLease`].
 ///
 /// Implementations hide transport identifiers and fencing tokens behind this
 /// trait. `finish()` must be idempotent for a retried completion after a lost
@@ -127,18 +145,16 @@ pub trait ScanSession: Send {
     /// Extends the active lease while the caller still owns the scan root.
     fn renew(&mut self) -> Result<(), ScanError>;
 
-    /// Reports whether state paired with this cursor was durably committed.
+    /// Reports whether state paired with this baseline was durably committed.
     fn finish(&mut self, outcome: ScanOutcome) -> Result<(), ScanError>;
 }
 
 /// One immutable scan root and the lease which keeps it valid.
-pub struct ScanLease {
-    /// Opaque cursor to persist only after a committed scan.
-    pub cursor: Vec<u8>,
+pub struct SnapshotLease {
+    /// Baseline to persist only after a committed scan.
+    pub next_baseline: SnapshotBaseline,
     /// Safe incremental narrowing hints for reads from `scan_root`.
     pub invalidation: Invalidation,
-    /// Identity metadata which callers validate before scanning.
-    pub identity: SnapshotIdentity,
     /// Lease deadline on the boot-time monotonic clock.
     pub expires_boottime_ns: u64,
     scan_root: File,
@@ -146,21 +162,19 @@ pub struct ScanLease {
     finished_outcome: Option<ScanOutcome>,
 }
 
-impl ScanLease {
+impl SnapshotLease {
     /// Creates a lease from a validated read-only directory handle and its
     /// private completion session.
     pub fn new(
-        cursor: Vec<u8>,
+        next_baseline: SnapshotBaseline,
         invalidation: Invalidation,
-        identity: SnapshotIdentity,
         expires_boottime_ns: u64,
         scan_root: File,
         session: Box<dyn ScanSession>,
     ) -> Self {
         Self {
-            cursor,
+            next_baseline,
             invalidation,
-            identity,
             expires_boottime_ns,
             scan_root,
             session,
@@ -265,29 +279,27 @@ pub fn validate_scan_root(scan_root: &File, expected: SnapshotIdentity) -> Resul
 /// A transport-independent AWACS scan client.
 pub trait ScanClient: Send {
     /// Starts one immutable scan lease for the requested live root.
-    fn begin_scan(&mut self, request: &BeginScanRequest) -> Result<ScanLease, ScanError>;
+    fn begin_scan(&mut self, request: &BeginScanRequest) -> Result<SnapshotLease, ScanError>;
 
     /// Validates the scan-root fd before a consumer traverses it.
     ///
     /// Real clients use the Btrfs identity check. In-process test doubles may
     /// override this when their synthetic root is an ordinary directory.
-    fn validate_scan_root(&self, lease: &ScanLease) -> Result<(), ScanError> {
-        validate_scan_root(lease.scan_root(), lease.identity)
+    fn validate_scan_root(&self, lease: &SnapshotLease) -> Result<(), ScanError> {
+        validate_scan_root(lease.scan_root(), lease.next_baseline.identity)
     }
 }
 
 /// Result returned by a daemon-side scan request handler.
-pub struct ServerScanLease {
+pub struct ServerSnapshotLease {
     /// Private session identifier used only for Renew and Finish.
     pub session_id: Vec<u8>,
-    /// Opaque cursor returned to the client for later persistence.
-    pub cursor: Vec<u8>,
+    /// Baseline returned to the client for later persistence.
+    pub next_baseline: SnapshotBaseline,
     /// Safe scan narrowing hints for the immutable root.
     pub invalidation: Invalidation,
     /// Lease deadline on the boot-time monotonic clock.
     pub expires_boottime_ns: u64,
-    /// Identity metadata paired with scan_root.
-    pub identity: SnapshotIdentity,
     /// Read-only directory fd transferred on successful Begin.
     pub scan_root: File,
 }
@@ -295,7 +307,7 @@ pub struct ServerScanLease {
 /// Daemon-side implementation behind the private scan socket protocol.
 pub trait ScanRequestHandler: Send {
     /// Cuts or reuses an immutable snapshot and returns a pinned session.
-    fn begin_scan(&mut self, request: BeginScanRequest) -> Result<ServerScanLease, ScanError>;
+    fn begin_scan(&mut self, request: BeginScanRequest) -> Result<ServerSnapshotLease, ScanError>;
     /// Renews one still-active private session.
     fn renew_scan(&mut self, session_id: &[u8]) -> Result<(), ScanError>;
     /// Finishes one private session with the client's durable outcome.
@@ -303,7 +315,7 @@ pub trait ScanRequestHandler: Send {
 }
 
 const SCAN_MAGIC: &[u8; 4] = b"BAWS";
-const SCAN_VERSION: u16 = 1;
+const SCAN_VERSION: u16 = 2;
 const SCAN_HEADER_SIZE: usize = 16;
 const SCAN_MAX_PAYLOAD: usize = 1024 * 1024;
 const SCAN_MAX_FDS: usize = 1;
@@ -392,10 +404,10 @@ fn discover_scan_socket(live_root: &Path) -> Result<PathBuf, ScanError> {
 }
 
 impl ScanClient for SocketScanClient {
-    fn begin_scan(&mut self, request: &BeginScanRequest) -> Result<ScanLease, ScanError> {
+    fn begin_scan(&mut self, request: &BeginScanRequest) -> Result<SnapshotLease, ScanError> {
         let mut payload = Encoder::default();
         payload.bytes(path_bytes(&request.live_root))?;
-        payload.optional_bytes(request.previous_cursor.as_deref())?;
+        payload.optional_baseline(request.previous_baseline.as_ref())?;
         let response = request_response(&self.socket, OP_BEGIN, payload.finish())?;
         let mut decoder = Decoder::new(&response.payload);
         decode_status(&mut decoder)?;
@@ -409,7 +421,7 @@ impl ScanClient for SocketScanClient {
             ));
         }
         let session_id = decoder.bytes()?;
-        let cursor = decoder.bytes()?;
+        let continuity_token = decoder.bytes()?;
         let invalidation = decoder.invalidation()?;
         let expires_boottime_ns = decoder.u64()?;
         let identity = SnapshotIdentity {
@@ -420,10 +432,13 @@ impl ScanClient for SocketScanClient {
         decoder.finish()?;
         let mut fds = response.fds;
         let scan_root = File::from(fds.pop().expect("fd count validated"));
-        Ok(ScanLease::new(
-            cursor,
+        Ok(SnapshotLease::new(
+            SnapshotBaseline {
+                identity,
+                continuity_token,
+                retention_token: Vec::new(),
+            },
             invalidation,
-            identity,
             expires_boottime_ns,
             scan_root,
             Box::new(SocketScanSession {
@@ -533,27 +548,27 @@ impl<H: ScanRequestHandler> SocketScanDispatcher<H> {
             OP_BEGIN => {
                 let mut decoder = Decoder::new(&request.payload);
                 let live_root = decoder.bytes()?;
-                let previous_cursor = decoder.optional_bytes()?;
+                let previous_baseline = decoder.optional_baseline()?;
                 decoder.finish()?;
                 let live_root = PathBuf::from(std::ffi::OsString::from_vec(live_root));
                 match handler.begin_scan(BeginScanRequest {
                     live_root,
-                    previous_cursor,
+                    previous_baseline,
                 }) {
                     Ok(lease) => {
                         let mut payload = Encoder::default();
                         payload.u8(0);
                         payload.bytes(&lease.session_id)?;
-                        payload.bytes(&lease.cursor)?;
+                        payload.bytes(&lease.next_baseline.continuity_token)?;
                         payload.invalidation(&lease.invalidation)?;
                         payload.u64(lease.expires_boottime_ns);
                         payload
                             .bytes
-                            .extend_from_slice(&lease.identity.filesystem_uuid);
+                            .extend_from_slice(&lease.next_baseline.identity.filesystem_uuid);
                         payload
                             .bytes
-                            .extend_from_slice(&lease.identity.subvolume_uuid);
-                        payload.u8(u8::from(lease.identity.read_only));
+                            .extend_from_slice(&lease.next_baseline.identity.subvolume_uuid);
+                        payload.u8(u8::from(lease.next_baseline.identity.read_only));
                         let result = socket.send(
                             OP_BEGIN,
                             FLAG_RESPONSE,
@@ -630,7 +645,7 @@ fn encode_error_kind(kind: ScanErrorKind) -> u8 {
     match kind {
         ScanErrorKind::UnsupportedFilesystem => 1,
         ScanErrorKind::Unavailable => 2,
-        ScanErrorKind::InvalidPreviousCursor => 3,
+        ScanErrorKind::InvalidPreviousBaseline => 3,
         ScanErrorKind::FullScanRequired => 4,
         ScanErrorKind::LeaseExpired => 5,
         ScanErrorKind::Unauthorized => 6,
@@ -665,7 +680,7 @@ fn decode_error_kind(value: u8) -> ScanErrorKind {
     match value {
         1 => ScanErrorKind::UnsupportedFilesystem,
         2 => ScanErrorKind::Unavailable,
-        3 => ScanErrorKind::InvalidPreviousCursor,
+        3 => ScanErrorKind::InvalidPreviousBaseline,
         4 => ScanErrorKind::FullScanRequired,
         5 => ScanErrorKind::LeaseExpired,
         6 => ScanErrorKind::Unauthorized,
@@ -705,17 +720,19 @@ impl Encoder {
         Ok(())
     }
 
-    fn optional_bytes(&mut self, value: Option<&[u8]>) -> Result<(), ScanError> {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.bytes(value)
-            }
-            None => {
-                self.u8(0);
-                Ok(())
-            }
-        }
+    fn optional_baseline(&mut self, value: Option<&SnapshotBaseline>) -> Result<(), ScanError> {
+        let Some(value) = value else {
+            self.u8(0);
+            return Ok(());
+        };
+        self.u8(1);
+        self.bytes
+            .extend_from_slice(&value.identity.filesystem_uuid);
+        self.bytes.extend_from_slice(&value.identity.subvolume_uuid);
+        self.u8(u8::from(value.identity.read_only));
+        self.bytes(&value.continuity_token)?;
+        self.bytes(&value.retention_token)?;
+        Ok(())
     }
 
     fn invalidation(&mut self, invalidation: &Invalidation) -> Result<(), ScanError> {
@@ -804,13 +821,21 @@ impl<'a> Decoder<'a> {
         Ok(self.take(length)?.to_vec())
     }
 
-    fn optional_bytes(&mut self) -> Result<Option<Vec<u8>>, ScanError> {
+    fn optional_baseline(&mut self) -> Result<Option<SnapshotBaseline>, ScanError> {
         match self.u8()? {
             0 => Ok(None),
-            1 => Ok(Some(self.bytes()?)),
+            1 => Ok(Some(SnapshotBaseline {
+                identity: SnapshotIdentity {
+                    filesystem_uuid: self.array()?,
+                    subvolume_uuid: self.array()?,
+                    read_only: self.bool()?,
+                },
+                continuity_token: self.bytes()?,
+                retention_token: self.bytes()?,
+            })),
             _ => Err(ScanError::new(
                 ScanErrorKind::MalformedResponse,
-                "AWACS payload has invalid optional-bytes tag",
+                "AWACS payload has invalid optional-baseline tag",
             )),
         }
     }
@@ -1222,6 +1247,18 @@ mod tests {
 
     use super::*;
 
+    fn baseline(token: &[u8]) -> SnapshotBaseline {
+        SnapshotBaseline {
+            identity: SnapshotIdentity {
+                filesystem_uuid: [1; 16],
+                subvolume_uuid: [2; 16],
+                read_only: true,
+            },
+            continuity_token: token.to_vec(),
+            retention_token: Vec::new(),
+        }
+    }
+
     struct RecordingSession {
         renewals: Arc<Mutex<usize>>,
         outcomes: Arc<Mutex<Vec<ScanOutcome>>>,
@@ -1249,14 +1286,9 @@ mod tests {
             renewals: renewals.clone(),
             outcomes: outcomes.clone(),
         };
-        let mut lease = ScanLease::new(
-            b"cursor".to_vec(),
+        let mut lease = SnapshotLease::new(
+            baseline(b"baseline"),
             Invalidation::Full,
-            SnapshotIdentity {
-                filesystem_uuid: [1; 16],
-                subvolume_uuid: [2; 16],
-                read_only: true,
-            },
             300,
             scan_root,
             Box::new(session),
@@ -1313,8 +1345,10 @@ mod tests {
             assert!(begin.fds.is_empty());
             let mut request = Decoder::new(&begin.payload);
             assert_eq!(request.bytes().unwrap(), b"/tmp/live");
-            assert_eq!(request.u8().unwrap(), 1);
-            assert_eq!(request.bytes().unwrap(), b"previous");
+            assert_eq!(
+                request.optional_baseline().unwrap(),
+                Some(baseline(b"previous"))
+            );
             request.finish().unwrap();
 
             let mut response = Encoder::default();
@@ -1363,10 +1397,10 @@ mod tests {
         let mut lease = client
             .begin_scan(&BeginScanRequest {
                 live_root: PathBuf::from("/tmp/live"),
-                previous_cursor: Some(b"previous".to_vec()),
+                previous_baseline: Some(baseline(b"previous")),
             })
             .unwrap();
-        assert_eq!(lease.cursor, b"cursor");
+        assert_eq!(lease.next_baseline, baseline(b"cursor"));
         assert_eq!(
             lease.invalidation,
             Invalidation::Prefixes(vec![b"dir".to_vec()])
@@ -1396,7 +1430,7 @@ mod tests {
         };
         let error = match client.begin_scan(&BeginScanRequest {
             live_root: PathBuf::from("/tmp/live"),
-            previous_cursor: None,
+            previous_baseline: None,
         }) {
             Ok(_) => panic!("error response unexpectedly produced a lease"),
             Err(error) => error,
@@ -1417,19 +1451,14 @@ mod tests {
             fn begin_scan(
                 &mut self,
                 request: BeginScanRequest,
-            ) -> Result<ServerScanLease, ScanError> {
+            ) -> Result<ServerSnapshotLease, ScanError> {
                 assert_eq!(request.live_root, PathBuf::from("/tmp/live"));
-                assert_eq!(request.previous_cursor, Some(b"previous".to_vec()));
-                Ok(ServerScanLease {
+                assert_eq!(request.previous_baseline, Some(baseline(b"previous")));
+                Ok(ServerSnapshotLease {
                     session_id: b"session".to_vec(),
-                    cursor: b"cursor".to_vec(),
+                    next_baseline: baseline(b"cursor"),
                     invalidation: Invalidation::ExactPaths(vec![b"file".to_vec()]),
                     expires_boottime_ns: u64::MAX,
-                    identity: SnapshotIdentity {
-                        filesystem_uuid: [1; 16],
-                        subvolume_uuid: [2; 16],
-                        read_only: true,
-                    },
                     scan_root: File::open(&self.scan_root).unwrap(),
                 })
             }
@@ -1468,7 +1497,7 @@ mod tests {
         let mut lease = client
             .begin_scan(&BeginScanRequest {
                 live_root: PathBuf::from("/tmp/live"),
-                previous_cursor: Some(b"previous".to_vec()),
+                previous_baseline: Some(baseline(b"previous")),
             })
             .unwrap();
         assert_eq!(

@@ -214,7 +214,7 @@ impl FacadeService {
     pub fn prepare_scan_query(
         &mut self,
         watch_id: [u8; 16],
-        previous_cursor: Option<&[u8]>,
+        previous_baseline: Option<&crate::scan::SnapshotBaseline>,
         requester_uid: u32,
         requester_gid: u32,
         now_ns: i64,
@@ -238,8 +238,14 @@ impl FacadeService {
             .store()
             .metadata()
             .map_err(|error| FacadeError::context("load direct cursor metadata", error))?;
-        let previous_claims = previous_cursor
-            .and_then(|cursor| decode_direct_scan_cursor(cursor, &metadata.clock_hmac_key).ok());
+        let previous_claims = previous_baseline.and_then(|baseline| {
+            decode_direct_scan_cursor(&baseline.continuity_token, &metadata.clock_hmac_key)
+                .ok()
+                .filter(|claims| {
+                    baseline.identity.read_only
+                        && claims.target_snapshot_uuid == baseline.identity.subvolume_uuid
+                })
+        });
         self.prepare_scan_after_cut(
             activation,
             authorization_id,
@@ -250,8 +256,8 @@ impl FacadeService {
         )
     }
 
-    /// Returns the opaque cursor prepared for the direct scan API.
-    pub fn direct_scan_cursor(
+    /// Returns the opaque continuity token prepared for the direct scan API.
+    pub fn direct_scan_continuity_token(
         &self,
         prepared: &PreparedQueryResult,
     ) -> Result<Vec<u8>, FacadeError> {

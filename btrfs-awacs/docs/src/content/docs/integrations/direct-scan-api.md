@@ -1,6 +1,6 @@
 ---
 title: "Direct immutable-snapshot API"
-description: "The Begin, Renew, and Finish protocol, authenticated cursors, immutable snapshot fds, and daemon sessions."
+description: "The Begin, Renew, and Finish protocol, typed snapshot baselines, immutable snapshot fds, and daemon sessions."
 sidebar:
   order: 3
 ---
@@ -12,13 +12,18 @@ Jujutsu:
 ```text
 BeginScanRequest {
     live_root: absolute live working-copy path,
-    previous_cursor: optional opaque authenticated cursor,
+    previous_baseline: optional SnapshotBaseline,
 }
 
-ScanLease {
-    cursor: opaque cursor for the selected immutable snapshot,
-    invalidation: Full | ExactPaths(raw-relative-paths) | Prefixes(raw-prefixes),
+SnapshotBaseline {
     identity: filesystem UUID + subvolume UUID + read-only flag,
+    continuity_token: opaque authenticated proof for that exact snapshot,
+    retention_token: optional durable pin capability,
+}
+
+SnapshotLease {
+    next_baseline: SnapshotBaseline for the selected immutable snapshot,
+    invalidation: Full | ExactPaths(raw-relative-paths) | Prefixes(raw-prefixes),
     expires_boottime_ns: advertised monotonic lease deadline,
     scan_root: open read-only snapshot directory fd,
     session: private Renew/Finish capability,
@@ -44,7 +49,7 @@ operation, flags, descriptor count, and payload length. The supported
 operations are:
 
 ```text
-Begin  -> session ID, cursor, invalidation, boot-time deadline, identity, one fd
+Begin  -> session ID, next baseline token, invalidation, boot-time deadline, identity, one fd
 Renew  -> extend the session's durable query lease
 Finish -> Committed or Aborted; release the pinned prepared response
 ```
@@ -70,15 +75,16 @@ absolute socket override bypasses the discovery subprocess.
 2. Calls `FacadeService::prepare_scan_query`, which creates an immutable cut.
 3. Resolves its exact managed snapshot path and opens the snapshot directory.
 4. Loads filesystem/subvolume identity and extends its durable query lease.
-5. Converts the projected invalidation and wraps the authenticated cursor.
+5. Converts the projected invalidation and wraps the authenticated continuity
+   token with the selected snapshot identity as `SnapshotBaseline`.
 6. Stores the `PreparedQueryResult` in an active-session map.
 7. Returns a session ID and the open directory fd.
 
 Renew extends the prepared query lease. Finish releases it and records a short
-idempotence tombstone. Invalid/expired cursors currently become safe full scans
+idempotence tombstone. Invalid/expired baselines currently become safe full scans
 when the selected target snapshot can still be leased.
 
 The handler resolves, authorizes, initializes or adopts, and activates each
 requested canonical root on demand. Multiple repositories and snapshot
 workspaces on the daemon's configured Btrfs filesystem can therefore share one
-mount-namespace daemon without sharing cursor or grant authority.
+mount-namespace daemon without sharing baseline or grant authority.

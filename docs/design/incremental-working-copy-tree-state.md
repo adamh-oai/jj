@@ -358,10 +358,10 @@ equivalent pin/handoff. A short-lived scan lease that releases B at
 
 ### Current AWACS v1 compatibility
 
-The first no-row implementation can use the existing authenticated AWACS
-cursor as a best-effort lineage token while the stronger promotion API is
-added. It persists a `CleanBaseline` record only after the local journal is
-durable and sends A's cursor on the next scan. In v1, “clean” means
+The first no-row implementation can use a typed AWACS snapshot baseline with
+an authenticated continuity token while the stronger promotion API is added.
+It persists a `CleanBaseline` record only after the local journal is durable
+and sends A's baseline on the next scan. In v1, “clean” means
 “paired with immutable A and safe to reuse only after AWACS proves A,” not
 “hard-pinned”: if AWACS has retained A, it returns a complete A→B delta; if A
 was pruned, expired, or cannot be proved, it returns `Full` and Jujutsu scans

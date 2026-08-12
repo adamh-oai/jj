@@ -735,7 +735,7 @@ struct SnapshotScan {
     scan_root: PathBuf,
     scope: ScanScope,
     fsmonitor_cursor: Option<crate::protos::local_working_copy::FsmonitorCursor>,
-    baseline: Option<crate::protos::local_working_copy::BaselineSnapshot>,
+    baseline: Option<crate::protos::local_working_copy::AwacsSnapshotBaseline>,
     completion: Option<PendingScan>,
     warning: Option<SnapshotWarning>,
 }
@@ -864,7 +864,7 @@ impl ScanSession for NoopScanSession {
 
 #[cfg(all(feature = "awacs", unix))]
 struct AwacsScanSession {
-    lease: Arc<Mutex<Option<btrfs_awacs::scan::ScanLease>>>,
+    lease: Arc<Mutex<Option<btrfs_awacs::scan::SnapshotLease>>>,
     renewal_error: Arc<Mutex<Option<String>>>,
     stop_renewal: Option<std::sync::mpsc::SyncSender<()>>,
     renewal_thread: Option<JoinHandle<()>>,
@@ -872,7 +872,7 @@ struct AwacsScanSession {
 
 #[cfg(all(feature = "awacs", unix))]
 impl AwacsScanSession {
-    fn new(lease: btrfs_awacs::scan::ScanLease) -> Self {
+    fn new(lease: btrfs_awacs::scan::SnapshotLease) -> Self {
         let renew_interval = lease.renewal_interval();
         let lease = Arc::new(Mutex::new(Some(lease)));
         let renewal_error = Arc::new(Mutex::new(None));
@@ -1004,32 +1004,15 @@ fn watchman_cursor(
     }
 }
 
-fn awacs_cursor(
-    token: Vec<u8>,
-    input_fingerprint: [u8; 32],
-) -> crate::protos::local_working_copy::FsmonitorCursor {
-    use crate::protos::local_working_copy::fsmonitor_cursor::Cursor;
-    crate::protos::local_working_copy::FsmonitorCursor {
-        cursor: Some(Cursor::Awacs(
-            crate::protos::local_working_copy::AwacsCursor {
-                opaque_token: token,
-                input_fingerprint_version: 1,
-                input_fingerprint: input_fingerprint.to_vec(),
-            },
-        )),
-    }
-}
-
 fn synthetic_test_awacs_baseline(
     token: &[u8],
     input_fingerprint: [u8; 32],
-) -> crate::protos::local_working_copy::BaselineSnapshot {
-    crate::protos::local_working_copy::BaselineSnapshot {
-        backend_kind: "test-awacs".to_owned(),
-        snapshot_identity: token.to_vec(),
-        lineage_token: token.to_vec(),
+) -> crate::protos::local_working_copy::AwacsSnapshotBaseline {
+    crate::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: vec![1; 16],
+        subvolume_uuid: token.to_vec(),
+        continuity_token: token.to_vec(),
         retention_token: token.to_vec(),
-        root_identity: Vec::new(),
         interpretation_input_fingerprint: input_fingerprint.to_vec(),
     }
 }
@@ -1081,15 +1064,14 @@ pub struct TreeState {
     journal_generation: u64,
     pending_tree: Option<MergedTree>,
     pending_sparse_patterns: Option<Vec<RepoPathBuf>>,
-    baseline: Option<crate::protos::local_working_copy::BaselineSnapshot>,
-    pending_baseline: Option<crate::protos::local_working_copy::BaselineSnapshot>,
+    baseline: Option<crate::protos::local_working_copy::AwacsSnapshotBaseline>,
+    pending_baseline: Option<crate::protos::local_working_copy::AwacsSnapshotBaseline>,
     transition_id: Vec<u8>,
     no_baseline_reason: String,
     mutation_kind: String,
 
-    /// The most recent backend-tagged filesystem-monitor cursor. A cursor is
-    /// valid only for the backend that created it and the semantic tree it was
-    /// persisted with.
+    /// The most recent mutable filesystem-monitor cursor. AWACS uses the
+    /// typed snapshot baseline above instead of this Watchman-shaped state.
     fsmonitor_cursor: Option<crate::protos::local_working_copy::FsmonitorCursor>,
 
     conflict_marker_style: ConflictMarkerStyle,
@@ -1141,7 +1123,7 @@ pub enum TreeStateError {
 }
 
 const WORKING_COPY_STATE_MAGIC: &[u8] = b"\0JJ-WORKING-COPY-STATE\0v1\n";
-const WORKING_COPY_STATE_FORMAT_VERSION: u32 = 1;
+const WORKING_COPY_STATE_FORMAT_VERSION: u32 = 2;
 const SQLITE_TREE_STATE_MARKER_MAGIC: &[u8] = b"\0JJ-SQLITE-TREE-STATE\0";
 
 fn invalid_working_copy_state(path: &Path, message: impl Into<String>) -> TreeStateError {
@@ -1216,14 +1198,11 @@ impl TreeState {
         WorkingCopyJournalStatus {
             phase,
             generation: self.journal_generation,
-            baseline_backend: self
-                .baseline
-                .as_ref()
-                .map(|baseline| baseline.backend_kind.clone()),
+            baseline_backend: self.baseline.as_ref().map(|_| "awacs".to_owned()),
             baseline_snapshot_identity: self
                 .baseline
                 .as_ref()
-                .map(|baseline| baseline.snapshot_identity.clone()),
+                .map(|baseline| baseline.subvolume_uuid.clone()),
             baseline_retention: self.baseline.as_ref().map(|baseline| {
                 if baseline.retention_token.is_empty() {
                     "best-effort"
@@ -1341,13 +1320,13 @@ impl TreeState {
                     "clean baseline is missing retained snapshot identity",
                 ));
             };
-            if self.fsmonitor_cursor.is_none()
-                || baseline.backend_kind.is_empty()
-                || baseline.snapshot_identity.is_empty()
+            if baseline.filesystem_uuid.len() != 16
+                || baseline.subvolume_uuid.len() != 16
+                || baseline.continuity_token.is_empty()
             {
                 return Err(invalid_working_copy_state(
                     state_path,
-                    "clean baseline is missing cursor or snapshot identity",
+                    "clean baseline is missing AWACS snapshot identity or continuity token",
                 ));
             }
         }
@@ -1719,7 +1698,6 @@ impl TreeState {
         use crate::protos::local_working_copy::fsmonitor_cursor::Cursor;
         match self.fsmonitor_cursor.as_ref()?.cursor.as_ref()? {
             Cursor::Watchman(clock) => Some(clock),
-            Cursor::Awacs(_) => None,
         }
     }
 
@@ -1746,9 +1724,9 @@ impl TreeState {
     fn publish_scan_baseline(
         &mut self,
         cursor: Option<crate::protos::local_working_copy::FsmonitorCursor>,
-        baseline: Option<crate::protos::local_working_copy::BaselineSnapshot>,
+        baseline: Option<crate::protos::local_working_copy::AwacsSnapshotBaseline>,
     ) {
-        if cursor.is_some() && baseline.is_some() {
+        if baseline.is_some() {
             self.fsmonitor_cursor = cursor;
             self.baseline = baseline;
             self.pending_baseline = None;
@@ -1803,35 +1781,28 @@ impl TreeState {
             (FsmonitorSettings::Watchman(_), Some(cursor)) => {
                 matches!(cursor.cursor, Some(Cursor::Watchman(_)))
             }
-            (FsmonitorSettings::Awacs(_), Some(cursor)) => {
-                matches!(cursor.cursor, Some(Cursor::Awacs(_)))
-            }
-            (FsmonitorSettings::TestAwacs { .. }, Some(cursor)) => {
-                matches!(cursor.cursor, Some(Cursor::Awacs(_)))
-            }
-            (FsmonitorSettings::Test { .. } | FsmonitorSettings::None, Some(_)) => false,
+            (
+                FsmonitorSettings::Awacs(_)
+                | FsmonitorSettings::TestAwacs { .. }
+                | FsmonitorSettings::Test { .. }
+                | FsmonitorSettings::None,
+                Some(_),
+            ) => false,
         }
     }
 
-    fn awacs_cursor_matches_input(&self, input_fingerprint: Option<[u8; 32]>) -> bool {
-        use crate::fsmonitor::AwacsInputFingerprintV1;
-        use crate::protos::local_working_copy::fsmonitor_cursor::Cursor;
-
+    fn awacs_baseline_matches_input(&self, input_fingerprint: Option<[u8; 32]>) -> bool {
         if !matches!(
             self.fsmonitor_settings,
             FsmonitorSettings::Awacs(_) | FsmonitorSettings::TestAwacs { .. }
         ) {
             return true;
         }
-        let Some(cursor) = self.fsmonitor_cursor.as_ref() else {
+        let Some(baseline) = self.baseline.as_ref() else {
             return true;
         };
-        let Some(Cursor::Awacs(cursor)) = cursor.cursor.as_ref() else {
-            // Backend mismatches are handled by cursor_matches_settings().
-            return true;
-        };
-        cursor.input_fingerprint_version == AwacsInputFingerprintV1::VERSION
-            && input_fingerprint.is_some_and(|fingerprint| cursor.input_fingerprint == fingerprint)
+        input_fingerprint
+            .is_some_and(|fingerprint| baseline.interpretation_input_fingerprint == fingerprint)
     }
 
     #[cfg(feature = "watchman")]
@@ -1992,7 +1963,7 @@ impl TreeState {
         if !self.cursor_matches_settings() {
             is_dirty |= self.clear_fsmonitor_cursor();
         }
-        if !self.awacs_cursor_matches_input(*awacs_input_fingerprint) {
+        if !self.awacs_baseline_matches_input(*awacs_input_fingerprint) {
             is_dirty |= self.clear_fsmonitor_cursor();
         }
         let SnapshotScan {
@@ -2199,13 +2170,10 @@ impl TreeState {
                 let input_fingerprint = awacs_input_fingerprint.unwrap_or([0; 32]);
                 (
                     scan_root.clone(),
-                    Some(awacs_cursor(cursor.clone(), input_fingerprint)),
+                    None,
                     if self.journal_phase
                         == crate::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline
-                        && self
-                            .baseline
-                            .as_ref()
-                            .is_some_and(|baseline| baseline.backend_kind == "test-awacs")
+                        && self.baseline.is_some()
                     {
                         changed_files.clone()
                     } else {
@@ -2219,8 +2187,6 @@ impl TreeState {
             }
             #[cfg(all(feature = "awacs", unix))]
             FsmonitorSettings::Awacs(config) => {
-                use crate::protos::local_working_copy::fsmonitor_cursor::Cursor;
-
                 let client = if let Some(client) = &config.client {
                     client.clone()
                 } else {
@@ -2242,28 +2208,34 @@ impl TreeState {
                         err: "AWACS input fingerprint was not provided".into(),
                     });
                 };
-                // A cursor is reusable only when the same durable record
-                // also binds it to X. Legacy cursors and NoBaseline
-                // records must request a fresh full cut.
-                let previous_cursor = (self.journal_phase
+                // A baseline is reusable only when the durable journal binds
+                // an exact AWACS snapshot to the current semantic tree.
+                let previous_baseline = (self.journal_phase
                     == crate::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline
-                    && self
-                        .baseline
-                        .as_ref()
-                        .is_some_and(|baseline| baseline.backend_kind == "awacs"))
-                .then(|| {
-                    self.fsmonitor_cursor
-                        .as_ref()
-                        .and_then(|cursor| match cursor.cursor.as_ref() {
-                            Some(Cursor::Awacs(cursor)) => Some(cursor.opaque_token.clone()),
-                            _ => None,
-                        })
-                })
-                .flatten();
-                let can_use_delta = previous_cursor.is_some();
+                    && self.baseline.is_some())
+                .then(|| self.baseline.as_ref())
+                .flatten()
+                .map(|baseline| btrfs_awacs::scan::SnapshotBaseline {
+                    identity: btrfs_awacs::scan::SnapshotIdentity {
+                        filesystem_uuid: baseline
+                            .filesystem_uuid
+                            .as_slice()
+                            .try_into()
+                            .expect("validated AWACS filesystem UUID"),
+                        subvolume_uuid: baseline
+                            .subvolume_uuid
+                            .as_slice()
+                            .try_into()
+                            .expect("validated AWACS subvolume UUID"),
+                        read_only: true,
+                    },
+                    continuity_token: baseline.continuity_token.clone(),
+                    retention_token: baseline.retention_token.clone(),
+                });
+                let can_use_delta = previous_baseline.is_some();
                 let request = btrfs_awacs::scan::BeginScanRequest {
                     live_root: self.working_copy_path.clone(),
-                    previous_cursor,
+                    previous_baseline,
                 };
                 let mut client = client.lock().map_err(|_| SnapshotError::Other {
                     message: "Failed to begin AWACS snapshot scan".to_string(),
@@ -2290,9 +2262,9 @@ impl TreeState {
                 }
                 let scan_root =
                     PathBuf::from(format!("/proc/self/fd/{}", lease.scan_root().as_raw_fd()));
-                // AWACS authenticates the previous cursor and returns
+                // AWACS authenticates the previous baseline and returns
                 // Full whenever that retained boundary was pruned or
-                // cannot be proven. Thus the cursor is a safe
+                // cannot be proven. Thus the baseline is a safe
                 // best-effort A binding even though v1 does not offer a
                 // hard client-owned retention pin.
                 let (changed_files, changed_prefixes) = if !can_use_delta {
@@ -2324,22 +2296,20 @@ impl TreeState {
                         ),
                     }
                 };
-                let cursor_token = lease.cursor.clone();
-                let baseline = crate::protos::local_working_copy::BaselineSnapshot {
-                    backend_kind: "awacs".to_owned(),
-                    snapshot_identity: lease.identity.subvolume_uuid.to_vec(),
-                    lineage_token: cursor_token.clone(),
+                let baseline = crate::protos::local_working_copy::AwacsSnapshotBaseline {
+                    filesystem_uuid: lease.next_baseline.identity.filesystem_uuid.to_vec(),
+                    subvolume_uuid: lease.next_baseline.identity.subvolume_uuid.to_vec(),
+                    continuity_token: lease.next_baseline.continuity_token.clone(),
                     // AWACS v1 authenticates this lineage token and returns
                     // Full when A is gone, but it does not expose a durable
                     // client-owned pin/handoff token yet.
-                    retention_token: Vec::new(),
-                    root_identity: lease.identity.filesystem_uuid.to_vec(),
+                    retention_token: lease.next_baseline.retention_token.clone(),
                     interpretation_input_fingerprint: awacs_input_fingerprint.to_vec(),
                 };
                 let completion = PendingScan::new(Box::new(AwacsScanSession::new(lease)));
                 (
                     scan_root,
-                    Some(awacs_cursor(cursor_token, awacs_input_fingerprint)),
+                    None,
                     changed_files,
                     changed_prefixes,
                     Some(completion),

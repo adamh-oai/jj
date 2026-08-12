@@ -46,16 +46,10 @@ message WatchmanClock {
 }
 
 message FsmonitorCursor {
+  reserved 2;
   oneof cursor {
     WatchmanClock watchman = 1;
-    AwacsCursor awacs = 2;
   }
-}
-
-message AwacsCursor {
-  bytes opaque_token = 1;
-  uint32 input_fingerprint_version = 2;
-  bytes input_fingerprint = 3;
 }
 
 message Checkout {
@@ -84,11 +78,8 @@ message WorkingCopyState {
   repeated bytes tree_ids = 4;
   repeated string conflict_labels = 5;
   SparsePatterns sparse_patterns = 6;
-  // Present only for a backend that can prove an authoritative physical
-  // baseline, or force Full when that baseline was pruned. Ordinary
-  // mutable-filesystem scans leave this unset. A best-effort backend may use
-  // this together with a lineage token even when it cannot hard-pin the
-  // baseline.
+  // Present only for Watchman-style mutable-filesystem monitors. AWACS
+  // baselines are typed snapshot state below, not event-stream cursors.
   FsmonitorCursor fsmonitor_cursor = 7;
   uint64 generation = 8;
   WorkingCopyStatePhase phase = 9;
@@ -96,27 +87,27 @@ message WorkingCopyState {
   // are populated only for PendingMaterialization.
   repeated bytes pending_tree_ids = 10;
   repeated string pending_conflict_labels = 11;
-  // Immutable snapshot identity for CleanBaseline. This is absent for
-  // NoBaseline and for backends without an authoritative delta contract.
-  BaselineSnapshot baseline = 12;
+  // Exact AWACS snapshot paired with the semantic tree for CleanBaseline.
+  // This is absent for NoBaseline and ordinary mutable-filesystem scans.
+  AwacsSnapshotBaseline baseline = 12;
   // Candidate retained snapshot while a baseline promotion is in flight.
-  BaselineSnapshot pending_baseline = 13;
+  AwacsSnapshotBaseline pending_baseline = 13;
   bytes transition_id = 14;
   string no_baseline_reason = 15;
   string mutation_kind = 16;
   repeated string pending_sparse_patterns = 17;
 }
 
-message BaselineSnapshot {
-  string backend_kind = 1;
-  bytes snapshot_identity = 2;
-  // Token used to ask the backend to prove continuity from this baseline.
-  bytes lineage_token = 3;
-  // Non-empty only when the backend has durably hard-pinned this baseline.
-  // Best-effort prove-or-Full baselines leave this empty.
+message AwacsSnapshotBaseline {
+  // Identity of the exact immutable Btrfs snapshot paired with the tree.
+  bytes filesystem_uuid = 1;
+  bytes subvolume_uuid = 2;
+  // Authenticated AWACS capability proving continuity from this snapshot.
+  bytes continuity_token = 3;
+  // Non-empty only once AWACS exposes a durable client-owned retention pin.
   bytes retention_token = 4;
-  bytes root_identity = 5;
-  bytes interpretation_input_fingerprint = 6;
+  // JJ-owned inputs which affect interpretation of the snapshot contents.
+  bytes interpretation_input_fingerprint = 5;
 }
 
 enum WorkingCopyStatePhase {

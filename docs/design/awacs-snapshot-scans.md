@@ -200,7 +200,7 @@ not a Watchman extension.
 ### Renew scan
 
 ~~~
-ScanLease::renew()
+SnapshotLease::renew()
 ~~~
 
 Jujutsu renews a lease only while it is actively scanning or waiting to
@@ -210,7 +210,7 @@ before any new clean baseline is saved.
 ### Promote baseline
 
 ~~~
-ScanLease::promote_baseline(transition_id)
+SnapshotLease::promote_baseline(transition_id)
 ~~~
 
 Promotion durably retains candidate B as a committed baseline while A remains
@@ -221,7 +221,7 @@ leave an orphan B pin, but must not leave a journal referring to a pruned B.
 ### Finish scan
 
 ~~~
-ScanLease::finish(outcome = Committed | Aborted)
+SnapshotLease::finish(outcome = Committed | Aborted)
 ~~~
 
 Committed means Jujutsu durably published its clean tree-Y↔B journal binding.
@@ -230,13 +230,13 @@ B because the next command depends on it. Aborted means no clean B binding was
 published; AWACS may reclaim an unpromoted B after a bounded lease timeout.
 Finish is idempotent so a retry after a lost response is safe.
 
-The initial compact-journal implementation also supports the existing AWACS v1
-cursor contract as a safe best-effort mode: a `CleanBaseline` local journal
-may send the authenticated prior cursor, and AWACS must return `Full`
-whenever that prior boundary is no longer retained or cannot be proved. In
-this mode “clean” means “authoritative if the server can still prove the
-cursor,” not “hard-pinned.” It can deliver incremental scans while retention
-happens to keep A alive, but it is not a substitute for the durable
+The initial compact-journal implementation also supports AWACS v1 as a safe
+best-effort mode: a `CleanBaseline` local journal persists a typed snapshot
+baseline whose continuity token is authenticated by AWACS, and AWACS must
+return `Full` whenever that prior snapshot is no longer retained or cannot be
+proved. In this mode “clean” means “authoritative if the server can still
+prove the baseline,” not “hard-pinned.” It can deliver incremental scans while
+retention happens to keep A alive, but it is not a substitute for the durable
 promotion/pin protocol above. The stronger `PendingBaselineCommit`
 transition remains the target for guaranteed retention and crash recovery.
 

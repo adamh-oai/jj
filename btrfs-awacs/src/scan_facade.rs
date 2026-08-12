@@ -5,7 +5,7 @@ use crate::facade::{FacadeService, PreparedQueryResult};
 use crate::manager::{Permissions, Principal, PERMISSION_CUT, PERMISSION_READ};
 use crate::scan::{
     BeginScanRequest, Invalidation, ScanError, ScanErrorKind, ScanOutcome, ScanRequestHandler,
-    ServerScanLease, SnapshotIdentity,
+    ServerSnapshotLease, SnapshotBaseline, SnapshotIdentity,
 };
 use crate::service::InitializeOptions;
 use std::collections::HashMap;
@@ -25,9 +25,9 @@ const TEST_SHORT_SCAN_TTL_NS: i64 = 300_000_000;
 
 /// Durable direct-scan handler sharing one root-aware snapshot facade.
 ///
-/// Direct cursors wrap the existing authenticated cut claims under a distinct
-/// authenticated scan domain. Exact replay is accepted only when the facade
-/// can retain that same cut sequence and target snapshot UUID.
+/// Direct continuity tokens wrap the existing authenticated cut claims under a
+/// distinct scan domain. Exact replay is accepted only when the facade can
+/// retain that same cut sequence and target snapshot UUID.
 pub struct FacadeScanHandler {
     facade: Arc<Mutex<FacadeService>>,
     precision_marker_directory: Option<PathBuf>,
@@ -246,7 +246,7 @@ impl FacadeScanHandler {
 }
 
 impl ScanRequestHandler for FacadeScanHandler {
-    fn begin_scan(&mut self, request: BeginScanRequest) -> Result<ServerScanLease, ScanError> {
+    fn begin_scan(&mut self, request: BeginScanRequest) -> Result<ServerSnapshotLease, ScanError> {
         let now_ns = unix_time_ns()?;
         let ttl_ns = self.scan_ttl_ns();
         self.expire_sessions(now_ns)?;
@@ -261,7 +261,7 @@ impl ScanRequestHandler for FacadeScanHandler {
         let prepared = facade
             .prepare_scan_query(
                 watch_id,
-                request.previous_cursor.as_deref(),
+                request.previous_baseline.as_ref(),
                 self.requester_uid,
                 self.requester_gid,
                 now_ns,
@@ -305,11 +305,11 @@ impl ScanRequestHandler for FacadeScanHandler {
         }
         let session_id = Uuid::new_v4().as_bytes().to_vec();
         let invalidation = direct_invalidation(&prepared.result.projection);
-        let cursor = match facade.direct_scan_cursor(&prepared) {
-            Ok(cursor) => cursor,
+        let continuity_token = match facade.direct_scan_continuity_token(&prepared) {
+            Ok(token) => token,
             Err(err) => {
                 let _ = facade.finish_query_response(prepared);
-                return Err(other(format!("encode AWACS direct cursor: {err}")));
+                return Err(other(format!("encode AWACS continuity token: {err}")));
             }
         };
         #[cfg(debug_assertions)]
@@ -327,12 +327,17 @@ impl ScanRequestHandler for FacadeScanHandler {
                 expires_ns,
             },
         );
-        Ok(ServerScanLease {
+        Ok(ServerSnapshotLease {
             session_id,
-            cursor,
+            next_baseline: SnapshotBaseline {
+                identity,
+                continuity_token,
+                // v1 proves retained history on demand but does not yet
+                // expose a durable client-owned retention capability.
+                retention_token: Vec::new(),
+            },
             invalidation,
             expires_boottime_ns: crate::scan::boottime_now_ns().saturating_add(ttl_ns as u64),
-            identity,
             scan_root,
         })
     }

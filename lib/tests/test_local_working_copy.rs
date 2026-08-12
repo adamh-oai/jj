@@ -140,7 +140,7 @@ impl btrfs_awacs::scan::ScanSession for FakeAwacsSession {
 struct FakeAwacsClient {
     scan_root: PathBuf,
     outcomes: Arc<Mutex<Vec<btrfs_awacs::scan::ScanOutcome>>>,
-    requests: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+    requests: Arc<Mutex<Vec<Option<btrfs_awacs::scan::SnapshotBaseline>>>>,
     valid_scan_root: bool,
 }
 
@@ -149,19 +149,22 @@ impl btrfs_awacs::scan::ScanClient for FakeAwacsClient {
     fn begin_scan(
         &mut self,
         request: &btrfs_awacs::scan::BeginScanRequest,
-    ) -> Result<btrfs_awacs::scan::ScanLease, btrfs_awacs::scan::ScanError> {
+    ) -> Result<btrfs_awacs::scan::SnapshotLease, btrfs_awacs::scan::ScanError> {
         self.requests
             .lock()
             .unwrap()
-            .push(request.previous_cursor.clone());
-        Ok(btrfs_awacs::scan::ScanLease::new(
-            b"cursor".to_vec(),
-            btrfs_awacs::scan::Invalidation::Prefixes(vec![b"dir".to_vec()]),
-            btrfs_awacs::scan::SnapshotIdentity {
-                filesystem_uuid: [1; 16],
-                subvolume_uuid: [2; 16],
-                read_only: true,
+            .push(request.previous_baseline.clone());
+        Ok(btrfs_awacs::scan::SnapshotLease::new(
+            btrfs_awacs::scan::SnapshotBaseline {
+                identity: btrfs_awacs::scan::SnapshotIdentity {
+                    filesystem_uuid: [1; 16],
+                    subvolume_uuid: [2; 16],
+                    read_only: true,
+                },
+                continuity_token: b"baseline".to_vec(),
+                retention_token: Vec::new(),
             },
+            btrfs_awacs::scan::Invalidation::Prefixes(vec![b"dir".to_vec()]),
             u64::MAX,
             File::open(&self.scan_root).unwrap(),
             Box::new(FakeAwacsSession {
@@ -172,7 +175,7 @@ impl btrfs_awacs::scan::ScanClient for FakeAwacsClient {
 
     fn validate_scan_root(
         &self,
-        _lease: &btrfs_awacs::scan::ScanLease,
+        _lease: &btrfs_awacs::scan::SnapshotLease,
     ) -> Result<(), btrfs_awacs::scan::ScanError> {
         if self.valid_scan_root {
             Ok(())
@@ -258,24 +261,12 @@ fn seed_test_awacs_baseline(
 ) -> io::Result<()> {
     let mut journal = read_compact_working_copy_state(state_path)?;
     journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
-    journal.baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
-        backend_kind: "test-awacs".to_owned(),
-        snapshot_identity: cursor.to_vec(),
-        lineage_token: cursor.to_vec(),
+    journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: vec![1; 16],
+        subvolume_uuid: cursor.to_vec(),
+        continuity_token: cursor.to_vec(),
         retention_token: cursor.to_vec(),
-        root_identity: Vec::new(),
         interpretation_input_fingerprint: input_fingerprint.to_vec(),
-    });
-    journal.fsmonitor_cursor = Some(jj_lib::protos::local_working_copy::FsmonitorCursor {
-        cursor: Some(
-            jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Awacs(
-                jj_lib::protos::local_working_copy::AwacsCursor {
-                    opaque_token: cursor.to_vec(),
-                    input_fingerprint_version: 1,
-                    input_fingerprint: input_fingerprint.to_vec(),
-                },
-            ),
-        ),
     });
     write_compact_working_copy_state(state_path, &journal)
 }
@@ -3452,25 +3443,18 @@ fn test_compact_working_copy_state_recovers_pending_materialization() -> TestRes
         .collect();
     journal.pending_conflict_labels = intended_tree.labels().as_slice().to_owned();
     journal.pending_sparse_patterns = vec!["new".to_owned()];
-    journal.fsmonitor_cursor = Some(jj_lib::protos::local_working_copy::FsmonitorCursor {
-        cursor: Some(
-            jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Awacs(
-                jj_lib::protos::local_working_copy::AwacsCursor {
-                    opaque_token: b"old-baseline".to_vec(),
-                    input_fingerprint_version: 1,
-                    input_fingerprint: vec![3; 32],
-                },
-            ),
-        ),
-    });
-    journal.baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
-        backend_kind: "test-awacs".to_owned(),
-        snapshot_identity: b"old-baseline".to_vec(),
+    journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: vec![1; 16],
+        subvolume_uuid: b"old-baseline".to_vec(),
+        continuity_token: b"old-baseline".to_vec(),
+        interpretation_input_fingerprint: vec![3; 32],
         ..Default::default()
     });
-    journal.pending_baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
-        backend_kind: "test-awacs".to_owned(),
-        snapshot_identity: b"candidate".to_vec(),
+    journal.pending_baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: vec![1; 16],
+        subvolume_uuid: b"candidate".to_vec(),
+        continuity_token: b"candidate".to_vec(),
+        interpretation_input_fingerprint: vec![3; 32],
         ..Default::default()
     });
     journal.transition_id = b"interrupted-transition".to_vec();
@@ -3902,25 +3886,13 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
     // value.
     let mut journal = read_compact_working_copy_state(&state_path)?;
     journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
-    journal.baseline = Some(jj_lib::protos::local_working_copy::BaselineSnapshot {
-        backend_kind: "awacs".to_owned(),
-        snapshot_identity: vec![2; 16],
-        lineage_token: b"cursor".to_vec(),
+    journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: vec![1; 16],
+        subvolume_uuid: vec![2; 16],
+        continuity_token: b"baseline".to_vec(),
         // Production AWACS v1 is prove-or-Full, not hard-pinned.
         retention_token: Vec::new(),
-        root_identity: vec![1; 16],
         interpretation_input_fingerprint: vec![3; 32],
-    });
-    journal.fsmonitor_cursor = Some(jj_lib::protos::local_working_copy::FsmonitorCursor {
-        cursor: Some(
-            jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Awacs(
-                jj_lib::protos::local_working_copy::AwacsCursor {
-                    opaque_token: b"cursor".to_vec(),
-                    input_fingerprint_version: 1,
-                    input_fingerprint: vec![3; 32],
-                },
-            ),
-        ),
     });
     write_compact_working_copy_state(&state_path, &journal)?;
     testutils::write_working_copy_file(&scan_root, path, "leased again\n");
@@ -3938,7 +3910,18 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
     assert_tree_eq!(*reloaded_tree_state.current_tree(), expected_tree);
     assert_eq!(
         requests.lock().unwrap().as_slice(),
-        &[None, Some(b"cursor".to_vec())]
+        &[
+            None,
+            Some(btrfs_awacs::scan::SnapshotBaseline {
+                identity: btrfs_awacs::scan::SnapshotIdentity {
+                    filesystem_uuid: [1; 16],
+                    subvolume_uuid: [2; 16],
+                    read_only: true,
+                },
+                continuity_token: b"baseline".to_vec(),
+                retention_token: Vec::new(),
+            }),
+        ]
     );
     assert_eq!(
         outcomes.lock().unwrap().as_slice(),
@@ -4002,11 +3985,7 @@ fn test_awacs_rejected_scan_root_aborts_accepted_lease() -> TestResult {
 
 #[test]
 #[cfg(all(feature = "awacs", unix))]
-fn test_awacs_cursor_input_mismatch_forces_full_begin() -> TestResult {
-    use jj_lib::protos::local_working_copy::AwacsCursor;
-    use jj_lib::protos::local_working_copy::FsmonitorCursor;
-    use jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor;
-
+fn test_awacs_baseline_input_mismatch_forces_full_begin() -> TestResult {
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
     let workspace_root = test_repo.env.root().join("workspace");
@@ -4016,16 +3995,23 @@ fn test_awacs_cursor_input_mismatch_forces_full_begin() -> TestResult {
     std::fs::create_dir(&scan_root)?;
     std::fs::create_dir(&state_path)?;
     let tree_state_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
-    let empty_tree = repo.store().empty_merged_tree();
-    write_legacy_tree_state(&state_path, &empty_tree, |proto| {
-        proto.fsmonitor_cursor = Some(FsmonitorCursor {
-            cursor: Some(Cursor::Awacs(AwacsCursor {
-                opaque_token: b"stale-cursor".to_vec(),
-                input_fingerprint_version: 1,
-                input_fingerprint: vec![9; 32],
-            })),
-        });
-    })?;
+    let mut tree_state = TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &tree_state_settings,
+    )?;
+    tree_state.save()?;
+    let mut journal = read_compact_working_copy_state(&state_path)?;
+    journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
+    journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: vec![1; 16],
+        subvolume_uuid: vec![2; 16],
+        continuity_token: b"stale-baseline".to_vec(),
+        retention_token: Vec::new(),
+        interpretation_input_fingerprint: vec![9; 32],
+    });
+    write_compact_working_copy_state(&state_path, &journal)?;
 
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let requests = Arc::new(Mutex::new(Vec::new()));
