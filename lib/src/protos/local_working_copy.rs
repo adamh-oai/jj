@@ -43,7 +43,7 @@ pub mod watchman_clock {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct FsmonitorCursor {
-    #[prost(oneof = "fsmonitor_cursor::Cursor", tags = "1, 2")]
+    #[prost(oneof = "fsmonitor_cursor::Cursor", tags = "1")]
     pub cursor: ::core::option::Option<fsmonitor_cursor::Cursor>,
 }
 /// Nested message and enum types in `FsmonitorCursor`.
@@ -52,18 +52,7 @@ pub mod fsmonitor_cursor {
     pub enum Cursor {
         #[prost(message, tag = "1")]
         Watchman(super::WatchmanClock),
-        #[prost(message, tag = "2")]
-        Awacs(super::AwacsCursor),
     }
-}
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct AwacsCursor {
-    #[prost(bytes = "vec", tag = "1")]
-    pub opaque_token: ::prost::alloc::vec::Vec<u8>,
-    #[prost(uint32, tag = "2")]
-    pub input_fingerprint_version: u32,
-    #[prost(bytes = "vec", tag = "3")]
-    pub input_fingerprint: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Checkout {
@@ -99,11 +88,8 @@ pub struct WorkingCopyState {
     pub conflict_labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, optional, tag = "6")]
     pub sparse_patterns: ::core::option::Option<SparsePatterns>,
-    /// Present only for a backend that can prove an authoritative physical
-    /// baseline, or force Full when that baseline was pruned. Ordinary
-    /// mutable-filesystem scans leave this unset. A best-effort backend may use
-    /// this together with a lineage token even when it cannot hard-pin the
-    /// baseline.
+    /// Present only for Watchman-style mutable-filesystem monitors. AWACS
+    /// baselines are typed snapshot state below, not event-stream cursors.
     #[prost(message, optional, tag = "7")]
     pub fsmonitor_cursor: ::core::option::Option<FsmonitorCursor>,
     #[prost(uint64, tag = "8")]
@@ -118,13 +104,13 @@ pub struct WorkingCopyState {
     pub pending_conflict_labels: ::prost::alloc::vec::Vec<
         ::prost::alloc::string::String,
     >,
-    /// Immutable snapshot identity for CleanBaseline. This is absent for
-    /// NoBaseline and for backends without an authoritative delta contract.
+    /// Exact AWACS snapshot paired with the semantic tree for CleanBaseline.
+    /// This is absent for NoBaseline and ordinary mutable-filesystem scans.
     #[prost(message, optional, tag = "12")]
-    pub baseline: ::core::option::Option<BaselineSnapshot>,
+    pub baseline: ::core::option::Option<AwacsSnapshotBaseline>,
     /// Candidate retained snapshot while a baseline promotion is in flight.
     #[prost(message, optional, tag = "13")]
-    pub pending_baseline: ::core::option::Option<BaselineSnapshot>,
+    pub pending_baseline: ::core::option::Option<AwacsSnapshotBaseline>,
     #[prost(bytes = "vec", tag = "14")]
     pub transition_id: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "15")]
@@ -137,21 +123,20 @@ pub struct WorkingCopyState {
     >,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct BaselineSnapshot {
-    #[prost(string, tag = "1")]
-    pub backend_kind: ::prost::alloc::string::String,
+pub struct AwacsSnapshotBaseline {
+    /// Identity of the exact immutable Btrfs snapshot paired with the tree.
+    #[prost(bytes = "vec", tag = "1")]
+    pub filesystem_uuid: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
-    pub snapshot_identity: ::prost::alloc::vec::Vec<u8>,
-    /// Token used to ask the backend to prove continuity from this baseline.
+    pub subvolume_uuid: ::prost::alloc::vec::Vec<u8>,
+    /// Authenticated AWACS capability proving continuity from this snapshot.
     #[prost(bytes = "vec", tag = "3")]
-    pub lineage_token: ::prost::alloc::vec::Vec<u8>,
-    /// Non-empty only when the backend has durably hard-pinned this baseline.
-    /// Best-effort prove-or-Full baselines leave this empty.
+    pub continuity_token: ::prost::alloc::vec::Vec<u8>,
+    /// Non-empty only once AWACS exposes a durable client-owned retention pin.
     #[prost(bytes = "vec", tag = "4")]
     pub retention_token: ::prost::alloc::vec::Vec<u8>,
+    /// JJ-owned inputs which affect interpretation of the snapshot contents.
     #[prost(bytes = "vec", tag = "5")]
-    pub root_identity: ::prost::alloc::vec::Vec<u8>,
-    #[prost(bytes = "vec", tag = "6")]
     pub interpretation_input_fingerprint: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
