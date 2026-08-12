@@ -76,6 +76,16 @@ pub struct Checkout {
     #[prost(string, tag = "3")]
     pub workspace_name: ::prost::alloc::string::String,
 }
+/// Durable intent written before a checkout starts. If this file survives a
+/// process failure, the next load treats this tree as the semantic target but
+/// forces a full filesystem reconciliation before trusting it as clean.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PendingCheckout {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub tree_ids: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    #[prost(string, repeated, tag = "2")]
+    pub conflict_labels: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum FileType {

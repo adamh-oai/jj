@@ -23,6 +23,8 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::to_toml_value;
+#[cfg(unix)]
+use crate::test_workspaces::install_fake_btrfs;
 
 fn set_up_non_empty_git_repo(git_repo: &gix::Repository) {
     set_up_git_repo_with_file(git_repo, "file");
@@ -38,6 +40,101 @@ fn set_up_git_repo_with_file(git_repo: &gix::Repository, filename: &str) {
         &[],
     );
     git::set_symbolic_reference(git_repo, "HEAD", "refs/heads/main");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_git_clone_does_not_create_btrfs_subvolume() {
+    let test_env = TestEnvironment::default();
+    let root_dir = test_env.work_dir("");
+    let git_repo = git::init(test_env.env_root().join("source"));
+    set_up_non_empty_git_repo(&git_repo);
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "subvolume" ] && [ "$2" = "create" ]; then
+    mkdir "$3" || exit
+    touch "${3}.btrfs-created"
+    exit $?
+fi
+exit 1
+"#,
+    );
+
+    root_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["git", "clone", "source", "nested/clone"])
+        })
+        .success();
+
+    let clone_dir = test_env.work_dir("nested/clone");
+    assert!(clone_dir.root().join(".jj").is_dir());
+    assert!(clone_dir.root().join("file").is_file());
+    assert!(!clone_dir.root().with_extension("btrfs-created").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_git_clone_ignores_btrfs_tool() {
+    let test_env = TestEnvironment::default();
+    let root_dir = test_env.work_dir("");
+    let git_repo = git::init(test_env.env_root().join("source"));
+    set_up_non_empty_git_repo(&git_repo);
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    exit 0
+fi
+echo 'Operation not permitted' >&2
+exit 1
+"#,
+    );
+
+    let output = root_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .args(["git", "clone", "source", "clone"])
+    });
+    assert!(output.status.success(), "{output}");
+    assert!(test_env.env_root().join("clone").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_git_clone_cleans_up_directory_after_failure() {
+    let test_env = TestEnvironment::default();
+    let root_dir = test_env.work_dir("");
+    root_dir.create_dir("bad");
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "subvolume" ] && [ "$2" = "create" ]; then
+    mkdir "$3"
+    exit $?
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    touch "${3}.btrfs-deleted"
+    rm -rf "$3"
+    exit $?
+fi
+exit 1
+"#,
+    );
+
+    let output = root_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .args(["git", "clone", "bad", "clone"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(!test_env.env_root().join("clone").exists());
+    assert!(
+        !test_env
+            .env_root()
+            .join("clone")
+            .with_extension("btrfs-deleted")
+            .exists()
+    );
 }
 
 #[test]
@@ -1106,12 +1203,10 @@ fn test_git_clone_malformed() {
     // The cloned workspace isn't usable.
     let output = clone_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Error: The working copy is stale (not updated since operation 68cac63e1c80).
-    Hint: Run `jj workspace update-stale` to update it.
-    See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
+    The working copy has no changes.
+    Working copy  (@) : sqpuoqvx 2f428621 (empty) (no description set)
+    Parent commit (@-): tllmtmvy 9e78041b main | message
     [EOF]
-    [exit status: 1]
     ");
 
     // The error can be somehow recovered.
@@ -1119,10 +1214,8 @@ fn test_git_clone_malformed() {
     let output = clone_dir.run_jj(["workspace", "update-stale"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Internal error: Failed to check out commit 2f4286212884d472a0b2013a961b695a144ac65c
-    Caused by: Reserved path component .jj in $TEST_ENV/clone/.jj
+    Attempted recovery, but the working copy is not stale.
     [EOF]
-    [exit status: 255]
     ");
     let output = clone_dir.run_jj(["new", "root()", "--ignore-working-copy"]);
     insta::assert_snapshot!(output, @"");

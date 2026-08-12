@@ -1123,7 +1123,82 @@ impl TreeState {
 
         let mut wc = Self::empty(store, working_copy_path, state_path, tree_state_settings);
         wc.read(&tree_state_path, file)?;
+        if let Some(pending_tree) = wc.read_pending_checkout()? {
+            // The previous process committed its checkout intent but did not
+            // clear it. Trust neither the old tree-state cache nor its
+            // Watchman clock: use the intended semantic tree as the baseline
+            // for a mandatory full physical reconciliation.
+            wc.tree = pending_tree;
+            wc.reset_watchman();
+        }
         Ok(wc)
+    }
+
+    fn pending_checkout_path(&self) -> PathBuf {
+        self.state_path.join("pending_checkout")
+    }
+
+    fn read_pending_checkout(&self) -> Result<Option<MergedTree>, TreeStateError> {
+        let path = self.pending_checkout_path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(TreeStateError::ReadTreeState { path, source }),
+        };
+        let proto = crate::protos::local_working_copy::PendingCheckout::decode(bytes.as_slice())
+            .map_err(|source| TreeStateError::DecodeTreeState {
+                path: path.clone(),
+                source,
+            })?;
+        if proto.tree_ids.is_empty() || proto.tree_ids.len() % 2 == 0 {
+            return Err(TreeStateError::ReadTreeState {
+                path,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid pending checkout tree shape",
+                ),
+            });
+        }
+        let tree_ids_builder: MergeBuilder<TreeId> =
+            proto.tree_ids.into_iter().map(TreeId::new).collect();
+        Ok(Some(MergedTree::new(
+            self.store.clone(),
+            tree_ids_builder.build(),
+            ConflictLabels::from_vec(proto.conflict_labels),
+        )))
+    }
+
+    fn write_pending_checkout(&self, tree: &MergedTree) -> Result<(), TreeStateError> {
+        let path = self.pending_checkout_path();
+        let proto = crate::protos::local_working_copy::PendingCheckout {
+            tree_ids: tree.tree_ids().iter().map(|id| id.to_bytes()).collect(),
+            conflict_labels: tree.labels().as_slice().to_owned(),
+        };
+        let wrap_write_err = |source| TreeStateError::WriteTreeState {
+            path: path.clone(),
+            source,
+        };
+        let mut temp_file = NamedTempFile::new_in(&self.state_path).map_err(wrap_write_err)?;
+        temp_file
+            .as_file_mut()
+            .write_all(&proto.encode_to_vec())
+            .map_err(wrap_write_err)?;
+        temp_file.as_file().sync_data().map_err(wrap_write_err)?;
+        persist_temp_file(temp_file, &path).map_err(|source| TreeStateError::PersistTreeState {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    fn clear_pending_checkout(&self) -> Result<(), TreeStateError> {
+        let path = self.pending_checkout_path();
+        if let Err(source) = fs::remove_file(&path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            return Err(TreeStateError::WriteTreeState { path, source });
+        }
+        Ok(())
     }
 
     fn update_own_mtime(&mut self) {
@@ -2869,8 +2944,6 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     }
 
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError> {
-        // TODO: Write a "pending_checkout" file with the new TreeId so we can
-        // continue an interrupted update if we find such a file.
         let new_tree = commit.tree();
         let tree_state = self.wc.tree_state_mut()?;
         if tree_state.tree.tree_ids_and_labels() != new_tree.tree_ids_and_labels() {
@@ -2880,6 +2953,16 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         } else {
             Ok(CheckoutStats::default())
         }
+    }
+
+    fn prepare_checkout(&mut self, commit: &Commit) -> Result<(), WorkingCopyStateError> {
+        self.wc
+            .tree_state()?
+            .write_pending_checkout(&commit.tree())
+            .map_err(|err| WorkingCopyStateError {
+                message: "Failed to write pending checkout".to_owned(),
+                err: Box::new(err),
+            })
     }
 
     fn rename_workspace(&mut self, new_name: WorkspaceNameBuf) {
@@ -2943,7 +3026,13 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             }
             self.wc.checkout_state.save(&self.wc.state_path)?;
         }
-        // TODO: Clear the "pending_checkout" file here.
+        self.wc
+            .tree_state()?
+            .clear_pending_checkout()
+            .map_err(|err| WorkingCopyStateError {
+                message: "Failed to clear pending checkout".to_owned(),
+                err: Box::new(err),
+            })?;
         Ok(Box::new(self.wc))
     }
 }

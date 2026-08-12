@@ -483,10 +483,7 @@ fn test_workspaces_add_ignore_working_copy() {
     insta::assert_snapshot!(output.normalize_backslash(), @r#"
     ------- stderr -------
     Created workspace in "../secondary"
-    Error: This command must be able to update the working copy.
-    Hint: Don't use --ignore-working-copy.
     [EOF]
-    [exit status: 1]
     "#);
 }
 
@@ -507,10 +504,8 @@ fn test_workspaces_add_no_integrate_operation() {
     insta::assert_snapshot!(output.normalize_backslash(), @r#"
     ------- stderr -------
     Created workspace in "../secondary"
-    Error: This command must be able to update the working copy.
-    Hint: Don't use --no-integrate-operation.
+    Operation left uncommitted because --no-integrate-operation was requested: 3fbea411d2b4
     [EOF]
-    [exit status: 1]
     "#);
 }
 

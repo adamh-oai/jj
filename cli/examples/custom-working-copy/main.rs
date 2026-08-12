@@ -267,6 +267,10 @@ impl LockedWorkingCopy for LockedConflictsWorkingCopy {
         self.inner.check_out(commit).await
     }
 
+    fn prepare_checkout(&mut self, commit: &Commit) -> Result<(), WorkingCopyStateError> {
+        self.inner.prepare_checkout(commit)
+    }
+
     fn rename_workspace(&mut self, new_name: WorkspaceNameBuf) {
         self.inner.rename_workspace(new_name);
     }

@@ -3709,6 +3709,41 @@ fn test_reset_head_detached_out_of_sync() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_reset_head_index_lock_failure_preserves_head() -> TestResult {
+    let settings = testutils::user_settings();
+    let temp_dir = testutils::new_temp_dir();
+    let workspace_root = temp_dir.path().join("repo");
+    let git_repo = testutils::git::init(&workspace_root);
+    let (_workspace, repo) =
+        Workspace::init_external_git(&settings, &workspace_root, &workspace_root.join(".git"))
+            .block_on()?;
+
+    let mut tx = repo.start_transaction();
+    let commit1 = write_random_commit(tx.repo_mut());
+    let commit2 = write_random_commit_with_parents(tx.repo_mut(), &[&commit1]);
+    let commit3 = write_random_commit_with_parents(tx.repo_mut(), &[&commit2]);
+
+    git::reset_head(tx.repo_mut(), WorkspaceName::DEFAULT, &commit2).block_on()?;
+    assert_eq!(git_repo.head_id()?.detach(), git_id(&commit1));
+
+    // Simulate another Git process, or a sandboxed linked worktree, making
+    // index.lock unavailable. The preflight reservation must fail before HEAD
+    // is moved from commit1 to commit2.
+    fs::write(git_repo.index_path().with_extension("lock"), b"held")?;
+    assert!(
+        git::reset_head(tx.repo_mut(), WorkspaceName::DEFAULT, &commit3)
+            .block_on()
+            .is_err()
+    );
+    assert_eq!(git_repo.head_id()?.detach(), git_id(&commit1));
+    assert_eq!(
+        tx.repo().git_head(WorkspaceName::DEFAULT),
+        &RefTarget::normal(commit1.id().clone())
+    );
+    Ok(())
+}
+
 fn get_index_state(workspace_root: &Path) -> String {
     let git_repo = gix::open(workspace_root).unwrap();
     let index = git_repo.index().unwrap();

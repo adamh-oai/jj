@@ -108,6 +108,108 @@ fn test_git_colocated() -> TestResult {
 }
 
 #[test]
+fn test_git_colocated_bookmark_does_not_lock_index() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+
+    // A bookmark-only transaction does not change the first parent or tree of
+    // the working-copy commit, so it must not try to reset the Git index.
+    std::fs::write(work_dir.root().join(".git/index.lock"), b"held")?;
+    work_dir
+        .run_jj(["bookmark", "set", "-r", "@", "topic"])
+        .success();
+    work_dir.run_jj(["bookmark", "list", "topic"]).success();
+    Ok(())
+}
+
+#[test]
+fn test_git_colocated_index_lock_failure_is_atomic() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    let git_repo = git::open(work_dir.root());
+
+    work_dir.write_file("file", "old\n");
+    work_dir.run_jj(["new"]).success();
+    let old_head = git_repo.head_id()?.detach();
+    let old_operation_id = work_dir.current_operation_id();
+
+    // Before the preflight fix, jj new updated detached HEAD first and then
+    // failed while acquiring index.lock. That left Git ahead of the durable
+    // JJ operation and made the next Git import misinterpret the old files as
+    // an externally materialized checkout.
+    std::fs::write(work_dir.root().join(".git/index.lock"), b"held")?;
+    let output = work_dir.run_jj(["new"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(output.stderr.raw().contains("index"), "{output}");
+    assert_eq!(git_repo.head_id()?.detach(), old_head);
+    assert_eq!(work_dir.current_operation_id(), old_operation_id);
+    std::fs::remove_file(work_dir.root().join(".git/index.lock"))?;
+
+    // Once the actual blocker is gone, the same command succeeds without any
+    // repair or compensating import.
+    work_dir.run_jj(["new"]).success();
+    assert_ne!(git_repo.head_id()?.detach(), old_head);
+    Ok(())
+}
+
+#[test]
+fn test_git_colocated_pending_checkout_recovers_published_operation() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("file", "old\n");
+    work_dir.run_jj(["new"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "old"])
+        .success();
+    work_dir.write_file("file", "new\n");
+    work_dir.run_jj(["new"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r", "@-", "target"])
+        .success();
+    work_dir.run_jj(["edit", "old"]).success();
+    assert_eq!(work_dir.read_file("file"), b"old\n");
+
+    // This is the real transaction ordering, with one deterministic failure
+    // injected after the JJ op is published and before checkout can touch the
+    // files. The repo now says @ is target, while disk still has old.
+    let output = work_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH", "1")
+            .args(["edit", "target"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert_eq!(work_dir.read_file("file"), b"old\n");
+
+    let pending_checkout = work_dir
+        .root()
+        .join(".jj")
+        .join("working_copy")
+        .join("pending_checkout");
+    assert!(pending_checkout.exists());
+    let recorded = work_dir.run_jj(["file", "show", "-r", "@", "file", "--ignore-working-copy"]);
+    assert_eq!(recorded.stdout.raw(), "new\n");
+
+    // Loading the pending journal must force a physical reconciliation instead
+    // of trusting the intended semantic tree as a clean checkout.
+    let output = work_dir.run_jj(["status"]);
+    assert!(output.status.success(), "{output}");
+    assert_eq!(work_dir.read_file("file"), b"old\n");
+    let recorded = work_dir.run_jj(["file", "show", "-r", "@", "file", "--ignore-working-copy"]);
+    assert_eq!(recorded.stdout.raw(), "old\n");
+    assert!(!pending_checkout.exists());
+    Ok(())
+}
+
+#[test]
 fn test_git_colocated_intent_to_add() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
