@@ -1288,16 +1288,7 @@ impl Service {
                 )
                 .map_err(|error| ServiceError::context("record cut snapshot", error))?
         };
-        if !completion.physical_published {
-            self.store
-                .publish_validated_physical_cut(
-                    reservation,
-                    completion.lease_owner,
-                    &recorded,
-                    completion.now_ns,
-                )
-                .map_err(|error| ServiceError::context("publish physical cut", error))?;
-        }
+        let mut physical_published = completion.physical_published;
         let base_path = self.snapshot_path(reservation.base_snapshot_id)?;
         let base = self
             .open_subvolume(&base_path)
@@ -1311,9 +1302,21 @@ impl Service {
         if parent_expected.subvolume_uuid != self.snapshot_uuid(reservation.base_snapshot_id)?
             || target_expected != *target
         {
-            return Err(ServiceError::new(
-                "comparison endpoints do not match reserved immutable snapshots",
-            ));
+            let error = "comparison endpoints do not match reserved immutable snapshots";
+            if !physical_published {
+                self.store
+                    .fail_unpublished_cut(
+                        reservation,
+                        completion.lease_owner,
+                        &recorded,
+                        error,
+                        completion.now_ns,
+                    )
+                    .map_err(|failure| {
+                        ServiceError::new(format!("{error}; fail unpublished cut: {failure}"))
+                    })?;
+            }
+            return Err(ServiceError::new(error));
         }
         let spool_name = format!(
             "manifest-{}-{}.part",
@@ -1442,6 +1445,20 @@ impl Service {
                 resolved_objects = target_objects.len(),
                 "query cut target objects resolved"
             );
+            self.store
+                .validate_adjacent_delta_target(reservation, &parsed.manifest, &target_objects)
+                .map_err(|error| ServiceError::context("validate indexed cut", error))?;
+            if !physical_published {
+                self.store
+                    .publish_validated_physical_cut(
+                        reservation,
+                        completion.lease_owner,
+                        &recorded,
+                        completion.now_ns,
+                    )
+                    .map_err(|error| ServiceError::context("publish physical cut", error))?;
+                physical_published = true;
+            }
             let publish_started = std::time::Instant::now();
             let published = self
                 .store
@@ -1474,18 +1491,80 @@ impl Service {
             Ok(published) => Ok(published),
             Err(error) if inject_manifest_stage_failure => Err(error),
             Err(incremental_error) => {
-                discard_private_spool(&spool_path)?;
-                // The legacy full-index encoding does not certify nested
-                // subvolume boundaries. This scan is redundant for v2, but
-                // is required before accepting a possible legacy fallback.
-                reject_nested_subvolumes(&completion.destination_path)?;
-                let full_index = self
-                    .broker_full_index(&target_expected, target_fd.as_fd())
-                    .map_err(|fallback| {
-                        ServiceError::new(format!(
+                let full_index = (|| -> Result<FullIndexResult, ServiceError> {
+                    discard_private_spool(&spool_path)?;
+                    // The legacy full-index encoding does not certify nested
+                    // subvolume boundaries. This scan is redundant for v2,
+                    // but is required before accepting a possible legacy
+                    // fallback.
+                    if let Err(error) = reject_nested_subvolumes(&completion.destination_path) {
+                        if !physical_published && is_nested_subvolume_rejection(&error) {
+                            let message = format!(
+                                "incremental cut failed: {incremental_error}; full-index fallback rejected target: {error}"
+                            );
+                            self.store
+                                .fail_unpublished_cut(
+                                    reservation,
+                                    completion.lease_owner,
+                                    &recorded,
+                                    &message,
+                                    completion.now_ns,
+                                )
+                                .map_err(|failure| {
+                                    ServiceError::new(format!(
+                                        "{message}; fail unpublished cut: {failure}"
+                                    ))
+                                })?;
+                        }
+                        return Err(error);
+                    }
+                    let full_index =
+                        self.broker_full_index_unvalidated(&target_expected, target_fd.as_fd())?;
+                    if let Err(error) = reject_fscrypt_index(&full_index.index) {
+                        if !physical_published {
+                            let message = format!(
+                                "incremental cut failed: {incremental_error}; full-index fallback rejected target: {error}"
+                            );
+                            self.store
+                                .fail_unpublished_cut(
+                                    reservation,
+                                    completion.lease_owner,
+                                    &recorded,
+                                    &message,
+                                    completion.now_ns,
+                                )
+                                .map_err(|failure| {
+                                    ServiceError::new(format!(
+                                        "{message}; fail unpublished cut: {failure}"
+                                    ))
+                                })?;
+                        }
+                        return Err(error);
+                    }
+                    Ok(full_index)
+                })();
+                let full_index = match full_index {
+                    Ok(full_index) => full_index,
+                    Err(fallback) => {
+                        let message = format!(
                             "incremental cut failed: {incremental_error}; full-index fallback failed: {fallback}"
-                        ))
-                    })?;
+                        );
+                        // Broker I/O, spool, and decoding failures remain
+                        // retryable. No physical head has been published, so
+                        // recovery can resume the same deterministic intent.
+                        return Err(ServiceError::new(message));
+                    }
+                };
+                if !physical_published {
+                    self.store
+                        .publish_validated_physical_cut(
+                            reservation,
+                            completion.lease_owner,
+                            &recorded,
+                            completion.now_ns,
+                        )
+                        .map_err(|error| ServiceError::context("publish physical cut", error))?;
+                }
                 self.store
                     .publish_full_fresh_checkpoint(
                         reservation,
@@ -1715,6 +1794,19 @@ impl Service {
         expected: &ExpectedSubvolume,
         snapshot: BorrowedFd<'_>,
     ) -> Result<FullIndexResult, ServiceError> {
+        let result = self.broker_full_index_unvalidated(expected, snapshot)?;
+        reject_fscrypt_index(&result.index)?;
+        Ok(result)
+    }
+
+    /// Loads the complete immutable index without applying the fscrypt policy
+    /// so cut finalization can distinguish a terminal target rejection from a
+    /// retryable broker/spool failure before publishing a physical head.
+    fn broker_full_index_unvalidated(
+        &self,
+        expected: &ExpectedSubvolume,
+        snapshot: BorrowedFd<'_>,
+    ) -> Result<FullIndexResult, ServiceError> {
         let path = self
             .config
             .spool_directory
@@ -1736,7 +1828,6 @@ impl Service {
             .map_err(|error| ServiceError::context("remove full-index spool", error))?;
         let index = decode_index(&bytes)
             .map_err(|error| ServiceError::context("decode full index", error))?;
-        reject_fscrypt_index(&index)?;
         Ok(FullIndexResult { index })
     }
 
@@ -1949,6 +2040,12 @@ fn reject_nested_subvolumes(root: &Path) -> Result<(), ServiceError> {
         }
     }
     Ok(())
+}
+
+fn is_nested_subvolume_rejection(error: &ServiceError) -> bool {
+    error
+        .message
+        .starts_with("immutable snapshot contains nested subvolume")
 }
 
 fn reject_fscrypt_index(index: &Index) -> Result<(), ServiceError> {
@@ -2667,6 +2764,16 @@ mod tests {
             references: BTreeSet::new(),
         };
         assert!(reject_fscrypt_index(&index).is_err());
+    }
+
+    #[test]
+    fn nested_subvolume_rejections_are_terminal_for_legacy_and_v2_streams() {
+        assert!(is_nested_subvolume_rejection(&ServiceError::new(
+            "immutable snapshot contains nested subvolume /tmp/child",
+        )));
+        assert!(is_nested_subvolume_rejection(&ServiceError::new(
+            "immutable snapshot contains nested subvolume boundary parent=1 child_root=2 name=[]",
+        )));
     }
 
     #[test]

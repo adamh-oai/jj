@@ -2470,6 +2470,42 @@ impl Store {
         Ok(())
     }
 
+    /// Checks that an adjacent manifest can be applied to the indexed
+    /// predecessor before the caller advances the physical cut head.
+    ///
+    /// Publication repeats the same derivation under its final fence. This
+    /// preflight is intentionally read-only: a malformed manifest or target
+    /// object set must not turn an otherwise healthy watch into a physical
+    /// head which can never be indexed.
+    pub fn validate_adjacent_delta_target(
+        &self,
+        reservation: &CutReservation,
+        manifest: &ChangedObjectsManifest,
+        target_objects: &BTreeMap<u64, Object>,
+    ) -> Result<(), ManagerError> {
+        let (base_revision_id, base_snapshot_id): (i64, i64) = self
+            .connection()
+            .query_row(
+                r#"SELECT w.indexed_revision_id, r.snapshot_id
+                     FROM watches w JOIN revisions r ON r.id = w.indexed_revision_id
+                    WHERE w.id = ?1 AND w.state = 'active'
+                      AND w.indexed_seq = ?2 AND r.state = 'ready'"#,
+                params![reservation.watch_id.as_slice(), reservation.sequence - 1],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| ManagerError::new("prior cut is not the ready indexed head"))?;
+        if base_snapshot_id != reservation.base_snapshot_id {
+            return Err(ManagerError::new(
+                "cut base snapshot differs from indexed predecessor",
+            ));
+        }
+        let base_subset = self.load_revision_delta_subset(base_revision_id, manifest)?;
+        apply_manifest(&base_subset, manifest, target_objects)
+            .map(|_| ())
+            .map_err(|error| ManagerError::new(format!("apply changed-object manifest: {error}")))
+    }
+
     pub fn publish_adjacent_delta(
         &mut self,
         reservation: &CutReservation,
@@ -2780,6 +2816,100 @@ impl Store {
             params![
                 reservation.operation_id.as_slice(),
                 reservation.watch_id.as_slice()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Terminally records a cut whose immutable target failed validation
+    /// before it was allowed to become the physical head.
+    ///
+    /// The failed cut row preserves the monotonic sequence gap needed by a
+    /// later full-fresh recovery cut, while the watch keeps its prior physical
+    /// and indexed heads. Releasing operation pins leaves the rejected target
+    /// eligible for the ordinary fenced snapshot-GC path.
+    pub fn fail_unpublished_cut(
+        &mut self,
+        reservation: &CutReservation,
+        lease_owner: [u8; 16],
+        snapshot: &RecordedSnapshot,
+        error: &str,
+        now_ns: i64,
+    ) -> Result<(), ManagerError> {
+        if error.is_empty() {
+            return Err(ManagerError::new("terminal cut failure needs an error"));
+        }
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_cut_snapshot(
+            &transaction,
+            reservation,
+            lease_owner,
+            snapshot.snapshot_id,
+            snapshot.identity.subvol_uuid,
+        )?;
+        transaction.execute(
+            r#"INSERT INTO watch_cuts(
+                   watch_id, sequence, operation_id, base_snapshot_id,
+                   target_snapshot_id, comparison_id,
+                   comparison_from_snapshot_id, state, fresh_instance
+               ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 'failed', 0)"#,
+            params![
+                reservation.watch_id.as_slice(),
+                reservation.sequence,
+                reservation.operation_id.as_slice(),
+                reservation.base_snapshot_id,
+                snapshot.snapshot_id,
+            ],
+        )?;
+        require_one(
+            transaction.execute(
+                r#"UPDATE operations
+                      SET state = 'failed', error = ?4, lease_owner = NULL,
+                          lease_expires_ns = NULL, updated_ns = ?5
+                    WHERE id = ?1 AND watch_id = ?2 AND sequence = ?3
+                      AND state = 'uuid_recorded' AND lease_owner = ?6
+                      AND lease_fence = ?7"#,
+                params![
+                    reservation.operation_id.as_slice(),
+                    reservation.watch_id.as_slice(),
+                    reservation.sequence,
+                    error,
+                    now_ns,
+                    lease_owner.as_slice(),
+                    reservation.operation_fence,
+                ],
+            )?,
+            "fail unpublished cut operation",
+        )?;
+        require_one(
+            transaction.execute(
+                r#"UPDATE watches
+                      SET cut_owner = NULL, cut_expires_ns = NULL
+                    WHERE id = ?1 AND state = 'active'
+                      AND last_cut_snapshot_id = ?2
+                      AND cut_owner = ?3 AND cut_fence = ?4"#,
+                params![
+                    reservation.watch_id.as_slice(),
+                    reservation.base_snapshot_id,
+                    lease_owner.as_slice(),
+                    reservation.cut_fence,
+                ],
+            )?,
+            "release unpublished cut lease",
+        )?;
+        transaction.execute(
+            "DELETE FROM snapshot_pins WHERE owner_kind = 'operation' AND owner_id = ?1",
+            [reservation.operation_id.as_slice()],
+        )?;
+        transaction.execute(
+            r#"UPDATE cut_admissions SET state = 'abandoned'
+                WHERE operation_id = ?1 AND watch_id = ?2 AND state = 'waiting'"#,
+            params![
+                reservation.operation_id.as_slice(),
+                reservation.watch_id.as_slice(),
             ],
         )?;
         transaction.commit()?;
@@ -6339,6 +6469,89 @@ mod tests {
             readonly: true,
             created_ns: 500,
         }
+    }
+
+    #[test]
+    fn invalid_unpublished_cut_preserves_heads_and_records_a_gap() {
+        let (_temp, mut store, request) = setup();
+        let (_initialize, initialized) = initialize_watch(&mut store, &request);
+        let cut_request = CutRequest {
+            watch_id: initialized.watch_id,
+            authorization_id: initialized.grant_id,
+            reserved_snapshot_path: b"/store/snapshots/w/invalid-cut".to_vec(),
+            requester_uid: 1000,
+            requester_gid: 1000,
+            lease_owner: [6; 16],
+            now_ns: 400,
+            lease_expires_ns: 2_000,
+        };
+        let cut = store.reserve_cut(&cut_request).unwrap();
+        store
+            .start_cut_filesystem_effect(&cut, cut_request.lease_owner, 450)
+            .unwrap();
+        let recorded = store
+            .record_cut_snapshot(
+                &cut,
+                cut_request.lease_owner,
+                &cut_snapshot(&cut_request, request.source_subvol_uuid),
+                500,
+            )
+            .unwrap();
+
+        store
+            .fail_unpublished_cut(
+                &cut,
+                cut_request.lease_owner,
+                &recorded,
+                "invalid immutable target",
+                550,
+            )
+            .unwrap();
+
+        let (last_cut_seq, indexed_seq, cut_owner): (i64, i64, Option<Vec<u8>>) = store
+            .connection()
+            .query_row(
+                "SELECT last_cut_seq, indexed_seq, cut_owner FROM watches WHERE id = ?1",
+                [initialized.watch_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((last_cut_seq, indexed_seq), (0, 0));
+        assert!(cut_owner.is_none());
+        let (operation_state, cut_state): (String, String) = store
+            .connection()
+            .query_row(
+                r#"SELECT o.state, c.state
+                     FROM operations o JOIN watch_cuts c ON c.operation_id = o.id
+                    WHERE o.id = ?1"#,
+                [cut.operation_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (operation_state.as_str(), cut_state.as_str()),
+            ("failed", "failed")
+        );
+        let operation_pins: i64 = store
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM snapshot_pins WHERE owner_kind = 'operation' AND owner_id = ?1",
+                [cut.operation_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_pins, 0);
+
+        let next_request = CutRequest {
+            reserved_snapshot_path: b"/store/snapshots/w/recovery-cut".to_vec(),
+            lease_owner: [7; 16],
+            now_ns: 600,
+            ..cut_request
+        };
+        let next = store.reserve_cut(&next_request).unwrap();
+        assert_eq!(next.sequence, 2);
+        assert_eq!(next.base_snapshot_id, initialized.snapshot_id);
+        assert!(store.foreign_key_violations().unwrap().is_empty());
     }
 
     #[test]

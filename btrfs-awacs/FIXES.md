@@ -7,6 +7,10 @@ The [documentation site](docs/) organizes the same lifecycle by component.
 
 The active findings below retain their original stable IDs. IDs that described
 removed compatibility paths are intentionally absent rather than reused.
+Range headings are tracking umbrellas only: each numbered bullet under one is
+an independent finding and fixing one does not close its siblings. Where two
+findings touch the same code path, an explicit overlap note names the invariant
+owned by each one.
 
 ## Scope and direct client contract
 
@@ -28,55 +32,106 @@ features.
 
 ### C-01: Removing the primary workspace can destroy every workspace
 
-`../jj/cli/src/commands/workspace/remove.rs` rejects only the currently
-selected workspace name. From a secondary workspace, removing the primary can
-delete the shared `.jj/repo` and colocated Git object database used by every
-surviving workspace.
+**Status:** Implemented in the current remediation change; keep open until the
+acceptance cases below pass in the supported checkout matrix.
+
+The earlier implementation rejected only the currently selected workspace
+name. From a secondary workspace, removing the primary could delete the shared
+`.jj/repo` and colocated Git object database used by every surviving workspace.
+The current change preflights from a no-snapshot view, rejects shared
+Jujutsu/Git storage and survivor ancestry/aliases, then holds a repository-wide
+workspace lifecycle lock while it repeats that proof, deletes the target,
+forgets its registration, and publishes the repo transaction. Add, rename, and
+forget take the same lock across their full lifecycle transitions.
+Registration and operation history are committed only after deletion succeeds.
+C-19 still owns a pathname replacement after the final identity check; this
+C-01 remediation does not claim descriptor-relative deletion.
 
 **Remediate:** Resolve the target identity and every shared operation/object/Git
 store before deletion. Refuse a target containing storage required by a
-surviving workspace; protect against ancestry, aliases, replaced symlinks, and
-concurrent workspace changes.
+surviving workspace; protect against ancestry and aliases; serialize the
+registered workspace topology across deletion and publication. C-19 separately
+owns an after-validation pathname replacement race.
 
 **Accept when:** Removing a shared-store owner fails without changing
 registrations, history, operations, filesystem contents, or Git objects.
 
+**Overlap:** C-01 owns deletion of a path that contains shared repository or
+Git storage. C-18 through C-20 cover distinct dirty-target, path-replacement,
+and failed-deletion ordering hazards.
+
 ### C-02: Optional snapshot fallback fabricates a populated baseline
 
-`../jj/cli/src/commands/workspace/add.rs` can retain a snapshot-only source
-baseline after optional Btrfs snapshot creation falls back to an ordinary empty
-directory. The next scan then records inherited tracked files as deleted or
-attaches a direct cursor to nonexistent contents.
+**Status:** Implemented in the current remediation change; keep open until the
+fallback matrix below passes on supported non-Btrfs and cross-filesystem hosts.
+
+The earlier `../jj/cli/src/commands/workspace/add.rs` path could retain a
+snapshot-only source baseline after optional Btrfs snapshot creation fell back
+to an ordinary empty directory. The current change records that inherited
+baseline only after a verified physical snapshot succeeds. Required snapshot
+mode still fails creation; auto fallback follows ordinary checkout and
+materialization.
 
 **Remediate:** Associate the inherited baseline only with a verified physical
-snapshot. Ordinary fallback must use stock workspace initialization and
+snapshot. When `btrfs.enabled = true` or `--btrfs-snapshot=true` requires a
+snapshot, any snapshot failure must fail workspace creation. Only auto mode may
+fall back, and that fallback must use stock workspace initialization and
 materialize the desired checkout before recording a cursor.
 
 **Accept when:** Nonempty sources survive auto fallback on non-Btrfs,
 cross-filesystem, absent-tooling, and existing-empty-destination cases.
 
-### C-03: The companion checkout cannot resolve its workspace dependencies
+**Overlap:** C-02 owns the unsafe baseline after fallback. C-28 and C-29 own
+whether auto mode reaches the supported fallback path at all.
 
-`../jj/Cargo.toml` points the path dependency at a nonexistent sibling. Cargo
-resolves that dependency before any build or test, even when AWACS is disabled.
+### C-03 (retired as P0): Standalone companion packaging needs a declared topology
 
-**Remediate:** Correct the path or use an independently resolvable integration
-strategy while preserving feature-disabled and non-Linux builds.
+The original “nonexistent sibling” claim is stale in the supplied layout:
+`../jj/Cargo.toml` points at `../bsend-watch`, that sibling exists, and
+`cargo metadata --no-deps --format-version 1` resolves here. The remaining
+concern is distribution topology: a Jujutsu-only clean checkout without that
+sibling still cannot resolve an optional path dependency during Cargo metadata,
+even when AWACS is disabled.
 
-**Accept when:** Jujutsu Cargo metadata, ordinary builds, and supported Linux
-`--features awacs` builds resolve from a clean checkout.
+**Decide/remediate:** Declare sibling checkouts as the supported development
+and release topology and make setup explicit, or use an independently
+resolvable dependency/overlay while preserving feature-disabled and non-Linux
+builds.
+
+**Accept when:** Metadata, ordinary builds, and supported Linux
+`--features awacs` builds resolve from every topology the project claims to
+support. Do not count this as a current P0 unless standalone Jujutsu checkouts
+are part of that claim.
 
 ### C-05: Invalid immutable targets can permanently wedge a watch
 
-`src/service.rs` advances the physical snapshot head before all
-nested-subvolume, fscrypt, manifest, and target-object checks complete. A
-permanently invalid target can leave physical and indexed heads inconsistent.
+**Status:** Implemented in the current remediation change; keep open until the
+kernel-backed injected-invalid-target acceptance cases below pass.
 
-**Remediate:** Perform rejection-sensitive validation before publishing the
-physical head, or define one atomic terminal-failure/quarantine transition.
+The earlier `src/service.rs` path called `publish_validated_physical_cut`
+before nested-subvolume, dirty-witness/manifest, fscrypt, and target-object
+checks completed. The current change keeps a newly recorded target staged
+while it validates endpoint identity, legacy and v2 nested-boundary/fscrypt
+policy, target objects, and adjacent-manifest applicability. Only a validated
+target advances the physical head. Deterministic invalid targets are recorded
+as failed gaps, release the cut lease/admissions/pins, and leave the old
+physical/indexed heads serviceable; retryable broker/spool failures leave the
+unpublished operation available for recovery.
 
-**Accept when:** Injected invalid targets leave no stuck heads, operations,
-admissions, pins, or permanently unserviceable direct clients after restart.
+**Remediate:** Separate deterministic policy rejection from transient
+I/O/spool/comparison failures. Perform rejection-sensitive validation before
+publishing the physical head, or define one fenced atomic terminal-failure or
+quarantine transition that releases admissions and pins and leaves future
+clients conservative rather than wedged.
+
+**Accept when:** Injected invalid nested-boundary, fscrypt, identity, and
+manifest targets leave no stuck heads, operations, admissions, pins, or
+permanently unserviceable direct clients after restart; transient failures
+remain retryable.
+
+**Overlap:** C-23 owns proving that a v2 stream describes the admitted
+endpoints. C-05 owns when that proof is required relative to physical-head
+publication and what durable state follows rejection.
 
 ### P-01: Production has no snapshot or history garbage collection
 
@@ -88,45 +143,91 @@ events, SQLite/WAL storage, and copy-on-write extents without a bound.
 observable production maintenance that honors heads, leases, grants, pins,
 operations, and broker fences.
 
-### P-02: Every status can flush unrelated filesystem-wide writes
+**Dependency:** P-01 cannot be accepted until C-06 makes retention
+foreign-key-safe and atomic.
 
-`src/broker.rs` calls `syncfs` after snapshot creation and deletion, waiting for
-unrelated writes on the same filesystem.
+### P-02: Each successful direct scan or GC delete can flush unrelated writes
 
-**Remediate:** Use the narrowest durable ordering primitive that preserves the
-changed-object contract and measure the cost under unrelated write pressure.
+`src/broker.rs` calls `syncfs` after snapshot creation and deletion, waiting
+for unrelated writes on the same filesystem. This is on successful direct
+AWACS cut and snapshot-GC paths, not every ordinary Jujutsu status.
+
+**Remediate:** Prove creation ordering and crash-durable deletion receipts
+separately, use the narrowest primitive each requires, and measure the cost
+under unrelated write pressure.
 
 ## P1: correctness, isolation, and lifecycle defects
 
 ### C-06: History compaction violates retained-boundary foreign keys
 
-`src/manager.rs` retains client boundaries while deleting older parent cut
-rows. SQLite rejects maintenance after partial compaction work has committed.
+`retain_exponential_replay_checkpoints` first commits removal of unretained
+boundaries and pin changes, then `reclaim_unreferenced_cut_comparisons`
+deletes every older `watch_cuts` row. Some of those cut rows are still parents
+of retained `fsmonitor_boundaries` through the composite
+`(watch_id, cut_sequence, target_snapshot_id, cut_operation_id)` foreign key,
+so SQLite rejects the later delete after earlier retention work has committed.
 
 **Remediate:** Make retained boundary ownership and deletion order
-foreign-key-safe and transactionally atomic.
+foreign-key-safe and transactionally atomic: co-retain the parent cut rows or
+change the ownership model, and never delete an active query's exact boundary.
 
-### C-07-C-09: External ignore handling changes or poisons Jujutsu state
+**Accept when:** Retention with non-newest retained and active-query
+boundaries succeeds without foreign-key errors or partial state, and a crash at
+any retention step preserves a valid replay set.
 
-The companion Jujutsu checkout can read the same ignore inputs twice, reverse
-relative global-ignore precedence, or omit worktree-relative global excludes
-from `jj run` and external diff-edit paths. A tree can then be paired with the
-wrong fingerprint or include/exclude private files even with AWACS disabled.
+**Dependency:** This is the correctness prerequisite for P-01 production
+maintenance.
 
-**Remediate:** Build one immutable external-input bundle and apply stock ignore
-precedence consistently across ordinary and direct scans.
+### C-07: External ignore inputs can be read twice
 
-**Accept when:** `none` and AWACS match stock behavior for global excludes,
-repository excludes, `jj run`, external diff editing, and concurrent ignore
-changes.
+The companion Jujutsu checkout can read the same ignore inputs once for a
+fingerprint and again for traversal, pairing a tree with a different input
+bundle after a concurrent edit.
+
+**Remediate:** Build one immutable external-input bundle and use it for both
+fingerprinting and traversal.
+
+### C-08: Relative global-ignore precedence can be reversed
+
+The companion checkout can apply relative global excludes in an order that
+differs from stock Jujutsu, changing which files are visible even with AWACS
+disabled.
+
+**Remediate:** Preserve stock global and repository ignore precedence.
+
+### C-09: Worktree-relative excludes are omitted from secondary scan paths
+
+`jj run` and external diff-edit paths can omit worktree-relative global
+excludes, so those paths observe a different tree from ordinary status.
+
+**Remediate:** Route ordinary scans, direct scans, `jj run`, and external
+diff editing through the same immutable input bundle.
+
+**Shared acceptance for C-07 through C-09:** `none` and AWACS match stock
+behavior for global excludes, repository excludes, `jj run`, external diff
+editing, and concurrent ignore changes.
 
 ### C-11: Server lease expiry and advertised client deadline disagree
 
-`src/scan_facade.rs` derives durable expiry before an expensive cut but
-advertises a later boot-time deadline after the cut.
+The old “before an expensive cut” description is stale: Begin now renews the
+durable query lease after cut preparation. The remaining mismatch is that it
+stores a Unix-time expiry from one sample and then independently advertises
+`boottime_now + ttl` from a later sample. Response construction, delivery, or
+clock-domain skew can make the client believe a lease is live after the
+durable server fence has expired.
 
-**Remediate:** Establish one boot-scoped monotonic deadline after the lease can
-actually be returned and communicate that exact deadline to both peers.
+**Remediate:** Derive the advertised boot-time deadline from the remaining
+duration of the already-committed durable expiry, with an explicit safety
+margin for response delivery; never advertise a deadline later than the
+server's durable lease.
+
+**Accept when:** Delayed cut preparation, delayed response delivery, and renew
+tests never let the client scan or commit after the server considers the lease
+expired.
+
+**Overlap:** C-11 is deadline conversion/advertisement correctness even with
+no contention. C-16 is lock scheduling that can prevent timely Renew or
+Finish.
 
 ### C-12: A connected descriptor can carry the wrong namespace authority
 
@@ -155,25 +256,92 @@ expired.
 **Remediate:** Separate admission, cut execution, response writing, renewal,
 and cleanup locks; add bounded read/write deadlines.
 
-### C-17-C-22: Workspace lifecycle violates stock safety
+### C-17: Sparse widening can record missing files as deletions
 
-Sparse widening can record missing files as deletions; removal can destroy
-unsnapshotted sibling edits, follow replaced symlinks, forget registrations
-before failed deletion, fail auto mode when `btrfs` is absent, or create nested
-subvolumes that violate AWACS boundaries.
+Sparse widening can record files absent from the old sparse materialization as
+deletions instead of materializing the requested destination first.
 
-**Remediate:** Preserve stock fallback semantics, verify target identity and
-shared storage, protect dirty workspaces, check deletion capability first, and
-materialize the requested sparse destination before recording a baseline.
+**Remediate:** Materialize the requested sparse destination before recording a
+baseline.
+
+### C-18: Workspace removal can destroy unsnapshotted sibling edits
+
+Removal can delete a target workspace whose working copy contains edits not
+represented by its recorded commit.
+
+**Remediate:** Refuse dirty targets unless the user explicitly chooses a
+destructive mode with a clear recovery story.
+
+### C-19: Workspace removal can follow a replaced target path
+
+The current lifecycle remediation rejects pre-existing symlink components and
+revalidates the registered path identity immediately before deletion, but the
+final deletion still names the path. A replacement after that check can cause
+deletion of a different directory.
+
+**Remediate:** Atomically claim the verified target before deletion, then
+delete only the claimed object: use descriptor-relative traversal for ordinary
+directories and Btrfs deletion by verified subvolume ID rather than a mutable
+pathname.
+
+### C-20: Workspace removal forgets registration before failed deletion
+
+**Status:** Implemented in the current lifecycle change; keep open until the
+supported failure matrix passes.
+
+The earlier path could commit registration/history changes before filesystem
+deletion proved it could succeed, leaving an undeleted but forgotten
+workspace. The current path prepares the repo edit in memory, deletes first,
+then forgets the registration and commits operation history.
+
+**Remediate:** Check deletion capability before committing registration changes,
+or make the failure recoverable without losing the registration.
+
+### C-21: Auto snapshot mode fails when `btrfs` tooling is absent
+
+**Status:** Implemented in the current lifecycle change; keep open until the
+supported-host acceptance matrix passes.
+
+The earlier auto path could return an error instead of using stock workspace
+creation when the optional `btrfs` command was unavailable. The current path
+falls back only in auto mode; required `true` mode preserves the error and
+fails workspace creation.
+
+**Remediate:** Treat absent optional tooling as a defined auto-fallback case.
+
+### C-22: Snapshot workspace creation can introduce nested subvolumes
+
+Workspace creation can leave nested subvolumes that violate AWACS's
+boundary-free source contract.
+
+**Remediate:** Reject or normalize nested boundaries before recording an AWACS
+baseline.
+
+**Overlap:** C-01 owns shared-store-owner deletion. C-02 owns baseline
+corruption after a fallback. C-17 through C-22 are separate workspace
+lifecycle failures and need independent tests.
 
 ### C-23: Parsed kernel identities and completion counters are incomplete
 
-`src/service.rs` and `src/broker.rs` do not reconcile every advertised
-filesystem/source/target identity, transaction/root ID, record count, and
-output-byte count before publication.
+The v2 parser validates its header and completion footer internally, but
+`ParsedKernelChangedObjects` drops the parsed endpoint header before
+`src/service.rs` can compare it with the admitted parent and target.
+`src/broker.rs` also receives ioctl-reported output byte/record counts but
+does not require them to equal the file length and parsed footer counters.
+Recovered staged manifests take the same path. Legacy streams do not advertise
+these v2 fields and must not be treated as if they did.
 
-**Remediate:** Carry authenticated endpoint expectations through normal and
-recovered manifest parsing and reject every independent inconsistency.
+**Remediate:** Carry the v2 endpoint header and completion counters through
+normal and recovered manifest parsing; compare FSID, source/target UUID,
+ctransid, root ID, reported bytes, and reported records with the
+broker-verified endpoints and ioctl result before publication. Reject every
+independent inconsistency.
+
+**Accept when:** Injected header, footer, ioctl-count, and recovered-spool
+mismatches fail before any physical or indexed publication.
+
+**Overlap:** C-23 defines the stream/endpoints proof. C-05 defines the durable
+publication ordering and terminal behavior when that proof rejects a cut.
 
 ### C-25: A failed Begin response can leave a snapshot pinned indefinitely
 
@@ -194,21 +362,29 @@ lack a leading slash, turning normal nonempty invalidations into Full.
 **Remediate:** Use one raw relative-path contract across index, projection,
 transport, and Jujutsu matcher conversion.
 
-### P-04-P-05: Adjacent deltas are recomputed and cuts fail to coalesce
+### P-04: Published adjacent deltas can be recomputed
 
-The facade can repeat an already-published adjacent comparison, while manager
-admission joins only the fleeting planned phase.
+The facade can repeat an already-published adjacent comparison instead of
+reusing the pinned result.
 
-**Remediate:** Reuse pinned published deltas and keep authorized batches
-joinable through expensive snapshot/index phases.
+**Remediate:** Reuse pinned published deltas.
 
-### P-06-P-12: Connections, sessions, and cleanup need hard bounds
+### P-05: Cut admission stops coalescing before expensive work
 
-The daemon creates one OS thread per connection; packet buffers, sessions,
-tombstones, and cleanup scans are not bounded enough for sustained load.
+Manager admission joins only the fleeting planned phase, so authorized callers
+stop coalescing through snapshot and index work.
 
-**Remediate:** Bound clients, workers, buffers, queue depth, in-flight cuts,
-deadlines, tombstones, and cleanup work.
+**Remediate:** Keep authorized batches joinable through expensive
+snapshot/index phases.
+
+### P-06: Connection and in-flight work need hard bounds
+
+The daemon creates one OS thread per connection and does not bound clients,
+workers, packet buffers, queue depth, or in-flight cuts enough for sustained
+load.
+
+**Remediate:** Bound connection admission, workers, buffers, queue depth,
+in-flight cuts, and read/write deadlines.
 
 ### P-07: Full freshness and directory moves over-crawl
 
@@ -225,6 +401,11 @@ apply conservative component-aware invalidation without unnecessary allocation.
 **Remediate:** Declare and maintain a real Linux/Btrfs direct-scan target or
 remove the runner and document the supported command.
 
+**Acceptance dependency:** Required acceptance gate 1 cannot claim direct
+end-to-end coverage until this target or its documented replacement actually
+builds and runs. A missing target or environment-skipped integration is a
+blocked gate, not a pass.
+
 ### P-09: Snapshot workspace creation rewrites copied metadata
 
 Workspace add snapshots the complete source and then recursively removes copied
@@ -233,13 +414,29 @@ Workspace add snapshots the complete source and then recursively removes copied
 **Remediate:** Separate mutable repository metadata from the snapshotted tree or
 construct the destination without recursive rewriting.
 
-### P-10-P-11: Each direct command repeats external work
+### P-10: Each direct command repeats immutable input and discovery work
 
-The client repeatedly parses sparse/ignore state, probes executable policy,
-runs discovery, opens a connection, and creates a renewal thread.
+The client repeatedly parses sparse/ignore state, probes executable policy, and
+runs discovery.
 
-**Remediate:** Reuse validated immutable input bundles and bounded connection or
-renewal infrastructure without sharing stale authority.
+**Remediate:** Reuse validated immutable input bundles without sharing stale
+authority.
+
+### P-11: Each direct command recreates connection and renewal infrastructure
+
+The client opens a new connection and creates a renewal thread for each direct
+command.
+
+**Remediate:** Reuse bounded connection or renewal infrastructure without
+sharing stale authority.
+
+### P-12: Sessions, tombstones, and cleanup scans need hard bounds
+
+Active sessions, finished-session tombstones, and cleanup scans are not bounded
+enough for sustained load.
+
+**Remediate:** Bound session count, tombstone lifetime/cardinality, and cleanup
+work per request or maintenance tick.
 
 ### P-13: Install entry points are not normally discoverable
 
@@ -261,14 +458,38 @@ committed.
 **Remediate:** Reject malformed paths or force Full before advancing the
 cursor.
 
-### C-28-C-30: Optional workspace behavior diverges from stock
+### C-28: Auto snapshot mode rejects an existing empty destination
 
-Auto snapshot creation rejects supported existing empty destinations, fails
-instead of falling back across filesystems, and leaves stale linked Git
-worktree state after colocated workspace removal.
+**Status:** Implemented in the current lifecycle change; keep open until the
+supported-host acceptance matrix passes.
 
-**Remediate:** Preserve stock behavior in auto mode and remove linked worktree
-administration together with the workspace.
+The earlier auto path rejected a destination that stock workspace creation
+accepts when it already exists and is empty. The current path selects ordinary
+workspace initialization for that case and materializes the requested checkout.
+
+**Remediate:** Preserve stock existing-empty-destination behavior in auto mode.
+
+### C-29: Auto snapshot mode does not fall back across filesystems
+
+**Status:** Implemented in the current lifecycle change; keep open until the
+supported-host acceptance matrix passes.
+
+The earlier auto path could fail instead of using ordinary workspace creation
+when source and destination could not participate in one Btrfs snapshot.
+
+**Remediate:** Define cross-filesystem failure as an auto-fallback case. When
+snapshot mode is required (`btrfs.enabled = true` or
+`--btrfs-snapshot=true`), preserve the error and fail workspace creation.
+
+### C-30: Colocated removal leaves stale linked Git worktree state
+
+Colocated workspace removal can leave linked Git worktree administration behind.
+
+**Remediate:** Remove linked worktree administration together with the
+workspace.
+
+**Overlap:** C-28 and C-29 are fallback reachability/stock-parity issues; C-02
+owns the separate unsafe baseline if fallback occurs. C-30 is independent.
 
 ## Required acceptance and support boundaries
 
@@ -279,8 +500,10 @@ inspection, and environment-skipped integrations cannot establish this
 boundary.
 
 1. **Build and deployment:** Resolve both checkouts with AWACS enabled and
-   disabled; run the supported direct end-to-end target, both installers,
-   broker activation, direct discovery, permissions, and clean startup.
+   disabled; after P-08 is repaired, run the supported direct end-to-end
+   target, both installers, broker activation, direct discovery, permissions,
+   and clean startup. Until then, record the direct end-to-end part of this
+   gate as blocked rather than passed.
 2. **Stock Jujutsu parity:** Compare `none` and AWACS for workspace add/remove,
    optional fallback, sparsity, ignores, `jj run`, external diff editing,
    colocated Git, and unsupported-cursor fallback.
@@ -301,6 +524,15 @@ boundary.
    filesystem writeback, changed-object calls, coalescing, metadata traversal,
    full-crawl count, inotify watches, subprocesses, threads, buffers,
    tombstones, SQLite/WAL growth, retained snapshot bytes, and pins.
+
+For gate 2, “unsupported-cursor fallback” is narrow: a malformed,
+unauthenticated, wrong-version/domain/store/epoch, or no-longer-retained opaque
+prior cursor is treated as no reusable boundary. The server must return Full
+from a newly leased immutable snapshot, and Jujutsu may replace the cursor
+only atomically with the tree derived from that snapshot. It must not reuse
+stale incremental paths, accept or rewrite an unknown cursor, or traverse the
+mutable live root while claiming an AWACS cursor. Backend-unavailable fallback,
+if supported, is a separate policy and needs its own stock-`none` oracle.
 
 Until these gates pass, the defensible support claim is limited to the reviewed
 custom-kernel ABI, eligible Btrfs root and mount topology, authorized broker,
