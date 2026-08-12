@@ -125,10 +125,14 @@ This document contains the help content for the `jj` command-line program.
 * [`jj util install-man-pages`↴](#jj-util-install-man-pages)
 * [`jj util markdown-help`↴](#jj-util-markdown-help)
 * [`jj util snapshot`↴](#jj-util-snapshot)
+* [`jj util subvolume`↴](#jj-util-subvolume)
+* [`jj util subvolume enable`↴](#jj-util-subvolume-enable)
+* [`jj util subvolume disable`↴](#jj-util-subvolume-disable)
 * [`jj version`↴](#jj-version)
 * [`jj workspace`↴](#jj-workspace)
 * [`jj workspace add`↴](#jj-workspace-add)
 * [`jj workspace adopt`↴](#jj-workspace-adopt)
+* [`jj workspace remove`↴](#jj-workspace-remove)
 * [`jj workspace forget`↴](#jj-workspace-forget)
 * [`jj workspace list`↴](#jj-workspace-list)
 * [`jj workspace rename`↴](#jj-workspace-rename)
@@ -1717,7 +1721,7 @@ Show the current colocation status
 
 Update the underlying Git repo with changes made in the repo
 
-By default, this command does nothing in colocated workspaces because the export happens automatically. Use `--ignore-working-copy` to forcibly export changes.
+There is no need to run this command if you're in colocated workspace because the export happens automatically there.
 
 **Usage:** `jj git export`
 
@@ -1771,7 +1775,7 @@ Commits that are no longer reachable from any branch in the Git repo will be con
 
 If a working-copy commit gets abandoned, it will be given a new, empty commit. This is true in general; it is not specific to this command.
 
-By default, this command does nothing in colocated workspaces because the import happens automatically. Use `--ignore-working-copy` to forcibly import changes.
+There is no need to run this command if you're in colocated workspace because the import happens automatically there.
 
 **Usage:** `jj git import`
 
@@ -2125,6 +2129,12 @@ The working-copy commit is indicated by a `@` symbol in the graph. [Immutable re
    [`jj help -k templates`]: https://docs.jj-vcs.dev/latest/templates/
 * `-p`, `--patch` — Show patch
 * `--count` — Print the number of commits instead of showing them
+* `--jq <FILTER>` — Evaluate a jq-compatible structured query for each revision
+* `--query-version <VERSION>` — Select the structured query language and schema version
+
+  Possible values: `v1`
+
+* `--slurp` — Supply one array of revisions to the structured query
 * `-s`, `--summary` — For each path, show only whether it was modified, added, or deleted
 * `--stat` — Show a histogram of the changes
 * `--types` — For each path, show only its type before and after
@@ -3608,6 +3618,7 @@ Infrequently used commands such as for generating shell completions
 * `install-man-pages` — Install Jujutsu's manpages to the provided path
 * `markdown-help` — Print the CLI help for all subcommands in Markdown
 * `snapshot` — Snapshot the working copy if needed
+* `subvolume` — Manage the Btrfs subvolume layout of the current repository
 
 
 
@@ -3782,6 +3793,35 @@ If you want to see the ID of the current operation after this command, run `jj o
 
 
 
+## `jj util subvolume`
+
+Manage the Btrfs subvolume layout of the current repository
+
+**Usage:** `jj util subvolume <COMMAND>`
+
+###### **Subcommands:**
+
+* `enable` — Put the repository root and its .git directory in Btrfs subvolumes
+* `disable` — Convert the repository root and its .git directory back to plain directories
+
+
+
+## `jj util subvolume enable`
+
+Put the repository root and its .git directory in Btrfs subvolumes
+
+**Usage:** `jj util subvolume enable`
+
+
+
+## `jj util subvolume disable`
+
+Convert the repository root and its .git directory back to plain directories
+
+**Usage:** `jj util subvolume disable`
+
+
+
 ## `jj version`
 
 Display version information
@@ -3806,6 +3846,7 @@ Each workspace also has own sparse patterns.
 
 * `add` — Add a workspace
 * `adopt` — Adopt the current linked Git worktree as a jj workspace
+* `remove` — Remove a workspace and its directory from disk
 * `forget` — Stop tracking a workspace's working-copy commit in the repo
 * `list` — List workspaces
 * `rename` — Renames the current workspace
@@ -3865,6 +3906,21 @@ The worktree must belong to the Git repository backing an existing Git-colocated
 * `--name <NAME>` — A name for the adopted workspace
 
    To override the default, which is the basename of the worktree root.
+
+
+
+
+## `jj workspace remove`
+
+Remove a workspace and its directory from disk
+
+The current workspace cannot be removed. Use `jj workspace forget` if you only want to stop tracking a workspace without deleting its files.
+
+**Usage:** `jj workspace remove <WORKSPACE>`
+
+###### **Arguments:**
+
+* `<WORKSPACE>` — Name of the workspace to remove
 
 
 

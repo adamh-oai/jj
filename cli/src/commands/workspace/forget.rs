@@ -42,6 +42,11 @@ pub async fn cmd_workspace_forget(
     command: &CommandHelper,
     args: &WorkspaceForgetArgs,
 ) -> Result<(), CommandError> {
+    let lifecycle_store = {
+        let workspace_command = command.workspace_helper_no_snapshot(ui).await?;
+        SimpleWorkspaceStore::load(workspace_command.repo_path())?
+    };
+    let lifecycle_lock = lifecycle_store.lock_lifecycle()?;
     let mut workspace_command = command.workspace_helper(ui).await?;
 
     let wss = if args.workspaces.is_empty() {
@@ -94,5 +99,6 @@ pub async fn cmd_workspace_forget(
     };
 
     tx.finish(ui, description).await?;
+    drop(lifecycle_lock);
     Ok(())
 }

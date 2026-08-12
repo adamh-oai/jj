@@ -543,11 +543,10 @@ impl GitBackend {
 
         let locked_repo = self.lock_git_repo();
         if !locked_repo.objects.exists(&oid) {
-            // reuse the precomputed hash, since Gitoxide provides an API for it (otherwise
-            // Gitoxide recomputes it).
+            // write_buf recomputes the hash; gix does the same in write_blob.
             let write_oid = locked_repo
                 .objects
-                .write_buf_with_known_id(gix::objs::Kind::Blob, bytes, oid)
+                .write_buf(gix::objs::Kind::Blob, bytes)
                 .map_err(|err| BackendError::WriteObject {
                     object_type,
                     source: err,
@@ -1619,6 +1618,7 @@ mod tests {
     use gix::date::parse::TimeBuf;
     use gix::objs::CommitRef;
     use indoc::indoc;
+    use pollster::FutureExt as _;
     use test_case::test_case;
 
     use super::*;

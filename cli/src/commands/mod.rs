@@ -19,6 +19,7 @@ mod arrange;
 mod bench;
 mod bisect;
 mod bookmark;
+mod btrfs;
 mod commit;
 mod config;
 mod converge;

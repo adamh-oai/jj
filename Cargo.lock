@@ -2703,6 +2703,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bstr",
+ "btrfs-awacs",
  "chrono",
  "clap",
  "clap-markdown",
