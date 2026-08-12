@@ -487,19 +487,24 @@ Remaining correctness fixtures before proposing the inode cache upstream:
 
 - `README.md`: reproduction instructions;
 - `a86246a467a3`: independent no-clone ABI experiment;
-- `4b0ed36b3a5b`: fixed inode-info cache;
-- `9e63650d2b2c`: scalar lookup with explicit
+- `6486379e59f1`: changed-object stream, now the bottom commit in the custom
+  stack and independently UML-tested;
+- `a09636e2eb5b`: fixed inode-info cache;
+- `2e1fe612be5b`: scalar lookup with explicit
   commit-root lifetime;
-- `9e4092a25535`: scalar directory-item
+- `d17d9a7e67e8`: scalar directory-item
   lookup with explicit commit-root lifetime;
-- `cb675033e9b1`: scalar first-reference lookup
+- `8153cc0f51d7`: scalar first-reference lookup
   with bounded name copying;
-- `ff3480e9e018`: best-effort 64 KiB
+- `8f10d8359ca9`: best-effort 64 KiB
   command batching for metadata-only streams;
-- `ce78bf7b1b68`: raw timestamp
+- `35f414a1ed69`: raw timestamp
   reuse through the inode-info cache;
-- `5210746a1c70`: `GET_SUBVOL_INFO` offset-zero error handling;
-- `91d4aeeef658`: changed-objects-v2 ioctl and stream implementation;
+- `eaf2c9218851`: `GET_SUBVOL_INFO` offset-zero error handling;
+- `3ce9f6629cf2`: changed-objects-v2 ioctl and stream implementation;
+- `882e343a5dd3`: removal of the full-index ioctl mode;
+- `0d37af11ce82`: file-data and directory-entry change classification;
+- `9b50bfebc7bd`: namespaced change-mask constants;
 - `patches/send-ioctl.c`: direct ioctl helper for normal, no-clone, discard,
   compact-path, and protocol-v2 equivalence modes;
 - `validate-changed-paths.py`: checks compact records and command masks against

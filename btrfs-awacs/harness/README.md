@@ -23,15 +23,19 @@ Run:
 ./harness/run-uml.sh
 ```
 
-The dedicated watcher ABI used by the service is committed in the Ubuntu HWE
-7.0 kernel tree at `~/code/linux` as `91d4aeeef658` (`btrfs: send: add changed
-objects v2 interface`). It defines ioctl 66 with
-fd-anchored delta and full-index modes, endpoint identities, exact target
-metadata/security xattrs, complete nested-subvolume boundary transitions,
-an explicit dirty-witness capability, caller byte/record limits, and a CRC32C
+The dedicated watcher implementation starts at the bottom of the custom
+Ubuntu HWE 7.0 stack in `~/code/linux` with `6486379e59f1` (`btrfs: send: add
+a changed object stream`). The fd-anchored v2 ioctl 66 ABI is introduced by
+`3ce9f6629cf2`; subsequent commits `882e343a5dd3`, `0d37af11ce82`, and
+`9b50bfebc7bd` remove its full-index mode, distinguish file-data from
+directory-entry changes, and namespace its change-mask constants. It reports
+snapshot-to-snapshot deltas only, with endpoint identities, exact target
+metadata/security xattrs, complete nested-subvolume boundary transitions, an
+explicit dirty-witness capability, caller byte/record limits, and a CRC32C
 completion record. The one-line `GET_SUBVOL_INFO` return fix needed by this HWE
-base is the preceding standalone commit `5210746a1c70`. The ioctl deliberately retains `CAP_SYS_ADMIN`;
-the service exercises it only in the broker.
+base is `eaf2c9218851`. The ioctl deliberately retains `CAP_SYS_ADMIN`; the
+service exercises it only in the broker. Initial index construction is a
+userspace traversal rather than an ioctl mode.
 
 To build installable Ubuntu Noble HWE packages from the currently checked-out
 kernel tree:
@@ -43,11 +47,11 @@ kernel tree:
 The script temporarily gives the package a non-stock ABI, restores the HWE
 changelog on exit, disables unrelated tools and out-of-tree DKMS builds, and
 builds Ubuntu's `binary-headers` and `binary-generic` targets. By default it
-uses ABI `2801`, build name `btrfs-fast-snap`, package revision `1`, and writes
+uses ABI `2801`, build name `btrfs-fast-snap`, package revision `2`, and writes
 packages, checksums, and the complete build log below
 `/tmp/btrfs-fast-snap-debs`. The default package version therefore contains
 the distinctive upstream suffix in
-`7.0.0+btrfs-fast-snap-2801.28+build1~24.04.1`, and the kernel release is
+`7.0.0+btrfs-fast-snap-2801.28+build2~24.04.1`, and the kernel release is
 `7.0.0+btrfs-fast-snap-2801-generic`.
 
 The main overrides are:
@@ -55,7 +59,7 @@ The main overrides are:
 ```sh
 LINUX_DIR=~/code/linux \
 OUTPUT_DIR=/tmp/btrfs-fast-snap-debs \
-ABI=2801 BUILD_NAME=btrfs-fast-snap BUILD_REVISION=1 JOBS="$(nproc)" \
+ABI=2801 BUILD_NAME=btrfs-fast-snap BUILD_REVISION=2 JOBS="$(nproc)" \
   ./harness/build-ubuntu-deb.sh
 ```
 
@@ -67,8 +71,9 @@ but its final hyphen-separated revision must begin with the selected ABI.
 The kernel checkout must have no tracked modifications. The build host needs
 the dependencies declared by the Ubuntu HWE source, including `debhelper`,
 `pahole`, `bindgen-0.65`, `rustc-1.91`, `rust-1.91-src`, `rustfmt-1.91`, and
-`clang-19`. The script removes an inherited `PYTHONSAFEPATH` setting while
-building so Ubuntu's source-local `kconfig` helper remains importable.
+`clang-19`. The script removes inherited `PYTHONSAFEPATH` and `RUST_LOG`
+settings while building so Ubuntu's source-local `kconfig` helper remains
+importable and bindgen does not emit unbounded debug logs.
 
 Artifacts are written below `/tmp/btrfs-awacs-uml`. The guest performs one
 warm-up and ten measured sends, saves a no-data stream and dump below
@@ -179,19 +184,19 @@ The scalar lookup changes started as standalone experiments against
 `3dab139d4795`; their authoritative versions are individual commits in
 `~/code/linux`, stacked in measured order:
 
-- `4b0ed36b3a5b` caches repeated inode-item
+- `a09636e2eb5b` caches repeated inode-item
   reads;
-- `9e63650d2b2c` copies scalar
+- `2e1fe612be5b` copies scalar
   inode fields while holding `commit_root_sem`, avoiding a full leaf clone;
-- `9e4092a25535`
+- `d17d9a7e67e8`
   copies a directory item's location key, or consumes its existence result,
   while holding `commit_root_sem`;
-- `cb675033e9b1` copies the
+- `8153cc0f51d7` copies the
   selected inode reference's parent and bounded name while holding
   `commit_root_sem`.
-- `ff3480e9e018` batches completed
+- `8f10d8359ca9` batches completed
   metadata-only commands into 64 KiB writes without changing stream bytes;
-- `ce78bf7b1b68` copies raw
+- `35f414a1ed69` copies raw
   inode timestamps into the inode-info cache and makes `send_utimes()` reuse
   them.
 

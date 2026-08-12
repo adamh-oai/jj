@@ -5,7 +5,7 @@ linux_dir=${LINUX_DIR:-/home/dev-user/code/linux}
 output_dir=${OUTPUT_DIR:-/tmp/btrfs-fast-snap-debs}
 abi=${ABI:-2801}
 build_name=${BUILD_NAME:-btrfs-fast-snap}
-build_revision=${BUILD_REVISION:-1}
+build_revision=${BUILD_REVISION:-2}
 jobs=${JOBS:-$(nproc)}
 debian_dir=$linux_dir/debian.hwe-7.0
 changelog=$debian_dir/changelog
@@ -103,8 +103,10 @@ build_log=$output_dir/build.log
 	cd "$linux_dir"
 	# Codex/OpenAI development shells set PYTHONSAFEPATH, which prevents
 	# Ubuntu's debian/scripts/misc/annotations wrapper from importing its
-	# adjacent kconfig package.
+	# adjacent kconfig package. An inherited RUST_LOG also makes bindgen emit
+	# gigabytes of debug output while Ubuntu probes and builds Rust support.
 	unset PYTHONSAFEPATH
+	unset RUST_LOG
 	fakeroot debian/rules clean
 	CONCURRENCY_LEVEL="$jobs" fakeroot debian/rules \
 		do_tools=false \

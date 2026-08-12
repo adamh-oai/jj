@@ -81,6 +81,27 @@ example numeric manager uid/gid environment file. The system service is the
 only installed component that runs as root; the namespace daemon, discovery
 shim, Git hook, SQLite manager, and precision journal run as the user.
 
+## End-to-end Worktree matrix
+
+`./run_e2e.sh` runs a privileged integration matrix on Btrfs. Each initial
+snapshot-tree variation is combined with every Worktree modification variation.
+Every matrix cell initializes the real service, creates its managed snapshots,
+publishes a writable Worktree through `Service::worktree`, activates the proved
+Worktree seed through `watch-project`, applies one modification, and verifies
+the incremental paths through authenticated BSER-v2 Watchman transport and a
+direct facade cross-check. The current three snapshot shapes and four
+modifications produce 12 independent cases. Add an entry to either variation
+table in `src/bin/btrfs-awacs-e2e.rs` to extend a complete row or column of the
+matrix.
+
+The runner builds without privilege and uses `sudo` only for the test binary.
+Set `BTRFS_AWACS_E2E_ROOT` to select an existing directory on the Btrfs
+filesystem. The host kernel must include the `GET_SUBVOL_INFO` fix and
+changed-object ABI described in the UML harness documentation. The runner
+preflights `GET_SUBVOL_INFO` once before expanding the matrix, while each matrix
+cell exercises the changed-object path. Pass `--keep-failures` to preserve
+failed case directories.
+
 The [UML profiling harness](harness/README.md) reproduces the OpenAI snapshot
 workload on a modified kernel. Its [results](harness/RESULTS.md) include exact
 call counts plus independent inode-info cache and scalar-lookup patches, each
