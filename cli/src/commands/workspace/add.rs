@@ -13,12 +13,19 @@
 // limitations under the License.
 
 use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
 
 use futures::future::try_join_all;
 use itertools::Itertools as _;
+use jj_lib::backend::CommitId;
 use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::file_util;
 use jj_lib::file_util::IoResultExt as _;
+use jj_lib::git;
+use jj_lib::lock::FileLock;
+use jj_lib::object_id::ObjectId;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
@@ -54,7 +61,6 @@ pub struct WorkspaceAddArgs {
     /// Where to create the new workspace
     #[arg(value_hint = clap::ValueHint::DirPath)]
     destination: String,
-
     /// A name for the workspace
     ///
     /// To override the default, which is the basename of the destination
@@ -86,6 +92,14 @@ pub struct WorkspaceAddArgs {
     sparse_patterns: SparseInheritance,
 }
 
+fn is_empty_dir(path: &Path) -> bool {
+    if let Ok(mut entries) = path.read_dir() {
+        entries.next().is_none()
+    } else {
+        false
+    }
+}
+
 #[instrument(skip_all)]
 pub async fn cmd_workspace_add(
     ui: &mut Ui,
@@ -114,12 +128,39 @@ pub async fn cmd_workspace_add(
             name = workspace_name.as_symbol()
         )));
     }
-    if !destination_path.exists() {
+    if destination_path.exists() {
+        if !is_empty_dir(&destination_path) {
+            return Err(user_error(
+                "Destination path exists and is not an empty directory",
+            ));
+        }
+    } else {
         fs::create_dir(&destination_path).context(&destination_path)?;
-    } else if !file_util::is_empty_dir(&destination_path)? {
-        return Err(user_error(
-            "Destination path exists and is not an empty directory",
-        ));
+    }
+    let git_worktree_plan =
+        if crate::git_util::is_colocated_git_workspace(old_workspace_command.workspace()) {
+            let git_backend = git::get_git_backend(repo.store()).map_err(|_| {
+                internal_error_with_message(
+                    "Colocated workspace does not use a Git-backed repository",
+                    "missing Git backend",
+                )
+            })?;
+            let git_repo_path = dunce::canonicalize(git_backend.git_repo_path())
+                .unwrap_or_else(|_| git_backend.git_repo_path().to_owned());
+            let checkout_commit_id = old_workspace_command
+                .get_wc_commit_id()
+                .cloned()
+                .unwrap_or_else(|| repo.store().root_commit_id().clone());
+            Some(GitWorktreePlan {
+                git_repo_path,
+                git_executable: git_backend.git_executable_path().to_owned(),
+                checkout_commit_id,
+            })
+        } else {
+            None
+        };
+    if let Some(plan) = &git_worktree_plan {
+        create_git_worktree(plan, &destination_path, old_workspace_command.repo_path())?;
     }
 
     let working_copy_factory = command.get_working_copy_factory()?;
@@ -232,5 +273,53 @@ pub async fn cmd_workspace_add(
         ),
     )
     .await?;
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct GitWorktreePlan {
+    pub(super) git_repo_path: PathBuf,
+    pub(super) git_executable: PathBuf,
+    pub(super) checkout_commit_id: CommitId,
+}
+
+pub(super) fn create_git_worktree(
+    plan: &GitWorktreePlan,
+    workspace_root: &Path,
+    lock_root: &Path,
+) -> Result<(), CommandError> {
+    let lock_path = lock_root.join("git_import_export.lock");
+    let _lock = FileLock::lock(lock_path.clone()).map_err(|err| {
+        user_error(format!(
+            "Failed to take lock for Git import/export at {}: {err}",
+            lock_path.display()
+        ))
+    })?;
+
+    let mut cmd = Command::new(&plan.git_executable);
+    cmd.arg("--git-dir")
+        .arg(&plan.git_repo_path)
+        .args([
+            "worktree",
+            "add",
+            "--force",
+            "--no-checkout",
+            "--detach",
+            "--quiet",
+        ])
+        .arg(workspace_root)
+        .arg(plan.checkout_commit_id.hex());
+    let output = cmd.output().map_err(|err| {
+        user_error(format!(
+            "Failed to create Git worktree using {}: {err}",
+            plan.git_executable.display()
+        ))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(user_error(format!(
+            "Failed to create Git worktree: {stderr}"
+        )));
+    }
     Ok(())
 }

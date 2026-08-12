@@ -20,6 +20,33 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 
+fn copy_directory(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_directory(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(std::fs::read_link(&src_path)?, &dst_path)?;
+            #[cfg(windows)]
+            {
+                if src_path.is_dir() {
+                    std::os::windows::fs::symlink_dir(std::fs::read_link(&src_path)?, &dst_path)?;
+                } else {
+                    std::os::windows::fs::symlink_file(std::fs::read_link(&src_path)?, &dst_path)?;
+                }
+            }
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn test_workspaces_invalid_name() {
     let test_env = TestEnvironment::default();
@@ -112,6 +139,17 @@ fn test_workspaces_add_second_and_third_workspace() {
     [EOF]
     "#);
 
+    // Existing non-empty directories are not allowed
+    main_dir.create_dir("../occupied");
+    main_dir.write_file("../occupied/file", "contents");
+    let output = main_dir.run_jj(["workspace", "add", "--name", "occupied", "../occupied"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    ------- stderr -------
+    Error: Destination path exists and is not an empty directory
+    [EOF]
+    [exit status: 1]
+    ");
+
     // Duplicate names are not allowed, directory not created
     let output = main_dir.run_jj(["workspace", "add", "--name", "third", "../tertiary"]);
     insta::assert_snapshot!(output.normalize_backslash(), @"
@@ -192,6 +230,214 @@ fn test_workspaces_add_with_message() {
     Added 1 files, modified 0 files, removed 0 files
     [EOF]
     "#);
+}
+
+#[test]
+fn test_workspaces_add_colocated_git_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir.create_dir("../secondary");
+    let output = main_dir.run_jj(["workspace", "add", "../secondary"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Created workspace in "../secondary"
+    Working copy  (@) now at: pmmvwywv 058f604d (empty) (no description set)
+    Parent commit (@-)      : qpvuntsm 7b22a8cb initial
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    assert!(secondary_dir.root().join(".git").exists());
+
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(secondary_dir.root().to_str().unwrap()),
+        "worktree list should mention secondary workspace: {stdout}"
+    );
+
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(secondary_dir.root())
+        .output()
+        .unwrap();
+    let git_status = String::from_utf8_lossy(&status_output.stdout);
+    assert!(
+        git_status.is_empty() || git_status.trim() == "?? .jj/",
+        "git status should be clean in the new worktree; got {git_status:?}"
+    );
+}
+
+#[test]
+fn test_workspaces_adopt_copied_workspace() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let source_dir = test_env.work_dir("source");
+    let copy_dir = test_env.work_dir("copy");
+
+    main_dir.write_file("file", "initial\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "source", "../source"])
+        .success();
+
+    // Copy dirty files too. Adoption must not snapshot them under the source
+    // workspace's identity.
+    source_dir.write_file("file", "changed in copy\n");
+    copy_directory(source_dir.root(), copy_dir.root())?;
+    source_dir.write_file("file", "initial\n");
+    // The source may advance after the copy is made. Adoption should use the
+    // operation recorded in the copy, not the source workspace's current @.
+    source_dir.run_jj(["new"]).success();
+
+    let output = copy_dir.run_jj(["workspace", "adopt"]).success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Adopted copied workspace as 'copy'")
+    );
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(output.stdout.raw().contains("source:"));
+    assert!(output.stdout.raw().contains("copy:"));
+
+    let output = main_dir
+        .run_jj(["workspace", "root", "--name", "copy"])
+        .success();
+    assert!(
+        output
+            .stdout
+            .raw()
+            .contains(copy_dir.root().to_str().unwrap())
+    );
+
+    // The copied dirty file belongs to the new workspace, while the source
+    // working copy remains clean.
+    let output = copy_dir.run_jj(["status"]).success();
+    assert!(output.stdout.raw().contains("M file"));
+    let output = source_dir.run_jj(["status"]).success();
+    assert!(
+        output
+            .stdout
+            .raw()
+            .contains("The working copy has no changes.")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_workspaces_adopt_copied_colocated_git_worktree() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let source_dir = test_env.work_dir("source");
+    let copy_dir = test_env.work_dir("copy");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--name", "source", "../source"])
+        .success();
+    copy_directory(source_dir.root(), copy_dir.root())?;
+
+    copy_dir
+        .run_jj(["workspace", "adopt", "--name", "copy"])
+        .success();
+
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(source_dir.root().to_str().unwrap()),
+        "worktree list should still mention source workspace: {stdout}"
+    );
+    assert!(
+        stdout.contains(copy_dir.root().to_str().unwrap()),
+        "worktree list should mention adopted workspace: {stdout}"
+    );
+
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(copy_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        status_output.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(output.stdout.raw().contains("source:"));
+    assert!(output.stdout.raw().contains("copy:"));
+
+    Ok(())
+}
+
+#[test]
+fn test_workspaces_status_in_linked_git_worktree_does_not_auto_import_git_refs() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    let git_repo = git::open(main_dir.root());
+    let commit_id = main_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "-Tcommit_id",
+            "--no-graph",
+            "-r@",
+        ])
+        .success()
+        .stdout
+        .into_raw();
+    let commit_id = gix::ObjectId::from_hex(commit_id.as_bytes()).unwrap();
+    git_repo
+        .reference(
+            "refs/heads/external",
+            commit_id,
+            gix::refs::transaction::PreviousValue::Any,
+            "",
+        )
+        .unwrap();
+
+    secondary_dir.run_jj(["status"]).success();
+    let output = secondary_dir.run_jj(["--ignore-working-copy", "log", "-rexternal@git"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Error: Revision `external@git` doesn't exist
+    [EOF]
+    [exit status: 1]
+    ");
 }
 
 /// Test how sparse patterns are inherited

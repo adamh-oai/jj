@@ -15,11 +15,13 @@
 //! Git utilities shared by various commands.
 
 use std::error;
+use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::iter;
 use std::mem;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -59,22 +61,38 @@ use crate::revset_util::parse_remote_auto_track_bookmarks_map;
 use crate::ui::ProgressOutput;
 use crate::ui::Ui;
 
-pub fn is_colocated_git_workspace(workspace: &Workspace) -> bool {
+fn resolve_git_dir(dot_git_path: &Path) -> Option<PathBuf> {
+    let git_path = if dot_git_path.is_dir() {
+        dot_git_path.to_path_buf()
+    } else {
+        let contents = fs::read_to_string(dot_git_path).ok()?;
+        let git_dir = contents
+            .strip_prefix("gitdir:")
+            .map(str::trim_start)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let git_dir_path = Path::new(git_dir);
+        if git_dir_path.is_absolute() {
+            git_dir_path.to_path_buf()
+        } else {
+            dot_git_path.parent()?.join(git_dir_path)
+        }
+    };
+    dunce::canonicalize(git_path).ok()
+}
+
+pub fn workspace_git_dir(workspace: &Workspace) -> Option<PathBuf> {
     let Ok(git_backend) = git::get_git_backend(workspace.repo_loader().store()) else {
-        return false;
+        return None;
     };
-    let Some(git_workdir) = git_backend.git_workdir() else {
-        return false; // Bare repository
-    };
-    if git_workdir == workspace.workspace_root() {
-        return true;
-    }
-    // Colocated workspace should have ".git" directory, file, or symlink. Compare
-    // its parent as the git_workdir might be resolved from the real ".git" path.
-    let Ok(dot_git_path) = dunce::canonicalize(workspace.workspace_root().join(".git")) else {
-        return false;
-    };
-    dunce::canonicalize(git_workdir).ok().as_deref() == dot_git_path.parent()
+    let git_repo_path = dunce::canonicalize(git_backend.git_repo_path()).ok()?;
+    let dot_git_path = workspace.workspace_root().join(".git");
+    let git_dir = resolve_git_dir(&dot_git_path)?;
+    (git_dir == git_repo_path || git_dir.starts_with(&git_repo_path)).then_some(git_dir)
+}
+
+pub fn is_colocated_git_workspace(workspace: &Workspace) -> bool {
+    workspace_git_dir(workspace).is_some()
 }
 
 /// Parses user-specified remote URL or path to absolute form.

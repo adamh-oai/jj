@@ -362,6 +362,11 @@ impl GitBackend {
         self.base_repo.path()
     }
 
+    /// Path to the git executable configured for this backend.
+    pub fn git_executable_path(&self) -> &Path {
+        &self.git_executable
+    }
+
     /// Path to the working directory if the repository isn't bare.
     pub fn git_workdir(&self) -> Option<&Path> {
         self.base_repo.work_dir()
