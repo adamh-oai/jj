@@ -123,7 +123,7 @@ percent-encoding = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-nix = { workspace = true, features = [ "signal" ] }
+nix = { workspace = true, features = [ "dir", "fs", "signal" ] }
 
 [dev-dependencies]
 anstream = { workspace = true }

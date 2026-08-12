@@ -13,9 +13,9 @@
 // limitations under the License.
 
 mod add;
-mod adopt;
 mod forget;
 mod list;
+mod remove;
 mod rename;
 mod root;
 mod update_stale;
@@ -25,12 +25,12 @@ use tracing::instrument;
 
 use self::add::WorkspaceAddArgs;
 use self::add::cmd_workspace_add;
-use self::adopt::WorkspaceAdoptArgs;
-use self::adopt::cmd_workspace_adopt;
 use self::forget::WorkspaceForgetArgs;
 use self::forget::cmd_workspace_forget;
 use self::list::WorkspaceListArgs;
 use self::list::cmd_workspace_list;
+use self::remove::WorkspaceRemoveArgs;
+use self::remove::cmd_workspace_remove;
 use self::rename::WorkspaceRenameArgs;
 use self::rename::cmd_workspace_rename;
 use self::root::WorkspaceRootArgs;
@@ -55,7 +55,7 @@ use crate::ui::Ui;
 #[derive(Subcommand, Clone, Debug)]
 pub(crate) enum WorkspaceCommand {
     Add(WorkspaceAddArgs),
-    Adopt(WorkspaceAdoptArgs),
+    Remove(WorkspaceRemoveArgs),
     Forget(WorkspaceForgetArgs),
     List(WorkspaceListArgs),
     Rename(WorkspaceRenameArgs),
@@ -71,7 +71,7 @@ pub(crate) async fn cmd_workspace(
 ) -> Result<(), CommandError> {
     match subcommand {
         WorkspaceCommand::Add(args) => cmd_workspace_add(ui, command, args).await,
-        WorkspaceCommand::Adopt(args) => cmd_workspace_adopt(ui, command, args).await,
+        WorkspaceCommand::Remove(args) => cmd_workspace_remove(ui, command, args).await,
         WorkspaceCommand::Forget(args) => cmd_workspace_forget(ui, command, args).await,
         WorkspaceCommand::List(args) => cmd_workspace_list(ui, command, args).await,
         WorkspaceCommand::Rename(args) => cmd_workspace_rename(ui, command, args).await,

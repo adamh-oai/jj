@@ -115,7 +115,7 @@
                 },
                 "pager": {
                     "description": "Pager to use for displaying command output",
-                    "default": "less -FRXK",
+                    "default": "less -FRX",
                     "oneOf": [
                         {
                             "$ref": "#/properties/ui/definitions/command"
@@ -306,7 +306,8 @@
                     "type": "string",
                     "enum": [
                         "none",
-                        "watchman"
+                        "watchman",
+                        "awacs"
                     ],
                     "default": "none",
                     "description": "Whether to use an external filesystem monitor, useful for large repos"
@@ -318,6 +319,16 @@
                             "type": "boolean",
                             "default": false,
                             "description": "Whether to use triggers to monitor for changes in the background."
+                        }
+                    }
+                },
+                "awacs": {
+                    "type": "object",
+                    "properties": {
+                        "socket": {
+                            "type": "string",
+                            "default": "",
+                            "description": "Optional absolute btrfs-awacs socket override. Empty uses library discovery for the current root and mount namespace."
                         }
                     }
                 }

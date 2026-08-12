@@ -20,31 +20,22 @@ use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 
-fn copy_directory(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_directory(&src_path, &dst_path)?;
-        } else if file_type.is_symlink() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(std::fs::read_link(&src_path)?, &dst_path)?;
-            #[cfg(windows)]
-            {
-                if src_path.is_dir() {
-                    std::os::windows::fs::symlink_dir(std::fs::read_link(&src_path)?, &dst_path)?;
-                } else {
-                    std::os::windows::fs::symlink_file(std::fs::read_link(&src_path)?, &dst_path)?;
-                }
-            }
-        } else {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    Ok(())
+#[cfg(unix)]
+pub(super) fn install_fake_btrfs(test_env: &TestEnvironment, script: &str) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin_dir = test_env.env_root().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    let btrfs_path = bin_dir.join("btrfs");
+    std::fs::write(&btrfs_path, script).unwrap();
+    let mut permissions = std::fs::metadata(&btrfs_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&btrfs_path, permissions).unwrap();
+    let mut paths = vec![bin_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
 }
 
 #[test]
@@ -279,105 +270,259 @@ fn test_workspaces_add_colocated_git_worktree() {
     );
 }
 
-#[test]
-fn test_workspaces_adopt_copied_workspace() -> TestResult {
-    let test_env = TestEnvironment::default();
-    test_env.run_jj_in(".", ["git", "init", "main"]).success();
-    let main_dir = test_env.work_dir("main");
-    let source_dir = test_env.work_dir("source");
-    let copy_dir = test_env.work_dir("copy");
-
-    main_dir.write_file("file", "initial\n");
-    main_dir.run_jj(["commit", "-m", "initial"]).success();
-    main_dir
-        .run_jj(["workspace", "add", "--name", "source", "../source"])
-        .success();
-
-    // Copy dirty files too. Adoption must not snapshot them under the source
-    // workspace's identity.
-    source_dir.write_file("file", "changed in copy\n");
-    copy_directory(source_dir.root(), copy_dir.root())?;
-    source_dir.write_file("file", "initial\n");
-    // The source may advance after the copy is made. Adoption should use the
-    // operation recorded in the copy, not the source workspace's current @.
-    source_dir.run_jj(["new"]).success();
-
-    let output = copy_dir.run_jj(["workspace", "adopt"]).success();
-    assert!(
-        output
-            .stderr
-            .raw()
-            .contains("Adopted copied workspace as 'copy'")
-    );
-
-    let output = main_dir.run_jj(["workspace", "list"]).success();
-    assert!(output.stdout.raw().contains("source:"));
-    assert!(output.stdout.raw().contains("copy:"));
-
-    let output = main_dir
-        .run_jj(["workspace", "root", "--name", "copy"])
-        .success();
-    assert!(
-        output
-            .stdout
-            .raw()
-            .contains(copy_dir.root().to_str().unwrap())
-    );
-
-    // The copied dirty file belongs to the new workspace, while the source
-    // working copy remains clean.
-    let output = copy_dir.run_jj(["status"]).success();
-    assert!(output.stdout.raw().contains("M file"));
-    let output = source_dir.run_jj(["status"]).success();
-    assert!(
-        output
-            .stdout
-            .raw()
-            .contains("The working copy has no changes.")
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_workspaces_adopt_copied_colocated_git_worktree() -> TestResult {
+#[test_case(false, false; "main worktree with full git index")]
+#[test_case(false, true; "main worktree with sparse git index")]
+#[test_case(true, false; "linked worktree with full git index")]
+#[test_case(true, true; "linked worktree with sparse git index")]
+fn test_workspaces_colocated_git_worktree_preserves_git_sparse_checkout(
+    linked_worktree: bool,
+    sparse_index: bool,
+) {
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
         .success();
     let main_dir = test_env.work_dir("main");
-    let source_dir = test_env.work_dir("source");
-    let copy_dir = test_env.work_dir("copy");
+    let secondary_dir = test_env.work_dir("secondary");
 
-    main_dir.write_file("file", "contents");
+    main_dir.write_file(".gitignore", ".jj/\n");
+    main_dir.create_dir("included");
+    main_dir.write_file("included/visible", "original\n");
+    main_dir.create_dir("excluded");
+    main_dir.write_file("excluded/hidden", "hidden\n");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
-    main_dir
-        .run_jj(["workspace", "add", "--name", "source", "../source"])
-        .success();
-    copy_directory(source_dir.root(), copy_dir.root())?;
-
-    copy_dir
-        .run_jj(["workspace", "adopt", "--name", "copy"])
-        .success();
-
-    let worktree_output = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(main_dir.root())
+    let sparse_dir = if linked_worktree {
+        main_dir
+            .run_jj(["workspace", "add", "../secondary"])
+            .success();
+        &secondary_dir
+    } else {
+        &main_dir
+    };
+    let initial_git_status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(sparse_dir.root())
         .output()
         .unwrap();
-    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
     assert!(
-        stdout.contains(source_dir.root().to_str().unwrap()),
-        "worktree list should still mention source workspace: {stdout}"
+        initial_git_status.status.success(),
+        "initial git status failed: {}",
+        String::from_utf8_lossy(&initial_git_status.stderr)
     );
     assert!(
-        stdout.contains(copy_dir.root().to_str().unwrap()),
-        "worktree list should mention adopted workspace: {stdout}"
+        initial_git_status.stdout.is_empty(),
+        "the linked Git worktree must start clean: {}",
+        String::from_utf8_lossy(&initial_git_status.stdout)
+    );
+
+    let index_mode = if sparse_index {
+        "--sparse-index"
+    } else {
+        "--no-sparse-index"
+    };
+    let sparse_checkout = std::process::Command::new("git")
+        .args(["sparse-checkout", "set", "--cone", index_mode, "included"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        sparse_checkout.status.success(),
+        "git sparse-checkout failed: {}",
+        String::from_utf8_lossy(&sparse_checkout.stderr)
+    );
+    let sparse_git_status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        !sparse_dir.root().join("excluded/hidden").exists(),
+        "Git must omit the excluded path when setting the sparse profile; \
+         sparse-checkout stderr: {}; git status: {}; git status stderr: {}",
+        String::from_utf8_lossy(&sparse_checkout.stderr),
+        String::from_utf8_lossy(&sparse_git_status.stdout),
+        String::from_utf8_lossy(&sparse_git_status.stderr)
+    );
+
+    let status = sparse_dir.run_jj(["status"]).success();
+    assert!(
+        !status.stdout.raw().contains("excluded/hidden"),
+        "jj must not snapshot a sparse-excluded path as deleted: {}",
+        status.stdout.raw()
+    );
+    assert!(!sparse_dir.root().join("excluded/hidden").exists());
+
+    sparse_dir.write_file("included/visible", "modified\n");
+    let status = sparse_dir.run_jj(["status"]).success();
+    assert!(
+        status.stdout.raw().contains("included/visible"),
+        "jj must continue tracking changes inside the sparse profile: {}",
+        status.stdout.raw()
+    );
+    assert!(
+        !status.stdout.raw().contains("excluded/hidden"),
+        "jj must preserve the sparse-excluded tree: {}",
+        status.stdout.raw()
+    );
+
+    sparse_dir
+        .run_jj(["describe", "-m", "preserve sparse Git worktree"])
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(sparse_dir.root().join("included/visible")).unwrap(),
+        "modified\n",
+        "jj must not discard changes inside the sparse profile"
+    );
+    let jj_diff = sparse_dir.run_jj(["diff", "--name-only"]).success();
+    assert!(
+        jj_diff.stdout.raw().contains("included/visible"),
+        "jj must retain the real included-path change: {}",
+        jj_diff.stdout.raw()
+    );
+    assert!(
+        !jj_diff.stdout.raw().contains("excluded/hidden"),
+        "jj must not record a sparse-excluded deletion: {}",
+        jj_diff.stdout.raw()
+    );
+
+    let git_files = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "-t",
+            "--",
+            "included/visible",
+            "excluded/hidden",
+        ])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        git_files.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&git_files.stderr)
+    );
+    let git_files = String::from_utf8_lossy(&git_files.stdout);
+    assert!(
+        git_files.contains("H included/visible\n"),
+        "jj must not mark an included path skip-worktree: {git_files}"
+    );
+    assert!(
+        git_files.contains("S excluded/hidden\n"),
+        "jj must preserve the Git skip-worktree flag: {git_files}"
+    );
+
+    let git_status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        git_status.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&git_status.stderr)
+    );
+    let git_status = String::from_utf8_lossy(&git_status.stdout);
+    assert!(
+        !git_status.contains("excluded/hidden"),
+        "Git must not report sparse-excluded paths as deleted: {git_status}"
+    );
+
+    assert!(!sparse_dir.root().join("excluded/hidden").exists());
+    if linked_worktree {
+        assert!(
+            main_dir.root().join("excluded/hidden").exists(),
+            "a linked-worktree sparse profile must not change the main worktree"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_add_snapshot() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file(".gitignore", "ignored\n");
+    main_dir.write_file("file", "first\n");
+    main_dir.run_jj(["commit", "-m", "first"]).success();
+    main_dir.write_file("file", "second\n");
+    main_dir.run_jj(["commit", "-m", "second"]).success();
+    main_dir.write_file("ignored", "cached build output\n");
+    main_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
+
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    exit 0
+fi
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "snapshot" ]; then
+    /bin/cp -a "$3" "$4"
+    exit $?
+fi
+exit 1
+"#,
+    );
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path).args([
+                "--debug",
+                "workspace",
+                "add",
+                "-r",
+                "@--",
+                "../secondary",
+            ])
+        })
+        .success();
+    for message in [
+        "created Btrfs snapshot",
+        "removed copied .jj metadata",
+        "removed copied .git metadata",
+        "recorded snapshot tree as workspace baseline",
+        "initialized snapshot workspace metadata",
+        "created temporary Git worktree for snapshot",
+        "repaired snapshot Git worktree metadata",
+        "checked out snapshot workspace",
+    ] {
+        assert!(
+            output.stderr.raw().contains(message),
+            "debug output should contain {message:?}: {}",
+            output.stderr.raw()
+        );
+    }
+
+    // The snapshot keeps ignored materialized files, while normal add
+    // checkout semantics still update tracked files to the requested revision.
+    assert_eq!(
+        std::fs::read_to_string(secondary_dir.root().join("file"))?,
+        "first\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(secondary_dir.root().join("ignored"))?,
+        "cached build output\n"
+    );
+    assert!(secondary_dir.root().join(".jj").is_dir());
+    assert!(secondary_dir.root().join(".git").is_file());
+    assert!(
+        secondary_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .is_file()
     );
 
     let status_output = std::process::Command::new("git")
         .args(["status", "--short"])
-        .current_dir(copy_dir.root())
+        .current_dir(secondary_dir.root())
         .output()
         .unwrap();
     assert!(
@@ -386,11 +531,467 @@ fn test_workspaces_adopt_copied_colocated_git_worktree() -> TestResult {
         String::from_utf8_lossy(&status_output.stderr)
     );
 
-    let output = main_dir.run_jj(["workspace", "list"]).success();
-    assert!(output.stdout.raw().contains("source:"));
-    assert!(output.stdout.raw().contains("copy:"));
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(secondary_dir.root().to_str().unwrap()),
+        "worktree list should mention snapshot workspace: {stdout}"
+    );
+
+    let tertiary_dir = test_env.work_dir("tertiary");
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["workspace", "add", "../tertiary"])
+        })
+        .success();
+    assert!(tertiary_dir.root().join(".jj").is_dir());
 
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_add_plain_workspace_when_subvolume_mode_is_disabled() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "tracked\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+touch "$0.called"
+echo unexpected-btrfs-probe >&2
+exit 1
+"#,
+    );
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["--debug", "workspace", "add", "../secondary"])
+        })
+        .success();
+
+    assert!(
+        !output
+            .stderr
+            .raw()
+            .contains("recorded snapshot tree as workspace baseline"),
+        "plain workspace must not retain snapshot-only baseline state: {}",
+        output.stderr.raw()
+    );
+    assert_eq!(
+        std::fs::read_to_string(secondary_dir.root().join("file"))?,
+        "tracked\n"
+    );
+    assert!(
+        !test_env.env_root().join("bin/btrfs.called").exists(),
+        "disabled mode must not infer snapshot semantics from filesystem topology"
+    );
+
+    // Stock workspace creation accepts an existing empty destination. Disabled
+    // mode must take that same ordinary-checkout path.
+    let tertiary_dir = test_env.work_dir("tertiary");
+    std::fs::create_dir(tertiary_dir.root())?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["workspace", "add", "../tertiary"])
+        })
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(tertiary_dir.root().join("file"))?,
+        "tracked\n"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_add_plain_workspace_without_btrfs_tool() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    let empty_path = test_env.env_root().join("empty-bin");
+    std::fs::create_dir(&empty_path)?;
+
+    main_dir.write_file("file", "tracked\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &empty_path)
+                .args(["workspace", "add", "../secondary"])
+        })
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(secondary_dir.root().join("file"))?,
+        "tracked\n"
+    );
+
+    let tertiary_dir = test_env.work_dir("tertiary");
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &empty_path)
+                .args(["workspace", "add", "../tertiary"])
+        })
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(tertiary_dir.root().join("file"))?,
+        "tracked\n"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_add_subvolume_cross_filesystem_fails() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+
+    main_dir.write_file("file", "tracked\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
+
+    // Model an enabled source whose destination is on a different filesystem.
+    // Persistent subvolume mode must preserve the Btrfs error.
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "snapshot" ]; then
+    echo 'Invalid cross-device link' >&2
+    exit 1
+fi
+exit 1
+"#,
+    );
+
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .args(["workspace", "add", "../secondary"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("Invalid cross-device link"),
+        "{output}"
+    );
+    assert!(!test_env.env_root().join("secondary").exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_add_plain_workspace_when_btrfs_path_is_not_subvolume() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+echo not-a-subvolume >&2
+exit 1
+"#,
+    );
+
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["workspace", "add", "../secondary"])
+        })
+        .success();
+    assert!(test_env.env_root().join("secondary").join(".jj").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_util_subvolume_enable_disable() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "tracked\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    test -f "$3/.fake-subvolume"
+    exit $?
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "create" ]; then
+    mkdir "$3"
+    touch "$3/.fake-subvolume"
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    rm -rf "$3"
+    exit 0
+fi
+exit 1
+"#,
+    );
+
+    main_dir
+        .run_jj_with(|cmd| cmd.env("PATH", &path).args(["util", "subvolume", "enable"]))
+        .success();
+    assert!(main_dir.root().join(".fake-subvolume").is_file());
+    assert!(main_dir.root().join(".git/.fake-subvolume").is_file());
+    assert!(
+        main_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .is_file()
+    );
+    assert!(!main_dir.root().join(".jj/working_copy/tree_state").exists());
+
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["util", "subvolume", "disable"])
+        })
+        .success();
+    assert!(main_dir.root().join("file").is_file());
+    assert!(main_dir.root().join(".git").is_dir());
+    assert!(
+        !main_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .exists()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_remove_btrfs_subvolume() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    let tertiary_dir = test_env.work_dir("tertiary");
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    main_dir
+        .run_jj(["workspace", "add", "../tertiary"])
+        .success();
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    case "$3" in
+        */secondary)
+            echo 5
+            exit 0
+            ;;
+        *) exit 1 ;;
+    esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    case "$3" in
+        */secondary) exit 0 ;;
+        *) exit 1 ;;
+    esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    if [ "$3" = "--subvolid" ] && [ "$4" = "5" ]; then
+        for target in "$5"/.jj-removing-*; do
+            if [ -d "$target" ]; then
+                touch "$5/btrfs-deleted"
+                rm -rf "$target"
+                exit 0
+            fi
+        done
+    fi
+    exit 1
+fi
+exit 1
+"#,
+    );
+
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["workspace", "remove", "secondary"])
+        })
+        .success();
+    assert!(!secondary_dir.root().exists());
+    assert!(test_env.env_root().join("btrfs-deleted").exists());
+
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .args(["workspace", "remove", "tertiary"])
+        })
+        .success();
+    assert!(!tertiary_dir.root().exists());
+    assert!(!tertiary_dir.root().with_extension("btrfs-deleted").exists());
+
+    let output = main_dir.run_jj(["workspace", "remove", "default"]);
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Cannot remove the current workspace")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_remove_btrfs_subvolume_permission_failure_preserves_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let operation_id = main_dir.current_operation_id();
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    echo 'Operation not permitted' >&2
+    exit 1
+fi
+exit 1
+"#,
+    );
+
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .args(["workspace", "remove", "secondary"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("Operation not permitted"),
+        "{output}"
+    );
+    assert!(
+        output.stderr.raw().contains("user_subvol_rm_allowed"),
+        "{output}"
+    );
+    assert!(
+        output.stderr.raw().contains("sudo btrfs subvolume delete"),
+        "{output}"
+    );
+    assert!(output.stderr.raw().contains("workspace was not forgotten"));
+    assert!(secondary_dir.root().exists());
+    assert_eq!(main_dir.current_operation_id(), operation_id);
+    assert!(
+        std::fs::read_dir(test_env.env_root())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".jj-removing-")),
+        "failed deletion must restore the registered target name"
+    );
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(output.stdout.raw().contains("secondary"), "{output}");
+}
+
+#[test]
+fn test_workspace_remove_rejects_dirty_target() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "clean\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    secondary_dir.write_file("file", "dirty\n");
+    let operation_id = main_dir.current_operation_id();
+
+    let output = main_dir.run_jj(["workspace", "remove", "secondary"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("uncommitted changes"),
+        "{output}"
+    );
+    assert_eq!(main_dir.current_operation_id(), operation_id);
+    assert_eq!(
+        std::fs::read_to_string(secondary_dir.root().join("file")).unwrap(),
+        "dirty\n"
+    );
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(output.stdout.raw().contains("secondary"), "{output}");
+}
+
+#[test]
+fn test_workspace_remove_cleans_colocated_git_worktree_admin() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    main_dir
+        .run_jj(["workspace", "remove", "secondary"])
+        .success();
+    assert!(!secondary_dir.root().exists());
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        worktree_output.status.success(),
+        "git worktree list failed: {}",
+        String::from_utf8_lossy(&worktree_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        !stdout.contains(secondary_dir.root().to_str().unwrap()),
+        "worktree list should not mention removed workspace: {stdout}"
+    );
 }
 
 #[test]
@@ -865,6 +1466,103 @@ fn test_workspaces_add_workspace_in_current_workspace() {
 }
 
 #[test]
+fn test_workspace_remove_rejects_shared_primary_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../secondary"])
+        .success();
+    let operation_id = main_dir.current_operation_id();
+
+    let output = secondary_dir.run_jj(["workspace", "remove", "default"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .to_string()
+            .contains("contains the shared Jujutsu repository"),
+        "{output}"
+    );
+    assert_eq!(main_dir.current_operation_id(), operation_id);
+    assert!(main_dir.root().join(".jj/repo").is_dir());
+
+    let output = secondary_dir.run_jj(["workspace", "list"]).success();
+    let listing = output.stdout.to_string();
+    assert!(listing.contains("default:"), "{output}");
+    assert!(listing.contains("second:"), "{output}");
+}
+
+#[test]
+fn test_workspace_remove_rejects_nested_surviving_workspace() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let nested_dir = test_env.work_dir("main/nested");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "nested", "nested"])
+        .success();
+    let operation_id = main_dir.current_operation_id();
+
+    let output = main_dir.run_jj(["workspace", "remove", "nested"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .to_string()
+            .contains("overlaps surviving workspace default"),
+        "{output}"
+    );
+    assert_eq!(main_dir.current_operation_id(), operation_id);
+    assert!(nested_dir.root().is_dir());
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    let listing = output.stdout.to_string();
+    assert!(listing.contains("default:"), "{output}");
+    assert!(listing.contains("nested:"), "{output}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspace_remove_rejects_replaced_symlink() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let second_dir = test_env.work_dir("second");
+
+    main_dir
+        .run_jj(["workspace", "add", "--name", "second", "../second"])
+        .success();
+    let moved_path = test_env.env_root().join("second-real");
+    std::fs::rename(second_dir.root(), &moved_path).unwrap();
+    let unrelated_path = test_env.env_root().join("unrelated");
+    std::fs::create_dir(&unrelated_path).unwrap();
+    std::os::unix::fs::symlink(&unrelated_path, second_dir.root()).unwrap();
+    let operation_id = main_dir.current_operation_id();
+
+    let output = main_dir.run_jj(["workspace", "remove", "second"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .to_string()
+            .contains("registered path contains a symlink"),
+        "{output}"
+    );
+    assert_eq!(main_dir.current_operation_id(), operation_id);
+    assert!(moved_path.is_dir());
+    assert!(unrelated_path.is_dir());
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    let listing = output.stdout.to_string();
+    assert!(listing.contains("default:"), "{output}");
+    assert!(listing.contains("second:"), "{output}");
+}
+
+#[test]
 fn test_workspace_add_override_path_in_store() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();
@@ -895,7 +1593,7 @@ fn test_workspace_add_override_path_in_store() {
     let output = main_dir.run_jj(["operation", "restore", "@--"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Restored to operation: 7d5981d12f2a (2001-02-03 08:05:08) commit 006bd1130b84e90ab082adeabd7409270d5a86da
+    Restored to operation: 98ef745836d5 (2001-02-03 08:05:08) commit 006bd1130b84e90ab082adeabd7409270d5a86da
     [EOF]
     ");
 
@@ -984,7 +1682,7 @@ fn test_workspaces_conflicting_edits() {
     let output = secondary_dir.run_jj(["st"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 149761aea7d1).
+    Error: The working copy is stale (not updated since operation 58f8ef773e05).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -994,7 +1692,7 @@ fn test_workspaces_conflicting_edits() {
     let output = secondary_dir.run_jj(["log"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 149761aea7d1).
+    Error: The working copy is stale (not updated since operation 58f8ef773e05).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -1085,7 +1783,7 @@ fn test_workspaces_updated_by_other() {
     let output = secondary_dir.run_jj(["st"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 149761aea7d1).
+    Error: The working copy is stale (not updated since operation 58f8ef773e05).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -1335,14 +2033,14 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
     ]);
     insta::allow_duplicates! {
         insta::assert_snapshot!(output, @"
-        @  a9b524b948 abandon commit de90575a14d8b9198dc0930f9de4a69f846ded36
-        ○  0392b7d733 create initial working-copy commit in workspace secondary
-        ○  766373d1f4 add workspace 'secondary'
-        ○  eb6701963b new empty commit
-        ○  1d937e1f1e snapshot working copy
-        ○  e22ce69861 new empty commit
-        ○  48aa617132 snapshot working copy
-        ○  f63ee16f95 add workspace 'default'
+        @  2dea766382 abandon commit de90575a14d8b9198dc0930f9de4a69f846ded36
+        ○  0d3faebd8c create initial working-copy commit in workspace secondary
+        ○  200ba564cb add workspace 'secondary'
+        ○  b34eafb924 new empty commit
+        ○  c883929a6b snapshot working copy
+        ○  bd7b1cfa98 new empty commit
+        ○  4509e20d8c snapshot working copy
+        ○  90267f31f9 add workspace 'default'
         ○  0000000000
         [EOF]
         ");
@@ -1377,7 +2075,7 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
         Parent commit (@-): rzvqmyuk 891f0006 (empty) (no description set)
         [EOF]
         ------- stderr -------
-        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 0392b7d73383f694906abd6ffd55416c30d1775a9790553062784f5c4553c09746b388aa86fb7d27b113d1096f50845e28dc24b3de8b1a9d515cbde3b44eb346 of type operation not found
+        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 0d3faebd8cf4f0e39ea3eab47f22c9cdbcdaa54d95e79a86a0dab4ebe3b0377f69e1d64fa4661913c8c6af01dc0ebb5ad7c8b2bfa3d229827b2ba756d729e0bf of type operation not found
         Created and checked out recovery commit 866928d1e0fd
         [EOF]
         ");
@@ -1395,7 +2093,7 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
         let output = secondary_dir.run_jj(["workspace", "update-stale"]);
         insta::assert_snapshot!(output, @"
         ------- stderr -------
-        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 0392b7d73383f694906abd6ffd55416c30d1775a9790553062784f5c4553c09746b388aa86fb7d27b113d1096f50845e28dc24b3de8b1a9d515cbde3b44eb346 of type operation not found
+        Failed to read working copy's current operation; attempting recovery. Error message from read attempt: Object 0d3faebd8cf4f0e39ea3eab47f22c9cdbcdaa54d95e79a86a0dab4ebe3b0377f69e1d64fa4661913c8c6af01dc0ebb5ad7c8b2bfa3d229827b2ba756d729e0bf of type operation not found
         Created and checked out recovery commit 866928d1e0fd
         [EOF]
         ");
@@ -1446,20 +2144,20 @@ fn test_workspaces_current_op_discarded_by_other(automatic: bool) {
         insta::assert_snapshot!(output, @"
         @  kmkuslsw test.user@example.com 2001-02-03 08:05:18 secondary@ 18851b39
         │  RECOVERY COMMIT FROM `jj workspace update-stale`
-        │  -- operation 91f539374e6a snapshot working copy
+        │  -- operation a35d39d101f4 snapshot working copy
         ○  kmkuslsw/1 test.user@example.com 2001-02-03 08:05:18 866928d1 (hidden)
            (empty) RECOVERY COMMIT FROM `jj workspace update-stale`
-           -- operation 2a845e0b4514 recovery commit
+           -- operation 754c2986ff83 recovery commit
         [EOF]
         ");
     } else {
         insta::assert_snapshot!(output, @"
         @  kmkuslsw test.user@example.com 2001-02-03 08:05:18 secondary@ 18851b39
         │  RECOVERY COMMIT FROM `jj workspace update-stale`
-        │  -- operation 2d387a4a6355 snapshot working copy
+        │  -- operation 3ae899f26750 snapshot working copy
         ○  kmkuslsw/1 test.user@example.com 2001-02-03 08:05:18 866928d1 (hidden)
            (empty) RECOVERY COMMIT FROM `jj workspace update-stale`
-           -- operation 2a845e0b4514 recovery commit
+           -- operation 754c2986ff83 recovery commit
         [EOF]
         ");
     }
@@ -1517,8 +2215,8 @@ fn test_workspaces_unpublished_operation_same_tree() {
     let output = main_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Internal error: The repo was loaded at operation eb46e46959f1, which seems to be a sibling of the working copy's operation 2a68fa5a5771
-    Hint: Run `jj op integrate 2a68fa5a5771` to add the working copy's operation to the operation log.
+    Internal error: The repo was loaded at operation 8627c7508be4, which seems to be a sibling of the working copy's operation eceacbdafd84
+    Hint: Run `jj op integrate eceacbdafd84` to add the working copy's operation to the operation log.
     [EOF]
     [exit status: 255]
     ");
@@ -1645,7 +2343,7 @@ fn test_colocated_workspace_update_stale() {
     let output = main_dir.run_jj(["st"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Error: The working copy is stale (not updated since operation 572e45b3fba3).
+    Error: The working copy is stale (not updated since operation 8ab980a3d398).
     Hint: Run `jj workspace update-stale` to update it.
     See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
     [EOF]
@@ -1852,7 +2550,7 @@ fn test_workspaces_forget_multi_transaction() {
     // the op log should have the multiple valid workspaces forgotten in a single tx
     let output = main_dir.run_jj(["op", "log", "--limit", "1"]);
     insta::assert_snapshot!(output, @"
-    @  da3075edb24f test-username@host.example.com default@ 2001-02-03 04:05:12.000 +07:00 - 2001-02-03 04:05:12.000 +07:00
+    @  90493ae75198 test-username@host.example.com default@ 2001-02-03 04:05:12.000 +07:00 - 2001-02-03 04:05:12.000 +07:00
     │  forget workspaces second, third
     │  args: jj workspace forget second third fourth
     [EOF]
@@ -2181,10 +2879,10 @@ fn test_debug_snapshot() {
     work_dir.run_jj(["debug", "snapshot"]).success();
     let output = work_dir.run_jj(["op", "log"]);
     insta::assert_snapshot!(output, @"
-    @  d870c9898b59 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
+    @  a60628738654 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
     │  snapshot working copy
     │  args: jj debug snapshot
-    ○  f63ee16f9553 test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
+    ○  90267f31f904 test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
     │  add workspace 'default'
     ○  000000000000 root()
     [EOF]
@@ -2192,13 +2890,13 @@ fn test_debug_snapshot() {
     work_dir.run_jj(["describe", "-m", "initial"]).success();
     let output = work_dir.run_jj(["op", "log"]);
     insta::assert_snapshot!(output, @"
-    @  fd7a8fca455a test-username@host.example.com default@ 2001-02-03 04:05:10.000 +07:00 - 2001-02-03 04:05:10.000 +07:00
+    @  e6e34553de88 test-username@host.example.com default@ 2001-02-03 04:05:10.000 +07:00 - 2001-02-03 04:05:10.000 +07:00
     │  describe commit 006bd1130b84e90ab082adeabd7409270d5a86da
     │  args: jj describe -m initial
-    ○  d870c9898b59 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
+    ○  a60628738654 test-username@host.example.com default@ 2001-02-03 04:05:08.000 +07:00 - 2001-02-03 04:05:08.000 +07:00
     │  snapshot working copy
     │  args: jj debug snapshot
-    ○  f63ee16f9553 test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
+    ○  90267f31f904 test-username@host.example.com 2001-02-03 04:05:07.000 +07:00 - 2001-02-03 04:05:07.000 +07:00
     │  add workspace 'default'
     ○  000000000000 root()
     [EOF]
