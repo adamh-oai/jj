@@ -1,13 +1,13 @@
 ---
 title: Btrfs AWACS
-description: Immutable Btrfs filesystem monitoring, Jujutsu integration, and the complete implementation review.
+description: Follow a repository through serial edits, concurrent snapshots, Btrfs worktree creation, and the first changes in its new workspace.
 template: splash
 hero:
   title: Btrfs AWACS
-  tagline: Authenticated filesystem cuts, immutable repository scans, and an honest account of their current implementation.
+  tagline: Follow one repository from its first immutable cut through concurrent edits, snapshot worktree creation, and the new workspace's first changes.
   actions:
-    - text: Explore the architecture
-      link: /architecture/system-overview/
+    - text: Start the repository walkthrough
+      link: /walkthroughs/single-workspace-serial/
       icon: right-arrow
     - text: Read the 43 review findings
       link: /review/overview/
@@ -21,26 +21,33 @@ Watchman-compatible clients consume authenticated path invalidations; Jujutsu
 can also lease the actual immutable snapshot and derive its working-copy tree
 without racing the live checkout.
 
+## Follow one repository through four scenarios
+
+The walkthroughs follow the same repository as its lifecycle becomes more
+complex. Each step identifies **where the work runs**, **which filesystem
+view is mutable or immutable**, **which durable records change**, and **which
+invariants must hold** before a client can safely advance its cursor.
+
 <CardGrid>
   <LinkCard
-    title="Understand the architecture"
-    description="Process boundaries, Btrfs identity, durable state, and privileged broker ownership."
-    href="/architecture/system-overview/"
+    title="1. Single workspace, serial changes"
+    description="Register one root, publish its initial cut, edit files, compare successive snapshots, and commit each matching client baseline."
+    href="/walkthroughs/single-workspace-serial/"
   />
   <LinkCard
-    title="Follow a filesystem cut"
-    description="Watch initialization, snapshot publication, crash recovery, and lease lifetime."
-    href="/lifecycle/watch-initialization/"
+    title="2. Single workspace, concurrent changes"
+    description="Trace edits racing status, overlapping snapshots, transient names, competing cuts, query pins, and renewable immutable leases."
+    href="/walkthroughs/single-workspace-concurrent/"
   />
   <LinkCard
-    title="Trace the integrations"
-    description="Watchman, Git fsmonitor, Jujutsu direct scans, fingerprints, and Btrfs workspaces."
-    href="/integrations/direct-scan-api/"
+    title="3. Initialize a snapshot worktree"
+    description="Create a writable Btrfs child, replace copied Jujutsu and Git identity, preserve shared stores, and establish an independent baseline."
+    href="/walkthroughs/new-snapshot-worktree/"
   />
   <LinkCard
-    title="Inspect the implementation review"
-    description="30 correctness findings and 13 performance findings, ordered by severity."
-    href="/review/overview/"
+    title="4. First changes in the new worktree"
+    description="Register or adopt the child watch, acquire its own immutable cut and cursor, and isolate parent and child changes."
+    href="/walkthroughs/first-worktree-changes/"
   />
 </CardGrid>
 
@@ -61,6 +68,31 @@ without racing the live checkout.
   </Card>
 </CardGrid>
 
+## Implementation reference
+
+<CardGrid>
+  <LinkCard
+    title="Architecture and source ownership"
+    description="Find the exact clients, manager, broker, kernel, database, and integration components responsible for each walkthrough step."
+    href="/architecture/system-overview/"
+  />
+  <LinkCard
+    title="Lifecycle and transaction details"
+    description="Inspect watch initialization, cut publication, replay, recovery, query pins, and lease ownership."
+    href="/lifecycle/watch-initialization/"
+  />
+  <LinkCard
+    title="Jujutsu, Watchman, and Git integrations"
+    description="Compare mutable live-tree monitoring with descriptor-based immutable scans and backend-tagged cursor persistence."
+    href="/integrations/direct-scan-api/"
+  />
+  <LinkCard
+    title="Correctness and performance review"
+    description="Trace 30 correctness findings and 13 performance findings back to the invariants they violate."
+    href="/review/overview/"
+  />
+</CardGrid>
+
 ## Implementation status
 
 This documentation describes the code that currently exists, including
@@ -68,7 +100,9 @@ verified regressions and missing production wiring. It does not equate a
 planned schema, unused helper, environment-gated test, or architectural
 proposal with a functioning production path.
 
-Start with the [system overview](/architecture/system-overview/), then follow
-the [cut-publication lifecycle](/lifecycle/cut-publication/), the
-[Jujutsu snapshot transaction](/integrations/jujutsu-transaction/), and the
-[review findings](/review/overview/).
+Start with the [single-workspace walkthrough](/walkthroughs/single-workspace-serial/),
+continue through [concurrent changes](/walkthroughs/single-workspace-concurrent/)
+and [snapshot worktree creation](/walkthroughs/new-snapshot-worktree/), then
+follow the [new worktree's first changes](/walkthroughs/first-worktree-changes/).
+The [architecture](/architecture/system-overview/) and
+[review findings](/review/overview/) remain available as detailed reference.

@@ -37,27 +37,54 @@ export default defineConfig({
       sidebar: [
         { label: 'Overview', slug: 'index' },
         {
+          label: 'Repository walkthroughs',
+          items: [
+            {
+              label: '1. Single workspace: serial changes',
+              slug: 'walkthroughs/single-workspace-serial',
+            },
+            {
+              label: '2. Single workspace: concurrent changes',
+              slug: 'walkthroughs/single-workspace-concurrent',
+            },
+            {
+              label: '3. Initialize a snapshot worktree',
+              slug: 'walkthroughs/new-snapshot-worktree',
+            },
+            {
+              label: '4. First changes in the new worktree',
+              slug: 'walkthroughs/first-worktree-changes',
+            },
+          ],
+        },
+        {
           label: 'Architecture',
+          collapsed: true,
           items: [{ autogenerate: { directory: 'architecture' } }],
         },
         {
           label: 'Lifecycle',
+          collapsed: true,
           items: [{ autogenerate: { directory: 'lifecycle' } }],
         },
         {
           label: 'Integrations',
+          collapsed: true,
           items: [{ autogenerate: { directory: 'integrations' } }],
         },
         {
           label: 'Operations',
+          collapsed: true,
           items: [{ autogenerate: { directory: 'operations' } }],
         },
         {
           label: 'Review findings',
+          collapsed: true,
           items: [{ autogenerate: { directory: 'review' } }],
         },
         {
           label: 'Reference',
+          collapsed: true,
           items: [{ autogenerate: { directory: 'reference' } }],
         },
       ],
