@@ -33,6 +33,7 @@ pub mod merge_tools;
 pub mod movement_util;
 pub mod operation_templater;
 mod progress;
+pub mod query;
 pub mod revset_util;
 pub mod template_builder;
 pub mod template_parser;

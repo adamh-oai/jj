@@ -1,0 +1,14 @@
+def mine: __jj_mine;
+def working_copies: __jj_working_copies;
+def current_working_copy: __jj_current_working_copy;
+def bookmarks: __jj_bookmarks;
+def tags: __jj_tags;
+def divergent: __jj_divergent;
+def hidden: __jj_hidden;
+def change_offset: __jj_change_offset;
+def immutable: __jj_immutable;
+def empty: __jj_empty;
+def signature_present: __jj_signature_present;
+def verify_signature: __jj_verify_signature;
+def diff_files: __jj_diff_files;
+def diff_stats: __jj_diff_stats;
