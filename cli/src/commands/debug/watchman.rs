@@ -45,7 +45,7 @@ pub async fn cmd_debug_watchman(
     command: &CommandHelper,
     subcommand: &DebugWatchmanCommand,
 ) -> Result<(), CommandError> {
-    use jj_lib::local_working_copy::LockedLocalWorkingCopy;
+    use jj_lib::local_working_copy::reset_local_working_copy_fsmonitor;
 
     let mut workspace_command = command.workspace_helper(ui).await?;
     let repo = workspace_command.repo().clone();
@@ -116,14 +116,11 @@ pub async fn cmd_debug_watchman(
         }
         DebugWatchmanCommand::ResetClock => {
             let (mut locked_ws, _commit) = workspace_command.start_working_copy_mutation().await?;
-            let Some(locked_local_wc): Option<&mut LockedLocalWorkingCopy> =
-                locked_ws.locked_wc().downcast_mut()
-            else {
+            if !reset_local_working_copy_fsmonitor(locked_ws.locked_wc())? {
                 return Err(user_error(
                     "This command requires a standard local-disk working copy",
                 ));
-            };
-            locked_local_wc.reset_watchman()?;
+            }
             locked_ws.finish(repo.op_id().clone()).await?;
             writeln!(ui.status(), "Reset Watchman clock.")?;
         }

@@ -867,6 +867,7 @@ exit 1
 }
 
 #[cfg(unix)]
+#[cfg(feature = "awacs")]
 #[test]
 #[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
@@ -879,7 +880,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         .map(std::path::PathBuf::from)
         .expect("JJ_TEST_BTRFS_ROOT must name a writable directory on real Btrfs");
     let awacs_command = std::env::var_os("BTRFS_AWACS_COMMAND")
-        .expect("BTRFS_AWACS_COMMAND must name the real btrfs-awacs binary");
+        .expect("BTRFS_AWACS_COMMAND must name the real awacs binary");
     let broker_socket = std::env::var_os("BTRFS_AWACS_BROKER_SOCKET")
         .expect("BTRFS_AWACS_BROKER_SOCKET must name a matching live AWACS broker");
     assert!(
@@ -904,6 +905,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             .as_nanos()
     );
     let repo_root = btrfs_root.join(format!("jj-subvolume-e2e-{suffix}"));
+    let initialized_root = btrfs_root.join(format!("jj-subvolume-init-e2e-{suffix}"));
     let awacs_state = btrfs_root.join(format!(".jj-subvolume-e2e-awacs-{suffix}"));
     std::fs::create_dir(&repo_root)?;
     std::fs::create_dir(&awacs_state)?;
@@ -919,7 +921,20 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         .run_jj(["git", "init", "--colocate", "."])
         .success();
     main_dir.write_file("file", "tracked\n");
+    main_dir.write_file(".gitignore", "tracked-ignored\nignored-untracked\n");
+    main_dir.write_file("tracked-large", &"x".repeat(1024 * 1024 + 1));
+    main_dir.write_file("tracked-ignored", "tracked despite ignore\n");
+    main_dir
+        .run_jj([
+            "file",
+            "track",
+            "--include-ignored",
+            "tracked-large",
+            "tracked-ignored",
+        ])
+        .success();
     main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.write_file("ignored-untracked", "leave me untracked\n");
 
     let configure_awacs = |cmd: &mut assert_cmd::Command| {
         cmd.env("BTRFS_AWACS_COMMAND", &awacs_command)
@@ -937,7 +952,12 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let output = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
-            cmd.args(["util", "subvolume", "enable"])
+            cmd.args([
+                "util",
+                "subvolume",
+                "init",
+                initialized_root.to_str().unwrap(),
+            ])
         })
         .success();
     assert!(
@@ -946,13 +966,36 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             .raw()
             .contains("Creating initial AWACS snapshot baseline...")
     );
+    assert!(
+        !output.stderr.raw().contains("tracked-large"),
+        "tracked large files must not be treated as new: {output}"
+    );
     // A Btrfs subvolume root always has inode 256. `btrfs subvolume show`
     // also searches the B-tree for child snapshots and can therefore exit
     // unsuccessfully for an otherwise fully capable unprivileged user.
-    assert_eq!(std::fs::metadata(&repo_root)?.ino(), 256);
-    assert_eq!(std::fs::metadata(repo_root.join(".git"))?.ino(), 256);
+    assert!(!repo_root.join(".jj/working_copy/subvolume_mode").exists());
+    assert_eq!(std::fs::metadata(&initialized_root)?.ino(), 256);
+    assert_eq!(std::fs::metadata(initialized_root.join(".git"))?.ino(), 256);
+    assert!(initialized_root.join("ignored-untracked").is_file());
+    let initialized_dir = test_env.work_dir(&initialized_root);
 
-    let status = main_dir
+    let tracked = initialized_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["file", "list", "tracked-large", "tracked-ignored"])
+        })
+        .success();
+    assert!(tracked.stdout.raw().contains("tracked-large"));
+    assert!(tracked.stdout.raw().contains("tracked-ignored"));
+    let ignored_untracked = initialized_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["file", "list", "ignored-untracked"])
+        })
+        .success();
+    assert!(!ignored_untracked.stdout.raw().contains("ignored-untracked"));
+
+    let status = initialized_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["util", "subvolume", "status"])
@@ -964,21 +1007,25 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
 
     // This is the behavior the synthetic lease cannot prove: a second command
     // must consume the real retained baseline through AWACS and remain fast.
-    main_dir
+    initialized_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["status"])
         })
         .success();
 
-    main_dir
+    initialized_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["util", "subvolume", "disable"])
         })
         .success();
-    assert!(repo_root.join("file").is_file());
-    assert!(!repo_root.join(".jj/working_copy/subvolume_mode").exists());
+    assert!(initialized_root.join("file").is_file());
+    assert!(
+        !initialized_root
+            .join(".jj/working_copy/subvolume_mode")
+            .exists()
+    );
     let retained_snapshots = std::fs::read_dir(awacs_state.join("managed"))?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("cut-"))
@@ -1010,12 +1057,14 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         );
     }
     std::fs::remove_dir_all(&repo_root)?;
+    std::fs::remove_dir_all(&initialized_root)?;
     std::fs::remove_dir_all(&awacs_state)?;
     std::fs::remove_dir_all(&runtime_dir)?;
     Ok(())
 }
 
 #[cfg(unix)]
+#[cfg(feature = "awacs")]
 #[test]
 fn test_util_subvolume_enable_disable() -> TestResult {
     let test_env = TestEnvironment::default();
@@ -1026,9 +1075,13 @@ fn test_util_subvolume_enable_disable() -> TestResult {
     main_dir.write_file(".gitignore", "/.fake-subvolume\n");
     main_dir.write_file("file", "tracked\n");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
-    // Simulate a concurrent Git process populating an object fanout in the
-    // hidden destination while conversion copies the original object store.
-    std::fs::create_dir_all(main_dir.root().join(".git/objects/35")).unwrap();
+    main_dir
+        .run_jj(["config", "set", "--repo", "fsmonitor.backend", "watchman"])
+        .success();
+    // Exercise the fast idempotent path: an earlier attempt may already have
+    // converted both boundaries before failing to publish the baseline.
+    main_dir.write_file(".fake-subvolume", "");
+    main_dir.write_file(".git/.fake-subvolume", "");
     let path = install_fake_btrfs(
         &test_env,
         r#"#!/bin/sh
@@ -1043,9 +1096,6 @@ fi
 if [ "$1" = "subvolume" ] && [ "$2" = "create" ]; then
     mkdir "$3"
     touch "$3/.fake-subvolume"
-    case "$3" in
-        */..git.jj-subvolume-enable-staged-*) mkdir -p "$3/objects/35" ;;
-    esac
     exit 0
 fi
 if [ "$1" = "subvolume" ] && [ "$2" = "snapshot" ]; then
@@ -1081,6 +1131,28 @@ exit 1
 "#,
     );
 
+    // Simulate an interrupted older enable which committed the strict marker
+    // before publishing its first AWACS baseline. The ordinary command (with
+    // working-copy snapshotting enabled) must enter recovery before generic
+    // workspace loading enforces the baseline invariant.
+    std::fs::write(
+        main_dir.root().join(".jj/working_copy/subvolume_mode"),
+        b"snapshot-backed\n",
+    )?;
+    let status = main_dir
+        .run_jj_with(|cmd| cmd.env("PATH", &path).args(["util", "subvolume", "status"]))
+        .success();
+    assert!(status.stdout.raw().contains("Subvolume mode: enabled"));
+    assert!(
+        status
+            .stdout
+            .raw()
+            .contains("Working copy snapshot: none (required committed AWACS baseline is missing)")
+    );
+    assert!(status.stdout.raw().contains(
+        "Recovery: run `jj util subvolume enable` to build and activate a replacement checkout."
+    ));
+
     let output = main_dir
         .run_jj_with(|cmd| {
             cmd.env("PATH", &path)
@@ -1092,19 +1164,19 @@ exit 1
         output
             .stderr
             .raw()
-            .contains("Preparing Btrfs subvolumes and rollback snapshot...")
+            .contains("Building snapshot-backed checkout at")
     );
     assert!(
         output
             .stderr
             .raw()
-            .contains("Converting .git to a Btrfs subvolume...")
+            .contains("Snapshotting repository root subvolume to")
     );
     assert!(
         output
             .stderr
             .raw()
-            .contains("Enabling snapshot-backed working-copy state...")
+            .contains("Snapshotting nested .git subvolume...")
     );
     assert!(
         output
@@ -1112,8 +1184,43 @@ exit 1
             .raw()
             .contains("Creating initial AWACS snapshot baseline...")
     );
+    assert!(
+        !output
+            .stderr
+            .raw()
+            .contains("Failed to query filesystem monitor")
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Original checkout retained at")
+    );
+    assert!(
+        output.stderr.raw().contains(
+            "If the snapshot-backed checkout looks good, delete the original checkout at"
+        )
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Enter the snapshot-backed checkout with: cd")
+    );
     assert!(main_dir.root().join(".fake-subvolume").is_file());
     assert!(main_dir.root().join(".git/.fake-subvolume").is_file());
+    let retained_sources = std::fs::read_dir(main_dir.root().parent().unwrap())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("main.jj-subvolume-source-")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retained_sources.len(), 1);
+    assert!(retained_sources[0].join("file").is_file());
     assert!(
         main_dir
             .root()
@@ -1138,6 +1245,21 @@ exit 1
     assert!(status.stdout.raw().contains(".git: Btrfs subvolume (ID 5)"));
     assert!(status.stdout.raw().contains("Working copy snapshot: awacs"));
     assert!(status.stdout.raw().contains("(clean-baseline,"));
+
+    // Re-running enable against a healthy strict marker is a true no-op.
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(["util", "subvolume", "enable"])
+        })
+        .success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Btrfs subvolume mode is already enabled.")
+    );
 
     // A controlled checkout should immediately advance the retained baseline
     // instead of leaving final subvolume mode in a no-baseline state.
@@ -1199,22 +1321,21 @@ exit 1
 }
 
 #[cfg(unix)]
+#[cfg(feature = "awacs")]
 #[test]
-fn test_util_subvolume_enable_restores_read_only_snapshot_on_failure() {
-    use std::os::unix::fs::MetadataExt as _;
-
+fn test_util_subvolume_init_compression_rewrites_extents() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
         .success();
     let main_dir = test_env.work_dir("main");
+    main_dir.write_file(".gitignore", "/.fake-subvolume\n/.compression-*\n");
     main_dir.write_file("file", "tracked\n");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
-    // Exercise rollback after the root is already a subvolume and .git
-    // conversion succeeds. The absent AWACS socket then fails initial
-    // baseline creation, proving that enable restores the pre-conversion tree
-    // across the new post-topology failure boundary.
+    // If --compress accidentally uses the fast path, these markers would make
+    // the source look snapshot-eligible.
     main_dir.write_file(".fake-subvolume", "");
+    main_dir.write_file(".git/.fake-subvolume", "");
     let path = install_fake_btrfs(
         &test_env,
         r#"#!/bin/sh
@@ -1232,16 +1353,87 @@ if [ "$1" = "subvolume" ] && [ "$2" = "create" ]; then
     exit 0
 fi
 if [ "$1" = "subvolume" ] && [ "$2" = "snapshot" ]; then
-    if [ "$3" = "-r" ]; then
-        source="$4"
-        destination="$5"
-    else
-        source="$3"
-        destination="$4"
-    fi
-    mkdir "$destination"
-    cp -a "$source/." "$destination/"
-    touch "$destination/.fake-subvolume"
+    echo snapshot must not be used with --compress >&2
+    exit 1
+fi
+if [ "$1" = "property" ] && [ "$2" = "set" ]; then
+    test "$4" = "compression" || exit 1
+    case "$5" in
+        zstd|none) touch "$3/.compression-$5" ;;
+        *) exit 1 ;;
+    esac
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    rm -rf "$3"
+    exit 0
+fi
+exit 1
+"#,
+    );
+
+    for (value, marker) in [
+        ("true", ".compression-zstd"),
+        ("false", ".compression-none"),
+    ] {
+        let destination = test_env.env_root().join(format!("initialized-{value}"));
+        let output = main_dir
+            .run_jj_with(|cmd| {
+                cmd.env("PATH", &path)
+                    .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                    .args([
+                        "util",
+                        "subvolume",
+                        "init",
+                        &format!("--compress={value}"),
+                        destination.to_str().unwrap(),
+                    ])
+            })
+            .success();
+        assert!(
+            output
+                .stderr
+                .raw()
+                .contains("Creating new repository root subvolume at")
+        );
+        assert!(!output.stderr.raw().contains("Snapshotting repository root"));
+        assert!(destination.join(marker).is_file());
+        assert!(destination.join(".git").join(marker).is_file());
+        assert_eq!(
+            std::fs::read_to_string(destination.join("file"))?,
+            "tracked\n"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
+fn test_util_subvolume_enable_keeps_source_and_staging_on_failure() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "tracked\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    test -f "$3/.fake-subvolume"
+    exit $?
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "create" ]; then
+    mkdir "$3"
+    touch "$3/.fake-subvolume"
     exit 0
 fi
 if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
@@ -1261,13 +1453,74 @@ exit 1
         root_inode
     );
     assert!(main_dir.root().join("file").is_file());
+    assert!(main_dir.root().join(".git/HEAD").is_file());
     assert!(main_dir.root().join(".git/objects").is_dir());
+    let staged = std::fs::read_dir(main_dir.root().parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(".main.jj-subvolume-init-")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(staged.is_empty());
+
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .args(["util", "subvolume", "enable", "--keep"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Partial migration checkout retained at")
+    );
+    let staged = std::fs::read_dir(main_dir.root().parent().unwrap())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(".main.jj-subvolume-init-")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(staged.len(), 1);
+    assert!(staged[0].join("file").is_file());
+    assert!(staged[0].join(".git/HEAD").is_file());
     assert!(
         !main_dir
             .root()
             .join(".jj/working_copy/subvolume_mode")
             .exists()
     );
+}
+
+#[cfg(all(unix, not(feature = "awacs")))]
+#[test]
+fn test_util_subvolume_is_unavailable_without_awacs() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let destination = test_env.env_root().join("initialized");
+
+    let output = main_dir.run_jj(["util", "subvolume", "init", destination.to_str().unwrap()]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("unrecognized subcommand 'subvolume'")
+    );
+    assert!(!destination.exists());
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1340,15 +1593,13 @@ if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
     esac
 fi
 if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
-    if [ "$3" = "--subvolid" ] && [ "$4" = "5" ]; then
-        for target in "$5"/.jj-removing-*; do
-            if [ -d "$target" ]; then
-                touch "$5/btrfs-deleted"
-                rm -rf "$target"
-                exit 0
-            fi
-        done
-    fi
+    case "$3" in
+        */.jj-removing-*)
+            touch "$(dirname "$3")/btrfs-deleted"
+            rm -rf "$3"
+            exit 0
+            ;;
+    esac
     exit 1
 fi
 exit 1

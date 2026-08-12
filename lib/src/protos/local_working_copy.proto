@@ -16,6 +16,10 @@ syntax = "proto3";
 
 package local_working_copy;
 
+message SparsePatterns {
+  repeated string prefixes = 1;
+}
+
 enum FileType {
   Normal = 0;
   Symlink = 1;
@@ -42,10 +46,6 @@ message FileStateEntry {
   FileState state = 2;
 }
 
-message SparsePatterns {
-  repeated string prefixes = 1;
-}
-
 message TreeState {
   bytes legacy_tree_id = 1 [deprecated = true];
   // Alternating positive and negative terms if there's a conflict, otherwise a
@@ -53,16 +53,28 @@ message TreeState {
   repeated bytes tree_ids = 5;
   // Labels for the terms of a conflict.
   repeated string conflict_labels = 7;
+  // Ordinary working copies retain the legacy per-path cache. Snapshot-mode
+  // working copies use WorkingCopyState below instead.
   repeated FileStateEntry file_states = 2;
   bool is_file_states_sorted = 6;
   SparsePatterns sparse_patterns = 3;
-  WatchmanClock watchman_clock = 4;
+  // Legacy Watchman-only cursor. Read for migration, but new state is written
+  // to fsmonitor_cursor instead.
+  WatchmanClock watchman_clock = 4 [deprecated = true];
+  FsmonitorCursor fsmonitor_cursor = 8;
 }
 
 message WatchmanClock {
   oneof watchman_clock {
     string string_clock = 1;
     int64 unix_timestamp = 2;
+  }
+}
+
+message FsmonitorCursor {
+  reserved 2;
+  oneof cursor {
+    WatchmanClock watchman = 1;
   }
 }
 
@@ -83,4 +95,61 @@ message Checkout {
 message PendingCheckout {
   repeated bytes tree_ids = 1;
   repeated string conflict_labels = 2;
+}
+
+// Compact durable state for a local working copy. This replaces the legacy
+// split checkout/tree_state files. It intentionally contains no per-path file
+// state: the semantic tree is paired with an optional authoritative filesystem
+// baseline instead.
+message WorkingCopyState {
+  uint32 format_version = 1;
+  // The operation at which the working copy was updated.
+  bytes operation_id = 2;
+  // The workspace name used to look up the working-copy commit in the view.
+  string workspace_name = 3;
+  // Alternating positive and negative terms if there's a conflict, otherwise a
+  // single positive value.
+  repeated bytes tree_ids = 4;
+  repeated string conflict_labels = 5;
+  SparsePatterns sparse_patterns = 6;
+  // Present only for Watchman-style mutable-filesystem monitors. AWACS
+  // baselines are typed snapshot state below, not event-stream cursors.
+  FsmonitorCursor fsmonitor_cursor = 7;
+  uint64 generation = 8;
+  WorkingCopyStatePhase phase = 9;
+  // The intended semantic tree during an interrupted materialization. These
+  // are populated only for PendingMaterialization.
+  repeated bytes pending_tree_ids = 10;
+  repeated string pending_conflict_labels = 11;
+  // Exact AWACS snapshot paired with the semantic tree for CleanBaseline.
+  // This is absent for NoBaseline and ordinary mutable-filesystem scans.
+  AwacsSnapshotBaseline baseline = 12;
+  // Candidate retained snapshot while a baseline promotion is in flight.
+  AwacsSnapshotBaseline pending_baseline = 13;
+  bytes transition_id = 14;
+  string no_baseline_reason = 15;
+  string mutation_kind = 16;
+  repeated string pending_sparse_patterns = 17;
+  // Stable opaque AWACS owner for this JJ workspace. It is deliberately not
+  // the workspace path or mutable @ commit id.
+  bytes awacs_baseline_owner_id = 18;
+}
+
+message AwacsSnapshotBaseline {
+  // Identity of the exact immutable Btrfs snapshot paired with the tree.
+  bytes filesystem_uuid = 1;
+  bytes subvolume_uuid = 2;
+  // Authenticated AWACS capability proving continuity from this snapshot.
+  bytes continuity_token = 3;
+  // Opaque owner token for the durable committed/pending baseline pins.
+  bytes retention_token = 4;
+  // JJ-owned inputs which affect interpretation of the snapshot contents.
+  bytes interpretation_input_fingerprint = 5;
+}
+
+enum WorkingCopyStatePhase {
+  NoBaseline = 0;
+  CleanBaseline = 1;
+  PendingMaterialization = 2;
+  PendingBaselineCommit = 3;
 }

@@ -61,6 +61,7 @@ rayon = { workspace = true }
 ref-cast = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 smallvec = { workspace = true }
 strsim = { workspace = true }
 tempfile = { workspace = true }
@@ -99,7 +100,11 @@ nix = { workspace = true, features = [ "fs" ] }
 default = ["git"]
 git = ["dep:gix"]
 watchman = ["dep:watchman_client", "dep:tokio"]
+awacs = ["dep:btrfs-awacs"]
 testing = ["git"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+btrfs-awacs = { workspace = true, optional = true }
 
 [lints]
 workspace = true

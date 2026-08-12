@@ -155,10 +155,13 @@ pub fn user_settings() -> UserSettings {
 pub fn empty_snapshot_options() -> SnapshotOptions<'static> {
     SnapshotOptions {
         base_ignores: GitIgnoreFile::empty(),
+        scan_root_ignores: vec![],
         progress: None,
         start_tracking_matcher: &EverythingMatcher,
         force_tracking_matcher: &NothingMatcher,
         max_new_file_size: u64::MAX,
+        awacs_input_fingerprint: None,
+        awacs_compatible_input_fingerprints: vec![],
     }
 }
 

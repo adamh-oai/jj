@@ -23,6 +23,7 @@ use crate::command_error::CommandError;
 use crate::command_error::user_error;
 
 const SUBVOLUME_MODE_MARKER: &str = "subvolume_mode";
+#[cfg(all(target_os = "linux", feature = "awacs"))]
 const SUBVOLUME_MODE_ENABLING: &[u8] = b"enabling\n";
 
 pub(super) fn subvolume_mode_marker(workspace_root: &Path) -> PathBuf {
@@ -34,6 +35,12 @@ pub(super) fn subvolume_mode_marker(workspace_root: &Path) -> PathBuf {
 
 pub(super) fn is_subvolume_mode_enabled(workspace_root: &Path) -> bool {
     subvolume_mode_marker(workspace_root).is_file()
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+pub(super) fn is_subvolume_mode_committed(workspace_root: &Path) -> bool {
+    fs::read(subvolume_mode_marker(workspace_root))
+        .is_ok_and(|marker| marker == b"snapshot-backed\n")
 }
 
 pub(super) fn set_subvolume_mode(workspace_root: &Path, enabled: bool) -> Result<(), CommandError> {
@@ -51,6 +58,7 @@ pub(super) fn set_subvolume_mode(workspace_root: &Path, enabled: bool) -> Result
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", feature = "awacs"))]
 pub(super) fn begin_subvolume_mode(workspace_root: &Path) -> Result<(), CommandError> {
     let marker = subvolume_mode_marker(workspace_root);
     fs::write(&marker, SUBVOLUME_MODE_ENABLING)

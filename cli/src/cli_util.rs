@@ -26,6 +26,8 @@ use std::io;
 use std::io::Write as _;
 use std::mem;
 use std::ops::Range;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -77,9 +79,15 @@ use jj_lib::fileset::FilesetAliasesMap;
 use jj_lib::fileset::FilesetDiagnostics;
 use jj_lib::fileset::FilesetExpression;
 use jj_lib::fileset::FilesetParseContext;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::fsmonitor::AwacsExternalInput;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::fsmonitor::AwacsInputFingerprintV1;
 use jj_lib::gitignore::GitIgnoreError;
 use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::id_prefix::IdPrefixContext;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::local_working_copy::effective_exec_bit_policy_for_fingerprint;
 use jj_lib::lock::FileLock;
 use jj_lib::matchers::Matcher;
 use jj_lib::matchers::NothingMatcher;
@@ -138,6 +146,7 @@ use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::LockedWorkingCopy;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::working_copy::SnapshotStats;
+use jj_lib::working_copy::SnapshotWarning;
 use jj_lib::working_copy::UntrackedReason;
 use jj_lib::working_copy::WorkingCopy;
 use jj_lib::working_copy::WorkingCopyFactory;
@@ -527,6 +536,22 @@ impl CommandHelper {
         self.load_from_workspace(ui, workspace, env).await
     }
 
+    /// Loads a workspace at another root without snapshotting it.
+    ///
+    /// Migration commands use this after constructing a new checkout on
+    /// disk, before that checkout has a committed working-copy baseline.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    #[instrument(skip(self, ui))]
+    pub(crate) async fn workspace_helper_no_snapshot_at(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+    ) -> Result<WorkspaceCommandHelper, CommandError> {
+        let workspace = self.load_workspace_at(workspace_root, self.settings())?;
+        let env = self.workspace_environment(ui, &workspace)?;
+        self.load_from_workspace(ui, workspace, env).await
+    }
+
     async fn load_from_workspace(
         &self,
         ui: &Ui,
@@ -670,7 +695,7 @@ impl CommandHelper {
                 // merged repo wouldn't change because the old one wins, but it's probably
                 // fine if we picked the new wc_commit_id.
                 let stale_stats = workspace_command
-                    .snapshot_working_copy(ui, git_import_export_lock)
+                    .snapshot_working_copy(ui, git_import_export_lock, false)
                     .await
                     .map_err(|err| err.into_command_error())?;
 
@@ -760,12 +785,15 @@ impl CommandHelper {
                     .map_err(|err| err.into_command_error())?;
                 let merged_stats = {
                     let SnapshotStats {
+                        mut warnings,
                         mut untracked_paths,
                         mut invalid_utf8_paths,
                     } = stale_stats;
+                    warnings.extend(fresh_stats.warnings);
                     untracked_paths.extend(fresh_stats.untracked_paths);
                     invalid_utf8_paths.extend(fresh_stats.invalid_utf8_paths);
                     SnapshotStats {
+                        warnings,
                         untracked_paths,
                         invalid_utf8_paths,
                     }
@@ -1305,6 +1333,72 @@ where
     SnapshotWorkingCopyError::Command(err.into())
 }
 
+#[cfg(feature = "git")]
+fn xdg_config_home() -> Option<PathBuf> {
+    if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
+        && !x.is_empty()
+    {
+        return Some(PathBuf::from(x));
+    }
+    etcetera::home_dir().ok().map(|home| home.join(".config"))
+}
+
+#[cfg(feature = "git")]
+fn normalize_worktree_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(component),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn awacs_external_input(path: Option<PathBuf>) -> Result<AwacsExternalInput, CommandError> {
+    let Some(path) = path else {
+        return Ok(AwacsExternalInput {
+            path: vec![],
+            contents: None,
+        });
+    };
+    let contents = match std::fs::read(&path) {
+        Ok(contents) => Some(contents),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(internal_error_with_message(
+                format!("Failed to read AWACS fingerprint input {}", path.display()),
+                err,
+            ));
+        }
+    };
+    Ok(AwacsExternalInput {
+        path: path.as_os_str().as_bytes().to_vec(),
+        contents,
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn encode_sparse_state(patterns: Option<Vec<RepoPathBuf>>) -> Vec<u8> {
+    let Some(patterns) = patterns else {
+        return b"disabled".to_vec();
+    };
+    let mut result = b"enabled".to_vec();
+    for path in patterns {
+        let path = path.as_internal_file_string().as_bytes();
+        result.extend_from_slice(&(path.len() as u64).to_be_bytes());
+        result.extend_from_slice(path);
+    }
+    result
+}
+
 impl WorkspaceCommandHelper {
     #[instrument(skip_all)]
     fn new(
@@ -1386,7 +1480,7 @@ impl WorkspaceCommandHelper {
         // In that situation, the ref would be conflicted anyway, so export
         // failure is okay.
         let stats = self
-            .snapshot_working_copy(ui, git_import_export_lock)
+            .snapshot_working_copy(ui, git_import_export_lock, false)
             .await?;
 
         // import_git_refs() can rebase the working-copy commit.
@@ -1411,6 +1505,49 @@ impl WorkspaceCommandHelper {
             .snapshot_impl(ui, &git_import_export_lock)
             .await
             .map_err(|err| err.into_command_error())?;
+        print_snapshot_stats(ui, &stats, self.env().path_converter())?;
+        Ok(())
+    }
+
+    /// Runs the first explicit snapshot after a subvolume-mode transition.
+    ///
+    /// Subvolume initialization starts with a no-snapshot helper so copying
+    /// or snapshotting topology cannot accidentally scan the mutable source.
+    /// Once the staged checkout exists, this deliberately reenables the
+    /// normal snapshot transaction to establish its first AWACS baseline.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    pub(crate) async fn snapshot_for_subvolume_enable(
+        &mut self,
+        ui: &Ui,
+        report_phase: &dyn Fn(&'static str) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
+        self.may_snapshot_working_copy = true;
+        report_phase("acquiring the colocated Git import lock")?;
+        let git_import_export_lock = self.lock_git_import_export()?;
+
+        #[cfg(feature = "git")]
+        if self.env.syncs_git_refs_automatically() {
+            report_phase("importing the colocated Git HEAD")?;
+            self.import_git_head(ui, &git_import_export_lock).await?;
+        }
+
+        report_phase("snapshotting the working copy and committing the AWACS baseline")?;
+        let stats = self
+            .snapshot_working_copy(ui, &git_import_export_lock, true)
+            .await
+            .map_err(|err| err.into_command_error())?;
+
+        // import_git_refs() can rebase the working-copy commit. In a large
+        // colocated repository this can outlive the filesystem snapshot by a
+        // wide margin, so keep it visible to the user instead of continuing
+        // to say that AWACS is snapshotting.
+        #[cfg(feature = "git")]
+        if self.env.syncs_git_refs_automatically() {
+            report_phase("importing colocated Git refs")?;
+            self.import_git_refs(ui, &git_import_export_lock).await?;
+        }
+
+        report_phase("printing snapshot results")?;
         print_snapshot_stats(ui, &stats, self.env().path_converter())?;
         Ok(())
     }
@@ -1695,13 +1832,124 @@ to the current parents may contain changes from multiple commits.
         if max_new_file_size == 0 {
             max_new_file_size = u64::MAX;
         }
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        let (awacs_input_fingerprint, awacs_compatible_input_fingerprints) =
+            if cfg!(debug_assertions) && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+                (Some([0; 32]), vec![])
+            } else {
+                let fingerprints = self
+                    .workspace_root()
+                    .join(".jj/working_copy/subvolume_mode")
+                    .is_file()
+                    .then(|| self.awacs_input_fingerprints(max_new_file_size))
+                    .transpose()?;
+                match fingerprints {
+                    Some((current, legacy)) => (Some(current), vec![legacy]),
+                    None => (None, vec![]),
+                }
+            };
+        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+        let awacs_input_fingerprint = None;
+        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+        let awacs_compatible_input_fingerprints = vec![];
+        #[cfg(feature = "git")]
+        let scan_root_ignores = self
+            .worktree_relative_git_excludes_path()
+            .into_iter()
+            .collect();
+        #[cfg(not(feature = "git"))]
+        let scan_root_ignores = vec![];
         Ok(SnapshotOptions {
             base_ignores,
+            scan_root_ignores,
             progress: None,
             start_tracking_matcher,
             force_tracking_matcher: &NothingMatcher,
             max_new_file_size,
+            awacs_input_fingerprint,
+            awacs_compatible_input_fingerprints,
         })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    fn awacs_input_fingerprints(
+        &self,
+        max_new_file_size: u64,
+    ) -> Result<([u8; 32], [u8; 32]), CommandError> {
+        let config = self.settings().config();
+        let sparse_patterns = self
+            .working_copy()
+            .sparse_patterns()
+            .map_err(internal_error)?;
+        let jj_sparse_prefixes = sparse_patterns
+            .iter()
+            .map(|path| path.as_internal_file_string().as_bytes().to_vec())
+            .collect();
+        let snapshot_auto_track = self.settings().get_string("snapshot.auto-track")?;
+        let fileset_aliases = config
+            .table_keys("fileset-aliases")
+            .map(|name| {
+                let key = ConfigNamePathBuf::from_iter(["fileset-aliases", name]);
+                Ok((
+                    name.as_bytes().to_vec(),
+                    self.settings().get_string(key)?.into_bytes(),
+                ))
+            })
+            .collect::<Result<Vec<_>, ConfigGetError>>()?;
+        let eol_conversion = self
+            .settings()
+            .get_string("working-copy.eol-conversion")?
+            .into_bytes();
+        let exec_bit_policy = effective_exec_bit_policy_for_fingerprint(
+            self.settings(),
+            &self.workspace_root().join(".jj").join("working_copy"),
+        )?
+        .as_bytes()
+        .to_vec();
+
+        #[cfg(feature = "git")]
+        let (core_excludes, git_info_exclude, git_sparse) = {
+            let core_excludes = if self.worktree_relative_git_excludes_path().is_some() {
+                awacs_external_input(None)?
+            } else {
+                awacs_external_input(self.selected_git_excludes_path())?
+            };
+            let git_info_exclude = awacs_external_input(self.git_info_exclude_path())?;
+            let git_sparse = self
+                .env
+                .git_workspace
+                .as_ref()
+                .map(|workspace| {
+                    jj_lib::git::sparse_patterns_in_git_dir(self.settings(), &workspace.git_dir)
+                })
+                .transpose()
+                .map_err(internal_error)?
+                .flatten();
+            (
+                core_excludes,
+                git_info_exclude,
+                encode_sparse_state(git_sparse),
+            )
+        };
+        #[cfg(not(feature = "git"))]
+        let (core_excludes, git_info_exclude, git_sparse) = (
+            awacs_external_input(None)?,
+            awacs_external_input(None)?,
+            b"unavailable".to_vec(),
+        );
+
+        let inputs = AwacsInputFingerprintV1 {
+            core_excludes,
+            git_info_exclude,
+            git_sparse,
+            jj_sparse_prefixes,
+            snapshot_auto_track: snapshot_auto_track.into_bytes(),
+            fileset_aliases,
+            max_new_file_size,
+            eol_conversion,
+            exec_bit_policy,
+        };
+        Ok((inputs.sha256(), inputs.legacy_sha256()))
     }
 
     pub(crate) fn path_converter(&self) -> &RepoPathUiConverter {
@@ -1714,44 +1962,69 @@ to the current parents may contain changes from multiple commits.
     }
 
     #[cfg(feature = "git")]
-    #[instrument(skip_all)]
-    pub fn base_ignores(&self) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
+    fn configured_git_excludes_path(&self) -> Option<PathBuf> {
         let get_excludes_file_path = |config: &gix::config::File| -> Option<PathBuf> {
             // TODO: maybe use path() and interpolate(), which can process non-utf-8
             // path on Unix.
-            if let Some(value) = config.string("core.excludesFile") {
-                let path = str::from_utf8(&value)
-                    .ok()
-                    .map(jj_lib::file_util::expand_home_path)?;
-                // The configured path is usually absolute, but if it's relative,
-                // the "git" command would read the file at the work-tree directory.
-                Some(self.workspace_root().join(path))
-            } else {
-                xdg_config_home().map(|x| x.join("git").join("ignore"))
-            }
+            let value = config.string("core.excludesFile")?;
+            str::from_utf8(&value)
+                .ok()
+                .map(jj_lib::file_util::expand_home_path)
         };
 
-        fn xdg_config_home() -> Option<PathBuf> {
-            if let Ok(x) = std::env::var("XDG_CONFIG_HOME")
-                && !x.is_empty()
-            {
-                return Some(PathBuf::from(x));
-            }
-            etcetera::home_dir().ok().map(|home| home.join(".config"))
+        if let Ok(git_backend) = jj_lib::git::get_git_backend(self.repo().store()) {
+            get_excludes_file_path(&git_backend.git_repo().config_snapshot())
+        } else if let Ok(git_config) = gix::config::File::from_globals() {
+            get_excludes_file_path(&git_config)
+        } else {
+            None
         }
+    }
 
+    #[cfg(feature = "git")]
+    fn worktree_relative_git_excludes_path(&self) -> Option<PathBuf> {
+        let path = self.configured_git_excludes_path()?;
+        if path.is_absolute() {
+            return None;
+        }
+        normalize_worktree_relative_path(&path)
+    }
+
+    #[cfg(feature = "git")]
+    fn selected_git_excludes_path(&self) -> Option<PathBuf> {
+        if let Some(path) = self.configured_git_excludes_path() {
+            return Some(if path.is_absolute() {
+                path
+            } else {
+                self.workspace_root().join(path)
+            });
+        }
+        xdg_config_home().map(|path| path.join("git").join("ignore"))
+    }
+
+    #[cfg(all(feature = "git", target_os = "linux", feature = "awacs"))]
+    fn git_info_exclude_path(&self) -> Option<PathBuf> {
+        jj_lib::git::get_git_backend(self.repo().store())
+            .ok()
+            .map(|backend| backend.git_repo_path().join("info").join("exclude"))
+    }
+
+    #[cfg(feature = "git")]
+    #[instrument(skip_all)]
+    pub fn base_ignores(&self) -> Result<Arc<GitIgnoreFile>, GitIgnoreError> {
         let mut git_ignores = GitIgnoreFile::empty();
         if let Ok(git_backend) = jj_lib::git::get_git_backend(self.repo().store()) {
-            let git_repo = git_backend.git_repo();
-            if let Some(excludes_file_path) = get_excludes_file_path(&git_repo.config_snapshot()) {
+            if self.worktree_relative_git_excludes_path().is_none()
+                && let Some(excludes_file_path) = self.selected_git_excludes_path()
+            {
                 git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
             }
             git_ignores = git_ignores.chain_with_file(
                 RepoPath::root(),
                 git_backend.git_repo_path().join("info").join("exclude"),
             )?;
-        } else if let Ok(git_config) = gix::config::File::from_globals()
-            && let Some(excludes_file_path) = get_excludes_file_path(&git_config)
+        } else if self.worktree_relative_git_excludes_path().is_none()
+            && let Some(excludes_file_path) = self.selected_git_excludes_path()
         {
             git_ignores = git_ignores.chain_with_file(RepoPath::root(), excludes_file_path)?;
         }
@@ -2133,6 +2406,7 @@ to the current parents may contain changes from multiple commits.
         &mut self,
         ui: &Ui,
         git_import_export_lock: &GitImportExportLock,
+        force_awacs_input_fingerprint: bool,
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         let workspace_name = self.workspace_name().to_owned();
         let repo = self.repo().clone();
@@ -2142,6 +2416,18 @@ to the current parents may contain changes from multiple commits.
         let options = self
             .snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)
             .map_err(snapshot_command_error)?;
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        let mut options = options;
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        if force_awacs_input_fingerprint && options.awacs_input_fingerprint.is_none() {
+            let (current, legacy) = self
+                .awacs_input_fingerprints(options.max_new_file_size)
+                .map_err(snapshot_command_error)?;
+            options.awacs_input_fingerprint = Some(current);
+            options.awacs_compatible_input_fingerprints = vec![legacy];
+        }
+        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+        let _ = force_awacs_input_fingerprint;
 
         // Compare working-copy tree and operation with repo's, and reload as needed.
         let mut locked_ws = self
@@ -3404,11 +3690,26 @@ fn print_invalid_utf8_paths(
     Ok(())
 }
 
+pub fn print_snapshot_warnings(ui: &Ui, warnings: &[SnapshotWarning]) -> io::Result<()> {
+    for warning in warnings {
+        match warning {
+            SnapshotWarning::FileSystemMonitor { message } => {
+                writeln!(ui.warning_default(), "Failed to query filesystem monitor:")?;
+                let mut formatter = ui.stderr_formatter();
+                for line in message.lines() {
+                    writeln!(formatter, "  {line}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 pub fn print_snapshot_stats(
     ui: &Ui,
     stats: &SnapshotStats,
     path_converter: &RepoPathUiConverter,
 ) -> io::Result<()> {
+    print_snapshot_warnings(ui, &stats.warnings)?;
     print_untracked_files(ui, &stats.untracked_paths, path_converter)?;
     print_invalid_utf8_paths(ui, &stats.invalid_utf8_paths, path_converter)?;
 

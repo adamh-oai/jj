@@ -24,6 +24,7 @@ use jj_lib::working_copy::WorkingCopy as _;
 use pollster::FutureExt as _;
 use testutils::TestResult;
 use testutils::TestWorkspace;
+use testutils::assert_tree_eq;
 use testutils::commit_with_tree;
 use testutils::create_tree;
 use testutils::repo_path;
@@ -118,10 +119,7 @@ fn test_sparse_checkout() -> TestResult {
     // Write the new state to disk
     locked_ws.finish(repo.op_id().clone()).block_on()?;
     let wc: &LocalWorkingCopy = ws.working_copy().downcast_ref().unwrap();
-    assert_eq!(
-        wc.file_states()?.paths().collect_vec(),
-        vec![dir1_file1_path, dir1_file2_path, dir1_subdir1_file1_path]
-    );
+    assert_tree_eq!(*wc.tree()?, commit.tree());
     assert_eq!(wc.sparse_patterns()?, sparse_patterns);
 
     // Reload the state to check that it was persisted
@@ -131,10 +129,7 @@ fn test_sparse_checkout() -> TestResult {
         wc.state_path().to_path_buf(),
         repo.settings(),
     )?;
-    assert_eq!(
-        wc.file_states()?.paths().collect_vec(),
-        vec![dir1_file1_path, dir1_file2_path, dir1_subdir1_file1_path]
-    );
+    assert_tree_eq!(*wc.tree()?, commit.tree());
     assert_eq!(wc.sparse_patterns()?, sparse_patterns);
 
     // Set sparse patterns to file2, dir1/subdir1/ and dir2/
@@ -185,10 +180,8 @@ fn test_sparse_checkout() -> TestResult {
     );
     let wc = locked_wc.finish(repo.op_id().clone()).block_on()?;
     let wc: &LocalWorkingCopy = wc.downcast_ref().unwrap();
-    assert_eq!(
-        wc.file_states()?.paths().collect_vec(),
-        vec![dir1_subdir1_file1_path, dir2_file1_path, root_file1_path]
-    );
+    assert_tree_eq!(*wc.tree()?, commit.tree());
+    assert_eq!(wc.sparse_patterns()?, sparse_patterns);
     Ok(())
 }
 

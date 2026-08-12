@@ -125,8 +125,10 @@ This document contains the help content for the `jj` command-line program.
 * [`jj util markdown-help`↴](#jj-util-markdown-help)
 * [`jj util snapshot`↴](#jj-util-snapshot)
 * [`jj util subvolume`↴](#jj-util-subvolume)
+* [`jj util subvolume init`↴](#jj-util-subvolume-init)
 * [`jj util subvolume enable`↴](#jj-util-subvolume-enable)
 * [`jj util subvolume disable`↴](#jj-util-subvolume-disable)
+* [`jj util subvolume status`↴](#jj-util-subvolume-status)
 * [`jj version`↴](#jj-version)
 * [`jj workspace`↴](#jj-workspace)
 * [`jj workspace add`↴](#jj-workspace-add)
@@ -1686,7 +1688,7 @@ Show the current colocation status
 
 Update the underlying Git repo with changes made in the repo
 
-There is no need to run this command if you're in colocated workspace because the export happens automatically there.
+By default, this command does nothing in colocated workspaces because the export happens automatically. Use `--ignore-working-copy` to forcibly export changes.
 
 **Usage:** `jj git export`
 
@@ -1740,7 +1742,7 @@ Commits that are no longer reachable from any branch in the Git repo will be con
 
 If a working-copy commit gets abandoned, it will be given a new, empty commit. This is true in general; it is not specific to this command.
 
-There is no need to run this command if you're in colocated workspace because the import happens automatically there.
+By default, this command does nothing in colocated workspaces because the import happens automatically. Use `--ignore-working-copy` to forcibly import changes.
 
 **Usage:** `jj git import`
 
@@ -3766,16 +3768,46 @@ Manage the Btrfs subvolume layout of the current repository
 
 ###### **Subcommands:**
 
-* `enable` — Put the repository root and its .git directory in Btrfs subvolumes
+* `init` — Build a snapshot-backed Btrfs checkout at a new path
+* `enable` — Initialize a replacement checkout, then atomically activate it
 * `disable` — Convert the repository root and its .git directory back to plain directories
+* `status` — Show the repository subvolume layout and working-copy snapshot state
+
+
+
+## `jj util subvolume init`
+
+Build a snapshot-backed Btrfs checkout at a new path
+
+**Usage:** `jj util subvolume init [OPTIONS] <DESTINATION>`
+
+###### **Arguments:**
+
+* `<DESTINATION>` — New repository path to initialize
+
+###### **Options:**
+
+* `--compress <COMPRESS>` — Set compression on new subvolumes and rewrite file extents instead of reflinking them
+
+  Possible values: `true`, `false`
+
+* `--keep` — Keep a partial migration checkout after failure
 
 
 
 ## `jj util subvolume enable`
 
-Put the repository root and its .git directory in Btrfs subvolumes
+Initialize a replacement checkout, then atomically activate it
 
-**Usage:** `jj util subvolume enable`
+**Usage:** `jj util subvolume enable [OPTIONS]`
+
+###### **Options:**
+
+* `--compress <COMPRESS>` — Set compression on new subvolumes and rewrite file extents instead of reflinking them
+
+  Possible values: `true`, `false`
+
+* `--keep` — Keep the displaced source checkout after activation, or a partial migration checkout after failure
 
 
 
@@ -3784,6 +3816,14 @@ Put the repository root and its .git directory in Btrfs subvolumes
 Convert the repository root and its .git directory back to plain directories
 
 **Usage:** `jj util subvolume disable`
+
+
+
+## `jj util subvolume status`
+
+Show the repository subvolume layout and working-copy snapshot state
+
+**Usage:** `jj util subvolume status`
 
 
 
