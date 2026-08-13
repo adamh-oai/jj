@@ -51,7 +51,11 @@ pub async fn cmd_workspace_list(
     command: &CommandHelper,
     args: &WorkspaceListArgs,
 ) -> Result<(), CommandError> {
-    let workspace_command = command.workspace_helper(ui).await?;
+    // Listing only reads the recorded repository view. Avoid snapshotting the
+    // current working copy first: that can be arbitrarily expensive, and it
+    // unnecessarily serializes this read-only command on the colocated Git
+    // import/export lock.
+    let workspace_command = command.workspace_helper_no_snapshot(ui).await?;
 
     let template: TemplateRenderer<WorkspaceRef> = {
         let language = workspace_command.commit_template_language();

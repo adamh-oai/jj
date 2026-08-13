@@ -46,6 +46,21 @@ fn test_workspaces_invalid_name() {
     ");
 }
 
+#[test]
+fn test_workspace_list_does_not_snapshot_working_copy() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("untracked", "contents");
+
+    work_dir.run_jj(["workspace", "list"]).success();
+
+    let output = work_dir
+        .run_jj(["--ignore-working-copy", "file", "list", "untracked"])
+        .success();
+    assert!(!output.stdout.raw().contains("untracked"));
+}
+
 /// Test adding a second and a third workspace
 #[test]
 fn test_workspaces_add_second_and_third_workspace() {
