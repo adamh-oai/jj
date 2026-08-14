@@ -83,6 +83,10 @@ use crate::ui::Ui;
 /// only want to stop tracking a workspace without deleting its files.
 #[derive(clap::Args, Clone, Debug)]
 pub struct WorkspaceRemoveArgs {
+    /// Skip validity and dirty checks; delete the recorded path if it exists
+    #[arg(long)]
+    force: bool,
+
     /// Name of the workspace to remove
     #[arg(value_name = "WORKSPACE", add = ArgValueCandidates::new(complete::workspaces))]
     workspace: WorkspaceNameBuf,
@@ -94,6 +98,10 @@ pub async fn cmd_workspace_remove(
     command: &CommandHelper,
     args: &WorkspaceRemoveArgs,
 ) -> Result<(), CommandError> {
+    if args.force {
+        return cmd_workspace_remove_force(ui, command, args).await;
+    }
+
     // Reject an unsafe target before snapshotting the invoking workspace. A
     // failed attempt to remove the primary workspace must not create an
     // operation while proving that its shared repo is still needed.
@@ -215,6 +223,79 @@ pub async fn cmd_workspace_remove(
     Ok(())
 }
 
+async fn cmd_workspace_remove_force(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &WorkspaceRemoveArgs,
+) -> Result<(), CommandError> {
+    // Force removal is also the recovery path for stale registrations, so do
+    // not snapshot the invoking working copy or try to load the target.
+    let initial_workspace = command.workspace_helper_no_snapshot(ui).await?;
+    let workspace_store = SimpleWorkspaceStore::load(initial_workspace.repo_path())?;
+    let lifecycle_lock = workspace_store.lock_lifecycle()?;
+    let mut workspace_command = command.workspace_helper_no_snapshot(ui).await?;
+
+    if args.workspace.as_str() == workspace_command.workspace_name().as_str() {
+        return Err(user_error(
+            "Cannot remove the current workspace; run this command from another workspace",
+        ));
+    }
+
+    let stored_path = workspace_store.get_workspace_path(args.workspace.as_ref())?;
+    let is_tracked = workspace_command
+        .repo()
+        .view()
+        .get_wc_commit_id(args.workspace.as_ref())
+        .is_some();
+    if !is_tracked && stored_path.is_none() {
+        return Err(user_error(format!(
+            "No such workspace: {}",
+            args.workspace.as_symbol()
+        )));
+    }
+
+    let registered_path = stored_path.as_ref().map(|stored_path| {
+        normalize_absolute_path(&workspace_command.repo_path().join(stored_path))
+    });
+    let mut tx = if is_tracked {
+        let mut tx = workspace_command.start_transaction();
+        tx.repo_mut().remove_workspace(&args.workspace).await?;
+        Some(tx)
+    } else {
+        None
+    };
+
+    let removed_path = if let Some(path) = registered_path.as_deref() {
+        force_delete_registered_path(args.workspace.as_ref(), path)?
+    } else {
+        false
+    };
+    workspace_store.forget(&[args.workspace.as_ref()])?;
+    if let Some(tx) = tx.take() {
+        tx.finish(
+            ui,
+            format!("force remove workspace {}", args.workspace.as_symbol()),
+        )
+        .await?;
+    }
+    drop(lifecycle_lock);
+
+    match (registered_path, removed_path) {
+        (Some(path), true) => writeln!(ui.status(), "Removed workspace at \"{}\"", path.display())?,
+        (Some(path), false) => writeln!(
+            ui.status(),
+            "Removed workspace registration; no path existed at \"{}\"",
+            path.display()
+        )?,
+        (None, _) => writeln!(
+            ui.status(),
+            "Removed workspace registration for {}",
+            args.workspace.as_symbol()
+        )?,
+    }
+    Ok(())
+}
+
 struct RemovalTarget {
     stored_path: PathBuf,
     registered_path: PathBuf,
@@ -224,6 +305,63 @@ struct RemovalTarget {
 
 struct ClaimedRemovalTarget {
     path: PathBuf,
+}
+
+/// Deletes the recorded force-removal path without following symlinks.
+///
+/// The force path intentionally skips workspace identity, overlap, and dirty
+/// checks. It still claims a directory before recursive deletion so a
+/// pathname replacement cannot redirect deletion after the command starts.
+fn force_delete_registered_path(
+    workspace_name: &WorkspaceName,
+    path: &Path,
+) -> Result<bool, CommandError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).context(path).map_err(Into::into),
+    };
+    if !metadata.is_dir() {
+        fs::remove_file(path).context(path)?;
+        return Ok(true);
+    }
+
+    let identity = path_identity(path)?;
+    let target = RemovalTarget {
+        stored_path: PathBuf::new(),
+        registered_path: path.to_owned(),
+        path: path.to_owned(),
+        identity,
+    };
+    let claimed = claim_removal_target(workspace_name, &target)?;
+    let deletion_result = if is_btrfs_subvolume(&claimed.path).unwrap_or(false) {
+        delete_btrfs_subvolume(&claimed.path)
+            .and_then(|deleted| {
+                if deleted {
+                    Ok(())
+                } else {
+                    Err(user_error(
+                        "Failed to delete Btrfs subvolume: claimed path is not on Btrfs",
+                    ))
+                }
+            })
+            .map_err(|mut err| {
+                add_btrfs_delete_hint(&mut err, path);
+                err
+            })
+    } else {
+        delete_claimed_directory(&claimed.path, &target.identity)
+    };
+    if let Err(mut err) = deletion_result {
+        if let Err(restore_err) = restore_claimed_target(&target, &claimed) {
+            err.add_hint(format!(
+                "The force-removal target remains at {} because restoring its original name +                 failed: {restore_err:?}",
+                claimed.path.display()
+            ));
+        }
+        return Err(err);
+    }
+    Ok(true)
 }
 
 /// Snapshots the target in memory with filesystem monitoring disabled, then
@@ -635,7 +773,6 @@ fn preflight_workspace_removal(
             continue;
         }
         let Some(survivor) = resolve_surviving_workspace(
-            command,
             workspace_command,
             workspace_store,
             survivor_name.as_ref(),
@@ -661,7 +798,6 @@ fn preflight_workspace_removal(
 }
 
 fn resolve_surviving_workspace(
-    command: &CommandHelper,
     workspace_command: &WorkspaceCommandHelper,
     workspace_store: &SimpleWorkspaceStore,
     workspace_name: &WorkspaceName,
@@ -692,8 +828,42 @@ fn resolve_surviving_workspace(
             return Err(err).context(&registered_path).map_err(Into::into);
         }
     }
-    resolve_registered_workspace(command, workspace_command, workspace_store, workspace_name)
-        .map(Some)
+    // Survivor validation only needs a stable path and filesystem identity for
+    // overlap checks. An unrelated stale registration must not block removal
+    // merely because its path is no longer a loadable JJ workspace.
+    resolve_registered_survivor_path(workspace_command, workspace_store, workspace_name).map(Some)
+}
+
+fn resolve_registered_survivor_path(
+    workspace_command: &WorkspaceCommandHelper,
+    workspace_store: &SimpleWorkspaceStore,
+    workspace_name: &WorkspaceName,
+) -> Result<RemovalTarget, CommandError> {
+    let stored_path = workspace_store
+        .get_workspace_path(workspace_name)?
+        .ok_or_else(|| {
+            user_error(format!(
+                "Workspace has no recorded path: {}",
+                workspace_name.as_symbol()
+            ))
+        })?;
+    let registered_path =
+        normalize_absolute_path(&workspace_command.repo_path().join(&stored_path));
+    reject_symlink_components(workspace_name, &registered_path)?;
+    let path = canonicalize_path(
+        &registered_path,
+        format!(
+            "Cannot resolve absolute workspace path: {}",
+            registered_path.display()
+        ),
+    )?;
+    let identity = path_identity(&path)?;
+    Ok(RemovalTarget {
+        stored_path,
+        registered_path,
+        path,
+        identity,
+    })
 }
 
 fn resolve_loaded_workspace(

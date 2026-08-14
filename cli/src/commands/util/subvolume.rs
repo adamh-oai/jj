@@ -120,7 +120,10 @@ pub async fn cmd_util_subvolume(
 
     match subcommand {
         UtilSubvolumeCommand::Enable { compress, keep } => {
-            require_main_colocated_workspace(&workspace_root)?;
+            let main_workspace = require_colocated_workspace(&workspace_command)?;
+            if !main_workspace {
+                require_main_subvolume_mode_for_linked_workspace(&workspace_command)?;
+            }
             if is_subvolume_mode_committed(&workspace_root) && !recovery_needed {
                 writeln!(ui.status(), "Btrfs subvolume mode is already enabled.")?;
                 drop(recovery_guard);
@@ -157,7 +160,7 @@ pub async fn cmd_util_subvolume(
             return Ok(());
         }
         UtilSubvolumeCommand::Disable => {
-            require_main_colocated_workspace(&workspace_root)?;
+            require_colocated_workspace(&workspace_command)?;
             workspace_command
                 .working_copy()
                 .tree()
@@ -276,7 +279,10 @@ async fn init_subvolume_at_inner(
     compress: Option<bool>,
 ) -> Result<(), CommandError> {
     let source_root = source_command.workspace_root();
-    require_main_colocated_workspace(source_root)?;
+    let main_colocated_workspace = require_colocated_workspace(source_command)?;
+    if !main_colocated_workspace {
+        require_main_subvolume_mode_for_linked_workspace(source_command)?;
+    }
     source_command
         .working_copy()
         .tree()
@@ -638,15 +644,43 @@ fn format_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn require_main_colocated_workspace(workspace_root: &Path) -> Result<(), CommandError> {
-    if workspace_root.join(".jj/repo").is_file() {
+fn require_colocated_workspace(
+    workspace_command: &crate::cli_util::WorkspaceCommandHelper,
+) -> Result<bool, CommandError> {
+    let workspace_root = workspace_command.workspace_root();
+    if !crate::git_util::is_colocated_git_workspace(workspace_command.workspace()) {
         return Err(user_error(
-            "This command cannot be used in a non-main Jujutsu workspace",
+            "This command requires a Git-colocated repository",
         ));
     }
-    if !workspace_root.join(".git").is_dir() {
+    let main_workspace = !workspace_root.join(".jj/repo").is_file();
+    if main_workspace && !workspace_root.join(".git").is_dir() {
         return Err(user_error(
-            "This command requires a Git-colocated repository with a .git directory",
+            "The main Git-colocated workspace must have a .git directory",
+        ));
+    }
+    if !main_workspace && !workspace_root.join(".git").is_file() {
+        return Err(user_error(
+            "A linked Git-colocated workspace must have a .git file",
+        ));
+    }
+    Ok(main_workspace)
+}
+
+fn require_main_subvolume_mode_for_linked_workspace(
+    workspace_command: &crate::cli_util::WorkspaceCommandHelper,
+) -> Result<(), CommandError> {
+    let main_root = workspace_command
+        .repo_path()
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| user_error("Cannot locate the main workspace root"))?;
+    if !is_subvolume_mode_committed(main_root) {
+        return Err(user_error(
+            "Cannot enable subvolume mode in a linked workspace until the main workspace is +             snapshot-backed",
+        )
+        .hinted(
+            "Run `jj util subvolume enable` from the main workspace first, then retry here.",
         ));
     }
     Ok(())

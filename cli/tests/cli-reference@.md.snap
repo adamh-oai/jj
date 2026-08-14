@@ -3842,7 +3842,7 @@ Initialize a replacement checkout, then atomically activate it
 
   Possible values: `true`, `false`
 
-* `--keep` — Keep the displaced source checkout after activation, or a partial migration checkout after failure
+* `--keep` — Keep a partial migration checkout after failure
 
 
 
@@ -3956,11 +3956,15 @@ Remove a workspace and its directory from disk
 
 The current workspace cannot be removed. Use `jj workspace forget` if you only want to stop tracking a workspace without deleting its files.
 
-**Usage:** `jj workspace remove <WORKSPACE>`
+**Usage:** `jj workspace remove [OPTIONS] <WORKSPACE>`
 
 ###### **Arguments:**
 
 * `<WORKSPACE>` — Name of the workspace to remove
+
+###### **Options:**
+
+* `--force` — Skip validity and dirty checks; delete the recorded path if it exists
 
 
 
