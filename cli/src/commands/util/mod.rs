@@ -20,6 +20,8 @@ mod gc;
 mod install_man_pages;
 mod markdown_help;
 mod snapshot;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+mod subvolume;
 
 use clap::Subcommand;
 use tracing::instrument;
@@ -40,6 +42,10 @@ use self::markdown_help::UtilMarkdownHelp;
 use self::markdown_help::cmd_util_markdown_help;
 use self::snapshot::UtilSnapshotArgs;
 use self::snapshot::cmd_util_snapshot;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use self::subvolume::UtilSubvolumeCommand;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use self::subvolume::cmd_util_subvolume;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::ui::Ui;
@@ -56,6 +62,9 @@ pub(crate) enum UtilCommand {
     InstallManPages(UtilInstallManPagesArgs),
     MarkdownHelp(UtilMarkdownHelp),
     Snapshot(UtilSnapshotArgs),
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    #[command(subcommand)]
+    Subvolume(UtilSubvolumeCommand),
 }
 
 #[instrument(skip_all)]
@@ -73,5 +82,7 @@ pub(crate) async fn cmd_util(
         UtilCommand::InstallManPages(args) => cmd_util_install_man_pages(ui, command, args).await,
         UtilCommand::MarkdownHelp(args) => cmd_util_markdown_help(ui, command, args).await,
         UtilCommand::Snapshot(args) => cmd_util_snapshot(ui, command, args).await,
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        UtilCommand::Subvolume(args) => cmd_util_subvolume(ui, command, args).await,
     }
 }
