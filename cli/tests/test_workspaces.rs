@@ -617,14 +617,9 @@ exit 1
     );
     let output = main_dir
         .run_jj_with(|cmd| {
-            cmd.env("PATH", &path).args([
-                "--debug",
-                "workspace",
-                "add",
-                "-r",
-                "@--",
-                "../secondary",
-            ])
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(["--debug", "workspace", "add", "-r", "@--", "../secondary"])
         })
         .success();
     for message in [
@@ -689,6 +684,7 @@ exit 1
     main_dir
         .run_jj_with(|cmd| {
             cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
                 .args(["workspace", "add", "../tertiary"])
         })
         .success();
@@ -871,6 +867,8 @@ exit 1
 #[test]
 #[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
+    use btrfs_awacs::store::Store;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
@@ -905,7 +903,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             .as_nanos()
     );
     let repo_root = btrfs_root.join(format!("jj-subvolume-e2e-{suffix}"));
-    let initialized_root = btrfs_root.join(format!("jj-subvolume-init-e2e-{suffix}"));
+    let secondary_root = btrfs_root.join(format!("jj-subvolume-secondary-e2e-{suffix}"));
     let awacs_state = btrfs_root.join(format!(".jj-subvolume-e2e-awacs-{suffix}"));
     std::fs::create_dir(&repo_root)?;
     std::fs::create_dir(&awacs_state)?;
@@ -939,12 +937,8 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let configure_awacs = |cmd: &mut assert_cmd::Command| {
         cmd.env("BTRFS_AWACS_COMMAND", &awacs_command)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("XDG_STATE_HOME", &awacs_state)
             .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
-            .env("BTRFS_AWACS_SPOOL_DIR", awacs_state.join("spool"))
-            .env(
-                "BTRFS_AWACS_MANAGER_DB",
-                awacs_state.join("manager.sqlite3"),
-            )
             .env("BTRFS_AWACS_LOG", awacs_state.join("daemon.log"))
             .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket);
     };
@@ -952,12 +946,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let output = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
-            cmd.args([
-                "util",
-                "subvolume",
-                "init",
-                initialized_root.to_str().unwrap(),
-            ])
+            cmd.args(["util", "subvolume", "enable"])
         })
         .success();
     assert!(
@@ -973,13 +962,12 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     // A Btrfs subvolume root always has inode 256. `btrfs subvolume show`
     // also searches the B-tree for child snapshots and can therefore exit
     // unsuccessfully for an otherwise fully capable unprivileged user.
-    assert!(!repo_root.join(".jj/working_copy/subvolume_mode").exists());
-    assert_eq!(std::fs::metadata(&initialized_root)?.ino(), 256);
-    assert_eq!(std::fs::metadata(initialized_root.join(".git"))?.ino(), 256);
-    assert!(initialized_root.join("ignored-untracked").is_file());
-    let initialized_dir = test_env.work_dir(&initialized_root);
+    assert!(repo_root.join(".jj/working_copy/subvolume_mode").exists());
+    assert_eq!(std::fs::metadata(&repo_root)?.ino(), 256);
+    assert_eq!(std::fs::metadata(repo_root.join(".git"))?.ino(), 256);
+    assert!(repo_root.join("ignored-untracked").is_file());
 
-    let tracked = initialized_dir
+    let tracked = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["file", "list", "tracked-large", "tracked-ignored"])
@@ -987,7 +975,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         .success();
     assert!(tracked.stdout.raw().contains("tracked-large"));
     assert!(tracked.stdout.raw().contains("tracked-ignored"));
-    let ignored_untracked = initialized_dir
+    let ignored_untracked = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["file", "list", "ignored-untracked"])
@@ -995,7 +983,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         .success();
     assert!(!ignored_untracked.stdout.raw().contains("ignored-untracked"));
 
-    let status = initialized_dir
+    let status = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["util", "subvolume", "status"])
@@ -1007,34 +995,155 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
 
     // This is the behavior the synthetic lease cannot prove: a second command
     // must consume the real retained baseline through AWACS and remain fast.
-    initialized_dir
+    main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["status"])
         })
         .success();
 
-    initialized_dir
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            // Exercise the real regression: the filesystem snapshot starts at
+            // the source workspace's current tree, but the new workspace is
+            // requested at a different tree. The child must commit its cloned
+            // AWACS baseline before Git import or checkout materializes that
+            // requested revision.
+            cmd.args([
+                "workspace",
+                "add",
+                "-r",
+                "root()",
+                "--name",
+                "secondary",
+                secondary_root.to_str().unwrap(),
+            ])
+        })
+        .success();
+    let secondary_dir = test_env.work_dir(&secondary_root);
+    secondary_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["status"])
+        })
+        .success();
+
+    let mut parent_store = None;
+    let mut child_store = None;
+    for entry in std::fs::read_dir(awacs_state.join("btrfs-awacs/roots"))? {
+        let manager_db = entry?.path().join("manager.sqlite3");
+        let store = Store::open(&manager_db)?;
+        let parent_count: i64 = store.connection().query_row(
+            "SELECT count(*) FROM watches WHERE live_path = ?1",
+            [repo_root.as_os_str().as_bytes()],
+            |row| row.get(0),
+        )?;
+        let child_count: i64 = store.connection().query_row(
+            "SELECT count(*) FROM watches WHERE live_path = ?1",
+            [secondary_root.as_os_str().as_bytes()],
+            |row| row.get(0),
+        )?;
+        if parent_count == 1 {
+            parent_store = Some((manager_db.clone(), store));
+        } else if child_count == 1 {
+            child_store = Some((manager_db.clone(), store));
+        }
+    }
+    let (parent_db, parent_store) = parent_store.expect("parent AWACS store should exist");
+    let (child_db, child_store) = child_store.expect("child AWACS store should exist");
+    assert_ne!(
+        parent_db, child_db,
+        "worktree initialization should create a fresh SQLite store"
+    );
+    let child_watch_count: i64 =
+        child_store
+            .connection()
+            .query_row("SELECT count(*) FROM watches", [], |row| row.get(0))?;
+    assert_eq!(
+        child_watch_count, 1,
+        "child SQLite must contain only itself"
+    );
+    let (parent_revision_id, parent_snapshot_id): (i64, i64) =
+        parent_store.connection().query_row(
+            r#"SELECT indexed_revision_id, last_cut_snapshot_id
+             FROM watches
+            WHERE live_path = ?1 AND state = 'active'"#,
+            [repo_root.as_os_str().as_bytes()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+    let (child_live_uuid, child_revision_id): (Vec<u8>, i64) = child_store.connection().query_row(
+        r#"SELECT live_subvol_uuid, indexed_revision_id
+             FROM watches
+            WHERE live_path = ?1 AND state = 'active'"#,
+        [secondary_root.as_os_str().as_bytes()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (initial_child_revision_id, initial_child_snapshot_id, initial_child_snapshot_path): (
+        i64,
+        i64,
+        Vec<u8>,
+    ) = child_store.connection().query_row(
+        r#"SELECT r.id, s.id, s.path
+             FROM snapshots s
+             JOIN revisions r ON r.snapshot_id = s.id
+            WHERE s.parent_uuid = ?1 AND r.state = 'ready'
+            ORDER BY r.id ASC LIMIT 1"#,
+        [child_live_uuid.as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    assert_ne!(
+        initial_child_revision_id, parent_revision_id,
+        "worktree initialization must publish a child-owned revision"
+    );
+    assert_ne!(
+        initial_child_snapshot_id, parent_snapshot_id,
+        "worktree initialization must create a child-owned baseline snapshot"
+    );
+    assert!(
+        std::path::Path::new(std::ffi::OsStr::from_bytes(&initial_child_snapshot_path)).exists(),
+        "the child initial snapshot should exist physically"
+    );
+    assert_eq!(
+        child_store.load_revision(initial_child_revision_id)?,
+        parent_store.load_revision(parent_revision_id)?,
+        "worktree initialization should clone the parent's path map"
+    );
+    child_store.load_revision(child_revision_id)?;
+
+    // Removing the worktree only removes its filesystem/repo registration.
+    // Its cloned baseline has no parent pins that require coordinated AWACS
+    // cleanup.
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["workspace", "remove", "secondary"])
+        })
+        .success();
+    assert!(!secondary_root.exists());
+
+    main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             cmd.args(["util", "subvolume", "disable"])
         })
         .success();
-    assert!(initialized_root.join("file").is_file());
-    assert!(
-        !initialized_root
-            .join(".jj/working_copy/subvolume_mode")
-            .exists()
-    );
+    assert!(repo_root.join("file").is_file());
+    assert!(!repo_root.join(".jj/working_copy/subvolume_mode").exists());
     let retained_snapshots = std::fs::read_dir(awacs_state.join("managed"))?
         .filter_map(|entry| entry.ok())
+        .flat_map(|directory| {
+            std::fs::read_dir(directory.path())
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+        })
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("cut-"))
         .map(|entry| entry.path())
         .collect::<Vec<_>>();
-    assert_eq!(
-        retained_snapshots.len(),
-        1,
-        "disable should release older per-workspace baselines"
+    assert!(
+        retained_snapshots.len() >= 2,
+        "the fixture should retain independent parent and removed-child baselines"
     );
     // AWACS intentionally keeps its newest watch checkpoint available for a
     // later re-enable. Remove that final fixture-owned snapshot explicitly so
@@ -1057,7 +1166,6 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         );
     }
     std::fs::remove_dir_all(&repo_root)?;
-    std::fs::remove_dir_all(&initialized_root)?;
     std::fs::remove_dir_all(&awacs_state)?;
     std::fs::remove_dir_all(&runtime_dir)?;
     Ok(())
@@ -1183,6 +1291,27 @@ exit 1
             .stderr
             .raw()
             .contains("Creating initial AWACS snapshot baseline...")
+    );
+    let stderr = output.stderr.raw();
+    assert!(
+        stderr
+            .find("AWACS init: test root initialized...")
+            .is_some_and(|initialized| {
+                stderr
+                    .find("Seeding snapshot-backed working-copy tree...")
+                    .is_some_and(|seed_tree| initialized < seed_tree)
+            }),
+        "AWACS root initialization must precede snapshot-backed tree seeding: {output}"
+    );
+    assert!(
+        stderr
+            .find("snapshotting the working copy and committing the AWACS baseline")
+            .is_some_and(|baseline| {
+                stderr
+                    .find("importing the colocated Git HEAD")
+                    .is_some_and(|import_head| baseline < import_head)
+            }),
+        "the first AWACS baseline must precede any Git HEAD materialization: {output}"
     );
     assert!(
         !output
@@ -1468,7 +1597,7 @@ exit 1
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]
-fn test_util_subvolume_init_compression_rewrites_extents() -> TestResult {
+fn test_util_subvolume_enable_compression_rewrites_extents() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
@@ -1477,10 +1606,6 @@ fn test_util_subvolume_init_compression_rewrites_extents() -> TestResult {
     main_dir.write_file(".gitignore", "/.fake-subvolume\n/.compression-*\n");
     main_dir.write_file("file", "tracked\n");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
-    // If --compress accidentally uses the fast path, these markers would make
-    // the source look snapshot-eligible.
-    main_dir.write_file(".fake-subvolume", "");
-    main_dir.write_file(".git/.fake-subvolume", "");
     let path = install_fake_btrfs(
         &test_env,
         r#"#!/bin/sh
@@ -1517,38 +1642,26 @@ exit 1
 "#,
     );
 
-    for (value, marker) in [
-        ("true", ".compression-zstd"),
-        ("false", ".compression-none"),
-    ] {
-        let destination = test_env.env_root().join(format!("initialized-{value}"));
-        let output = main_dir
-            .run_jj_with(|cmd| {
-                cmd.env("PATH", &path)
-                    .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
-                    .args([
-                        "util",
-                        "subvolume",
-                        "init",
-                        &format!("--compress={value}"),
-                        destination.to_str().unwrap(),
-                    ])
-            })
-            .success();
-        assert!(
-            output
-                .stderr
-                .raw()
-                .contains("Creating new repository root subvolume at")
-        );
-        assert!(!output.stderr.raw().contains("Snapshotting repository root"));
-        assert!(destination.join(marker).is_file());
-        assert!(destination.join(".git").join(marker).is_file());
-        assert_eq!(
-            std::fs::read_to_string(destination.join("file"))?,
-            "tracked\n"
-        );
-    }
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(["util", "subvolume", "enable", "--compress=true"])
+        })
+        .success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("AWACS init: preparing Btrfs subvolume conversion")
+    );
+    assert!(!output.stderr.raw().contains("Snapshotting repository root"));
+    assert!(main_dir.root().join(".compression-zstd").is_file());
+    assert!(main_dir.root().join(".git/.compression-zstd").is_file());
+    assert_eq!(
+        std::fs::read_to_string(main_dir.root().join("file"))?,
+        "tracked\n"
+    );
     Ok(())
 }
 
@@ -1654,9 +1767,7 @@ fn test_util_subvolume_is_unavailable_without_awacs() -> TestResult {
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
         .success();
     let main_dir = test_env.work_dir("main");
-    let destination = test_env.env_root().join("initialized");
-
-    let output = main_dir.run_jj(["util", "subvolume", "init", destination.to_str().unwrap()]);
+    let output = main_dir.run_jj(["util", "subvolume", "enable"]);
     assert!(!output.status.success(), "{output}");
     assert!(
         output
@@ -1664,7 +1775,6 @@ fn test_util_subvolume_is_unavailable_without_awacs() -> TestResult {
             .raw()
             .contains("unrecognized subcommand 'subvolume'")
     );
-    assert!(!destination.exists());
     Ok(())
 }
 

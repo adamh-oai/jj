@@ -125,7 +125,6 @@ This document contains the help content for the `jj` command-line program.
 * [`jj util markdown-help`↴](#jj-util-markdown-help)
 * [`jj util snapshot`↴](#jj-util-snapshot)
 * [`jj util subvolume`↴](#jj-util-subvolume)
-* [`jj util subvolume init`↴](#jj-util-subvolume-init)
 * [`jj util subvolume enable`↴](#jj-util-subvolume-enable)
 * [`jj util subvolume disable`↴](#jj-util-subvolume-disable)
 * [`jj util subvolume status`↴](#jj-util-subvolume-status)
@@ -3768,30 +3767,9 @@ Manage the Btrfs subvolume layout of the current repository
 
 ###### **Subcommands:**
 
-* `init` — Build a snapshot-backed Btrfs checkout at a new path
 * `enable` — Initialize a replacement checkout, then atomically activate it
 * `disable` — Convert the repository root and its .git directory back to plain directories
 * `status` — Show the repository subvolume layout and working-copy snapshot state
-
-
-
-## `jj util subvolume init`
-
-Build a snapshot-backed Btrfs checkout at a new path
-
-**Usage:** `jj util subvolume init [OPTIONS] <DESTINATION>`
-
-###### **Arguments:**
-
-* `<DESTINATION>` — New repository path to initialize
-
-###### **Options:**
-
-* `--compress <COMPRESS>` — Set compression on new subvolumes and rewrite file extents instead of reflinking them
-
-  Possible values: `true`, `false`
-
-* `--keep` — Keep a partial migration checkout after failure
 
 
 

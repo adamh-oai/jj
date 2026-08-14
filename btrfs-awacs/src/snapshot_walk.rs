@@ -134,6 +134,15 @@ pub fn read_snapshot_index_with_progress(
     while let Some((directory, parent_ino, parent_path)) = directories.pop_front() {
         directories_seen += 1;
         for name in directory_names(directory.as_fd())? {
+            // A colocated JJ checkout may keep `.git` as its own Btrfs
+            // subvolume. It is repository control state, not working-copy
+            // namespace: neither JJ nor Git fsmonitor consumes paths below
+            // it, and parent-subvolume changed-object comparisons cannot
+            // describe its descendants anyway. Skip only the root control
+            // directory; other nested subvolumes remain a hard error.
+            if parent_path.is_empty() && name == b".git" {
+                continue;
+            }
             let relative_path = join_path(&parent_path, &name);
             let child = open_path(directory.as_fd(), &name)?;
             let stat = fd_stat(child.as_fd())?;

@@ -3040,7 +3040,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
                 err: Box::new(err),
             })?;
         Ok(Box::new(crate::local_working_copy::LocalWorkingCopy {
-            inner: crate::local_working_copy::LocalWorkingCopyInner::Legacy(self.wc),
+            inner: crate::local_working_copy::LocalWorkingCopyInner::Legacy(Box::new(self.wc)),
             reload: None,
         }))
     }

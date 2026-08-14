@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::bootstrap::{InitProgress, initialize_descendant_root};
 use futures::future::try_join_all;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
@@ -27,6 +29,8 @@ use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::file_util;
 use jj_lib::file_util::IoResultExt as _;
 use jj_lib::git;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::local_working_copy::seed_local_working_copy_tree;
 use jj_lib::lock::FileLock;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::WorkspaceNameBuf;
@@ -41,6 +45,8 @@ use crate::cli_util::RevisionArg;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use crate::commands::btrfs::begin_subvolume_mode;
 use crate::commands::btrfs::btrfs_command;
 use crate::commands::btrfs::delete_btrfs_subvolume;
 use crate::commands::btrfs::is_btrfs_subvolume;
@@ -164,6 +170,7 @@ pub async fn cmd_workspace_add(
                 .unwrap_or_else(|| repo.store().root_commit_id().clone());
             let source_commit = repo.store().get_commit_async(&source_commit_id).await?;
             match create_btrfs_snapshot(
+                ui,
                 old_workspace_command.workspace().workspace_root(),
                 &destination_path,
             ) {
@@ -232,7 +239,7 @@ pub async fn cmd_workspace_add(
     let initialization_started = Instant::now();
     // If we add per-workspace configuration, we'll need to reload settings for
     // the new workspace.
-    let (mut new_workspace, repo) = Workspace::init_workspace_with_existing_repo(
+    let (new_workspace, repo) = Workspace::init_workspace_with_existing_repo(
         &destination_path,
         repo_path,
         repo,
@@ -241,6 +248,9 @@ pub async fn cmd_workspace_add(
     )
     .await?;
     if snapshot {
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        begin_subvolume_mode(&destination_path)?;
+        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
         set_subvolume_mode(&destination_path, true)?;
         tracing::debug!(
             elapsed = ?initialization_started.elapsed(),
@@ -276,25 +286,33 @@ pub async fn cmd_workspace_add(
                 name = workspace_name.as_symbol()
             ))
             .await?;
-        let mut locked_ws = new_workspace.start_working_copy_mutation().await?;
-        locked_ws
-            .locked_wc()
-            .reset(source_commit)
-            .await
-            .map_err(|err| {
-                internal_error_with_message("Failed to record snapshot baseline", err)
-            })?;
-        locked_ws.finish(repo.op_id().clone()).await?;
-        tracing::debug!(
-            elapsed = ?baseline_started.elapsed(),
-            "recorded snapshot tree as workspace baseline"
-        );
+        tracing::debug!(elapsed = ?baseline_started.elapsed(), "recorded snapshot tree in repository");
         repo
     } else {
         repo
     };
 
-    let mut new_workspace_command = command.for_workable_repo(ui, new_workspace, repo)?;
+    let mut new_workspace_command = if snapshot {
+        // Workspace::init_workspace_with_existing_repo() selected the ordinary
+        // working-copy implementation before the marker above existed. Reload
+        // after the marker is durable so the child gets snapshot-backed
+        // journal state, then pair that journal with the independently cloned
+        // AWACS baseline before any checkout mutation asks to advance it.
+        drop(new_workspace);
+        let mut workspace_command = command
+            .workspace_helper_no_snapshot_at(ui, &destination_path)
+            .await?;
+        let source_commit = snapshot_source_commit
+            .as_ref()
+            .expect("snapshot workspaces always retain the source commit");
+        seed_snapshot_workspace_tree(&mut workspace_command, source_commit).await?;
+        establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
+        set_subvolume_mode(&destination_path, true)?;
+        tracing::debug!("recorded snapshot tree as workspace baseline");
+        workspace_command
+    } else {
+        command.for_workable_repo(ui, new_workspace, repo)?
+    };
 
     let sparsity = match args.sparse_patterns {
         SparseInheritance::Full => None,
@@ -394,10 +412,67 @@ pub async fn cmd_workspace_add(
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn initialize_snapshot_awacs_root(ui: &Ui, root: &Path) -> Result<(), CommandError> {
+    // Synthetic CLI tests model the scan response without a real Btrfs
+    // snapshot lineage or manager database.
+    if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+        return Ok(());
+    }
+    initialize_descendant_root(root, |progress| match progress {
+        InitProgress::Phase(phase) => {
+            let _status_result = writeln!(ui.status(), "AWACS worktree init: {phase}...");
+        }
+        InitProgress::Index(counts) => {
+            let _status_result = writeln!(
+                ui.status(),
+                "AWACS worktree init: indexed {} directories, {} objects, {} paths...",
+                counts.directories,
+                counts.objects,
+                counts.references,
+            );
+        }
+    })
+    .map_err(|err| user_error(format!("Failed to initialize AWACS worktree: {err}")))?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+async fn seed_snapshot_workspace_tree(
+    workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
+    source_commit: &jj_lib::commit::Commit,
+) -> Result<(), CommandError> {
+    let operation_id = workspace_command.repo().op_id().clone();
+    let (mut locked_workspace, _commit) = workspace_command
+        .unchecked_start_working_copy_mutation()
+        .await?;
+    if !seed_local_working_copy_tree(locked_workspace.locked_wc(), &source_commit.tree())
+        .await
+        .map_err(|err| internal_error_with_message("Failed to seed snapshot workspace tree", err))?
+    {
+        return Err(internal_error_with_message(
+            "Failed to seed snapshot workspace tree",
+            "new workspace did not reload as snapshot-backed",
+        ));
+    }
+    locked_workspace.finish(operation_id).await?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+async fn establish_snapshot_workspace_baseline(
+    ui: &Ui,
+    workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
+) -> Result<(), CommandError> {
+    workspace_command
+        .snapshot_for_subvolume_enable(ui, &|_| Ok(()))
+        .await
+}
+
 /// Attempts a Btrfs snapshot, then checks whether `source` is a subvolume
 /// only if the snapshot fails. Returns `Ok(false)` when it is not so auto
 /// mode can fall back to a normal workspace.
-fn create_btrfs_snapshot(source: &Path, destination: &Path) -> Result<bool, CommandError> {
+fn create_btrfs_snapshot(ui: &Ui, source: &Path, destination: &Path) -> Result<bool, CommandError> {
     let total_started = Instant::now();
     let operation_started = Instant::now();
     let output = btrfs_command()
@@ -433,6 +508,10 @@ fn create_btrfs_snapshot(source: &Path, destination: &Path) -> Result<bool, Comm
         drop(delete_btrfs_subvolume(destination));
         return Err(err);
     }
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    initialize_snapshot_awacs_root(ui, destination)?;
+    #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+    let _ = ui;
 
     let operation_started = Instant::now();
     remove_copied_metadata(&destination.join(".jj"))?;

@@ -1525,17 +1525,23 @@ impl WorkspaceCommandHelper {
         report_phase("acquiring the colocated Git import lock")?;
         let git_import_export_lock = self.lock_git_import_export()?;
 
-        #[cfg(feature = "git")]
-        if self.env.syncs_git_refs_automatically() {
-            report_phase("importing the colocated Git HEAD")?;
-            self.import_git_head(ui, &git_import_export_lock).await?;
-        }
-
+        // Establish A before any colocated-Git import can materialize a
+        // different tree. A new snapshot-backed worktree starts with no
+        // compact-journal baseline; if import_git_head() checks out the
+        // requested revision first, that checkout cannot advance A -> B and
+        // fails with "subvolume mode has no committed baseline before
+        // materialization".
         report_phase("snapshotting the working copy and committing the AWACS baseline")?;
         let stats = self
             .snapshot_working_copy(ui, &git_import_export_lock, true)
             .await
             .map_err(|err| err.into_command_error())?;
+
+        #[cfg(feature = "git")]
+        if self.env.syncs_git_refs_automatically() {
+            report_phase("importing the colocated Git HEAD")?;
+            self.import_git_head(ui, &git_import_export_lock).await?;
+        }
 
         // import_git_refs() can rebase the working-copy commit. In a large
         // colocated repository this can outlive the filesystem snapshot by a

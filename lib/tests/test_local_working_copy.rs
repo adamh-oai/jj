@@ -3336,14 +3336,13 @@ fn test_compact_working_copy_state_rejects_invalid_phase_and_sparse_prefix() -> 
     let mut journal = read_compact_working_copy_state(&state_path)?;
     journal.phase = 99;
     write_compact_working_copy_state(&state_path, &journal)?;
-    let err = match TreeState::load(
+    let Err(err) = TreeState::load(
         repo.store().clone(),
         workspace_root.clone(),
         state_path.clone(),
         &settings,
-    ) {
-        Ok(_) => panic!("unknown compact-journal phase must fail closed"),
-        Err(err) => err,
+    ) else {
+        panic!("unknown compact-journal phase must fail closed")
     };
     assert!(
         err.to_string().contains("unsupported journal phase 99"),
@@ -3355,14 +3354,13 @@ fn test_compact_working_copy_state_rejects_invalid_phase_and_sparse_prefix() -> 
         prefixes: vec!["bad//prefix".to_owned()],
     });
     write_compact_working_copy_state(&state_path, &journal)?;
-    let err = match TreeState::load(
+    let Err(err) = TreeState::load(
         repo.store().clone(),
         workspace_root.clone(),
         state_path.clone(),
         &settings,
-    ) {
-        Ok(_) => panic!("invalid compact-journal sparse prefix must fail closed"),
-        Err(err) => err,
+    ) else {
+        panic!("invalid compact-journal sparse prefix must fail closed")
     };
     assert!(
         err.to_string().contains("invalid sparse prefix"),
@@ -3374,14 +3372,13 @@ fn test_compact_working_copy_state_rejects_invalid_phase_and_sparse_prefix() -> 
     });
     journal.tree_ids = vec![vec![1], vec![2]];
     write_compact_working_copy_state(&state_path, &journal)?;
-    let err = match TreeState::load(
+    let Err(err) = TreeState::load(
         repo.store().clone(),
         workspace_root.clone(),
         state_path.clone(),
         &settings,
-    ) {
-        Ok(_) => panic!("even compact-journal tree-ID merge shape must fail closed"),
-        Err(err) => err,
+    ) else {
+        panic!("even compact-journal tree-ID merge shape must fail closed")
     };
     assert!(
         err.to_string().contains("odd, non-empty merge shape"),
@@ -3397,9 +3394,9 @@ fn test_compact_working_copy_state_rejects_invalid_phase_and_sparse_prefix() -> 
         .collect();
     journal.conflict_labels = vec!["invalid label".to_owned()];
     write_compact_working_copy_state(&state_path, &journal)?;
-    let err = match TreeState::load(repo.store().clone(), workspace_root, state_path, &settings) {
-        Ok(_) => panic!("resolved compact-journal tree labels must fail closed"),
-        Err(err) => err,
+    let Err(err) = TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)
+    else {
+        panic!("resolved compact-journal tree labels must fail closed")
     };
     assert!(
         err.to_string().contains("conflict labels do not match"),
@@ -3541,9 +3538,9 @@ fn test_enabled_subvolume_mode_requires_committed_baseline() -> TestResult {
     tree_state.save()?;
     std::fs::write(state_path.join("subvolume_mode"), b"snapshot-backed\n")?;
 
-    let err = match TreeState::load(repo.store().clone(), workspace_root, state_path, &settings) {
-        Ok(_) => panic!("enabled subvolume mode without a baseline must fail"),
-        Err(err) => err,
+    let Err(err) = TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)
+    else {
+        panic!("enabled subvolume mode without a baseline must fail")
     };
     assert!(
         err.to_string()
@@ -4002,7 +3999,6 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
     let requests = Arc::new(Mutex::new(Vec::new()));
     let settings = TreeStateSettings {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
-            socket: None,
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root: scan_root.clone(),
                 outcomes: outcomes.clone(),
@@ -4109,7 +4105,6 @@ fn test_awacs_rejected_scan_root_aborts_accepted_lease() -> TestResult {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let settings = TreeStateSettings {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
-            socket: None,
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root,
                 outcomes: outcomes.clone(),
@@ -4173,7 +4168,6 @@ fn test_awacs_baseline_input_mismatch_forces_full_begin() -> TestResult {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let settings = TreeStateSettings {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
-            socket: None,
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root,
                 outcomes,

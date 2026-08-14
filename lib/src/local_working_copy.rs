@@ -1281,7 +1281,7 @@ impl TreeState {
         tree_ids: Vec<Vec<u8>>,
         conflict_labels: Vec<String>,
     ) -> Result<(), TreeStateError> {
-        if tree_ids.is_empty() || tree_ids.len() % 2 == 0 {
+        if tree_ids.is_empty() || tree_ids.len().is_multiple_of(2) {
             return Err(invalid_working_copy_state(
                 &self.state_path.join("checkout"),
                 "tree IDs must contain an odd, non-empty merge shape",
@@ -1859,11 +1859,11 @@ impl TreeState {
         mutation_kind: &str,
     ) {
         self.fsmonitor_cursor = None;
-        // Preserve the committed A baseline while jj performs a controlled
+        // Preserve the committed A cursor while jj performs a controlled
         // materialization. Once the writes finish, AWACS can atomically
-        // advance that owner pin to B without a filesystem traversal: every
-        // A..B path was written (or removed) by this mutation, and unchanged
-        // untracked paths were already accounted for when A was committed.
+        // advance to B without a filesystem traversal: every A..B path was
+        // written (or removed) by this mutation, and unchanged untracked
+        // paths were already accounted for when A was committed.
         // CLI transactions call prepare_checkout() before publication and
         // then check_out() after publication. Keep the same A binding across
         // both halves instead of consuming it again on the second call.
@@ -2139,7 +2139,7 @@ impl TreeState {
         if !self.cursor_matches_settings() {
             is_dirty |= self.clear_fsmonitor_cursor();
         }
-        let had_committed_awacs_baseline = matches!(
+        let mut had_committed_awacs_baseline = matches!(
             self.fsmonitor_settings,
             FsmonitorSettings::Awacs(_) | FsmonitorSettings::TestAwacs { .. }
         ) && self.journal_phase
@@ -2149,13 +2149,12 @@ impl TreeState {
             *awacs_input_fingerprint,
             awacs_compatible_input_fingerprints,
         ) {
-            if had_committed_awacs_baseline {
-                return Err(SnapshotError::Other {
-                    message: "Snapshot-backed working copy refused a full scan".to_owned(),
-                    err: "working-copy interpretation settings changed; run jj util subvolume init <new-path> to rebuild the committed baseline explicitly".into(),
-                });
-            }
+            // A semantic-input change invalidates the old cursor itself, not
+            // the immutable snapshot backend. Begin without a baseline so
+            // AWACS returns a fresh immutable root, then commit the rebuilt
+            // tree and its replacement cursor together.
             is_dirty |= self.clear_fsmonitor_cursor();
+            had_committed_awacs_baseline = false;
         }
         let SnapshotScan {
             scan_root,
@@ -2185,7 +2184,7 @@ impl TreeState {
         if had_committed_awacs_baseline && scan_scope.requires_full_traversal() {
             return Err(SnapshotError::Other {
                 message: "Snapshot-backed working copy refused a full scan".to_owned(),
-                err: "AWACS could not prove an incremental delta from the committed baseline; run jj util subvolume init <new-path> to rebuild the committed baseline explicitly".into(),
+                err: "AWACS could not prove an incremental delta from the committed baseline; run jj util subvolume enable to rebuild the committed baseline explicitly".into(),
             });
         }
         let mut scan_root_base_ignores = base_ignores.clone();
@@ -2384,17 +2383,16 @@ impl TreeState {
                 let client = if let Some(client) = &config.client {
                     client.clone()
                 } else {
-                    let client = btrfs_awacs::scan::SocketScanClient::connect_for_root(
-                        &self.working_copy_path,
-                        config.socket.as_deref(),
-                    )
-                    .map_err(|err| SnapshotError::Other {
-                        message: "Failed to connect to AWACS scan socket".to_string(),
-                        err: Box::new(err),
-                    })?;
-                    Arc::new(Mutex::new(
-                        Box::new(client) as Box<dyn btrfs_awacs::scan::ScanClient>
-                    ))
+                    let client: Box<dyn btrfs_awacs::scan::ScanClient> = Box::new(
+                        btrfs_awacs::scan_facade::DirectScanClient::for_root(
+                            &self.working_copy_path,
+                        )
+                        .map_err(|err| SnapshotError::Other {
+                            message: "Failed to open AWACS root state".to_string(),
+                            err: Box::new(err),
+                        })?,
+                    );
+                    Arc::new(Mutex::new(client))
                 };
                 let Some(awacs_input_fingerprint) = awacs_input_fingerprint else {
                     return Err(SnapshotError::Other {
@@ -2407,7 +2405,7 @@ impl TreeState {
                 let previous_baseline = (self.journal_phase
                     == crate::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline
                     && self.baseline.is_some())
-                .then(|| self.baseline.as_ref())
+                .then_some(self.baseline.as_ref())
                 .flatten()
                 .map(|baseline| btrfs_awacs::scan::SnapshotBaseline {
                     identity: btrfs_awacs::scan::SnapshotIdentity {
@@ -2461,8 +2459,8 @@ impl TreeState {
                 }
                 let scan_root =
                     PathBuf::from(format!("/proc/self/fd/{}", lease.scan_root().as_raw_fd()));
-                // AWACS authenticates the previous baseline and returns Full
-                // whenever its owner pin or lineage cannot be proven.
+                // AWACS replays retained adjacent cut events and returns Full
+                // whenever this cursor's retained lineage cannot be proven.
                 let (changed_files, changed_prefixes) = if !can_use_delta {
                     (None, None)
                 } else {
@@ -2496,8 +2494,9 @@ impl TreeState {
                     filesystem_uuid: lease.next_baseline.identity.filesystem_uuid.to_vec(),
                     subvolume_uuid: lease.next_baseline.identity.subvolume_uuid.to_vec(),
                     continuity_token: lease.next_baseline.continuity_token.clone(),
-                    // The retention token is the opaque durable owner
-                    // capability returned by AWACS.
+                    // Kept for journal compatibility with the transitional
+                    // daemon protocol. The daemon-free coordinator does not
+                    // use this field to pin a physical snapshot.
                     retention_token: lease.next_baseline.retention_token.clone(),
                     interpretation_input_fingerprint: awacs_input_fingerprint.to_vec(),
                 };
@@ -2571,12 +2570,12 @@ impl TreeState {
                     let repo_paths = changed_files
                         .unwrap_or_default()
                         .iter()
-                        .map(|path| RepoPathBuf::from_relative_path(path))
+                        .map(RepoPathBuf::from_relative_path)
                         .collect::<Result<Vec<_>, _>>();
                     let prefixes = changed_prefixes
                         .unwrap_or_default()
                         .iter()
-                        .map(|path| RepoPathBuf::from_relative_path(path))
+                        .map(RepoPathBuf::from_relative_path)
                         .collect::<Result<Vec<_>, _>>();
                     match (repo_paths, prefixes) {
                         (Ok(repo_paths), Ok(prefixes)) => Ok((repo_paths, prefixes)),
@@ -3784,7 +3783,7 @@ impl TreeState {
                     self.write_conflict(&disk_path, contents.as_bytes(), ExecBit(false))
                         .await?;
                 }
-            };
+            }
             Ok(())
         };
 
@@ -4053,7 +4052,6 @@ impl SnapshotLocalWorkingCopy {
             };
         } else {
             tree_state_settings.fsmonitor_settings = FsmonitorSettings::Awacs(AwacsConfig {
-                socket: None,
                 #[cfg(all(target_os = "linux", feature = "awacs"))]
                 client: None,
             });
@@ -4061,7 +4059,6 @@ impl SnapshotLocalWorkingCopy {
         #[cfg(not(debug_assertions))]
         {
             tree_state_settings.fsmonitor_settings = FsmonitorSettings::Awacs(AwacsConfig {
-                socket: None,
                 #[cfg(all(target_os = "linux", feature = "awacs"))]
                 client: None,
             });
@@ -4250,8 +4247,8 @@ pub struct LocalWorkingCopy {
 }
 
 pub(crate) enum LocalWorkingCopyInner {
-    Legacy(crate::legacy_local_working_copy::LocalWorkingCopy),
-    Snapshot(SnapshotLocalWorkingCopy),
+    Legacy(Box<crate::legacy_local_working_copy::LocalWorkingCopy>),
+    Snapshot(Box<SnapshotLocalWorkingCopy>),
 }
 
 pub(crate) struct LocalWorkingCopyReload {
@@ -4348,23 +4345,25 @@ impl LocalWorkingCopy {
             user_settings: user_settings.clone(),
         };
         let inner = if is_snapshot_mode(&state_path) {
-            LocalWorkingCopyInner::Snapshot(SnapshotLocalWorkingCopy::init(
+            LocalWorkingCopyInner::Snapshot(Box::new(SnapshotLocalWorkingCopy::init(
                 store,
                 working_copy_path,
                 state_path,
                 operation_id,
                 workspace_name,
                 user_settings,
-            )?)
+            )?))
         } else {
-            LocalWorkingCopyInner::Legacy(crate::legacy_local_working_copy::LocalWorkingCopy::init(
-                store,
-                working_copy_path,
-                state_path,
-                operation_id,
-                workspace_name,
-                user_settings,
-            )?)
+            LocalWorkingCopyInner::Legacy(Box::new(
+                crate::legacy_local_working_copy::LocalWorkingCopy::init(
+                    store,
+                    working_copy_path,
+                    state_path,
+                    operation_id,
+                    workspace_name,
+                    user_settings,
+                )?,
+            ))
         };
         Ok(Self {
             inner,
@@ -4385,19 +4384,21 @@ impl LocalWorkingCopy {
             user_settings: user_settings.clone(),
         };
         let inner = if is_snapshot_mode(&state_path) {
-            LocalWorkingCopyInner::Snapshot(SnapshotLocalWorkingCopy::load(
+            LocalWorkingCopyInner::Snapshot(Box::new(SnapshotLocalWorkingCopy::load(
                 store,
                 working_copy_path,
                 state_path,
                 user_settings,
-            )?)
+            )?))
         } else {
-            LocalWorkingCopyInner::Legacy(crate::legacy_local_working_copy::LocalWorkingCopy::load(
-                store,
-                working_copy_path,
-                state_path,
-                user_settings,
-            )?)
+            LocalWorkingCopyInner::Legacy(Box::new(
+                crate::legacy_local_working_copy::LocalWorkingCopy::load(
+                    store,
+                    working_copy_path,
+                    state_path,
+                    user_settings,
+                )?,
+            ))
         };
         Ok(Self {
             inner,
@@ -4666,7 +4667,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
         }
         // TODO: Clear the "pending_checkout" file here.
         Ok(Box::new(LocalWorkingCopy {
-            inner: LocalWorkingCopyInner::Snapshot(self.wc),
+            inner: LocalWorkingCopyInner::Snapshot(Box::new(self.wc)),
             reload: None,
         }))
     }
@@ -4747,17 +4748,14 @@ impl LockedLocalWorkingCopy {
         let client = if let Some(client) = config.client {
             client
         } else {
-            let client = btrfs_awacs::scan::SocketScanClient::connect_for_root(
-                &self.wc.working_copy_path,
-                config.socket.as_deref(),
-            )
-            .map_err(|err| SnapshotError::Other {
-                message: "Failed to connect to AWACS scan socket".to_string(),
-                err: Box::new(err),
-            })?;
-            Arc::new(Mutex::new(
-                Box::new(client) as Box<dyn btrfs_awacs::scan::ScanClient>
-            ))
+            let client: Box<dyn btrfs_awacs::scan::ScanClient> = Box::new(
+                btrfs_awacs::scan_facade::DirectScanClient::for_root(&self.wc.working_copy_path)
+                    .map_err(|err| SnapshotError::Other {
+                        message: "Failed to open AWACS root state".to_string(),
+                        err: Box::new(err),
+                    })?,
+            );
+            Arc::new(Mutex::new(client))
         };
         client
             .lock()
@@ -4840,7 +4838,6 @@ pub async fn seed_local_working_copy_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     struct RecordingScanSession {
         outcomes: Arc<Mutex<Vec<ScanOutcome>>>,
