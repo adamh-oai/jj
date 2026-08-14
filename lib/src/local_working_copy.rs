@@ -48,6 +48,7 @@ use std::sync::mpsc::sync_channel;
 use std::thread::JoinHandle;
 #[cfg(debug_assertions)]
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use either::Either;
@@ -1908,11 +1909,11 @@ impl TreeState {
         mutation_kind: &str,
     ) {
         self.fsmonitor_cursor = None;
-        // Preserve the committed A baseline while jj performs a controlled
+        // Preserve the committed A cursor while jj performs a controlled
         // materialization. Once the writes finish, AWACS can atomically
-        // advance that owner pin to B without a filesystem traversal: every
-        // A..B path was written (or removed) by this mutation, and unchanged
-        // untracked paths were already accounted for when A was committed.
+        // advance to B without a filesystem traversal: every A..B path was
+        // written (or removed) by this mutation, and unchanged untracked
+        // paths were already accounted for when A was committed.
         // CLI transactions call prepare_checkout() before publication and
         // then check_out() after publication. Keep the same A binding across
         // both halves instead of consuming it again on the second call.
@@ -2190,7 +2191,7 @@ impl TreeState {
         if !self.cursor_matches_settings() {
             is_dirty |= self.clear_fsmonitor_cursor();
         }
-        let had_committed_awacs_baseline = matches!(
+        let mut had_committed_awacs_baseline = matches!(
             self.fsmonitor_settings,
             FsmonitorSettings::Awacs(_) | FsmonitorSettings::TestAwacs { .. }
         ) && self.scan_baseline().is_some();
@@ -2198,13 +2199,12 @@ impl TreeState {
             *awacs_input_fingerprint,
             awacs_compatible_input_fingerprints,
         ) {
-            if had_committed_awacs_baseline {
-                return Err(SnapshotError::Other {
-                    message: "Snapshot-backed working copy refused a full scan".to_owned(),
-                    err: "working-copy interpretation settings changed; run jj util subvolume init <new-path> to rebuild the committed baseline explicitly".into(),
-                });
-            }
+            // A semantic-input change invalidates the old cursor itself, not
+            // the immutable snapshot backend. Begin without a baseline so
+            // AWACS returns a fresh immutable root, then commit the rebuilt
+            // tree and its replacement cursor together.
             is_dirty |= self.clear_fsmonitor_cursor();
+            had_committed_awacs_baseline = false;
         }
         let SnapshotScan {
             scan_root,
@@ -2234,7 +2234,7 @@ impl TreeState {
         if had_committed_awacs_baseline && scan_scope.requires_full_traversal() {
             return Err(SnapshotError::Other {
                 message: "Snapshot-backed working copy refused a full scan".to_owned(),
-                err: "AWACS could not prove an incremental delta from the committed baseline; run jj util subvolume init <new-path> to rebuild the committed baseline explicitly".into(),
+                err: "AWACS could not prove an incremental delta from the committed baseline; run jj util subvolume enable --rebuild-baseline to rebuild the committed baseline explicitly".into(),
             });
         }
         let mut scan_root_base_ignores = base_ignores.clone();
@@ -2433,17 +2433,16 @@ impl TreeState {
                 let client = if let Some(client) = &config.client {
                     client.clone()
                 } else {
-                    let client = btrfs_awacs::scan::SocketScanClient::connect_for_root(
-                        &self.working_copy_path,
-                        config.socket.as_deref(),
-                    )
-                    .map_err(|err| SnapshotError::Other {
-                        message: "Failed to connect to AWACS scan socket".to_string(),
-                        err: Box::new(err),
-                    })?;
-                    Arc::new(Mutex::new(
-                        Box::new(client) as Box<dyn btrfs_awacs::scan::ScanClient>
-                    ))
+                    let client: Box<dyn btrfs_awacs::scan::ScanClient> = Box::new(
+                        btrfs_awacs::scan_facade::DirectScanClient::for_root(
+                            &self.working_copy_path,
+                        )
+                        .map_err(|err| SnapshotError::Other {
+                            message: "Failed to open AWACS root state".to_string(),
+                            err: Box::new(err),
+                        })?,
+                    );
+                    Arc::new(Mutex::new(client))
                 };
                 let Some(awacs_input_fingerprint) = awacs_input_fingerprint else {
                     return Err(SnapshotError::Other {
@@ -2456,21 +2455,21 @@ impl TreeState {
                 let previous_baseline =
                     self.scan_baseline()
                         .map(|baseline| btrfs_awacs::scan::SnapshotBaseline {
-                    identity: btrfs_awacs::scan::SnapshotIdentity {
-                        filesystem_uuid: baseline
-                            .filesystem_uuid
-                            .as_slice()
-                            .try_into()
-                            .expect("validated AWACS filesystem UUID"),
-                        subvolume_uuid: baseline
-                            .subvolume_uuid
-                            .as_slice()
-                            .try_into()
-                            .expect("validated AWACS subvolume UUID"),
-                        read_only: true,
-                    },
-                    continuity_token: baseline.continuity_token.clone(),
-                    retention_token: baseline.retention_token.clone(),
+                            identity: btrfs_awacs::scan::SnapshotIdentity {
+                                filesystem_uuid: baseline
+                                    .filesystem_uuid
+                                    .as_slice()
+                                    .try_into()
+                                    .expect("validated AWACS filesystem UUID"),
+                                subvolume_uuid: baseline
+                                    .subvolume_uuid
+                                    .as_slice()
+                                    .try_into()
+                                    .expect("validated AWACS subvolume UUID"),
+                                read_only: true,
+                            },
+                            continuity_token: baseline.continuity_token.clone(),
+                            retention_token: baseline.retention_token.clone(),
                         });
                 let can_use_delta = previous_baseline.is_some();
                 let request = btrfs_awacs::scan::BeginScanRequest {
@@ -2507,8 +2506,8 @@ impl TreeState {
                 }
                 let scan_root =
                     PathBuf::from(format!("/proc/self/fd/{}", lease.scan_root().as_raw_fd()));
-                // AWACS authenticates the previous baseline and returns Full
-                // whenever its owner pin or lineage cannot be proven.
+                // AWACS replays retained adjacent cut events and returns Full
+                // whenever this cursor's retained lineage cannot be proven.
                 let (changed_files, changed_prefixes) = if !can_use_delta {
                     (None, None)
                 } else {
@@ -2542,8 +2541,9 @@ impl TreeState {
                     filesystem_uuid: lease.next_baseline.identity.filesystem_uuid.to_vec(),
                     subvolume_uuid: lease.next_baseline.identity.subvolume_uuid.to_vec(),
                     continuity_token: lease.next_baseline.continuity_token.clone(),
-                    // The retention token is the opaque durable owner
-                    // capability returned by AWACS.
+                    // Kept for journal compatibility with the transitional
+                    // daemon protocol. The daemon-free coordinator does not
+                    // use this field to pin a physical snapshot.
                     retention_token: lease.next_baseline.retention_token.clone(),
                     interpretation_input_fingerprint: awacs_input_fingerprint.to_vec(),
                 };
@@ -3012,7 +3012,7 @@ impl FileSnapshotter<'_> {
                 .block_on()?;
             if !present && tracked_paths.get(prefix).is_some() {
                 self.deleted_files_tx.send(prefix.to_owned()).ok();
-            }
+            };
             Ok(())
         }
     }
@@ -3862,7 +3862,7 @@ impl TreeState {
                     self.write_conflict(&disk_path, contents.as_bytes(), ExecBit(false))
                         .await?;
                 }
-            };
+            }
             Ok(())
         };
 
@@ -4131,7 +4131,6 @@ impl SnapshotLocalWorkingCopy {
             };
         } else {
             tree_state_settings.fsmonitor_settings = FsmonitorSettings::Awacs(AwacsConfig {
-                socket: None,
                 #[cfg(all(target_os = "linux", feature = "awacs"))]
                 client: None,
             });
@@ -4139,7 +4138,6 @@ impl SnapshotLocalWorkingCopy {
         #[cfg(not(debug_assertions))]
         {
             tree_state_settings.fsmonitor_settings = FsmonitorSettings::Awacs(AwacsConfig {
-                socket: None,
                 #[cfg(all(target_os = "linux", feature = "awacs"))]
                 client: None,
             });
@@ -4706,18 +4704,25 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             self.tree_state_dirty
                 || self.old_tree.tree_ids_and_labels() == self.wc.tree()?.tree_ids_and_labels()
         );
-        if let Some(pending_scan) = self.pending_scan.as_mut()
-            && let Err(err) = pending_scan.prepare_to_commit()
-        {
-            // The tree produced from the immutable scan is still useful, but
-            // its cursor is no longer safe to persist. Abort the accepted
-            // lease and save the tree without a cursor so the next snapshot
-            // must request Full.
-            tracing::warn!(
-                ?err,
-                "AWACS scan lease failed before tree-state commit; clearing cursor"
+        if let Some(pending_scan) = self.pending_scan.as_mut() {
+            let started = Instant::now();
+            let result = pending_scan.prepare_to_commit();
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                succeeded = result.is_ok(),
+                "prepared pending filesystem-monitor scan for commit"
             );
-            self.abort_pending_scan()?;
+            if let Err(err) = result {
+                // The tree produced from the immutable scan is still useful,
+                // but its cursor is no longer safe to persist. Abort the
+                // accepted lease and save the tree without a cursor so the
+                // next snapshot must request Full.
+                tracing::warn!(
+                    ?err,
+                    "AWACS scan lease failed before tree-state commit; clearing cursor"
+                );
+                self.abort_pending_scan()?;
+            }
         }
         if self.old_operation_id != operation_id || self.new_workspace_name.is_some() {
             self.wc.checkout_state.operation_id = operation_id;
@@ -4726,21 +4731,36 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             }
             self.tree_state_dirty = true;
         }
-        if self.tree_state_dirty
-            && let Err(err) = self.wc.save_working_copy_state()
-        {
-            self.abort_pending_scan()?;
-            return Err(err);
-        }
-        if let Some(pending_scan) = self.pending_scan.take()
-            && let Err(err) = pending_scan.finish(ScanOutcome::Committed)
-        {
-            // Tree state already durably contains the cursor. Completion is
-            // cleanup only; a failed response is retried or expires server-side.
-            tracing::warn!(
-                ?err,
-                "failed to finish committed filesystem-monitor scan session"
+        if self.tree_state_dirty {
+            let started = Instant::now();
+            let result = self.wc.save_working_copy_state();
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                succeeded = result.is_ok(),
+                "saved working-copy state"
             );
+            if let Err(err) = result {
+                self.abort_pending_scan()?;
+                return Err(err);
+            }
+        }
+        if let Some(pending_scan) = self.pending_scan.take() {
+            let started = Instant::now();
+            let result = pending_scan.finish(ScanOutcome::Committed);
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                succeeded = result.is_ok(),
+                "finished committed filesystem-monitor scan session"
+            );
+            if let Err(err) = result {
+                // Tree state already durably contains the cursor. Completion
+                // is cleanup only; a failed response is retried or expires
+                // server-side.
+                tracing::warn!(
+                    ?err,
+                    "failed to finish committed filesystem-monitor scan session"
+                );
+            }
         }
         // TODO: Clear the "pending_checkout" file here.
         Ok(Box::new(LocalWorkingCopy {
@@ -4825,17 +4845,14 @@ impl LockedLocalWorkingCopy {
         let client = if let Some(client) = config.client {
             client
         } else {
-            let client = btrfs_awacs::scan::SocketScanClient::connect_for_root(
-                &self.wc.working_copy_path,
-                config.socket.as_deref(),
-            )
-            .map_err(|err| SnapshotError::Other {
-                message: "Failed to connect to AWACS scan socket".to_string(),
-                err: Box::new(err),
-            })?;
-            Arc::new(Mutex::new(
-                Box::new(client) as Box<dyn btrfs_awacs::scan::ScanClient>
-            ))
+            let client: Box<dyn btrfs_awacs::scan::ScanClient> = Box::new(
+                btrfs_awacs::scan_facade::DirectScanClient::for_root(&self.wc.working_copy_path)
+                    .map_err(|err| SnapshotError::Other {
+                        message: "Failed to open AWACS root state".to_string(),
+                        err: Box::new(err),
+                    })?,
+            );
+            Arc::new(Mutex::new(client))
         };
         client
             .lock()

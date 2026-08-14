@@ -16,14 +16,18 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write as _;
+use std::os::fd::AsFd as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use btrfs_awacs::bootstrap::{InitProgress, RootInitPaths, initialize_root};
+use btrfs_awacs::btrfs::{destroy_snapshot, set_subvolume_readonly, subvolume_info};
 use btrfs_awacs::subvolume_migration::{
-    MigrationOptions, SubvolumeMigration, copy_children, copy_children_except,
+    MigrationOptions, convert_subvolume_root, copy_children, copy_children_except,
 };
 use futures::future::{Either, select};
 use jj_lib::file_util::IoResultExt as _;
@@ -39,23 +43,12 @@ use crate::commands::btrfs::{
     begin_subvolume_mode, btrfs_command, btrfs_subvolume_id, delete_btrfs_subvolume, is_btrfs_path,
     is_btrfs_subvolume, is_subvolume_mode_committed, is_subvolume_mode_enabled, set_subvolume_mode,
 };
+use crate::progress::ProgressWriter;
 use crate::ui::Ui;
 
 /// Manage the Btrfs subvolume layout of the current repository.
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum UtilSubvolumeCommand {
-    /// Build a snapshot-backed Btrfs checkout at a new path.
-    Init {
-        /// New repository path to initialize.
-        destination: PathBuf,
-        /// Set compression on new subvolumes and rewrite file extents instead
-        /// of reflinking them.
-        #[arg(long)]
-        compress: Option<bool>,
-        /// Keep a partial migration checkout after failure.
-        #[arg(long)]
-        keep: bool,
-    },
     /// Initialize a replacement checkout, then atomically activate it.
     Enable {
         /// Set compression on new subvolumes and rewrite file extents instead
@@ -65,6 +58,10 @@ pub enum UtilSubvolumeCommand {
         /// Keep a partial migration checkout after failure.
         #[arg(long)]
         keep: bool,
+        /// Discard and rebuild the committed AWACS cursor for an already
+        /// enabled checkout.
+        #[arg(long)]
+        rebuild_baseline: bool,
     },
     /// Convert the repository root and its .git directory back to plain directories.
     Disable,
@@ -90,9 +87,7 @@ pub async fn cmd_util_subvolume(
     let relax_load_invariant = missing_committed_baseline
         && matches!(
             subcommand,
-            UtilSubvolumeCommand::Init { .. }
-                | UtilSubvolumeCommand::Enable { .. }
-                | UtilSubvolumeCommand::Status
+            UtilSubvolumeCommand::Enable { .. } | UtilSubvolumeCommand::Status
         );
     let recovery_needed =
         missing_committed_baseline && matches!(subcommand, UtilSubvolumeCommand::Enable { .. });
@@ -119,12 +114,21 @@ pub async fn cmd_util_subvolume(
     let workspace_root = workspace_command.workspace_root().to_owned();
 
     match subcommand {
-        UtilSubvolumeCommand::Enable { compress, keep } => {
+        UtilSubvolumeCommand::Enable {
+            compress,
+            keep,
+            rebuild_baseline,
+        } => {
             let main_workspace = require_colocated_workspace(&workspace_command)?;
             if !main_workspace {
                 require_main_subvolume_mode_for_linked_workspace(&workspace_command)?;
             }
             if is_subvolume_mode_committed(&workspace_root) && !recovery_needed {
+                if *rebuild_baseline {
+                    rebuild_snapshot_baseline(ui, &mut workspace_command).await?;
+                    drop(recovery_guard);
+                    return Ok(());
+                }
                 writeln!(ui.status(), "Btrfs subvolume mode is already enabled.")?;
                 drop(recovery_guard);
                 return Ok(());
@@ -142,22 +146,6 @@ pub async fn cmd_util_subvolume(
             finish_retained_checkout(ui, &original_checkout, &workspace_root)?;
             recovery_armed.store(false, Ordering::Relaxed);
             drop(recovery_guard);
-        }
-        UtilSubvolumeCommand::Init {
-            destination,
-            compress,
-            keep,
-        } => {
-            init_subvolume_at(
-                ui,
-                command,
-                &workspace_command,
-                destination,
-                *compress,
-                *keep,
-            )
-            .await?;
-            return Ok(());
         }
         UtilSubvolumeCommand::Disable => {
             require_colocated_workspace(&workspace_command)?;
@@ -199,12 +187,128 @@ pub async fn cmd_util_subvolume(
     }
 
     let mode = match subcommand {
-        UtilSubvolumeCommand::Init { .. } => unreachable!(),
         UtilSubvolumeCommand::Enable { .. } => "enabled",
         UtilSubvolumeCommand::Disable => "disabled",
         UtilSubvolumeCommand::Status => unreachable!(),
     };
     writeln!(ui.status(), "Btrfs subvolume mode {mode}.")?;
+    Ok(())
+}
+
+async fn rebuild_snapshot_baseline(
+    ui: &Ui,
+    workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
+) -> Result<(), CommandError> {
+    writeln!(
+        ui.status(),
+        "Rebuilding committed AWACS snapshot baseline..."
+    )?;
+    let workspace_root = workspace_command.workspace_root().to_owned();
+    rebuild_awacs_root_state(ui, &workspace_root)?;
+    let operation_id = workspace_command.repo().op_id().clone();
+    let (mut locked_workspace, _commit) = workspace_command
+        .unchecked_start_working_copy_mutation()
+        .await?;
+    if !reset_local_working_copy_fsmonitor(locked_workspace.locked_wc())? {
+        return Err(user_error(
+            "This command requires a snapshot-backed local-disk working copy",
+        ));
+    }
+    locked_workspace.finish(operation_id).await?;
+    // The compact journal is intentionally baseline-less between the reset
+    // above and the replacement immutable scan below. Temporarily use the
+    // transition marker so helper reloads can enter that state, then restore
+    // strict mode whether reseeding succeeds or fails.
+    begin_subvolume_mode(&workspace_root)?;
+    let baseline_result = establish_initial_snapshot_baseline(ui, workspace_command).await;
+    let marker_result = set_subvolume_mode(&workspace_root, true);
+    baseline_result?;
+    marker_result?;
+    writeln!(ui.status(), "Rebuilt committed AWACS snapshot baseline.")?;
+    Ok(())
+}
+
+fn rebuild_awacs_root_state(ui: &Ui, root: &Path) -> Result<(), CommandError> {
+    // Synthetic CLI tests provide their own baseline without a real Btrfs
+    // root or external manager database.
+    if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+        return Ok(());
+    }
+    let paths = RootInitPaths::from_environment(root)
+        .map_err(|err| user_error(format!("Failed to resolve AWACS root state: {err}")))?;
+    let state_dir = paths
+        .manager_db
+        .parent()
+        .ok_or_else(|| user_error("AWACS manager database has no state directory"))?;
+    writeln!(
+        ui.status(),
+        "Removing existing AWACS root state at {}...",
+        state_dir.display()
+    )?;
+    if !paths.managed_dir.starts_with(state_dir) {
+        remove_btrfs_aware(&paths.managed_dir)?;
+    }
+    remove_btrfs_aware(state_dir)?;
+    writeln!(ui.status(), "Initializing fresh AWACS root state...")?;
+    seed_initial_awacs_root(ui, root)
+}
+
+fn remove_btrfs_aware(path: &Path) -> Result<(), CommandError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let file_type = fs::symlink_metadata(path).context(path)?.file_type();
+    if !file_type.is_dir() {
+        fs::remove_file(path).context(path)?;
+        return Ok(());
+    }
+    if is_btrfs_subvolume(path)? {
+        delete_rebuild_snapshot(path)?;
+        return Ok(());
+    }
+    for entry in fs::read_dir(path).context(path)? {
+        let entry = entry.context(path)?;
+        remove_btrfs_aware(&entry.path())?;
+    }
+    fs::remove_dir(path).context(path)?;
+    Ok(())
+}
+
+/// Deletes one managed snapshot during a from-scratch rebuild.
+///
+/// The normal AWACS GC path makes a retained read-only snapshot writable
+/// immediately before destroying it. Rebuild has no live store left to drive
+/// GC, so it must perform the same transition directly instead of asking the
+/// btrfs CLI to remove a read-only root.
+fn delete_rebuild_snapshot(path: &Path) -> Result<(), CommandError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| user_error(format!("Btrfs subvolume has no parent: {}", path.display())))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| user_error(format!("Btrfs subvolume has no name: {}", path.display())))?;
+    let target = fs::File::open(path).context(path)?;
+    let readonly = subvolume_info(target.as_fd())
+        .map_err(|err| user_error(format!("Failed to inspect Btrfs subvolume: {err}")))?
+        .readonly();
+    if readonly {
+        set_subvolume_readonly(target.as_fd(), false).map_err(|err| {
+            user_error(format!(
+                "Failed to make Btrfs subvolume writable for deletion: {err}"
+            ))
+        })?;
+    }
+    let parent = fs::File::open(parent).context(parent)?;
+    if let Err(err) = destroy_snapshot(parent.as_fd(), name.as_bytes()) {
+        if readonly && let Err(restore_err) = set_subvolume_readonly(target.as_fd(), true) {
+            return Err(user_error(format!(
+                "Failed to delete Btrfs subvolume: {err}; also failed to restore read-only flag: {restore_err}"
+            )));
+        }
+        return Err(user_error(format!(
+            "Failed to delete Btrfs subvolume: {err}"
+        )));
+    }
     Ok(())
 }
 
@@ -327,7 +431,7 @@ async fn init_subvolume_at_inner(
             destination.display()
         )?;
         fs::create_dir(&destination).context(&destination)?;
-        if is_btrfs_subvolume(&source_git)? {
+        if allow_reflinks && is_btrfs_subvolume(&source_git)? {
             copy_children_except(
                 source_root,
                 &destination,
@@ -351,21 +455,17 @@ async fn init_subvolume_at_inner(
         create_btrfs_snapshot(&source_git, &destination_git, false)?;
     }
 
-    let migration = SubvolumeMigration::prepare(
+    let committed = convert_subvolume_root(
         &destination,
         MigrationOptions {
             compression: compress,
             keep_temporary_on_drop: false,
         },
+        |phase| {
+            let _status_result = writeln!(ui.status(), "AWACS init: {phase}...");
+        },
     )
-    .map_err(|err| user_error(format!("Failed to prepare subvolume migration: {err}")))?;
-    if let Some(plan) = migration.pending_snapshot() {
-        writeln!(ui.status(), "Snapshotting nested .git subvolume...")?;
-        create_btrfs_snapshot(&plan.source, &plan.destination, false)?;
-    }
-    let committed = migration
-        .commit()
-        .map_err(|err| user_error(format!("Failed to publish subvolume migration: {err}")))?;
+    .map_err(|err| user_error(format!("Failed to publish subvolume migration: {err}")))?;
     committed
         .discard_displaced()
         .map_err(|err| user_error(format!("Failed to remove migration source: {err}")))?;
@@ -378,6 +478,12 @@ async fn init_subvolume_at_inner(
     let mut destination_command = command
         .workspace_helper_no_snapshot_at(ui, &destination)
         .await?;
+    // Initialize the new Btrfs UUID before writing the mode marker. Even
+    // though destination_command was loaded as an ordinary local working
+    // copy, finishing its reset can reload mode from disk and begin a
+    // snapshot-backed materialization. That path needs the external AWACS
+    // baseline to exist already.
+    seed_initial_awacs_root(ui, &destination)?;
     begin_subvolume_mode(&destination)?;
     reset_local_working_copy_state(&mut destination_command).await?;
     // Finishing the reset replaces the working-copy state directory.
@@ -391,6 +497,7 @@ async fn init_subvolume_at_inner(
     let mut destination_command = command
         .workspace_helper_no_snapshot_at(ui, &destination)
         .await?;
+    writeln!(ui.status(), "Seeding snapshot-backed working-copy tree...")?;
     seed_snapshot_working_copy_tree(&mut destination_command).await?;
     writeln!(ui.status(), "Creating initial AWACS snapshot baseline...")?;
     establish_initial_snapshot_baseline(ui, &mut destination_command).await?;
@@ -400,6 +507,45 @@ async fn init_subvolume_at_inner(
         "Initialized snapshot-backed Btrfs checkout at {}.",
         destination.display()
     )?;
+    Ok(())
+}
+
+fn seed_initial_awacs_root(ui: &Ui, root: &Path) -> Result<(), CommandError> {
+    // The existing CLI test backend supplies a synthetic AWACS baseline and
+    // intentionally does not provide a real Btrfs filesystem to index.
+    if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+        writeln!(ui.status(), "AWACS init: test root initialized...")?;
+        return Ok(());
+    }
+    let mut progress_writer = ProgressWriter::new(ui, "AWACS init");
+    let mut final_counts = None;
+    initialize_root(root, |progress| match progress {
+        InitProgress::Phase(phase) => {
+            let _status_result = writeln!(ui.status(), "AWACS init: {phase}...");
+        }
+        InitProgress::Index(counts) => {
+            final_counts = Some(counts);
+            if let Some(writer) = &mut progress_writer {
+                writer
+                    .display(&format!(
+                        "{} directories, {} objects, {} paths",
+                        counts.directories, counts.objects, counts.references,
+                    ))
+                    .ok();
+            }
+        }
+    })
+    .map_err(|err| user_error(format!("Failed to initialize AWACS root: {err}")))?;
+    drop(progress_writer);
+    if let Some(counts) = final_counts {
+        writeln!(
+            ui.status(),
+            "AWACS init: indexed {} directories, {} objects, {} paths.",
+            counts.directories,
+            counts.objects,
+            counts.references,
+        )?;
+    }
     Ok(())
 }
 

@@ -165,11 +165,8 @@ pub struct WatchmanConfig {
 /// Config for direct immutable snapshot scans through the `btrfs-awacs`
 /// library.
 pub struct AwacsConfig {
-    /// Optional explicit AWACS socket. `None` lets the library discover the
-    /// service for the live root and mount namespace.
-    pub socket: Option<PathBuf>,
     /// Injectable crate-owned client used by direct-backend tests. Production
-    /// configuration leaves this unset and uses library discovery.
+    /// configuration leaves this unset and uses the in-process coordinator.
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     pub client: Option<Arc<Mutex<Box<dyn btrfs_awacs::scan::ScanClient>>>>,
 }
@@ -177,7 +174,6 @@ pub struct AwacsConfig {
 impl Clone for AwacsConfig {
     fn clone(&self) -> Self {
         Self {
-            socket: self.socket.clone(),
             #[cfg(all(target_os = "linux", feature = "awacs"))]
             client: self.client.clone(),
         }
@@ -188,14 +184,14 @@ impl std::fmt::Debug for AwacsConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AwacsConfig")
-            .field("socket", &self.socket)
             .finish_non_exhaustive()
     }
 }
 
 impl PartialEq for AwacsConfig {
     fn eq(&self, other: &Self) -> bool {
-        self.socket == other.socket
+        let _ = other;
+        true
     }
 }
 

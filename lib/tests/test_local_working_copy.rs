@@ -52,6 +52,7 @@ use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateSettings;
+use jj_lib::local_working_copy::snapshot_mode_has_committed_baseline;
 use jj_lib::matchers::FilesMatcher;
 use jj_lib::merge::Merge;
 use jj_lib::merge::SameChange;
@@ -4079,7 +4080,6 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
     let requests = Arc::new(Mutex::new(Vec::new()));
     let settings = TreeStateSettings {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
-            socket: None,
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root: scan_root.clone(),
                 outcomes: outcomes.clone(),
@@ -4186,7 +4186,6 @@ fn test_awacs_rejected_scan_root_aborts_accepted_lease() -> TestResult {
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let settings = TreeStateSettings {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
-            socket: None,
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root,
                 outcomes: outcomes.clone(),
@@ -4250,7 +4249,6 @@ fn test_awacs_baseline_input_mismatch_forces_full_begin() -> TestResult {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let settings = TreeStateSettings {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
-            socket: None,
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root,
                 outcomes,
