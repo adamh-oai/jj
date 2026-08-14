@@ -125,6 +125,9 @@ percent-encoding = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true, features = [ "signal" ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+btrfs-awacs = { workspace = true, optional = true }
+
 [dev-dependencies]
 anstream = { workspace = true }
 assert_cmd = { workspace = true }
@@ -141,8 +144,9 @@ testutils = { workspace = true }
 jj-cli = { path = ".", features = ["test-fakes"], default-features = false }
 
 [features]
-default = ["watchman", "git"]
+default = ["watchman", "git", "awacs"]
 bench = ["dep:criterion"]
+awacs = ["dep:btrfs-awacs"]
 git = ["jj-lib/git", "dep:gix"]
 test-fakes = ["jj-lib/testing"]
 watchman = ["jj-lib/watchman"]
