@@ -1323,6 +1323,151 @@ exit 1
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]
+fn test_util_subvolume_enable_linked_requires_enabled_main() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    let output = secondary_dir.run_jj(["util", "subvolume", "enable"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains(
+            "Cannot enable subvolume mode in a linked workspace until the main workspace is +             snapshot-backed"
+        ),
+        "{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Run `jj util subvolume enable` from the main workspace first"),
+        "{output}"
+    );
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
+fn test_util_subvolume_enable_is_workspace_local() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    main_dir.write_file(".gitignore", "/.fake-subvolume\n");
+    main_dir.write_file("file", "tracked\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+
+    // Pretend that only the main root and its .git directory are already
+    // Btrfs subvolumes. The linked workspace starts as an ordinary directory
+    // with a Git .git file.
+    main_dir.write_file(".fake-subvolume", "");
+    main_dir.write_file(".git/.fake-subvolume", "");
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    test -f "$3/.fake-subvolume"
+    exit $?
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "create" ]; then
+    mkdir "$3"
+    touch "$3/.fake-subvolume"
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "snapshot" ]; then
+    if [ "$3" = "-r" ]; then
+        source="$4"
+        destination="$5"
+    else
+        source="$3"
+        destination="$4"
+    fi
+    mkdir "$destination"
+    cp -a "$source/." "$destination/"
+    touch "$destination/.fake-subvolume"
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    rm -rf "$3"
+    exit 0
+fi
+exit 1
+"#,
+    );
+
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(["util", "subvolume", "enable"])
+        })
+        .success();
+    assert!(
+        main_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .is_file()
+    );
+    assert!(
+        !secondary_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .exists()
+    );
+    secondary_dir.write_file("file", "legacy workspace change\n");
+    let legacy_status = secondary_dir
+        .run_jj_with(|cmd| cmd.env("PATH", &path).args(["status"]))
+        .success();
+    assert!(legacy_status.stdout.raw().contains("M file"));
+
+    secondary_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", secondary_dir.root())
+                .args(["util", "subvolume", "enable"])
+        })
+        .success();
+    assert!(
+        secondary_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .is_file()
+    );
+    assert!(secondary_dir.root().join(".git").is_file());
+    let migrated_status = secondary_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", secondary_dir.root())
+                .args(["util", "subvolume", "status"])
+        })
+        .success();
+    assert!(
+        migrated_status
+            .stdout
+            .raw()
+            .contains("Working copy snapshot: awacs")
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
 fn test_util_subvolume_init_compression_rewrites_extents() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
@@ -1557,6 +1702,47 @@ fn test_workspace_remove_ignores_missing_unrelated_workspace() {
 
     main_dir.run_jj(["workspace", "remove", "target"]).success();
     assert!(!target_dir.root().exists());
+}
+
+#[test]
+fn test_workspace_remove_force_skips_snapshot_and_target_checks() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let stale_dir = test_env.work_dir("stale");
+    let target_dir = test_env.work_dir("target");
+
+    main_dir.run_jj(["workspace", "add", "../stale"]).success();
+    main_dir.run_jj(["workspace", "add", "../target"]).success();
+    std::fs::remove_dir_all(stale_dir.root()).unwrap();
+    target_dir.write_file("dirty", "uncommitted target contents");
+    main_dir.write_file("untracked", "must not be snapshotted");
+
+    main_dir
+        .run_jj(["workspace", "remove", "--force", "target"])
+        .success();
+    assert!(!target_dir.root().exists());
+    let output = main_dir
+        .run_jj(["--ignore-working-copy", "file", "list", "untracked"])
+        .success();
+    assert!(!output.stdout.raw().contains("untracked"));
+}
+
+#[test]
+fn test_workspace_remove_force_forgets_missing_target() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let target_dir = test_env.work_dir("target");
+
+    main_dir.run_jj(["workspace", "add", "../target"]).success();
+    std::fs::remove_dir_all(target_dir.root()).unwrap();
+
+    main_dir
+        .run_jj(["workspace", "remove", "--force", "target"])
+        .success();
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(!output.stdout.raw().contains("target:"));
 }
 
 #[cfg(unix)]

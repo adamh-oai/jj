@@ -4044,7 +4044,11 @@ impl SnapshotLocalWorkingCopy {
         if let Some(scan_root) = std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT") {
             tree_state_settings.fsmonitor_settings = FsmonitorSettings::TestAwacs {
                 scan_root: PathBuf::from(scan_root),
-                changed_files: None,
+                // Before the first baseline TestAwacs still takes the
+                // initialization scan below. Once that baseline is committed,
+                // model an authoritative empty incremental delta instead of
+                // asking snapshot mode to fall back to a forbidden full scan.
+                changed_files: Some(vec![]),
                 cursor: vec![2; 16],
             };
         } else {
