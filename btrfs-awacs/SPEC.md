@@ -14,38 +14,41 @@ invariants, verified defects, and unsupported features. A schema table, helper
 function, design proposal, or environment-gated test is not evidence that a
 production path works.
 
-### 1.1 Daemon-free target architecture
+### 1.1 Daemon-free architecture
 
-The current implementation still contains the persistent per-user daemon,
-scan socket, facade sessions, watches, grants, query leases, and daemon-owned
-maintenance as transitional machinery. Default Jujutsu and Git-hook callers
-now enter through the in-process coordinator, but the richer manager schema
-and explicit legacy socket path remain to be removed. This section is
-normative for the target design and supersedes conflicting daemon-oriented
-descriptions in later sections until those sections are rewritten alongside
-the implementation.
+Jujutsu and Git-hook callers enter through the in-process coordinator. There
+is no persistent per-user daemon, scan socket, activation path, or daemon-owned
+maintenance. The existing manager schema still contains richer historical
+state than the steady-state target below requires; shrinking that schema is a
+separate storage migration.
 
 The AWACS library embedded by Jujutsu, and the short-lived
 `git-fsmonitor-awacs` hook process, coordinate directly through one
 independent state bundle per worktree:
 
 ```text
-${XDG_STATE_HOME:-$HOME/.local/state}/btrfs-awacs/roots/<live-subvolume-uuid>/
+<worktree-root-parent>/.<worktree-root-name>-awacs-state/<live-subvolume-uuid>/
     manager.sqlite3
     manager.sqlite3-wal
     manager.sqlite3-shm
+    path-map.sqlite3
+    path-map.sqlite3-wal
+    path-map.sqlite3-shm
     root.lock
     spool/
-
-<worktree-root-parent>/.btrfs-awacs-managed/<live-subvolume-uuid>/
-    s-<sequence>
-    quarantine/
+    managed/
+        s-<sequence>
+        quarantine/
 ```
 
-The SQLite directory may live on any filesystem. The managed snapshot
-directory must be private, outside the worktree, and on the same Btrfs
-filesystem as the worktree. There is no per-worktree daemon socket, daemon
-lock, pid file, or persistent lease directory. The privileged broker remains
+The entire state bundle defaults to a private hidden sibling of the worktree.
+Each root owns a small operational manager database; descendants share the
+append-only immutable path-map database instead of cloning and scrubbing the
+parent manager. `BTRFS_AWACS_STATE_DIR` may override that root. The managed
+snapshot directory remains
+private, outside the worktree, and on the same Btrfs filesystem as the
+worktree. There is no per-worktree daemon socket, daemon lock, pid file, or
+persistent lease directory. The privileged broker remains
 as a stateless helper for bounded snapshot create/destroy and changed-object
 ioctls over authenticated passed fds; it owns no watches, cursors, path maps,
 or recovery state.
@@ -208,15 +211,13 @@ snapshot. It must not reopen the managed snapshot pathname after Begin. If
 descriptor identity, continuity, external inputs, or invalidation paths cannot
 be proven, the client must abort or conservatively perform a full traversal.
 
-## 3. Current transitional process topology and authority
+## 3. Process topology and authority
 
 ```mermaid
 flowchart TD
     JJ["Jujutsu command and working-copy transaction"]
     CLIENT["AWACS direct ScanClient"]
-    DISCOVERY["Namespace-scoped daemon discovery"]
-    SOCKET["scan.sock: private sequenced-packet API"]
-    SESSION["FacadeScanHandler: snapshot leases"]
+    SESSION["DirectScanHandler: snapshot leases"]
     FACADE["FacadeService: cursors, continuity, query pins"]
     SERVICE["Service: initialize, cuts, indexing, recovery"]
     STORE["Manager SQLite: watches, revisions, grants, pins"]
@@ -224,10 +225,7 @@ flowchart TD
     KERNEL["Linux Btrfs snapshots and changed-object ioctl"]
 
     JJ --> CLIENT
-    CLIENT --> DISCOVERY
-    DISCOVERY --> SOCKET
-    CLIENT --> SOCKET
-    SOCKET --> SESSION
+    CLIENT --> SESSION
     SESSION --> FACADE
     FACADE --> SERVICE
     SERVICE --> STORE
@@ -238,21 +236,21 @@ flowchart TD
 There are three authority domains:
 
 1. The client owns Jujutsu working-copy state.
-2. The per-user namespace daemon owns watches, scan sessions, continuity
-   monitors, and the manager database connection.
+2. The embedded coordinator opens the per-root manager database, serializes
+   state transitions with root.lock, and owns the short-lived scan session.
 3. The privileged broker performs bounded read-only Btrfs inspection over
    authenticated passed file descriptors.
 
 A direct-scan request must not supply the broker's underlying authority,
 manager database, managed-snapshot directory, or arbitrary commands.
 
-## 4. Current transitional source ownership
+## 4. Source ownership
 
 | Component | Source | Responsibilities |
 | --- | --- | --- |
 | Btrfs identity and kernel calls | [`src/btrfs.rs`](src/btrfs.rs) | Open subvolume roots, inspect identity, create/destroy snapshots, and invoke changed-object interfaces. |
 | Kernel stream parser | [`src/manifest.rs`](src/manifest.rs) | Parse versioned records, changed-object masks, reference changes, target attributes, and completion data. |
-| Immutable namespace inspection | [`src/snapshot_walk.rs`](src/snapshot_walk.rs) | Build complete immutable indexes with ordinary user-daemon VFS walks. |
+| Immutable namespace inspection | [`src/snapshot_walk.rs`](src/snapshot_walk.rs) | Build complete immutable indexes with ordinary userspace VFS walks. |
 | Changed-object materialization | [`src/tree_index.rs`](src/tree_index.rs) | Materialize requested target objects from changed-object records. |
 | Logical inode graph | [`src/index.rs`](src/index.rs) | Validate reachability, resolve hardlink aliases, apply manifests, and produce semantic path events. |
 | Database bootstrap | [`src/store.rs`](src/store.rs) | Configure SQLite, extract the normative schema, migrate, and load cursor-key metadata. |
@@ -261,12 +259,11 @@ manager database, managed-snapshot directory, or arbitrary commands.
 | Broker wire protocol | [`src/broker_protocol.rs`](src/broker_protocol.rs) | Authenticate broker sessions and encode fd-passing requests. |
 | Core orchestration | [`src/service.rs`](src/service.rs) | Initialize watches, create cuts, stage/apply comparisons, recover effects, and expose maintenance helpers. |
 | Namespace continuity | [`src/namespace.rs`](src/namespace.rs) | Bind the exact root and mount view, observe relevant topology changes, and reject continuity loss. |
-| Optional precision journal | [`src/precision.rs`](src/precision.rs) | Record exact mutation hints or mark an epoch gapped. |
 | Cursor and path projection | [`src/compat.rs`](src/compat.rs) | Authenticate direct cursors and conservatively project semantic events. |
 | Snapshot facade | [`src/facade.rs`](src/facade.rs) | Verify continuity, request cuts, resolve baselines, mint cursors, and manage query leases. |
-| Public direct-scan API | [`src/scan.rs`](src/scan.rs) | Define Begin/Renew/Promote/Finish/ReleaseBaseline, discover the scan socket, and transfer one snapshot fd. |
-| Direct-scan daemon bridge | [`src/scan_facade.rs`](src/scan_facade.rs) | Bind requests to roots, retain prepared responses, renew/release leases, and remember completed sessions. |
-| Executable and activation | [`src/main.rs`](src/main.rs) | Start/discover the namespace daemon, configure paths, publish the scan socket, authenticate clients, and dispatch connections. |
+| Public direct-scan API | [`src/scan.rs`](src/scan.rs) | Define Begin/Renew/Promote/Finish/ReleaseBaseline and carry one already-open snapshot fd. |
+| Embedded direct coordinator | [`src/scan_facade.rs`](src/scan_facade.rs) | Bind requests to initialized roots, retain prepared responses, renew/release leases, and remember completed sessions. |
+| Executable | [`src/main.rs`](src/main.rs) | Run initialization, broker, diagnostics, and the Git fsmonitor hook. |
 
 The companion checkout adds Btrfs-backed workspace materialization and the
 optional direct AWACS snapshot backend. Its relevant ownership lies in
@@ -296,7 +293,7 @@ moves are inputs to conservative endpoint projection. A direct scan reads the
 opened immutable snapshot, so live mutations after Begin cannot change the
 tree being traversed.
 
-## 6. Current transitional durable state and deployment layout
+## 6. Durable state and deployment layout
 
 The manager database contains filesystems, watches, grants, operations,
 snapshots, revisions/checkpoints/overlays, comparisons/events, client
@@ -307,16 +304,14 @@ schema SQL is checked in alongside the store implementation in
 The deployment layout is:
 
 ```text
-${XDG_RUNTIME_DIR}/btrfs-awacs/mnt-<device>-<inode>/
-    daemon.lock
-    scan.sock
-
-${XDG_STATE_HOME:-$HOME/.local/state}/btrfs-awacs/
-    <manager database>
+<worktree-root-parent>/.<worktree-root-name>-awacs-state/<live-subvolume-uuid>/
+    manager.sqlite3
+    manager.sqlite3-wal
+    manager.sqlite3-shm
+    root.lock
     spool/
-
-<watch-root-parent>/.btrfs-awacs-managed/
-    managed read-only snapshots
+    managed/
+        read-only snapshots
 
 /run/btrfs-awacs/broker.sock
     privileged broker, unless explicitly overridden
@@ -327,9 +322,9 @@ ${XDG_STATE_HOME:-$HOME/.local/state}/btrfs-awacs/
 corresponding paths. BTRFS_AWACS_PROBE_ROOT names a readable Btrfs subvolume
 root that the privileged broker probes at startup; it refuses to listen if
 the running kernel returns ENOTTY for BTRFS_IOC_CHANGED_OBJECTS. Runtime
-directories must be private and client sockets mode `0600`.
+state directories must be private.
 
-## 7. Current transitional core lifecycle
+## 7. Core lifecycle
 
 awacs init <root> is the explicit bootstrap boundary. It converts the root to
 the shared Btrfs subvolume layout, resolves and verifies the source subvolume,
@@ -337,36 +332,35 @@ reserves a watch, grant, operation, and destination, creates a read-only
 snapshot, reopens and verifies that snapshot, builds a complete userspace
 path/inode index, validates the graph and metadata, and publishes revision
 zero. jj util subvolume enable calls the same conversion and bootstrap
-helpers. Starting or discovering a scan daemon for a root without that
-durable state is an error; a scan request never creates a watch.
+helpers. Opening an uninitialized root through the direct client is an error;
+a scan request never creates a watch.
 
 Sequence zero establishes core watch identity but is not a client cursor
 boundary. A later synchronized cut produces the first client-visible cursor.
 
-For a cut, AWACS reserves a sequence, creates and verifies a new snapshot,
+For a cut, AWACS takes root.lock, creates and verifies the next snapshot,
 compares immutable endpoints, stages events and overlays, validates the target,
-publishes the indexed head and client boundary, then keeps required snapshots
-pinned until every active lease releases them.
+and publishes the indexed head and client boundary in SQLite. The returned
+open snapshot fd retains an in-flight scan after older snapshot pathnames are
+unlinked.
 
-Each Jujutsu workspace also owns one opaque consumer-baseline ID. A committed
-scan atomically promotes candidate B and releases committed A; an in-flight
-scan may therefore retain only A+B. When `jj util subvolume disable` drops
-snapshot-backed state, it sends `ReleaseBaseline` for that owner and triggers
-a bounded cleanup slice, leaving only AWACS's newest watch checkpoint rather
-than accumulating old per-workspace baselines.
+Each Jujutsu workspace persists one opaque cursor. A committed scan atomically
+promotes candidate B with the Jujutsu tree state; a failed scan does not
+advance the cursor. ReleaseBaseline clears the direct caller's logical
+baseline and triggers bounded cleanup.
 
 Recovery reconciles fenced manager operations before retrying effects. It must
 reject unmanaged lookalike snapshots, stale grants, continuity loss, and
-mismatched identities. A periodic production worker runs bounded lease expiry,
-retained-boundary cleanup, orphan-history reclamation, and fenced physical
-garbage collection on a separate manager handle.
+mismatched identities. Each direct coordinator entry performs bounded lease
+expiry, retained-boundary cleanup, orphan-history reclamation, and physical
+garbage collection while holding the per-root lock.
 
-## 8. Current transitional direct API and Jujutsu transaction
+## 8. Direct API and Jujutsu transaction
 
-The private transport uses Unix `SOCK_SEQPACKET` at `scan.sock`. Begin returns
-one fd, cursor, invalidation, identity, deadline, and session capability.
-Renew extends the durable lease. Finish records `Committed` or `Aborted` and
-releases the pinned response.
+The embedded library exposes Begin/Renew/Promote/Finish/ReleaseBaseline.
+Begin returns one fd, cursor, invalidation, identity, deadline, and session
+capability. Renew extends the lease. Finish records Committed or Aborted and
+releases the prepared response.
 
 Jujutsu's direct transaction:
 
@@ -389,13 +383,11 @@ The supported configuration is:
 [fsmonitor]
 backend = "awacs"
 
-[fsmonitor.awacs]
-socket = ""
 ```
 
-An explicit absolute socket path may be supplied. Unsupported platforms or
-feature-disabled binaries reject `awacs`; a configured direct backend fails
-closed when discovery, connection, identity, or lease verification fails.
+Unsupported platforms or feature-disabled binaries reject awacs; a configured
+direct backend fails closed when initialization, identity, or lease
+verification fails.
 
 ## 9. Btrfs-backed Jujutsu workspaces
 
@@ -423,11 +415,11 @@ before forgetting registrations, preserving auto-mode fallback, preventing
 unsupported nested subvolumes, materializing widened sparse destinations, and
 cleaning linked Git worktree metadata.
 
-## 10. Current transitional concurrency, performance, and active gaps
+## 10. Concurrency, performance, and active gaps
 
-Cut publication is writer-serialized per watch. Expensive filesystem work must
-run outside writer transactions. Query leases retain exactly the snapshots,
-revisions, and comparisons needed by an active response or scan. Direct
+Cut publication is serialized per root by root.lock. Expensive filesystem work
+must run outside writer transactions. Query leases retain exactly the logical
+revisions and comparisons needed by an active response or scan. Direct
 Begin/Renew/Finish must not hold global locks across unrelated expensive work
 or blocking writes; deadlines need one coherent monotonic time base.
 
@@ -438,7 +430,7 @@ boundary foreign-key failures, external-ignore drift, lease/deadline
 disagreement, descriptor delegation risk, slow Begin
 starvation, sparse workspace materialization failures, incomplete kernel
 identity checks, abandoned session pins, malformed invalidation handling, and
-installer/discovery friction. See [`FIXES.md`](FIXES.md) and the documentation
+installer friction. See [`FIXES.md`](FIXES.md) and the documentation
 review pages for the stable finding IDs.
 
 ## 11. Validation and support boundary

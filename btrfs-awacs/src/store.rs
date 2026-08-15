@@ -1,7 +1,9 @@
 use getrandom::fill as random_fill;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,7 +11,8 @@ use uuid::Uuid;
 
 const CONNECTION_SCHEMA: &str = include_str!("store_connection.sql");
 const MANAGER_SCHEMA: &str = include_str!("store_schema.sql");
-const SCHEMA_VERSION: i64 = 6;
+const PATH_MAP_SCHEMA: &str = include_str!("store_path_map.sql");
+const SCHEMA_VERSION: i64 = 7;
 const MANAGER_APPLICATION_ID: i64 = 0x4241_5731; // BAW1
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +42,7 @@ impl ServiceMetadata {
 #[derive(Debug)]
 pub struct Store {
     path: PathBuf,
+    path_map_path: PathBuf,
     connection: Connection,
 }
 
@@ -71,18 +75,48 @@ impl From<rusqlite::Error> for StoreError {
 
 impl Store {
     pub fn create(path: &Path, metadata: &ServiceMetadata) -> Result<Self, StoreError> {
+        let path_map_path = path.with_file_name("path-map.sqlite3");
+        Self::create_with_path_map(path, &path_map_path, metadata, true)
+    }
+
+    fn create_with_path_map(
+        path: &Path,
+        path_map_path: &Path,
+        metadata: &ServiceMetadata,
+        create_path_map: bool,
+    ) -> Result<Self, StoreError> {
         create_private_file(path)?;
         let result = (|| {
+            if create_path_map {
+                create_private_file(path_map_path)?;
+                let path_map = open_connection(path_map_path)?;
+                configure_manager_connection(&path_map)?;
+                path_map.execute_batch(PATH_MAP_SCHEMA)?;
+            } else if !path_map_path.is_file() {
+                return Err(StoreError::new(format!(
+                    "shared AWACS path-map store {} does not exist",
+                    path_map_path.display()
+                )));
+            }
             let mut connection = open_connection(path)?;
             configure_manager_connection(&connection)?;
             install_manager_schema(&mut connection, metadata)?;
+            connection.execute(
+                "INSERT INTO path_map_store(singleton, path) VALUES (1, ?1)",
+                [path_map_path.as_os_str().as_bytes()],
+            )?;
+            attach_path_map(&connection, path_map_path)?;
             Ok(Self {
                 path: path.to_owned(),
+                path_map_path: path_map_path.to_owned(),
                 connection,
             })
         })();
         if result.is_err() {
             cleanup_new_database(path);
+            if create_path_map {
+                cleanup_new_database(path_map_path);
+            }
         }
         result
     }
@@ -102,14 +136,134 @@ impl Store {
                 "manager database does not contain exactly one service metadata row",
             ));
         }
+        let path_map_path = stored_path_map_path(&connection)?;
+        attach_path_map(&connection, &path_map_path)?;
         Ok(Self {
             path: path.to_owned(),
+            path_map_path,
             connection,
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn path_map_path(&self) -> &Path {
+        &self.path_map_path
+    }
+
+    /// Creates a fresh child operational database while retaining only the
+    /// small revision/snapshot metadata needed to resolve one inherited seed.
+    ///
+    /// Checkpoint and overlay payload rows stay in the parent's append-only
+    /// path-map database, which is attached to the child as shared immutable
+    /// history. No manager database bytes are cloned and no copied
+    /// operational rows need scrubbing.
+    pub fn create_descendant_seed(
+        parent: &Store,
+        path: &Path,
+        metadata: &ServiceMetadata,
+        seed_revision_id: i64,
+        now_ns: i64,
+        inert_snapshot_path_prefix: &[u8],
+    ) -> Result<Self, StoreError> {
+        let mut child = Self::create_with_path_map(path, parent.path_map_path(), metadata, false)?;
+        let result = (|| {
+            child.connection.execute(
+                "ATTACH DATABASE ?1 AS parent_manager",
+                [parent.path().as_os_str().as_bytes()],
+            )?;
+            let transaction = child
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction
+                .execute_batch("CREATE TEMP TABLE retained_revisions(id INTEGER PRIMARY KEY);")?;
+            transaction.execute(
+                r#"WITH RECURSIVE chain(id) AS (
+                       SELECT ?1
+                       UNION ALL
+                       SELECT r.storage_base_revision_id
+                         FROM parent_manager.revisions r
+                         JOIN chain c ON r.id = c.id
+                        WHERE r.storage_base_revision_id IS NOT NULL
+                   )
+                   INSERT INTO retained_revisions SELECT id FROM chain"#,
+                [seed_revision_id],
+            )?;
+            let ready: Option<i64> = transaction
+                .query_row(
+                    "SELECT 1 FROM parent_manager.revisions
+                      WHERE id = ?1 AND state = 'ready'",
+                    [seed_revision_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if ready != Some(1) {
+                return Err(StoreError::new("descendant seed revision is not ready"));
+            }
+            transaction.execute_batch(
+                "INSERT INTO filesystems(id, fs_uuid)
+                   SELECT DISTINCT f.id, f.fs_uuid
+                     FROM parent_manager.filesystems f
+                     JOIN parent_manager.snapshots s ON s.filesystem_id = f.id
+                     JOIN parent_manager.revisions r ON r.snapshot_id = s.id
+                     JOIN retained_revisions keep ON keep.id = r.id;",
+            )?;
+            transaction.execute(
+                r#"INSERT INTO snapshots(
+                       id, filesystem_id, subvol_uuid, parent_uuid, received_uuid,
+                       root_id, ctransid, otransid, path, readonly,
+                       physical_state, created_ns, deleted_ns)
+                   SELECT s.id, s.filesystem_id, s.subvol_uuid, s.parent_uuid,
+                          s.received_uuid, s.root_id, s.ctransid, s.otransid,
+                          CAST(?1 || CAST(s.id AS TEXT) AS BLOB), s.readonly,
+                          'deleted', s.created_ns, ?2
+                     FROM parent_manager.snapshots s
+                     JOIN parent_manager.revisions r ON r.snapshot_id = s.id
+                     JOIN retained_revisions keep ON keep.id = r.id"#,
+                params![inert_snapshot_path_prefix, now_ns],
+            )?;
+            transaction.execute_batch(
+                "INSERT INTO revisions(
+                     id, snapshot_id, storage_base_revision_id,
+                     provenance_comparison_id, delta_depth, state,
+                     builder_owner, builder_fence, builder_expires_ns,
+                     object_count, ref_count, state_hash, single_owner_uid,
+                     privileged_metadata_count, security_state_hash,
+                     owner_cardinality, owner_uid_xor, summary_version,
+                     created_ns)
+                   SELECT r.id, r.snapshot_id, r.storage_base_revision_id,
+                          NULL, r.delta_depth, r.state, NULL, r.builder_fence,
+                          NULL, r.object_count, r.ref_count, r.state_hash,
+                          r.single_owner_uid, r.privileged_metadata_count,
+                          r.security_state_hash, r.owner_cardinality,
+                          r.owner_uid_xor, r.summary_version, r.created_ns
+                     FROM parent_manager.revisions r
+                     JOIN retained_revisions keep ON keep.id = r.id
+                    ORDER BY r.id;
+
+                 INSERT INTO revision_checkpoints(
+                     revision_id, state, builder_owner, builder_fence,
+                     builder_expires_ns, object_count, ref_count, state_hash)
+                   SELECT c.revision_id, c.state, NULL, c.builder_fence,
+                          NULL, c.object_count, c.ref_count, c.state_hash
+                     FROM parent_manager.revision_checkpoints c
+                     JOIN retained_revisions keep ON keep.id = c.revision_id;
+
+                 DROP TABLE retained_revisions;",
+            )?;
+            transaction.commit()?;
+            child
+                .connection
+                .execute_batch("DETACH DATABASE parent_manager;")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            cleanup_new_database(path);
+            return Err(error);
+        }
+        Ok(child)
     }
 
     pub fn connection(&self) -> &Connection {
@@ -185,6 +339,29 @@ fn open_connection(path: &Path) -> Result<Connection, StoreError> {
     .map_err(|error| StoreError::new(format!("open {}: {error}", path.display())))
 }
 
+fn stored_path_map_path(connection: &Connection) -> Result<PathBuf, StoreError> {
+    let bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT path FROM path_map_store WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            StoreError::new(format!(
+                "manager database has no shared path-map store; rebuild AWACS state: {error}"
+            ))
+        })?;
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+fn attach_path_map(connection: &Connection, path: &Path) -> Result<(), StoreError> {
+    connection.execute(
+        "ATTACH DATABASE ?1 AS path_map",
+        [path.as_os_str().as_bytes()],
+    )?;
+    Ok(())
+}
+
 fn configure_manager_connection(connection: &Connection) -> Result<(), StoreError> {
     connection.busy_timeout(Duration::from_secs(30))?;
     connection.execute_batch(
@@ -251,6 +428,11 @@ fn install_manager_schema(
     transaction.execute(
         "INSERT INTO schema_migrations(version, name, applied_ns) \
          VALUES (6, 'consumer-baseline-pins-v6', ?1)",
+        [metadata.created_ns],
+    )?;
+    transaction.execute(
+        "INSERT INTO schema_migrations(version, name, applied_ns) \
+         VALUES (7, 'shared-immutable-path-map-v7', ?1)",
         [metadata.created_ns],
     )?;
     transaction.pragma_update(None, "application_id", MANAGER_APPLICATION_ID)?;
@@ -401,6 +583,28 @@ fn migrate_manager_schema(connection: &mut Connection) -> Result<(), StoreError>
         )?;
         transaction.pragma_update(None, "user_version", 6)?;
         transaction.commit()?;
+        version = 6;
+    }
+    if version == 6 {
+        let has_path_map_store: i64 = connection.query_row(
+            "SELECT count(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'path_map_store'",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_path_map_store != 1 {
+            return Err(StoreError::new(
+                "manager schema v6 embeds path maps; rebuild AWACS state",
+            ));
+        }
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, name, applied_ns) \
+             VALUES (7, 'shared-immutable-path-map-v7', 0)",
+            [],
+        )?;
+        transaction.pragma_update(None, "user_version", 7)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -521,6 +725,32 @@ mod tests {
                 .contains("create")
         );
         assert_eq!(Store::open(&path).unwrap().metadata().unwrap(), metadata());
+    }
+
+    #[test]
+    fn rejects_embedded_path_map_schema_with_rebuild_guidance() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manager.sqlite3");
+        let store = Store::create(&path, &metadata()).unwrap();
+        store
+            .connection()
+            .execute("DROP TABLE path_map_store", [])
+            .unwrap();
+        store
+            .connection()
+            .execute("DELETE FROM schema_migrations WHERE version = 7", [])
+            .unwrap();
+        store
+            .connection()
+            .pragma_update(None, "user_version", 6)
+            .unwrap();
+        drop(store);
+        assert!(
+            Store::open(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("rebuild AWACS state")
+        );
     }
 
     #[test]

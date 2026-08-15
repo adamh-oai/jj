@@ -1,20 +1,18 @@
-use btrfs_awacs::bootstrap::{InitProgress, RootInitPaths, initialize_root, root_state_key};
+use btrfs_awacs::bootstrap::{InitProgress, initialize_root};
 use btrfs_awacs::broker::{
     ChangedObjectsExecution, ExpectedSubvolume, SeqPacketListener, execute_changed_objects,
 };
 use btrfs_awacs::broker_protocol::BrokerDispatcher;
 use btrfs_awacs::btrfs::{OpenedSubvolume, send_changed_objects, supports_changed_objects_v2};
-use btrfs_awacs::facade::FacadeService;
 use btrfs_awacs::manager::{PERMISSION_CUT, PERMISSION_READ, Permissions, Principal};
 use btrfs_awacs::manifest::{
     CHANGED_OBJECTS_V2_MAGIC, parse_changed_objects, parse_changed_objects_v2,
 };
 use btrfs_awacs::namespace::NamespaceMonitor;
 use btrfs_awacs::scan::{
-    BeginScanRequest, Invalidation, ScanClient, ScanOutcome, ScanSocket, ScanSocketListener,
-    SnapshotBaseline, SnapshotIdentity, SocketScanClient, SocketScanDispatcher,
+    BeginScanRequest, Invalidation, ScanClient, ScanOutcome, SnapshotBaseline, SnapshotIdentity,
 };
-use btrfs_awacs::scan_facade::{DirectScanClient, FacadeScanHandler};
+use btrfs_awacs::scan_facade::DirectScanClient;
 use btrfs_awacs::service::{ChangesOptions, InitializeOptions, Service, ServiceConfig};
 use btrfs_awacs::store::{ServiceMetadata, Store};
 use btrfs_awacs::subvolume_migration::{MigrationOptions, convert_subvolume_root};
@@ -25,14 +23,14 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -40,7 +38,6 @@ use uuid::Uuid;
 const SNAPSHOT_DIR: &str = ".btrfs-awacs";
 const SNAPSHOT_PREFIX: &str = "snapshot-";
 const CHANGED_OBJECTS_HELPER: &str = "__changed-objects-send";
-const SCAN_SERVER: &str = "scan-serve";
 const GIT_FSMONITOR_AWACS: &str = "git-fsmonitor-awacs";
 const SEND_HELPER_UNSUPPORTED_EXIT_CODE: i32 = 2;
 const EOPNOTSUPP: i32 = 95;
@@ -49,7 +46,7 @@ const EOPNOTSUPP: i32 = 95;
 #[command(
     name = "awacs",
     version,
-    about = "Btrfs snapshot change index, direct scan service, and benchmark tools"
+    about = "Btrfs snapshot change index, direct scan client, and benchmark tools"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -97,13 +94,6 @@ enum CliCommand {
         #[arg(value_name = "BTRFS_PROBE_ROOT")]
         probe_root: PathBuf,
     },
-    /// Run the direct immutable-snapshot scan service.
-    ScanServe(ScanServeArgs),
-    /// Discover or activate the namespace daemon and print its scan socket.
-    ScanSockname {
-        #[arg(value_name = "LIVE_ROOT")]
-        root: PathBuf,
-    },
     /// Diagnostic: emit the legacy changed-object stream.
     #[command(name = "__changed-objects-send")]
     ChangedObjectsSend {
@@ -137,16 +127,6 @@ enum CliCommand {
 enum SnapshotMode {
     Ro,
     Rw,
-}
-
-#[derive(Debug, clap::Args)]
-struct ScanServeArgs {
-    root: PathBuf,
-    socket: PathBuf,
-    managed_dir: PathBuf,
-    spool_dir: PathBuf,
-    manager_db: PathBuf,
-    broker_socket: PathBuf,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -187,7 +167,6 @@ fn main() {
     }
     let explicit_command = env::args_os().nth(1);
     let component = match explicit_command.as_deref() {
-        Some(command) if command == OsStr::new(SCAN_SERVER) => "scan-serve",
         Some(command) if command == OsStr::new("broker-serve") => "broker-serve",
         _ => "awacs",
     };
@@ -294,8 +273,6 @@ fn run_cli(cli: Cli) {
             manager_gid,
             probe_root,
         )),
-        CliCommand::ScanServe(arguments) => finish(run_scan_server(arguments)),
-        CliCommand::ScanSockname { root } => finish(run_scan_sockname(&root)),
         CliCommand::ChangedObjectsSend {
             snapshot,
             parent_root_id,
@@ -370,15 +347,6 @@ fn run_init(root: &Path, compress: Option<bool>, keep: bool) -> Result<(), Strin
         initialized.snapshot_id,
     );
     Ok(())
-}
-
-fn run_scan_sockname(root: &Path) -> Result<(), String> {
-    let scan_socket = ensure_scan_daemon(root)?;
-    validate_user_socket(&scan_socket)?;
-    io::stdout()
-        .write_all(scan_socket.as_os_str().as_bytes())
-        .and_then(|()| io::stdout().write_all(&[0]))
-        .map_err(|error| format!("write AWACS scan socket discovery response: {error}"))
 }
 
 /// Implements Git's fsmonitor hook protocol v2 without a persistent user
@@ -896,208 +864,6 @@ fn finish_send_helper(result: Result<(), SendHelperError>) {
     }
 }
 
-fn ensure_scan_daemon(caller_directory: &Path) -> Result<PathBuf, String> {
-    let root = automatic_scan_root(caller_directory)?;
-    let socket = namespace_scan_socket(&root)?;
-    if socket.exists() && existing_scan_socket_is_live(&socket)? {
-        return Ok(socket);
-    }
-    let namespace_directory = socket
-        .parent()
-        .ok_or_else(|| "namespace socket has no parent".to_owned())?;
-    let lock_path = namespace_directory.join("daemon.lock");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)
-        .map_err(|error| format!("open daemon lock {}: {error}", lock_path.display()))?;
-    // SAFETY: lock is live and LOCK_EX serializes namespace daemon activation.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!(
-            "lock daemon activation: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    if socket.exists() && existing_scan_socket_is_live(&socket)? {
-        return Ok(socket);
-    }
-    let paths = automatic_scan_paths(&root)?;
-    let executable = env::current_exe().map_err(|error| format!("locate awacs: {error}"))?;
-    let daemon_stderr = automatic_daemon_stderr()?;
-    let mut child = Command::new(executable)
-        .arg(SCAN_SERVER)
-        .arg(&root)
-        .arg(&socket)
-        .arg(&paths.managed_dir)
-        .arg(&paths.spool_dir)
-        .arg(&paths.manager_db)
-        .arg(&paths.broker_socket)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        // Discovery is invoked with stderr captured by callers such as jj. A
-        // long-lived daemon must not inherit that pipe, or the caller waits
-        // forever for EOF after discovery itself exits.
-        .stderr(daemon_stderr)
-        .spawn()
-        .map_err(|error| format!("start AWACS scan daemon: {error}"))?;
-    // Keep the activation lock until the daemon publishes its socket so
-    // concurrent discovery calls cannot spawn competing daemons.
-    for _ in 0..12_000 {
-        if socket.exists() {
-            validate_user_socket(&socket)?;
-            return Ok(socket);
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("inspect AWACS scan daemon: {error}"))?
-        {
-            return Err(format!("AWACS scan daemon exited with {status}"));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Err("timed out waiting for AWACS scan daemon socket".to_owned())
-}
-
-#[derive(Debug)]
-struct AutomaticScanPaths {
-    managed_dir: PathBuf,
-    spool_dir: PathBuf,
-    manager_db: PathBuf,
-    broker_socket: PathBuf,
-}
-
-fn automatic_scan_root(caller_directory: &Path) -> Result<PathBuf, String> {
-    let canonical = fs::canonicalize(caller_directory)
-        .map_err(|error| format!("canonicalize AWACS caller directory: {error}"))?;
-    // Discovery may be invoked from somewhere inside a working copy. Prefer
-    // the nearest repository root so snapshots cover the whole tree rather
-    // than only the caller's current subdirectory.
-    for candidate in canonical.ancestors() {
-        if candidate.join(".jj").exists() || candidate.join(".git").exists() {
-            return Ok(candidate.to_path_buf());
-        }
-    }
-    Ok(canonical)
-}
-
-fn automatic_scan_paths(root: &Path) -> Result<AutomaticScanPaths, String> {
-    let paths = RootInitPaths::from_environment(root)
-        .map_err(|error| format!("resolve AWACS root state: {error}"))?;
-    Ok(AutomaticScanPaths {
-        // Snapshot clones must stay on the live root's Btrfs filesystem.
-        managed_dir: paths.managed_dir,
-        spool_dir: paths.spool_dir,
-        manager_db: paths.manager_db,
-        broker_socket: env::var_os("BTRFS_AWACS_BROKER_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/run/btrfs-awacs/broker.sock")),
-    })
-}
-
-fn automatic_daemon_stderr() -> Result<Stdio, String> {
-    let path = awacs_log_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| "AWACS log path has no parent".to_owned())?;
-    fs::create_dir_all(parent)
-        .map_err(|error| format!("create AWACS log directory {}: {error}", parent.display()))?;
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|error| format!("open AWACS daemon error log {}: {error}", path.display()))?;
-    Ok(Stdio::from(file))
-}
-
-fn namespace_scan_socket(root: &Path) -> Result<PathBuf, String> {
-    let runtime = PathBuf::from(
-        env::var_os("XDG_RUNTIME_DIR").ok_or_else(|| "XDG_RUNTIME_DIR is required".to_owned())?,
-    );
-    validate_private_runtime(&runtime)?;
-    let namespace = fs::metadata("/proc/self/ns/mnt")
-        .map_err(|error| format!("stat mount namespace: {error}"))?;
-    let base = runtime.join("btrfs-awacs");
-    create_private_directory(&base)?;
-    let directory = base.join(format!("mnt-{}-{}", namespace.dev(), namespace.ino()));
-    create_private_directory(&directory)?;
-    let key = root_state_key(root).map_err(|error| format!("identify AWACS root: {error}"))?;
-    Ok(directory.join(format!("scan-{key}.sock")))
-}
-
-fn create_private_directory(path: &Path) -> Result<(), String> {
-    match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(format!(
-                "create runtime directory {}: {error}",
-                path.display()
-            ));
-        }
-    }
-    validate_private_runtime(path)
-}
-
-fn validate_private_runtime(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("stat runtime directory {}: {error}", path.display()))?;
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(format!(
-            "runtime directory {} must be owned by uid {uid} and mode 0700 or stricter",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn validate_user_socket(path: &Path) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("stat AWACS socket {}: {error}", path.display()))?;
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != uid
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(format!(
-            "AWACS socket {} has unsafe type, owner, or mode",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn existing_scan_socket_is_live(path: &Path) -> Result<bool, String> {
-    validate_user_socket(path)?;
-    match SocketScanClient::connect(path) {
-        Ok(_) => Ok(true),
-        Err(error)
-            if error.message().contains("Connection refused")
-                || error.message().contains("No such file or directory") =>
-        {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!(
-                        "remove stale AWACS scan socket {}: {error}",
-                        path.display()
-                    ));
-                }
-            }
-            Ok(false)
-        }
-        Err(error) => Err(format!(
-            "connect to existing AWACS scan socket {}: {error}",
-            path.display()
-        )),
-    }
-}
-
 fn run_btrfs_inspect_helper(path: &Path) -> Result<(), String> {
     let opened = OpenedSubvolume::open(path).map_err(|error| error.to_string())?;
     opened.revalidate().map_err(|error| error.to_string())?;
@@ -1467,180 +1233,6 @@ fn validate_root_broker_directory(path: &Path, private: bool) -> Result<(), Stri
         ));
     }
     Ok(())
-}
-
-fn run_scan_server(arguments: ScanServeArgs) -> Result<(), String> {
-    let ScanServeArgs {
-        root,
-        socket: socket_path,
-        managed_dir: managed,
-        spool_dir: spool,
-        manager_db: store_path,
-        broker_socket,
-    } = arguments;
-    let runtime = socket_path
-        .parent()
-        .ok_or_else(|| "AWACS scan socket has no parent directory".to_owned())?;
-    let runtime_metadata = fs::symlink_metadata(runtime)
-        .map_err(|error| format!("stat runtime directory {}: {error}", runtime.display()))?;
-    let uid = unsafe { libc::geteuid() };
-    let gid = unsafe { libc::getegid() };
-    if !runtime_metadata.is_dir()
-        || runtime_metadata.uid() != uid
-        || runtime_metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(format!(
-            "runtime directory {} must be owned by uid {uid} and mode 0700 or stricter",
-            runtime.display()
-        ));
-    }
-    if socket_path.exists() {
-        return Err(format!(
-            "refusing to replace existing AWACS scan socket {}",
-            socket_path.display()
-        ));
-    }
-    let boot_id = read_boot_id()?;
-    if !store_path.exists() {
-        return Err(format!(
-            "{} is not initialized; run awacs init {} first",
-            root.display(),
-            root.display(),
-        ));
-    }
-    let store = Store::open(&store_path).map_err(|error| format!("open manager store: {error}"))?;
-    let config = ServiceConfig::new(managed, spool, boot_id).with_broker_socket(broker_socket);
-    let service = Service::new_external(store, config).map_err(|error| error.to_string())?;
-    service
-        .require_initialized_root(&root)
-        .map_err(|error| format!("start AWACS scan daemon: {error}"))?;
-    // Keep maintenance on its own store/broker connection. Snapshot deletion
-    // can include filesystem durability work, so it must not hold the
-    // request facade mutex while a client is waiting for Begin/Renew/Finish.
-    let mut maintenance_service = service
-        .maintenance_worker()
-        .map_err(|error| format!("create AWACS maintenance worker: {error}"))?;
-    let facade = std::sync::Arc::new(std::sync::Mutex::new(FacadeService::new(service)));
-    let precision_marker_directory = (env::var_os("BTRFS_AWACS_PRECISION_GUARD").as_deref()
-        == Some(OsStr::new("1")))
-    .then(|| runtime.to_path_buf());
-    let listener = ScanSocketListener::bind(&socket_path, 0o600)
-        .map_err(|error| format!("bind AWACS scan listener: {error}"))?;
-    let dispatcher = std::sync::Arc::new(SocketScanDispatcher::new(FacadeScanHandler::new(
-        std::sync::Arc::clone(&facade),
-        precision_marker_directory,
-        uid,
-        gid,
-    )));
-    std::thread::Builder::new()
-        .name("btrfs-awacs-maintenance".to_owned())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(30));
-                let now_ns = match current_time_ns() {
-                    Ok(now_ns) => now_ns,
-                    Err(error) => {
-                        warn!(error = %error, "skip AWACS maintenance tick");
-                        continue;
-                    }
-                };
-                let started = Instant::now();
-                let result = maintenance_service.maintenance_tick(now_ns);
-                match result {
-                    Ok(report) => info!(
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        expired_query_leases = report.expired_query_leases,
-                        expired_retention_leases = report.expired_retention_leases,
-                        expired_historical_comparisons = report.expired_historical_comparisons,
-                        watches_processed = report.watches_processed,
-                        history_rows_reclaimed = report.history_rows_reclaimed,
-                        snapshots_deleted = report.snapshots_deleted,
-                        more_work = report.more_work,
-                        "AWACS maintenance tick completed"
-                    ),
-                    Err(error) => warn!(
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        error = %error,
-                        "AWACS maintenance tick failed"
-                    ),
-                }
-            }
-        })
-        .map_err(|error| format!("start AWACS maintenance worker: {error}"))?;
-    loop {
-        let connection = listener
-            .accept()
-            .map_err(|error| format!("accept AWACS scan connection: {error}"))?;
-        if let Err(error) = validate_scan_peer_view(&connection, uid) {
-            warn!(error = %error, "reject AWACS scan peer");
-            continue;
-        }
-        let dispatcher = std::sync::Arc::clone(&dispatcher);
-        std::thread::Builder::new()
-            .name("btrfs-awacs-scan-client".to_owned())
-            .spawn(move || while dispatcher.serve_one(&connection).is_ok() {})
-            .map_err(|error| format!("start AWACS scan client worker: {error}"))?;
-    }
-}
-fn validate_scan_peer_view(socket: &ScanSocket, expected_uid: u32) -> Result<(), String> {
-    let peer = socket
-        .peer_credentials()
-        .map_err(|error| format!("read AWACS scan peer credentials: {error}"))?;
-    if peer.uid != expected_uid {
-        return Err(format!(
-            "AWACS scan peer uid {} does not match daemon uid {expected_uid}",
-            peer.uid
-        ));
-    }
-    let peer_mount_namespace = fs::metadata(format!("/proc/{}/ns/mnt", peer.pid))
-        .map_err(|error| format!("stat AWACS peer mount namespace: {error}"))?;
-    let own_mount_namespace = fs::metadata("/proc/self/ns/mnt")
-        .map_err(|error| format!("stat AWACS daemon mount namespace: {error}"))?;
-    if peer_mount_namespace.dev() != own_mount_namespace.dev()
-        || peer_mount_namespace.ino() != own_mount_namespace.ino()
-    {
-        return Err("AWACS scan peer is in a different mount namespace".to_owned());
-    }
-    let peer_root = fs::metadata(format!("/proc/{}/root", peer.pid))
-        .map_err(|error| format!("stat AWACS peer process root: {error}"))?;
-    let own_root = fs::metadata("/proc/self/root")
-        .map_err(|error| format!("stat AWACS daemon process root: {error}"))?;
-    if peer_root.dev() != own_root.dev() || peer_root.ino() != own_root.ino() {
-        return Err("AWACS scan peer has a different process root".to_owned());
-    }
-    Ok(())
-}
-
-fn parse_hex_id(value: &OsStr) -> Result<[u8; 16], String> {
-    let value = value.as_bytes();
-    if value.len() != 32 {
-        return Err("identifier must contain exactly 32 hexadecimal bytes".to_owned());
-    }
-    let mut output = [0_u8; 16];
-    for (index, pair) in value.chunks_exact(2).enumerate() {
-        let digit = |byte| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        };
-        output[index] = digit(pair[0])
-            .zip(digit(pair[1]))
-            .map(|(high, low)| high * 16 + low)
-            .ok_or_else(|| "identifier contains a non-hexadecimal byte".to_owned())?;
-    }
-    Ok(output)
-}
-
-fn read_boot_id() -> Result<[u8; 16], String> {
-    let text = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map_err(|error| format!("read kernel boot ID: {error}"))?;
-    let compact: String = text
-        .trim()
-        .chars()
-        .filter(|character| *character != '-')
-        .collect();
-    parse_hex_id(OsStr::new(&compact))
 }
 
 fn snap(source: &Path, snapshot_dir: &Path) -> Result<(), String> {
@@ -2071,20 +1663,15 @@ fn first_shell_word(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChangedObjectsSummary, Cli, CliCommand, ScanServeArgs, changed_paths,
-        decode_git_fsmonitor_token, encode_git_fsmonitor_token, last_two_snapshots,
-        parse_changed_objects_manifest, parse_hex_id, require_last_two_snapshots, run_scan_server,
-        validate_user_socket,
+        ChangedObjectsSummary, Cli, CliCommand, changed_paths, decode_git_fsmonitor_token,
+        encode_git_fsmonitor_token, last_two_snapshots, parse_changed_objects_manifest,
+        require_last_two_snapshots,
     };
     use btrfs_awacs::manifest::{
         CHANGE_DELETED as CHANGED_OBJECT_DELETED, CHANGE_INODE as CHANGED_OBJECT_INODE,
         CHANGE_REF as CHANGED_OBJECT_REF,
     };
     use clap::{CommandFactory, Parser};
-    use std::ffi::OsStr;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
 
     #[test]
     fn git_fsmonitor_token_round_trips_snapshot_identity() {
@@ -2104,40 +1691,6 @@ mod tests {
         assert!(decoded.retention_token.is_empty());
     }
     use std::path::{Path, PathBuf};
-    use tempfile::tempdir;
-
-    #[test]
-    fn parses_fixed_width_runtime_identifiers() {
-        assert_eq!(
-            parse_hex_id(OsStr::new("000102030405060708090a0b0c0d0e0f")).unwrap(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-        );
-        assert!(parse_hex_id(OsStr::new("00")).is_err());
-        assert!(parse_hex_id(OsStr::new("gg0102030405060708090a0b0c0d0e0f")).is_err());
-    }
-
-    #[test]
-    fn discovery_accepts_only_an_owned_scan_socket() {
-        let temp = tempdir().unwrap();
-        let socket = temp.path().join("scan.sock");
-        let _listener = match UnixListener::bind(&socket) {
-            Ok(listener) => listener,
-            Err(error) if error.raw_os_error() == Some(libc::EPERM) => return,
-            Err(error) => panic!("bind discovery test socket: {error}"),
-        };
-        if let Err(error) =
-            std::fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        {
-            if error.raw_os_error() == Some(libc::EPERM) {
-                return;
-            }
-            panic!("set socket permissions: {error}");
-        }
-        validate_user_socket(&socket).unwrap();
-        let regular = temp.path().join("not-a-socket");
-        std::fs::write(&regular, b"").unwrap();
-        assert!(validate_user_socket(&regular).is_err());
-    }
 
     #[test]
     fn parses_snap_and_compare_subcommands() {
@@ -2178,27 +1731,6 @@ mod tests {
     }
 
     #[test]
-    fn scan_daemon_requires_explicit_root_initialization() {
-        let temp = tempdir().unwrap();
-        let runtime = temp.path().join("runtime");
-        fs::create_dir(&runtime).unwrap();
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
-        let root = temp.path().join("root");
-        fs::create_dir(&root).unwrap();
-        let error = run_scan_server(ScanServeArgs {
-            root: root.clone(),
-            socket: runtime.join("scan.sock"),
-            managed_dir: temp.path().join("managed"),
-            spool_dir: temp.path().join("spool"),
-            manager_db: temp.path().join("missing.sqlite3"),
-            broker_socket: temp.path().join("broker.sock"),
-        })
-        .unwrap_err();
-        assert!(error.contains("not initialized"), "{error}");
-        assert!(error.contains(&root.display().to_string()), "{error}");
-    }
-
-    #[test]
     fn default_help_lists_every_subcommand() {
         let help = Cli::command().render_long_help().to_string();
         for command in [
@@ -2207,8 +1739,6 @@ mod tests {
             "compare",
             "dump",
             "broker-serve",
-            "scan-serve",
-            "scan-sockname",
             "__changed-objects-send",
             "__btrfs-inspect",
             "__broker-changed-objects",

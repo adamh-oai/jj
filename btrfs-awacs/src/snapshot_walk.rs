@@ -11,7 +11,7 @@ use crate::tree_index::{
     PRIVILEGE_SETGID, PRIVILEGE_SETUID, PRIVILEGE_TRUSTED_XATTR,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fmt;
 use std::mem::zeroed;
@@ -41,6 +41,20 @@ pub struct SnapshotWalkProgress {
     pub directories: usize,
     pub objects: usize,
     pub references: usize,
+}
+
+/// One active depth-first traversal frame.
+///
+/// Holding frames only for the current ancestor chain keeps descriptor usage
+/// proportional to tree depth. A breadth-first queue of open directory fds can
+/// exhaust RLIMIT_NOFILE on a shallow repository with many sibling
+/// directories.
+struct DirectoryFrame {
+    directory: OwnedFd,
+    parent_ino: u64,
+    parent_path: Vec<u8>,
+    names: Vec<Vec<u8>>,
+    next_name: usize,
 }
 
 impl SnapshotIndexError {
@@ -87,8 +101,9 @@ pub fn read_snapshot_index(root: BorrowedFd<'_>) -> Result<Index, SnapshotIndexE
 }
 
 /// Builds the complete inode/reference graph and reports monotonic traversal
-/// counts after each directory. Callers can use this for interactive progress
-/// without coupling the library walker to a terminal.
+/// counts after every 100 visited entries and at completion. Callers can use
+/// this for interactive progress without coupling the library walker to a
+/// terminal.
 pub fn read_snapshot_index_with_progress(
     root: BorrowedFd<'_>,
     mut progress: impl FnMut(SnapshotWalkProgress),
@@ -125,77 +140,117 @@ pub fn read_snapshot_index_with_progress(
         references: BTreeSet::new(),
     };
     let mut directories_seen = 0;
+    let mut entries_since_progress = 0;
     progress(SnapshotWalkProgress {
         directories: directories_seen,
         objects: index.objects.len(),
         references: index.references.len(),
     });
-    let mut directories = VecDeque::from([(dup_fd(root)?, ROOT_INO, Vec::<u8>::new())]);
-    while let Some((directory, parent_ino, parent_path)) = directories.pop_front() {
-        directories_seen += 1;
-        for name in directory_names(directory.as_fd())? {
-            // A colocated JJ checkout may keep `.git` as its own Btrfs
-            // subvolume. It is repository control state, not working-copy
-            // namespace: neither JJ nor Git fsmonitor consumes paths below
-            // it, and parent-subvolume changed-object comparisons cannot
-            // describe its descendants anyway. Skip only the root control
-            // directory; other nested subvolumes remain a hard error.
-            if parent_path.is_empty() && name == b".git" {
-                continue;
+    let root_directory = dup_fd(root)?;
+    let root_names = directory_names(root_directory.as_fd())?;
+    let mut directories = vec![DirectoryFrame {
+        directory: root_directory,
+        parent_ino: ROOT_INO,
+        parent_path: Vec::new(),
+        names: root_names,
+        next_name: 0,
+    }];
+    directories_seen += 1;
+    while !directories.is_empty() {
+        let frame = directories.last_mut().unwrap();
+        if frame.next_name == frame.names.len() {
+            directories.pop();
+            continue;
+        }
+        let name = frame.names[frame.next_name].clone();
+        frame.next_name += 1;
+        // A colocated JJ checkout may keep `.git` as its own Btrfs
+        // subvolume. It is repository control state, not working-copy
+        // namespace: neither JJ nor Git fsmonitor consumes paths below
+        // it, and parent-subvolume changed-object comparisons cannot
+        // describe its descendants anyway. Skip only the root control
+        // directory; other nested subvolumes remain a hard error.
+        if frame.parent_path.is_empty() && name == b".git" {
+            entries_since_progress += 1;
+            if entries_since_progress == 100 {
+                progress(SnapshotWalkProgress {
+                    directories: directories_seen,
+                    objects: index.objects.len(),
+                    references: index.references.len(),
+                });
+                entries_since_progress = 0;
             }
-            let relative_path = join_path(&parent_path, &name);
-            let child = open_path(directory.as_fd(), &name)?;
-            let stat = fd_stat(child.as_fd())?;
-            if stat.st_dev != root_stat.st_dev {
+            continue;
+        }
+        let relative_path = join_path(&frame.parent_path, &name);
+        let child = open_path(frame.directory.as_fd(), &name)?;
+        let stat = fd_stat(child.as_fd())?;
+        if stat.st_dev != root_stat.st_dev {
+            return Err(SnapshotIndexError::new(format!(
+                "snapshot index crosses a mount at {:?}",
+                String::from_utf8_lossy(&relative_path)
+            )));
+        }
+        let ino = stat.st_ino;
+        let is_directory = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+        if is_directory && ino == ROOT_INO {
+            return Err(SnapshotIndexError::NestedSubvolume(relative_path));
+        }
+        let generation =
+            generation_from_handle(frame.directory.as_fd(), &name, ino, root_info.root_id)?;
+        let xattrs = read_xattrs(
+            proc_fd_path(frame.directory.as_raw_fd(), Some(&name)),
+            false,
+        )?;
+        let object = object_from_stat(ino, generation, &stat, &xattrs)?;
+        if object.privilege_flags & PRIVILEGE_FSCRYPT != 0 {
+            return Err(SnapshotIndexError::FscryptDirectory(relative_path));
+        }
+        if let Some(existing) = index.objects.get(&ino) {
+            if existing != &object {
                 return Err(SnapshotIndexError::new(format!(
-                    "snapshot index crosses a mount at {:?}",
-                    String::from_utf8_lossy(&relative_path)
+                    "snapshot index found inconsistent aliases for inode {ino}"
                 )));
             }
-            let ino = stat.st_ino;
-            let is_directory = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
-            if is_directory && ino == ROOT_INO {
-                return Err(SnapshotIndexError::NestedSubvolume(relative_path));
-            }
-            let generation =
-                generation_from_handle(directory.as_fd(), &name, ino, root_info.root_id)?;
-            let xattrs = read_xattrs(proc_fd_path(directory.as_raw_fd(), Some(&name)), false)?;
-            let object = object_from_stat(ino, generation, &stat, &xattrs)?;
-            if object.privilege_flags & PRIVILEGE_FSCRYPT != 0 {
-                return Err(SnapshotIndexError::FscryptDirectory(relative_path));
-            }
-            if let Some(existing) = index.objects.get(&ino) {
-                if existing != &object {
-                    return Err(SnapshotIndexError::new(format!(
-                        "snapshot index found inconsistent aliases for inode {ino}"
-                    )));
-                }
-            } else {
-                index.objects.insert(ino, object);
-            }
-            if !index.references.insert(Reference {
-                ino,
-                parent_ino,
-                name: name.clone(),
-            }) {
-                return Err(SnapshotIndexError::new(
-                    "snapshot index contains duplicate reference",
-                ));
-            }
-            if is_directory {
-                directories.push_back((
-                    open_directory(directory.as_fd(), &name)?,
-                    ino,
-                    relative_path,
-                ));
-            }
+        } else {
+            index.objects.insert(ino, object);
         }
-        progress(SnapshotWalkProgress {
-            directories: directories_seen,
-            objects: index.objects.len(),
-            references: index.references.len(),
-        });
+        if !index.references.insert(Reference {
+            ino,
+            parent_ino: frame.parent_ino,
+            name: name.clone(),
+        }) {
+            return Err(SnapshotIndexError::new(
+                "snapshot index contains duplicate reference",
+            ));
+        }
+        if is_directory {
+            let directory = open_directory(frame.directory.as_fd(), &name)?;
+            let names = directory_names(directory.as_fd())?;
+            directories_seen += 1;
+            directories.push(DirectoryFrame {
+                directory,
+                parent_ino: ino,
+                parent_path: relative_path,
+                names,
+                next_name: 0,
+            });
+        }
+        entries_since_progress += 1;
+        if entries_since_progress == 100 {
+            progress(SnapshotWalkProgress {
+                directories: directories_seen,
+                objects: index.objects.len(),
+                references: index.references.len(),
+            });
+            entries_since_progress = 0;
+        }
     }
+    progress(SnapshotWalkProgress {
+        directories: directories_seen,
+        objects: index.objects.len(),
+        references: index.references.len(),
+    });
     index
         .validate()
         .map_err(|error| SnapshotIndexError::new(format!("snapshot index is invalid: {error}")))?;
@@ -545,5 +600,106 @@ mod tests {
         let (flags, hash) = classify_xattrs(&xattrs);
         assert_ne!(flags & PRIVILEGE_FSCRYPT, 0);
         assert_ne!(hash, [0; 32]);
+    }
+
+    #[test]
+    #[ignore = "requires JJ_TEST_BTRFS_ROOT, Btrfs subvolume permissions, and --test-threads=1"]
+    fn wide_snapshot_walk_stays_below_low_fd_limit() {
+        use std::fs::{self, File};
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        struct RlimitGuard(libc::rlimit);
+
+        impl Drop for RlimitGuard {
+            fn drop(&mut self) {
+                // SAFETY: restoring the process-wide limit captured before
+                // this serial ignored test is the inverse of the successful
+                // setrlimit call below.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.0) }, 0);
+            }
+        }
+
+        let btrfs_root = std::env::var_os("JJ_TEST_BTRFS_ROOT")
+            .map(PathBuf::from)
+            .expect("JJ_TEST_BTRFS_ROOT must name a writable Btrfs directory");
+        let suffix = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let source = btrfs_root.join(format!("awacs-wide-source-{suffix}"));
+        let snapshot = btrfs_root.join(format!("awacs-wide-snapshot-{suffix}"));
+        assert!(
+            Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for index in 0..256 {
+            let directory = source.join(format!("wide-{index:03}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("file"), format!("{index}\n")).unwrap();
+        }
+        assert!(
+            Command::new("btrfs")
+                .args(["subvolume", "snapshot", "-r"])
+                .arg(&source)
+                .arg(&snapshot)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // SAFETY: getrlimit writes one initialized value to this local.
+        let mut original = unsafe { zeroed::<libc::rlimit>() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut original) },
+            0
+        );
+        let open_fds = fs::read_dir("/proc/self/fd").unwrap().count() as libc::rlim_t;
+        let limited_soft = open_fds + 16;
+        assert!(
+            limited_soft < original.rlim_cur,
+            "test needs room to lower RLIMIT_NOFILE below the 256-wide tree"
+        );
+        let limited = libc::rlimit {
+            rlim_cur: limited_soft,
+            rlim_max: original.rlim_max,
+        };
+        // SAFETY: limited keeps the original hard limit and raises no limit.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
+        let guard = RlimitGuard(original);
+        let snapshot_file = File::open(&snapshot).unwrap();
+        let index = read_snapshot_index(snapshot_file.as_fd()).unwrap();
+        drop(snapshot_file);
+        drop(guard);
+        assert_eq!(index.references.len(), 512);
+
+        assert!(
+            Command::new("btrfs")
+                .args(["property", "set", "-ts"])
+                .arg(&snapshot)
+                .args(["ro", "false"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        for path in [&snapshot, &source] {
+            assert!(
+                Command::new("btrfs")
+                    .args(["subvolume", "delete"])
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
     }
 }

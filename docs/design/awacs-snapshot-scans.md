@@ -4,12 +4,12 @@ Status: draft
 
 ## Summary
 
-This document proposes a direct integration between Jujutsu and AWACS, a
-Btrfs-backed service that can create a read-only snapshot, retain it as a
-durable baseline, and return a complete delta from the prior retained
-baseline. The integration lets Jujutsu scan an immutable filesystem view
-instead of querying a filesystem monitor and then crawling the live working
-copy.
+This document proposes a direct integration between Jujutsu and the embedded
+AWACS library. The library coordinates a Btrfs-backed read-only snapshot,
+records a logical cut and its changed paths, and returns a complete delta from
+the prior logical baseline. The integration lets Jujutsu scan an immutable
+filesystem view instead of querying a filesystem monitor and then crawling the
+live working copy.
 
 The current Watchman integration is intentionally path-oriented: it returns a
 clock and a set of names that may have changed. That is a good fit for an event
@@ -98,10 +98,9 @@ The following invariants are required:
    build tree Y came from snapshot B.
 2. Jujutsu never uses a baseline after changing the working-copy semantic tree
    without materializing matching files or deliberately invalidating it.
-3. A hard-pinned AWACS protocol retains A while deriving A→B, retains B before
-   Jujutsu publishes the clean B binding, and releases A only after that
-   binding is durable. AWACS v1 instead must prove A for every delta or return
-   `Full`.
+3. AWACS retains the logical A→B event range while deriving B and returns an
+   already-open B descriptor before Jujutsu publishes the clean B binding.
+   AWACS must prove A for every delta or return `Full`.
 4. A failed or abandoned session does not advance the persisted baseline.
 5. The live root is used only for state and mutation operations while the scan
    session is active.
@@ -120,10 +119,10 @@ command.
 
 ## Proposed user interface
 
-Snapshot-backed subvolume mode selects AWACS internally. It should prefer
-AWACS discovery (`awacs scan-sockname <live-root>`) over requiring users
-to copy a namespace-specific path, and should fail with an actionable error on
-unsupported platforms.
+Snapshot-backed subvolume mode selects AWACS internally. Jujutsu embeds the
+AWACS library and opens the initialized per-root state directly; there is no
+daemon socket to discover or configure. Unsupported platforms and
+uninitialized roots fail with actionable errors.
 
 The first version should not expose trigger configuration. Background snapshot
 triggers can be designed later against the direct protocol rather than copied
@@ -132,10 +131,9 @@ from fsmonitor.watchman.register-snapshot-trigger.
 ## btrfs-awacs library API
 
 Jujutsu should use the versioned `btrfs-awacs` Rust library API. The library
-owns service discovery, activation, and any private Unix-domain wire protocol;
-`jj-lib` must not implement or depend on that framing. The service remains
-privileged, deployment-specific, and independently versioned behind the
-library boundary.
+owns direct per-root coordination, cursor handling, and snapshot-fd lifetime;
+`jj-lib` must not implement those details. Only the bounded Btrfs broker
+remains privileged and deployment-specific behind the library boundary.
 
 AWACS needs a dedicated scan lease plus a committed-baseline handoff. It should
 require ordinary read/cut authority, retain only the prior baseline A and the
@@ -162,7 +160,7 @@ BeginScanResult {
 }
 ~~~
 
-snapshot_fd is an SCM_RIGHTS read-only directory fd plus identity metadata:
+snapshot_fd is an already-open read-only directory fd plus identity metadata:
 
 ~~~
 SnapshotLocator {
@@ -203,10 +201,10 @@ before any new clean baseline is saved.
 SnapshotLease::promote()
 ~~~
 
-Promotion durably retains candidate B as a pending baseline while A remains
-committed. A crash after promotion but before local journal publication may
-leave an orphan B pin, but the next Begin reconciles it against the baseline
-named by the journal and must not leave a journal referring to a pruned B.
+Promotion marks candidate B as pending while A remains committed. A crash
+after promotion but before local journal publication may leave an orphan
+logical handoff, but the next Begin reconciles it against the baseline named
+by the journal.
 
 ### Finish scan
 
@@ -215,32 +213,29 @@ SnapshotLease::finish(outcome = Committed | Aborted)
 ~~~
 
 Committed means Jujutsu durably published its clean tree-Y↔B journal binding.
-It releases A and cleans up the scan session, but it must not reclaim retained
-B because the next command depends on it. Aborted means no clean B binding was
-published; AWACS may reclaim an unpromoted B after a bounded lease timeout.
-Finish is idempotent so a retry after a lost response is safe.
+It releases the prepared scan session. Aborted means no clean B binding was
+published; AWACS may reclaim unneeded physical paths during bounded cleanup.
+Finish is idempotent so a retry after an interrupted call is safe.
 
 The compact journal persists a stable opaque owner ID beside its typed
-baseline. AWACS retains one committed snapshot per owner plus one pending
-candidate only while a handoff is in flight; old generic replay checkpoints
-are not durable consumer references.
+baseline. AWACS keeps logical event history needed to replay retained cursors;
+physical snapshot pathnames are not durable consumer references.
 
 ### Errors
 
 The library API must distinguish:
 
 * unsupported filesystem/layout;
-* unavailable service;
+* unavailable or uninitialized AWACS root;
 * invalid, expired, or pruned previous baseline;
 * fresh/full-scan-required continuity loss;
 * snapshot lease expiration;
 * authentication or authorization failure;
-* library/service-version mismatch;
+* incompatible library/state version;
 * malformed response.
 
-The library must use Unix peer credentials, process root, and mount namespace
-as part of transport authentication; Jujutsu must not send a self-asserted
-client PID as authority.
+The embedded coordinator must validate the process root and mount namespace;
+Jujutsu must not supply self-asserted filesystem identity as authority.
 
 Invalid, expired, or pruned previous baselines are not errors: AWACS should
 return a valid target snapshot with delta = Full. Other errors before a scan
@@ -408,7 +403,7 @@ invariant explicit.
    journal and lock remain under the live root.
 4. Add the AWACS config variant and a fake in-process AWACS client that models
    complete deltas, Full fallback, retention, promotion, and release.
-5. Add the crate-owned production client/discovery adapter and
+5. Add the crate-owned direct production client and
    begin/promote/finish baseline state machine.
 6. Add Linux/Btrfs integration tests behind explicit AWACS test environment
    variables.
@@ -443,8 +438,9 @@ invariant explicit.
 
 ### Integration tests
 
-Use a real Btrfs subvolume and AWACS daemon, gated by explicit environment
-variables like the existing Watchman compatibility test:
+Use a real Btrfs subvolume and the direct AWACS coordinator with a matching
+broker, gated by explicit environment variables like the existing Watchman
+compatibility test:
 
 * tracked edits, new files, deletions, renames, hardlinks, .gitignore, sparse
   patterns, and ignored paths match a full-scan oracle;
@@ -456,7 +452,7 @@ variables like the existing Watchman compatibility test:
 * expire the active lease mid-scan and require an aborted session plus a
   fail-closed error, or an explicit live-fallback warning when that mode is
   enabled;
-* restart AWACS between begin and finish;
+* crash the calling process between begin and finish;
 * rename/replace/restore the live root and attach/detach a mount between cuts;
 * colocated Git HEAD import/export and stale working-copy recovery invalidate
   the baseline when disk materialization is not proved.

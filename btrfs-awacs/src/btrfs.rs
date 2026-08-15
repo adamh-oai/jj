@@ -7,6 +7,8 @@ use std::path::Path;
 
 pub const ROOT_INODE: u64 = 256;
 pub const TOP_LEVEL_ROOT_ID: u64 = 5;
+const ROOT_TREE_OBJECT_ID: u64 = 1;
+const ROOT_REF_KEY: u32 = 156;
 /// Input flag for `BTRFS_IOC_SNAP_CREATE_V2`.
 pub const SUBVOL_RDONLY: u64 = 1 << 1;
 /// Root-item flag returned by `BTRFS_IOC_GET_SUBVOL_INFO`.
@@ -37,6 +39,11 @@ const BTRFS_IOC_FS_INFO: libc::c_ulong =
     ioctl_number(IOC_READ, 31, size_of::<BtrfsIoctlFsInfoArgs>());
 const BTRFS_IOC_GET_SUBVOL_INFO: libc::c_ulong =
     ioctl_number(IOC_READ, 60, size_of::<BtrfsIoctlGetSubvolInfoArgs>());
+const BTRFS_IOC_TREE_SEARCH_V2: libc::c_ulong = ioctl_number(
+    IOC_READ | IOC_WRITE,
+    17,
+    size_of::<BtrfsIoctlSearchArgsV2>(),
+);
 const BTRFS_IOC_SUBVOL_SETFLAGS: libc::c_ulong = ioctl_number(IOC_WRITE, 26, size_of::<u64>());
 const BTRFS_IOC_SEND: libc::c_ulong = ioctl_number(IOC_WRITE, 38, size_of::<BtrfsIoctlSendArgs>());
 const BTRFS_IOC_SNAP_DESTROY_V2: libc::c_ulong =
@@ -60,6 +67,7 @@ const CHANGED_OBJECTS_STATUS_COMPLETE: u32 = 0;
 const _: [(); 4096] = [(); size_of::<BtrfsIoctlVolArgsV2>()];
 const _: [(); 1024] = [(); size_of::<BtrfsIoctlFsInfoArgs>()];
 const _: [(); 504] = [(); size_of::<BtrfsIoctlGetSubvolInfoArgs>()];
+const _: [(); 112] = [(); size_of::<BtrfsIoctlSearchArgsV2>()];
 const _: [(); 72] = [(); size_of::<BtrfsIoctlSendArgs>()];
 const _: [(); 128] = [(); size_of::<BtrfsIoctlChangedObjectsArgs>()];
 
@@ -115,6 +123,43 @@ struct BtrfsIoctlGetSubvolInfoArgs {
     stime: BtrfsIoctlTimespec,
     rtime: BtrfsIoctlTimespec,
     reserved: [u64; 8],
+}
+
+/// Fixed header for BTRFS_IOC_TREE_SEARCH_V2. The UAPI declares the result
+/// buffer as a flexible array immediately after this header, so the ioctl
+/// number is derived from this type while calls use the fixed buffer below.
+#[repr(C)]
+struct BtrfsIoctlSearchArgsV2 {
+    key: BtrfsIoctlSearchKey,
+    buf_size: u64,
+}
+
+#[repr(C)]
+struct BtrfsIoctlSearchKey {
+    tree_id: u64,
+    min_objectid: u64,
+    max_objectid: u64,
+    min_offset: u64,
+    max_offset: u64,
+    min_transid: u64,
+    max_transid: u64,
+    min_type: u32,
+    max_type: u32,
+    nr_items: u32,
+    unused: u32,
+    unused1: u64,
+    unused2: u64,
+    unused3: u64,
+    unused4: u64,
+}
+
+/// One root-ref item is enough for a yes/no answer. Root-ref payloads contain
+/// a bounded subvolume name, so 4 KiB comfortably covers one returned item
+/// while keeping the broker request allocation fixed.
+#[repr(C)]
+struct BtrfsIoctlSearchArgsV2Buffer {
+    header: BtrfsIoctlSearchArgsV2,
+    buffer: [u64; 512],
 }
 
 #[repr(C)]
@@ -369,6 +414,53 @@ pub fn subvolume_info(fd: BorrowedFd<'_>) -> Result<SubvolumeInfo, BtrfsError> {
     })
 }
 
+/// Returns whether root_id directly references any child subvolume.
+///
+/// A Btrfs root-ref key is a fast index of subvolumes referenced by one root.
+/// Searching the root tree for one ROOT_REF_KEY with object ID root_id
+/// therefore answers the nested-subvolume yes/no question without walking the
+/// directory tree.
+pub fn has_nested_subvolumes(fd: BorrowedFd<'_>, root_id: u64) -> Result<bool, BtrfsError> {
+    if root_id == 0 {
+        return Err(BtrfsError::new("subvolume root ID must not be zero"));
+    }
+    let mut args = BtrfsIoctlSearchArgsV2Buffer {
+        header: BtrfsIoctlSearchArgsV2 {
+            key: BtrfsIoctlSearchKey {
+                tree_id: ROOT_TREE_OBJECT_ID,
+                min_objectid: root_id,
+                max_objectid: root_id,
+                min_offset: 0,
+                max_offset: u64::MAX,
+                min_transid: 0,
+                max_transid: u64::MAX,
+                min_type: ROOT_REF_KEY,
+                max_type: ROOT_REF_KEY,
+                nr_items: 1,
+                unused: 0,
+                unused1: 0,
+                unused2: 0,
+                unused3: 0,
+                unused4: 0,
+            },
+            buf_size: (512 * size_of::<u64>()) as u64,
+        },
+        buffer: [0; 512],
+    };
+    ioctl(
+        fd,
+        BTRFS_IOC_TREE_SEARCH_V2,
+        &mut args,
+        "BTRFS_IOC_TREE_SEARCH_V2 nested subvolumes",
+    )?;
+    if args.header.key.nr_items > 1 {
+        return Err(BtrfsError::new(
+            "BTRFS_IOC_TREE_SEARCH_V2 returned more root refs than requested",
+        ));
+    }
+    Ok(args.header.key.nr_items == 1)
+}
+
 pub fn create_snapshot(
     source: BorrowedFd<'_>,
     destination_parent: BorrowedFd<'_>,
@@ -580,9 +672,11 @@ mod tests {
         assert_eq!(size_of::<BtrfsIoctlVolArgsV2>(), 4096);
         assert_eq!(size_of::<BtrfsIoctlFsInfoArgs>(), 1024);
         assert_eq!(size_of::<BtrfsIoctlGetSubvolInfoArgs>(), 504);
+        assert_eq!(size_of::<BtrfsIoctlSearchArgsV2>(), 112);
         assert_eq!(BTRFS_IOC_SNAP_CREATE_V2, 0x5000_9417);
         assert_eq!(BTRFS_IOC_FS_INFO, 0x8400_941f);
         assert_eq!(BTRFS_IOC_GET_SUBVOL_INFO, 0x81f8_943c);
+        assert_eq!(BTRFS_IOC_TREE_SEARCH_V2, 0xc070_9411);
         assert_eq!(BTRFS_IOC_SEND, 0x4048_9426);
         assert_eq!(BTRFS_IOC_SNAP_DESTROY_V2, 0x5000_943f);
         assert_eq!(BTRFS_IOC_CHANGED_OBJECTS, 0xc080_9442);
@@ -619,6 +713,17 @@ mod tests {
         let file = File::open("/dev/null").unwrap();
         assert!(
             send_changed_objects(file.as_fd(), 0, file.as_fd())
+                .unwrap_err()
+                .to_string()
+                .contains("must not be zero")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_root_before_nested_subvolume_ioctl() {
+        let file = File::open("/dev/null").unwrap();
+        assert!(
+            has_nested_subvolumes(file.as_fd(), 0)
                 .unwrap_err()
                 .to_string()
                 .contains("must not be zero")

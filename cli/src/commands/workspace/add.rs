@@ -13,8 +13,6 @@
 // limitations under the License.
 
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -22,6 +20,8 @@ use std::time::Instant;
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 use btrfs_awacs::bootstrap::{InitProgress, initialize_descendant_root};
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::manager::SnapshotIdentity;
 use futures::future::try_join_all;
 use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
@@ -48,13 +48,19 @@ use crate::command_error::user_error;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 use crate::commands::btrfs::begin_subvolume_mode;
 use crate::commands::btrfs::btrfs_command;
-use crate::commands::btrfs::delete_btrfs_subvolume;
 use crate::commands::btrfs::is_btrfs_subvolume;
 use crate::commands::btrfs::is_subvolume_mode_enabled;
 use crate::commands::btrfs::set_subvolume_mode;
 use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use crate::progress::ProgressWriter;
 use crate::ui::Ui;
+
+struct SnapshotPreparation {
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    initialized_awacs_snapshot: Option<SnapshotIdentity>,
+}
 
 /// How to handle sparse patterns when creating a new workspace.
 #[derive(clap::ValueEnum, Clone, Debug, Eq, PartialEq)]
@@ -154,6 +160,11 @@ pub async fn cmd_workspace_add(
         )));
     }
     let mut snapshot_source_commit = None;
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "awacs")),
+        allow(unused_variables)
+    )]
+    let mut snapshot_preparation = None;
     if snapshot {
         if destination_path.exists() {
             if snapshot_required {
@@ -174,16 +185,17 @@ pub async fn cmd_workspace_add(
                 old_workspace_command.workspace().workspace_root(),
                 &destination_path,
             ) {
-                Ok(true) => {
+                Ok(Some(preparation)) => {
                     // The source tree describes files inherited by a physical
                     // snapshot. A plain workspace starts empty and must
                     // materialize its checkout instead.
                     snapshot_source_commit = Some(source_commit);
+                    snapshot_preparation = Some(preparation);
                 }
-                Ok(false) if snapshot_required => {
+                Ok(None) if snapshot_required => {
                     return Err(user_error("Current checkout is not on a Btrfs filesystem"));
                 }
-                Ok(false) => snapshot = false,
+                Ok(None) => snapshot = false,
                 Err(error) if snapshot_required => return Err(error),
                 Err(_) => snapshot = false,
             }
@@ -306,6 +318,21 @@ pub async fn cmd_workspace_add(
             .as_ref()
             .expect("snapshot workspaces always retain the source commit");
         seed_snapshot_workspace_tree(&mut workspace_command, source_commit).await?;
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        if let Some(snapshot_identity) = snapshot_preparation
+            .as_ref()
+            .and_then(|preparation| preparation.initialized_awacs_snapshot.as_ref())
+        {
+            workspace_command
+                .seed_initialized_snapshot_workspace_awacs_baseline(ui, snapshot_identity)
+                .await?;
+        } else {
+            workspace_command
+                .seed_snapshot_workspace_awacs_baseline(ui)
+                .await?;
+            establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
+        }
+        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
         establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
         set_subvolume_mode(&destination_path, true)?;
         tracing::debug!("recorded snapshot tree as workspace baseline");
@@ -327,7 +354,9 @@ pub async fn cmd_workspace_add(
     };
 
     let sparsity_started = Instant::now();
-    if let Some(sparse_patterns) = sparsity {
+    if let Some(sparse_patterns) = sparsity
+        && new_workspace_command.working_copy().sparse_patterns()? != sparse_patterns.as_slice()
+    {
         let (mut locked_ws, _wc_commit) =
             new_workspace_command.start_working_copy_mutation().await?;
         locked_ws
@@ -413,28 +442,46 @@ pub async fn cmd_workspace_add(
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-fn initialize_snapshot_awacs_root(ui: &Ui, root: &Path) -> Result<(), CommandError> {
+fn initialize_snapshot_awacs_root(
+    ui: &Ui,
+    root: &Path,
+    parent_root: &Path,
+) -> Result<Option<SnapshotIdentity>, CommandError> {
     // Synthetic CLI tests model the scan response without a real Btrfs
     // snapshot lineage or manager database.
     if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
-        return Ok(());
+        return Ok(None);
     }
-    initialize_descendant_root(root, |progress| match progress {
+    let mut progress_writer = ProgressWriter::new(ui, "AWACS worktree init");
+    let mut final_counts = None;
+    let initialized = initialize_descendant_root(root, parent_root, |progress| match progress {
         InitProgress::Phase(phase) => {
             let _status_result = writeln!(ui.status(), "AWACS worktree init: {phase}...");
         }
         InitProgress::Index(counts) => {
-            let _status_result = writeln!(
-                ui.status(),
-                "AWACS worktree init: indexed {} directories, {} objects, {} paths...",
-                counts.directories,
-                counts.objects,
-                counts.references,
-            );
+            final_counts = Some(counts);
+            if let Some(writer) = &mut progress_writer {
+                writer
+                    .display(&format!(
+                        "{} directories, {} objects, {} paths",
+                        counts.directories, counts.objects, counts.references,
+                    ))
+                    .ok();
+            }
         }
     })
     .map_err(|err| user_error(format!("Failed to initialize AWACS worktree: {err}")))?;
-    Ok(())
+    drop(progress_writer);
+    if let Some(counts) = final_counts {
+        writeln!(
+            ui.status(),
+            "AWACS worktree init: indexed {} directories, {} objects, {} paths.",
+            counts.directories,
+            counts.objects,
+            counts.references,
+        )?;
+    }
+    Ok(Some(initialized.snapshot_identity))
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
@@ -472,7 +519,11 @@ async fn establish_snapshot_workspace_baseline(
 /// Attempts a Btrfs snapshot, then checks whether `source` is a subvolume
 /// only if the snapshot fails. Returns `Ok(false)` when it is not so auto
 /// mode can fall back to a normal workspace.
-fn create_btrfs_snapshot(ui: &Ui, source: &Path, destination: &Path) -> Result<bool, CommandError> {
+fn create_btrfs_snapshot(
+    ui: &Ui,
+    source: &Path,
+    destination: &Path,
+) -> Result<Option<SnapshotPreparation>, CommandError> {
     let total_started = Instant::now();
     let operation_started = Instant::now();
     let output = btrfs_command()
@@ -489,7 +540,7 @@ fn create_btrfs_snapshot(ui: &Ui, source: &Path, destination: &Path) -> Result<b
         })?;
     if !output.status.success() {
         if !is_btrfs_subvolume(source)? {
-            return Ok(false);
+            return Ok(None);
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(user_error(format!(
@@ -500,16 +551,8 @@ fn create_btrfs_snapshot(ui: &Ui, source: &Path, destination: &Path) -> Result<b
         elapsed = ?operation_started.elapsed(),
         "created Btrfs snapshot"
     );
-    if let Err(err) = reject_nested_btrfs_subvolumes(destination) {
-        // The source was checked immediately before snapshotting, but repeat
-        // the boundary check before recording a baseline in case the source
-        // changed concurrently. Cleanup is best-effort because nested
-        // subvolumes may make deleting the new root fail.
-        drop(delete_btrfs_subvolume(destination));
-        return Err(err);
-    }
     #[cfg(all(target_os = "linux", feature = "awacs"))]
-    initialize_snapshot_awacs_root(ui, destination)?;
+    let initialized_awacs_snapshot = initialize_snapshot_awacs_root(ui, destination, source)?;
     #[cfg(not(all(target_os = "linux", feature = "awacs")))]
     let _ = ui;
 
@@ -530,39 +573,10 @@ fn create_btrfs_snapshot(ui: &Ui, source: &Path, destination: &Path) -> Result<b
         elapsed = ?total_started.elapsed(),
         "prepared Btrfs snapshot for workspace initialization"
     );
-    Ok(true)
-}
-
-/// Rejects descendant Btrfs subvolume roots. A snapshot workspace must remain
-/// one boundary-free filesystem tree before its inherited files are recorded
-/// as an already-materialized baseline.
-fn reject_nested_btrfs_subvolumes(root: &Path) -> Result<(), CommandError> {
-    #[cfg(unix)]
-    {
-        let mut directories = vec![root.to_owned()];
-        while let Some(directory) = directories.pop() {
-            for entry in fs::read_dir(&directory).context(&directory)? {
-                let entry = entry.context(&directory)?;
-                let path = entry.path();
-                let metadata = fs::symlink_metadata(&path).context(&path)?;
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    continue;
-                }
-                if metadata.ino() == 256 {
-                    return Err(user_error(format!(
-                        "Cannot create Btrfs snapshot workspace: nested Btrfs subvolume at {}",
-                        path.display()
-                    )));
-                }
-                directories.push(path);
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    let _ = root;
-
-    Ok(())
+    Ok(Some(SnapshotPreparation {
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        initialized_awacs_snapshot,
+    }))
 }
 
 fn remove_copied_metadata(path: &Path) -> Result<(), CommandError> {

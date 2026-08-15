@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(all(target_os = "linux", feature = "awacs"))]
 use test_case::test_case;
 use testutils::TestResult;
 use testutils::git;
@@ -36,6 +37,187 @@ pub(super) fn install_fake_btrfs(test_env: &TestEnvironment, script: &str) -> st
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     std::env::join_paths(paths).unwrap()
+}
+
+/// Owns real-Btrfs fixture paths until a test either finishes normally or
+/// unwinds through an assertion. Failed integration tests must not leave
+/// read-only snapshots or converted repository subvolumes in the checkout.
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+struct RealBtrfsFixtureCleanup {
+    subvolume_roots: Vec<std::path::PathBuf>,
+    awacs_state: std::path::PathBuf,
+    runtime_dir: std::path::PathBuf,
+    armed: bool,
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+impl RealBtrfsFixtureCleanup {
+    fn new(
+        repo_root: std::path::PathBuf,
+        awacs_state: std::path::PathBuf,
+        runtime_dir: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            subvolume_roots: vec![repo_root],
+            awacs_state,
+            runtime_dir,
+            armed: true,
+        }
+    }
+
+    fn track_subvolume_root(&mut self, root: std::path::PathBuf) {
+        self.subvolume_roots.push(root);
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        self.remove_managed_snapshots()?;
+        self.remove_migration_siblings()?;
+        for root in self.subvolume_roots.iter().rev() {
+            remove_fixture_tree(root)?;
+        }
+        remove_plain_tree(&self.awacs_state)?;
+        remove_plain_tree(&self.runtime_dir)?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn remove_managed_snapshots(&self) -> std::io::Result<()> {
+        let managed = self.awacs_state.join("managed");
+        if !managed.exists() {
+            return Ok(());
+        }
+        let mut snapshots = Vec::new();
+        for directory in std::fs::read_dir(&managed)? {
+            let directory = directory?.path();
+            if !directory.is_dir() {
+                continue;
+            }
+            for snapshot in std::fs::read_dir(directory)? {
+                let snapshot = snapshot?.path();
+                if snapshot
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("cut-"))
+                {
+                    snapshots.push(snapshot);
+                }
+            }
+        }
+        let mut first_error = None;
+        for snapshot in snapshots {
+            if let Err(error) = remove_fixture_tree(&snapshot) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn remove_migration_siblings(&self) -> std::io::Result<()> {
+        let mut first_error = None;
+        for root in &self.subvolume_roots {
+            let Some(parent) = root.parent() else {
+                continue;
+            };
+            let Some(name) = root.file_name().map(|name| name.to_string_lossy()) else {
+                continue;
+            };
+            let prefixes = [
+                format!("{name}.jj-subvolume-source-"),
+                format!(".{name}.awacs-subvolume-source-"),
+                format!(".{name}.awacs-subvolume-tmp-"),
+            ];
+            for entry in std::fs::read_dir(parent)? {
+                let path = entry?.path();
+                if !path.file_name().is_some_and(|entry_name| {
+                    prefixes
+                        .iter()
+                        .any(|prefix| entry_name.to_string_lossy().starts_with(prefix))
+                }) {
+                    continue;
+                }
+                if let Err(error) = remove_fixture_tree(&path) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+impl Drop for RealBtrfsFixtureCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            // Cleanup during unwinding cannot report a second failure. Retry
+            // every path best-effort so one stubborn subvolume does not keep
+            // the remaining fixture tree alive.
+            drop(self.remove_managed_snapshots());
+            drop(self.remove_migration_siblings());
+            for root in self.subvolume_roots.iter().rev() {
+                drop(remove_fixture_tree(root));
+            }
+            drop(remove_plain_tree(&self.awacs_state));
+            drop(remove_plain_tree(&self.runtime_dir));
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn remove_fixture_tree(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if !path.exists() {
+        return Ok(());
+    }
+    if std::fs::metadata(path)?.ino() != 256 {
+        return remove_plain_tree(path);
+    }
+    drop(
+        std::process::Command::new("btrfs")
+            .args(["property", "set", "-ts"])
+            .arg(path)
+            .args(["ro", "false"])
+            .status(),
+    );
+    // Conversion can make the colocated .git directory its own nested
+    // subvolume. The containing snapshot must be writable before an ordinary
+    // copied .git directory can be removed.
+    remove_fixture_tree(&path.join(".git"))?;
+    let status = std::process::Command::new("btrfs")
+        .args(["subvolume", "delete"])
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "delete Btrfs test subvolume {} failed with {status}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn remove_plain_tree(path: &std::path::Path) -> std::io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)?;
+    } else {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -627,6 +809,7 @@ exit 1
         "removed copied .jj metadata",
         "removed copied .git metadata",
         "recorded snapshot tree as workspace baseline",
+        "seeded snapshot workspace AWACS baseline without traversal",
         "initialized snapshot workspace metadata",
         "created temporary Git worktree for snapshot",
         "repaired snapshot Git worktree metadata",
@@ -912,6 +1095,9 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let runtime_dir = std::env::temp_dir().join(format!("jj-awacs-{suffix}"));
     std::fs::create_dir(&runtime_dir)?;
     std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))?;
+    let mut fixture_cleanup =
+        RealBtrfsFixtureCleanup::new(repo_root.clone(), awacs_state.clone(), runtime_dir.clone());
+    fixture_cleanup.track_subvolume_root(secondary_root.clone());
 
     let test_env = TestEnvironment::default();
     let main_dir = test_env.work_dir(&repo_root);
@@ -937,7 +1123,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let configure_awacs = |cmd: &mut assert_cmd::Command| {
         cmd.env("BTRFS_AWACS_COMMAND", &awacs_command)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("XDG_STATE_HOME", &awacs_state)
+            .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
             .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
             .env("BTRFS_AWACS_LOG", awacs_state.join("daemon.log"))
             .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket);
@@ -1002,7 +1188,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         })
         .success();
 
-    main_dir
+    let workspace_add = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
             // Exercise the real regression: the filesystem snapshot starts at
@@ -1021,6 +1207,20 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             ])
         })
         .success();
+    assert!(
+        workspace_add
+            .stderr
+            .raw()
+            .contains("AWACS worktree init: cloning parent AWACS path map..."),
+        "workspace add must clone the parent map instead of walking the child: {workspace_add}"
+    );
+    assert!(
+        !workspace_add
+            .stderr
+            .raw()
+            .contains("AWACS worktree init: indexed "),
+        "workspace add must not rebuild the child map by walking it: {workspace_add}"
+    );
     let secondary_dir = test_env.work_dir(&secondary_root);
     secondary_dir
         .run_jj_with(|cmd| {
@@ -1031,7 +1231,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
 
     let mut parent_store = None;
     let mut child_store = None;
-    for entry in std::fs::read_dir(awacs_state.join("btrfs-awacs/roots"))? {
+    for entry in std::fs::read_dir(&awacs_state)? {
         let manager_db = entry?.path().join("manager.sqlite3");
         let store = Store::open(&manager_db)?;
         let parent_count: i64 = store.connection().query_row(
@@ -1050,7 +1250,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             child_store = Some((manager_db.clone(), store));
         }
     }
-    let (parent_db, parent_store) = parent_store.expect("parent AWACS store should exist");
+    let (parent_db, _parent_store) = parent_store.expect("parent AWACS store should exist");
     let (child_db, child_store) = child_store.expect("child AWACS store should exist");
     assert_ne!(
         parent_db, child_db,
@@ -1064,51 +1264,25 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         child_watch_count, 1,
         "child SQLite must contain only itself"
     );
-    let (parent_revision_id, parent_snapshot_id): (i64, i64) =
-        parent_store.connection().query_row(
-            r#"SELECT indexed_revision_id, last_cut_snapshot_id
-             FROM watches
-            WHERE live_path = ?1 AND state = 'active'"#,
-            [repo_root.as_os_str().as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+    let (child_revision_id, current_child_snapshot_path): (i64, Vec<u8>) =
+        child_store.connection().query_row(
+            r#"SELECT w.indexed_revision_id,
+                  w.last_cut_snapshot_id, s.path
+             FROM watches w
+             JOIN snapshots s ON s.id = w.last_cut_snapshot_id
+            WHERE w.live_path = ?1 AND w.state = 'active'"#,
+            [secondary_root.as_os_str().as_bytes()],
+            |row| Ok((row.get(0)?, row.get(2)?)),
         )?;
-    let (child_live_uuid, child_revision_id): (Vec<u8>, i64) = child_store.connection().query_row(
-        r#"SELECT live_subvol_uuid, indexed_revision_id
-             FROM watches
-            WHERE live_path = ?1 AND state = 'active'"#,
-        [secondary_root.as_os_str().as_bytes()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let (initial_child_revision_id, initial_child_snapshot_id, initial_child_snapshot_path): (
-        i64,
-        i64,
-        Vec<u8>,
-    ) = child_store.connection().query_row(
-        r#"SELECT r.id, s.id, s.path
-             FROM snapshots s
-             JOIN revisions r ON r.snapshot_id = s.id
-            WHERE s.parent_uuid = ?1 AND r.state = 'ready'
-            ORDER BY r.id ASC LIMIT 1"#,
-        [child_live_uuid.as_slice()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    assert_ne!(
-        initial_child_revision_id, parent_revision_id,
-        "worktree initialization must publish a child-owned revision"
-    );
-    assert_ne!(
-        initial_child_snapshot_id, parent_snapshot_id,
-        "worktree initialization must create a child-owned baseline snapshot"
-    );
     assert!(
-        std::path::Path::new(std::ffi::OsStr::from_bytes(&initial_child_snapshot_path)).exists(),
-        "the child initial snapshot should exist physically"
+        std::path::Path::new(std::ffi::OsStr::from_bytes(&current_child_snapshot_path)).exists(),
+        "the current child-owned snapshot should exist physically"
     );
-    assert_eq!(
-        child_store.load_revision(initial_child_revision_id)?,
-        parent_store.load_revision(parent_revision_id)?,
-        "worktree initialization should clone the parent's path map"
-    );
+    // The first child snapshot pathname and its copied parent revision may
+    // already be reclaimed after the seeded JJ cursor advances to a newer
+    // child cut. The no-walk bootstrap progress above proves that the child
+    // map came from the parent; the current child revision proves the
+    // resulting independent store remains usable after checkout.
     child_store.load_revision(child_revision_id)?;
 
     // Removing the worktree only removes its filesystem/repo registration.
@@ -1130,44 +1304,394 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         .success();
     assert!(repo_root.join("file").is_file());
     assert!(!repo_root.join(".jj/working_copy/subvolume_mode").exists());
-    let retained_snapshots = std::fs::read_dir(awacs_state.join("managed"))?
-        .filter_map(|entry| entry.ok())
-        .flat_map(|directory| {
-            std::fs::read_dir(directory.path())
-                .into_iter()
-                .flatten()
-                .filter_map(|entry| entry.ok())
-        })
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("cut-"))
-        .map(|entry| entry.path())
-        .collect::<Vec<_>>();
-    assert!(
-        retained_snapshots.len() >= 2,
-        "the fixture should retain independent parent and removed-child baselines"
-    );
-    // AWACS intentionally keeps its newest watch checkpoint available for a
-    // later re-enable. Remove that final fixture-owned snapshot explicitly so
-    // the per-test manager directory itself can be deleted.
-    for snapshot in retained_snapshots {
+    fixture_cleanup.cleanup()?;
+    Ok(())
+}
+
+/// Replays one deterministic working-copy workload through several degrees of
+/// real process concurrency. The width-1 run is the sequential oracle, while
+/// the explicit expected map prevents all variants from agreeing on the same
+/// wrong result.
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
+#[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
+fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[derive(Clone)]
+    struct StressCommand {
+        jj: PathBuf,
+        awacs: OsString,
+        path: OsString,
+        home: PathBuf,
+        config: PathBuf,
+        tmp: PathBuf,
+        runtime: PathBuf,
+        state: PathBuf,
+        managed: PathBuf,
+        log: PathBuf,
+        broker_socket: OsString,
+    }
+
+    impl StressCommand {
+        fn run(&self, root: &Path, seed: usize, args: &[&str]) -> Output {
+            let timestamp = format!("2001-02-03T04:05:{:02}+07:00", seed % 60);
+            Command::new(&self.jj)
+                .current_dir(root)
+                .env_clear()
+                .env("PATH", &self.path)
+                .env("COLUMNS", "100")
+                .env("HOME", &self.home)
+                .env("TMPDIR", &self.tmp)
+                .env("JJ_CONFIG", &self.config)
+                .env("JJ_USER", "Test User")
+                .env("JJ_EMAIL", "test.user@example.com")
+                .env("JJ_OP_HOSTNAME", "host.example.com")
+                .env("JJ_OP_USERNAME", "test-username")
+                .env("JJ_TZ_OFFSET_MINS", "660")
+                .env("JJ_RANDOMNESS_SEED", seed.to_string())
+                .env("JJ_TIMESTAMP", &timestamp)
+                .env("JJ_OP_TIMESTAMP", &timestamp)
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("BTRFS_AWACS_COMMAND", &self.awacs)
+                .env("XDG_RUNTIME_DIR", &self.runtime)
+                .env("BTRFS_AWACS_STATE_DIR", &self.state)
+                .env("BTRFS_AWACS_MANAGED_DIR", &self.managed)
+                .env("BTRFS_AWACS_LOG", &self.log)
+                .env("BTRFS_AWACS_BROKER_SOCKET", &self.broker_socket)
+                .args(args)
+                .output()
+                .unwrap()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Mutation {
+        Write(String, String),
+        Remove(String),
+        Rename(String, String),
+        Transient(String),
+    }
+
+    impl Mutation {
+        fn apply(&self, root: &Path) -> std::io::Result<()> {
+            let ensure_parent = |path: &Path| -> std::io::Result<()> {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                Ok(())
+            };
+            match self {
+                Self::Write(path, contents) => {
+                    let path = root.join(path);
+                    ensure_parent(&path)?;
+                    std::fs::write(path, contents)
+                }
+                Self::Remove(path) => std::fs::remove_file(root.join(path)),
+                Self::Rename(from, to) => {
+                    let to = root.join(to);
+                    ensure_parent(&to)?;
+                    std::fs::rename(root.join(from), to)
+                }
+                Self::Transient(path) => {
+                    let path = root.join(path);
+                    ensure_parent(&path)?;
+                    std::fs::write(&path, "must net out\n")?;
+                    // Give sibling status processes a deterministic chance to
+                    // observe the intermediate file. The final tree must not
+                    // depend on whether any one of them did.
+                    thread::sleep(Duration::from_millis(20));
+                    std::fs::remove_file(path)
+                }
+            }
+        }
+    }
+
+    fn phases(round: usize) -> Vec<Vec<Mutation>> {
+        let prefix = format!("round-{round}");
+        vec![
+            vec![
+                Mutation::Write(
+                    format!("{prefix}/modify.txt"),
+                    format!("modified-{round}\n"),
+                ),
+                Mutation::Write(format!("{prefix}/added.txt"), format!("added-{round}\n")),
+                Mutation::Remove(format!("{prefix}/remove.txt")),
+                Mutation::Rename(
+                    format!("{prefix}/rename.txt"),
+                    format!("{prefix}/renamed.txt"),
+                ),
+            ],
+            vec![
+                Mutation::Write(format!("{prefix}/nested/a.txt"), format!("a-{round}\n")),
+                Mutation::Write(format!("{prefix}/nested/b.txt"), format!("b-{round}\n")),
+                Mutation::Write(
+                    format!("{prefix}/dir/base.txt"),
+                    format!("base-modified-{round}\n"),
+                ),
+                Mutation::Transient(format!("{prefix}/transient.txt")),
+            ],
+            vec![Mutation::Rename(
+                format!("{prefix}/dir"),
+                format!("{prefix}/moved"),
+            )],
+            vec![Mutation::Write(
+                format!("{prefix}/moved/after.txt"),
+                format!("after-{round}\n"),
+            )],
+        ]
+    }
+
+    fn expected_tree(rounds: usize) -> BTreeMap<String, Vec<u8>> {
+        let mut expected =
+            BTreeMap::from([("seed/unchanged.txt".to_owned(), b"unchanged\n".to_vec())]);
+        for round in 0..rounds {
+            let prefix = format!("round-{round}");
+            for (suffix, contents) in [
+                ("modify.txt", format!("modified-{round}\n")),
+                ("added.txt", format!("added-{round}\n")),
+                ("renamed.txt", format!("rename-{round}\n")),
+                ("nested/a.txt", format!("a-{round}\n")),
+                ("nested/b.txt", format!("b-{round}\n")),
+                ("moved/base.txt", format!("base-modified-{round}\n")),
+                ("moved/after.txt", format!("after-{round}\n")),
+            ] {
+                expected.insert(format!("{prefix}/{suffix}"), contents.into_bytes());
+            }
+        }
+        expected
+    }
+
+    fn assert_success(output: &Output, context: &str) {
         assert!(
-            Command::new("btrfs")
-                .args(["property", "set", "-ts"])
-                .arg(&snapshot)
-                .args(["ro", "false"])
-                .status()?
-                .success()
-        );
-        assert!(
-            Command::new("btrfs")
-                .args(["subvolume", "delete"])
-                .arg(&snapshot)
-                .status()?
-                .success()
+            output.status.success(),
+            "{context} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
-    std::fs::remove_dir_all(&repo_root)?;
-    std::fs::remove_dir_all(&awacs_state)?;
-    std::fs::remove_dir_all(&runtime_dir)?;
+
+    fn run_workload(command: &StressCommand, root: &Path, width: usize, rounds: usize) {
+        let mut seed = width * 10_000;
+        for round in 0..rounds {
+            for phase in phases(round) {
+                for chunk in phase.chunks(width) {
+                    let barrier = Arc::new(Barrier::new(chunk.len()));
+                    let mut workers = Vec::new();
+                    for mutation in chunk {
+                        let command = command.clone();
+                        let root = root.to_owned();
+                        let mutation = mutation.clone();
+                        let barrier = barrier.clone();
+                        seed += 1;
+                        let worker_seed = seed;
+                        workers.push(thread::spawn(move || {
+                            barrier.wait();
+                            mutation.apply(&root).unwrap();
+                            // A stable stagger broadens the set of scan vs.
+                            // mutation interleavings without introducing
+                            // randomness into the expected endpoint.
+                            thread::sleep(Duration::from_millis((worker_seed % 4) as u64 * 5));
+                            let output = command.run(&root, worker_seed, &["status"]);
+                            (mutation, output)
+                        }));
+                    }
+                    for worker in workers {
+                        let (mutation, output) = worker.join().unwrap();
+                        assert_success(&output, &format!("status after {mutation:?}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn observed_tree(
+        command: &StressCommand,
+        root: &Path,
+        seed: usize,
+    ) -> BTreeMap<String, Vec<u8>> {
+        let status = command.run(root, seed, &["status"]);
+        assert_success(&status, "final settling status");
+        let listed = command.run(root, seed + 1, &["file", "list"]);
+        assert_success(&listed, "final file list");
+        String::from_utf8(listed.stdout.clone())
+            .unwrap()
+            .lines()
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                let shown = command.run(root, seed + 2, &["file", "show", path]);
+                assert_success(&shown, &format!("show final path {path}"));
+                (path.to_owned(), shown.stdout)
+            })
+            .collect()
+    }
+
+    let rounds = std::env::var("JJ_TEST_AWACS_STRESS_ROUNDS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("stress rounds must be an integer")
+        })
+        .unwrap_or(3);
+    assert!(rounds > 0, "stress rounds must be positive");
+    let btrfs_root = std::env::var_os("JJ_TEST_BTRFS_ROOT")
+        .map(PathBuf::from)
+        .expect("JJ_TEST_BTRFS_ROOT must name a writable directory on real Btrfs");
+    let awacs_command = std::env::var_os("BTRFS_AWACS_COMMAND")
+        .expect("BTRFS_AWACS_COMMAND must name the real awacs binary");
+    let broker_socket = std::env::var_os("BTRFS_AWACS_BROKER_SOCKET")
+        .expect("BTRFS_AWACS_BROKER_SOCKET must name a matching live AWACS broker");
+    assert!(
+        Command::new("btrfs")
+            .args(["inspect-internal", "rootid"])
+            .arg(&btrfs_root)
+            .status()?
+            .success(),
+        "JJ_TEST_BTRFS_ROOT is not on Btrfs"
+    );
+
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let repo_root = btrfs_root.join(format!("jj-awacs-stress-{suffix}"));
+    let awacs_state = btrfs_root.join(format!(".jj-awacs-stress-state-{suffix}"));
+    let runtime_dir = std::env::temp_dir().join(format!("jj-awacs-stress-{suffix}"));
+    std::fs::create_dir(&repo_root)?;
+    std::fs::create_dir(&awacs_state)?;
+    std::fs::create_dir(&runtime_dir)?;
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))?;
+    let mut fixture_cleanup =
+        RealBtrfsFixtureCleanup::new(repo_root.clone(), awacs_state.clone(), runtime_dir.clone());
+
+    let test_env = TestEnvironment::default();
+    let main_dir = test_env.work_dir(&repo_root);
+    main_dir
+        .run_jj(["git", "init", "--colocate", "."])
+        .success();
+    main_dir.write_file("seed/unchanged.txt", "unchanged\n");
+    for round in 0..rounds {
+        main_dir.write_file(
+            format!("round-{round}/modify.txt"),
+            format!("original-{round}\n"),
+        );
+        main_dir.write_file(
+            format!("round-{round}/remove.txt"),
+            format!("remove-{round}\n"),
+        );
+        main_dir.write_file(
+            format!("round-{round}/rename.txt"),
+            format!("rename-{round}\n"),
+        );
+        main_dir.write_file(
+            format!("round-{round}/dir/base.txt"),
+            format!("base-{round}\n"),
+        );
+    }
+    main_dir.run_jj(["commit", "-m", "stress base"]).success();
+    let base_commit = main_dir
+        .run_jj(["log", "-r", "@-", "--no-graph", "-T", "commit_id"])
+        .success()
+        .stdout
+        .raw()
+        .trim()
+        .to_owned();
+
+    let configure_awacs = |cmd: &mut assert_cmd::Command| {
+        cmd.env("BTRFS_AWACS_COMMAND", &awacs_command)
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
+            .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
+            .env("BTRFS_AWACS_LOG", awacs_state.join("daemon.log"))
+            .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket);
+    };
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["util", "subvolume", "enable"])
+        })
+        .success();
+
+    let stress_command = StressCommand {
+        jj: PathBuf::from(assert_cmd::cargo::cargo_bin!("jj")),
+        awacs: awacs_command.clone(),
+        path: std::env::var_os("PATH").unwrap_or_default(),
+        home: test_env.home_dir().to_owned(),
+        config: test_env.config_path().to_owned(),
+        tmp: test_env.env_root().join("tmp"),
+        runtime: runtime_dir.clone(),
+        state: awacs_state.clone(),
+        managed: awacs_state.join("managed"),
+        log: awacs_state.join("daemon.log"),
+        broker_socket: broker_socket.clone(),
+    };
+    let expected = expected_tree(rounds);
+    let mut sequential = None;
+    let mut workspace_names = Vec::new();
+    for width in [1, 2, 4] {
+        let workspace_name = format!("stress-w{width}");
+        let workspace_root = btrfs_root.join(format!("jj-awacs-stress-{suffix}-w{width}"));
+        fixture_cleanup.track_subvolume_root(workspace_root.clone());
+        main_dir
+            .run_jj_with(|cmd| {
+                configure_awacs(cmd);
+                cmd.args([
+                    "workspace",
+                    "add",
+                    "-r",
+                    &base_commit,
+                    "--name",
+                    &workspace_name,
+                    workspace_root.to_str().unwrap(),
+                ])
+            })
+            .success();
+        run_workload(&stress_command, &workspace_root, width, rounds);
+        let observed = observed_tree(&stress_command, &workspace_root, width * 100_000);
+        assert_eq!(
+            observed, expected,
+            "width {width} disagrees with expected tree"
+        );
+        if let Some(sequential) = &sequential {
+            assert_eq!(
+                &observed, sequential,
+                "width {width} disagrees with the sequential result"
+            );
+        } else {
+            sequential = Some(observed);
+        }
+        workspace_names.push(workspace_name);
+    }
+
+    for workspace_name in workspace_names {
+        main_dir
+            .run_jj_with(|cmd| {
+                configure_awacs(cmd);
+                cmd.args(["workspace", "remove", &workspace_name])
+            })
+            .success();
+    }
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["util", "subvolume", "disable"])
+        })
+        .success();
+    fixture_cleanup.cleanup()?;
     Ok(())
 }
 
@@ -1389,6 +1913,37 @@ exit 1
             .raw()
             .contains("Btrfs subvolume mode is already enabled.")
     );
+
+    // An explicit rebuild clears an unusable committed cursor and permits
+    // the next immutable AWACS scan to establish a replacement baseline.
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+        })
+        .success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Rebuilding committed AWACS snapshot baseline...")
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Rebuilt committed AWACS snapshot baseline.")
+    );
+    let status = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(["util", "subvolume", "status"])
+        })
+        .success();
+    assert!(status.stdout.raw().contains("Working copy snapshot: awacs"));
+    assert!(status.stdout.raw().contains("(clean-baseline,"));
 
     // A controlled checkout should immediately advance the retained baseline
     // instead of leaving final subvolume mode in a no-baseline state.

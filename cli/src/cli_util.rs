@@ -88,6 +88,10 @@ use jj_lib::gitignore::GitIgnoreFile;
 use jj_lib::id_prefix::IdPrefixContext;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 use jj_lib::local_working_copy::effective_exec_bit_policy_for_fingerprint;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::local_working_copy::seed_local_working_copy_awacs_baseline;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::local_working_copy::seed_local_working_copy_initialized_awacs_baseline;
 use jj_lib::lock::FileLock;
 use jj_lib::matchers::Matcher;
 use jj_lib::matchers::NothingMatcher;
@@ -292,14 +296,16 @@ impl TracingSubscription {
         self.reload_log_filter
             .modify(|filter| {
                 // The default is INFO.
-                // jj-lib and jj-cli are whitelisted for DEBUG logging.
+                // jj-lib, jj-cli, and the embedded AWACS library are
+                // whitelisted for DEBUG logging.
                 // This ensures that other crates' logging doesn't show up by default.
                 *filter = tracing_subscriber::EnvFilter::builder()
                     .with_default_directive(tracing::metadata::LevelFilter::INFO.into())
                     .with_env_var(Self::ENV_VAR_NAME)
                     .from_env_lossy()
                     .add_directive("jj_lib=debug".parse().unwrap())
-                    .add_directive("jj_cli=debug".parse().unwrap());
+                    .add_directive("jj_cli=debug".parse().unwrap())
+                    .add_directive("btrfs_awacs=debug".parse().unwrap());
             })
             .map_err(|err| internal_error_with_message("failed to enable debug logging", err))?;
         tracing::info!("debug logging enabled");
@@ -1555,6 +1561,78 @@ impl WorkspaceCommandHelper {
 
         report_phase("printing snapshot results")?;
         print_snapshot_stats(ui, &stats, self.env().path_converter())?;
+        Ok(())
+    }
+
+    /// Records the first child-owned AWACS cursor for an already-seeded
+    /// snapshot worktree without rediscovering every path in that worktree.
+    ///
+    /// The workspace-add caller has just cloned the parent's AWACS path map
+    /// and copied semantic tree into a fresh child journal. The child still
+    /// needs its own cursor, but scanning the immutable clone again would be
+    /// O(repository size) work with no new information.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    pub(crate) async fn seed_snapshot_workspace_awacs_baseline(
+        &mut self,
+        ui: &Ui,
+    ) -> Result<(), CommandError> {
+        let auto_tracking_matcher = self.auto_tracking_matcher(ui)?;
+        let options = self.snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)?;
+        let input_fingerprint = options.awacs_input_fingerprint.ok_or_else(|| {
+            internal_error_with_message(
+                "Failed to seed snapshot workspace AWACS baseline",
+                "AWACS input fingerprint was not provided",
+            )
+        })?;
+        let operation_id = self.repo().op_id().clone();
+        let (mut locked_workspace, _commit) = self.unchecked_start_working_copy_mutation().await?;
+        if !seed_local_working_copy_awacs_baseline(locked_workspace.locked_wc(), input_fingerprint)
+            .await
+            .map_err(internal_error)?
+        {
+            return Err(internal_error_with_message(
+                "Failed to seed snapshot workspace AWACS baseline",
+                "new workspace did not reload as snapshot-backed",
+            ));
+        }
+        locked_workspace.finish(operation_id).await?;
+        tracing::debug!("seeded snapshot workspace AWACS baseline without traversal");
+        Ok(())
+    }
+
+    /// Records the child baseline already published during snapshot-workspace
+    /// initialization, without opening another AWACS scan lease or cut.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    pub(crate) async fn seed_initialized_snapshot_workspace_awacs_baseline(
+        &mut self,
+        ui: &Ui,
+        snapshot_identity: &btrfs_awacs::manager::SnapshotIdentity,
+    ) -> Result<(), CommandError> {
+        let auto_tracking_matcher = self.auto_tracking_matcher(ui)?;
+        let options = self.snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)?;
+        let input_fingerprint = options.awacs_input_fingerprint.ok_or_else(|| {
+            internal_error_with_message(
+                "Failed to seed initialized snapshot workspace AWACS baseline",
+                "AWACS input fingerprint was not provided",
+            )
+        })?;
+        let operation_id = self.repo().op_id().clone();
+        let (mut locked_workspace, _commit) = self.unchecked_start_working_copy_mutation().await?;
+        if !seed_local_working_copy_initialized_awacs_baseline(
+            locked_workspace.locked_wc(),
+            snapshot_identity,
+            input_fingerprint,
+        )
+        .await
+        .map_err(internal_error)?
+        {
+            return Err(internal_error_with_message(
+                "Failed to seed initialized snapshot workspace AWACS baseline",
+                "new workspace did not reload as snapshot-backed",
+            ));
+        }
+        locked_workspace.finish(operation_id).await?;
+        tracing::debug!("seeded initialized snapshot workspace AWACS baseline without a scan");
         Ok(())
     }
 

@@ -134,6 +134,7 @@ pub struct InitializedWatch {
     pub grant_id: [u8; 16],
     pub revision_id: i64,
     pub snapshot_id: i64,
+    pub snapshot_identity: SnapshotIdentity,
     pub sequence: i64,
     pub fresh_instance: bool,
 }
@@ -1849,6 +1850,25 @@ impl Store {
         &mut self,
         request: &InitializeRequest,
     ) -> Result<InitializeReservation, ManagerError> {
+        self.reserve_initialize_with_state(request, "planned")
+    }
+
+    /// Reserves initialization and durably crosses the filesystem-effect
+    /// boundary in the same transaction. Callers which create the snapshot
+    /// immediately after reservation do not need a second SQLite commit just
+    /// to change `planned` into `fs_started`.
+    pub fn reserve_initialize_started(
+        &mut self,
+        request: &InitializeRequest,
+    ) -> Result<InitializeReservation, ManagerError> {
+        self.reserve_initialize_with_state(request, "fs_started")
+    }
+
+    fn reserve_initialize_with_state(
+        &mut self,
+        request: &InitializeRequest,
+        operation_state: &'static str,
+    ) -> Result<InitializeReservation, ManagerError> {
         if !path_is_absolute(&request.source_path)
             || !path_is_absolute(&request.reserved_snapshot_path)
         {
@@ -1950,11 +1970,12 @@ impl Store {
                  authorization_id, reserved_path, lease_owner, lease_fence, \
                  lease_expires_ns, updated_ns \
              ) VALUES ( \
-                 ?1, 'initialize', 'planned', ?2, ?3, 0, ?4, NULL, ?4, 1, \
-                 ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11 \
+                 ?1, 'initialize', ?2, ?3, ?4, 0, ?5, NULL, ?5, 1, \
+                 ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12 \
              )",
             params![
                 operation_id.as_slice(),
+                operation_state,
                 filesystem_id,
                 watch_id.as_slice(),
                 request.source_subvol_uuid.as_slice(),
@@ -2190,9 +2211,10 @@ impl Store {
             snapshot.snapshot_id,
             snapshot.identity.subvol_uuid,
         )?;
+        let revision_id = allocate_revision_id(&transaction)?;
         transaction.execute(
             "INSERT INTO revisions( \
-                 snapshot_id, storage_base_revision_id, provenance_comparison_id, \
+                 id, snapshot_id, storage_base_revision_id, provenance_comparison_id, \
                  delta_depth, state, builder_owner, builder_fence, \
                  builder_expires_ns, object_count, ref_count, state_hash, \
                  single_owner_uid, privileged_metadata_count, security_state_hash, \
@@ -2200,10 +2222,11 @@ impl Store {
                  summary_version, \
                  created_ns \
              ) VALUES ( \
-                 ?1, NULL, NULL, 0, 'building', ?2, ?3, NULL, ?4, ?5, ?6, \
-                 ?7, ?8, ?9, ?10, ?11, 2, ?12 \
+                 ?1, ?2, NULL, NULL, 0, 'building', ?3, ?4, NULL, ?5, ?6, ?7, \
+                 ?8, ?9, ?10, ?11, ?12, 2, ?13 \
              )",
             params![
+                revision_id,
                 snapshot.snapshot_id,
                 lease_owner.as_slice(),
                 reservation.operation_fence,
@@ -2223,7 +2246,6 @@ impl Store {
                 now_ns,
             ],
         )?;
-        let revision_id = transaction.last_insert_rowid();
         transaction.execute(
             "INSERT INTO revision_checkpoints( \
                  revision_id, state, builder_owner, builder_fence, \
@@ -2325,6 +2347,138 @@ impl Store {
             grant_id: reservation.grant_id,
             revision_id,
             snapshot_id: snapshot.snapshot_id,
+            snapshot_identity: snapshot.identity.clone(),
+            sequence: 0,
+            fresh_instance: true,
+        })
+    }
+
+    /// Activates a fresh child watch by attaching its first snapshot as an
+    /// empty overlay over a shared immutable parent path-map revision.
+    ///
+    /// The fresh operational store contains no parent watches, leases,
+    /// events, or live snapshot paths. Retaining the revision chain as a
+    /// storage base avoids copying every checkpoint object/reference row
+    /// during worktree creation.
+    pub fn publish_initial_inherited_revision(
+        &mut self,
+        reservation: &InitializeReservation,
+        lease_owner: [u8; 16],
+        snapshot: &RecordedSnapshot,
+        seed_revision_id: i64,
+        now_ns: i64,
+    ) -> Result<InitializedWatch, ManagerError> {
+        let metadata = self.load_revision_metadata(seed_revision_id)?;
+        let base_depth: i64 = self.connection().query_row(
+            "SELECT delta_depth FROM revisions WHERE id = ?1 AND state = 'ready'",
+            [seed_revision_id],
+            |row| row.get(0),
+        )?;
+        let delta_depth = base_depth
+            .checked_add(1)
+            .ok_or_else(|| ManagerError::new("inherited revision depth overflow"))?;
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        verify_initialize_publication(
+            &transaction,
+            reservation,
+            lease_owner,
+            snapshot.snapshot_id,
+            snapshot.identity.subvol_uuid,
+        )?;
+        let revision_id = allocate_revision_id(&transaction)?;
+        transaction.execute(
+            r#"INSERT INTO revisions(
+                 id, snapshot_id, storage_base_revision_id, provenance_comparison_id,
+                 delta_depth, state, builder_owner, builder_fence,
+                 builder_expires_ns, object_count, ref_count, state_hash,
+                 single_owner_uid, privileged_metadata_count, security_state_hash,
+                 owner_cardinality, owner_uid_xor, summary_version, created_ns
+             ) VALUES (
+                 ?1, ?2, ?3, NULL, ?4, 'ready', NULL, ?5, NULL, ?6, ?7, ?8,
+                 ?9, ?10, ?11, ?12, ?13, ?14, ?15
+             )"#,
+            params![
+                revision_id,
+                snapshot.snapshot_id,
+                seed_revision_id,
+                delta_depth,
+                reservation.operation_fence,
+                metadata.object_count,
+                metadata.ref_count,
+                metadata.state_hash.as_slice(),
+                metadata
+                    .single_owner_uid
+                    .map(encode_u64)
+                    .as_ref()
+                    .map(<[u8; 8]>::as_slice),
+                metadata.privileged_metadata_count,
+                metadata.security_state_hash.as_slice(),
+                metadata.owner_cardinality,
+                encode_u64(metadata.owner_uid_xor).as_slice(),
+                metadata.summary_version,
+                now_ns,
+            ],
+        )?;
+        require_one(
+            transaction.execute(
+                r#"UPDATE watches
+                      SET indexed_revision_id = ?2, indexed_seq = 0,
+                          last_cut_snapshot_id = ?3, last_cut_seq = 0,
+                          replay_floor_seq = 0, state = 'active'
+                    WHERE id = ?1 AND state = 'initializing'
+                      AND indexed_revision_id IS NULL AND last_cut_snapshot_id IS NULL"#,
+                params![
+                    reservation.watch_id.as_slice(),
+                    revision_id,
+                    snapshot.snapshot_id,
+                ],
+            )?,
+            "activate inherited initialized watch",
+        )?;
+        for (kind, reason) in [
+            ("watch-indexed-head", "initialized-index-head"),
+            ("watch-last-cut", "initialized-physical-head"),
+        ] {
+            transaction.execute(
+                "INSERT INTO snapshot_pins(snapshot_id, owner_kind, owner_id, reason) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    snapshot.snapshot_id,
+                    kind,
+                    reservation.watch_id.as_slice(),
+                    reason,
+                ],
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM snapshot_pins WHERE snapshot_id = ?1 AND owner_kind = 'operation' AND owner_id = ?2 AND reason = 'initialize-build'",
+            params![snapshot.snapshot_id, reservation.operation_id.as_slice()],
+        )?;
+        require_one(
+            transaction.execute(
+                r#"UPDATE operations
+                      SET state = 'done', lease_owner = NULL, lease_expires_ns = NULL,
+                          updated_ns = ?4
+                    WHERE id = ?1 AND watch_id = ?2 AND state = 'uuid_recorded'
+                      AND lease_owner = ?3 AND lease_fence = ?5"#,
+                params![
+                    reservation.operation_id.as_slice(),
+                    reservation.watch_id.as_slice(),
+                    lease_owner.as_slice(),
+                    now_ns,
+                    reservation.operation_fence,
+                ],
+            )?,
+            "complete inherited initialize operation",
+        )?;
+        transaction.commit()?;
+        Ok(InitializedWatch {
+            watch_id: reservation.watch_id,
+            grant_id: reservation.grant_id,
+            revision_id,
+            snapshot_id: snapshot.snapshot_id,
+            snapshot_identity: snapshot.identity.clone(),
             sequence: 0,
             fresh_instance: true,
         })
@@ -2810,9 +2964,12 @@ impl Store {
             ));
         }
         let base_subset = self.load_revision_delta_subset(base_revision_id, manifest)?;
-        let applied = apply_manifest(&base_subset, manifest, target_objects).map_err(|error| {
-            ManagerError::new(format!("apply changed-object manifest: {error}"))
-        })?;
+        let (manifest, target_objects) =
+            project_manifest_to_indexed_subset(&base_subset, manifest, target_objects);
+        let applied =
+            apply_manifest(&base_subset, &manifest, &target_objects).map_err(|error| {
+                ManagerError::new(format!("apply changed-object manifest: {error}"))
+            })?;
         first_fscrypt_path(&applied.index)
     }
 
@@ -2853,9 +3010,12 @@ impl Store {
             base_metadata = self.load_revision_metadata(base_revision_id)?;
         }
         let base_subset = self.load_revision_delta_subset(base_revision_id, manifest)?;
-        let applied = apply_manifest(&base_subset, manifest, target_objects).map_err(|error| {
-            ManagerError::new(format!("apply changed-object manifest: {error}"))
-        })?;
+        let (manifest, target_objects) =
+            project_manifest_to_indexed_subset(&base_subset, manifest, target_objects);
+        let applied =
+            apply_manifest(&base_subset, &manifest, &target_objects).map_err(|error| {
+                ManagerError::new(format!("apply changed-object manifest: {error}"))
+            })?;
         if let Some(path) = first_fscrypt_path(&applied.index)? {
             return Err(ManagerError::new(format!(
                 "immutable snapshot contains fscrypt directory {:?}",
@@ -2876,13 +3036,13 @@ impl Store {
             &base_metadata,
             &base_subset,
             &applied.index,
-            manifest,
+            &manifest,
             &base_owner_counts,
         )?;
         let manifest_hash = manifest.canonical_hash();
         stage_delta_rows(
             self.connection_mut(),
-            manifest,
+            &manifest,
             &applied.events,
             &applied.index,
             &owner_count_overrides,
@@ -2919,18 +3079,20 @@ impl Store {
         )?;
         let comparison_id = transaction.last_insert_rowid();
         import_staged_comparison_rows(&transaction, comparison_id)?;
+        let revision_id = allocate_revision_id(&transaction)?;
         transaction.execute(
             r#"INSERT INTO revisions(
-                   snapshot_id, storage_base_revision_id, provenance_comparison_id,
+                   id, snapshot_id, storage_base_revision_id, provenance_comparison_id,
                    delta_depth, state, builder_owner, builder_fence,
                    builder_expires_ns, object_count, ref_count, state_hash,
                    single_owner_uid, privileged_metadata_count, security_state_hash,
                    owner_cardinality, owner_uid_xor,
                    summary_version,
                    created_ns
-               ) VALUES (?1, ?2, ?3, ?4, 'building', ?5, ?6, NULL, ?7, ?8,
-                         ?9, ?10, ?11, ?12, ?13, ?14, 2, ?15)"#,
+               ) VALUES (?1, ?2, ?3, ?4, ?5, 'building', ?6, ?7, NULL, ?8, ?9,
+                         ?10, ?11, ?12, ?13, ?14, ?15, 2, ?16)"#,
             params![
+                revision_id,
                 snapshot.snapshot_id,
                 base_revision_id,
                 comparison_id,
@@ -2952,7 +3114,6 @@ impl Store {
                 now_ns,
             ],
         )?;
-        let revision_id = transaction.last_insert_rowid();
         import_staged_revision_rows(&transaction, revision_id)?;
         require_one(
             transaction.execute(
@@ -3399,16 +3560,18 @@ impl Store {
                 ])?;
             }
         }
+        let revision_id = allocate_revision_id(&transaction)?;
         transaction.execute(
             r#"INSERT INTO revisions(
-                   snapshot_id, storage_base_revision_id, provenance_comparison_id,
+                   id, snapshot_id, storage_base_revision_id, provenance_comparison_id,
                    delta_depth, state, builder_owner, builder_fence,
                    builder_expires_ns, object_count, ref_count, state_hash,
                    single_owner_uid, privileged_metadata_count, security_state_hash,
                    owner_cardinality, owner_uid_xor, summary_version, created_ns)
-               VALUES (?1, NULL, ?2, 0, 'building', ?3, ?4, NULL, ?5, ?6,
-                       ?7, ?8, ?9, ?10, ?11, ?12, 2, ?13)"#,
+               VALUES (?1, ?2, NULL, ?3, 0, 'building', ?4, ?5, NULL, ?6, ?7,
+                       ?8, ?9, ?10, ?11, ?12, ?13, 2, ?14)"#,
             params![
+                revision_id,
                 snapshot.snapshot_id,
                 comparison_id,
                 lease_owner.as_slice(),
@@ -3429,7 +3592,6 @@ impl Store {
                 now_ns,
             ],
         )?;
-        let revision_id = transaction.last_insert_rowid();
         transaction.execute(
             r#"INSERT INTO revision_checkpoints(
                    revision_id, state, builder_owner, builder_fence,
@@ -5528,7 +5690,7 @@ impl Store {
                 .query_row(
                     r#"SELECT present, generation, mode, nlink, uid, gid, rdev,
                               privilege_flags, security_xattr_hash
-                         FROM object_overrides
+                         FROM path_map.object_overrides
                         WHERE revision_id = ?1 AND ino = ?2"#,
                     params![revision_id, encoded.as_slice()],
                     decode_optional_object_row,
@@ -5548,7 +5710,7 @@ impl Store {
             .query_row(
                 r#"SELECT generation, mode, nlink, uid, gid, rdev,
                           privilege_flags, security_xattr_hash
-                     FROM checkpoint_objects
+                     FROM path_map.checkpoint_objects
                     WHERE revision_id = ?1 AND ino = ?2"#,
                 params![checkpoint_id, encoded.as_slice()],
                 |row| decode_checkpoint_object_row(row, ino),
@@ -5568,7 +5730,7 @@ impl Store {
         let encoded = encode_u64(ino);
         let mut references = BTreeSet::new();
         let mut statement = self.connection().prepare(
-            "SELECT parent_ino, name FROM checkpoint_refs \
+            "SELECT parent_ino, name FROM path_map.checkpoint_refs \
              WHERE revision_id = ?1 AND ino = ?2 ORDER BY parent_ino, name",
         )?;
         let rows = statement.query_map(params![checkpoint_id, encoded.as_slice()], |row| {
@@ -5584,7 +5746,7 @@ impl Store {
         drop(statement);
         for &revision_id in chain[..chain.len().saturating_sub(1)].iter().rev() {
             let mut statement = self.connection().prepare(
-                "SELECT parent_ino, name, present FROM ref_overrides \
+                "SELECT parent_ino, name, present FROM path_map.ref_overrides \
                  WHERE revision_id = ?1 AND ino = ?2 ORDER BY parent_ino, name",
             )?;
             let rows = statement.query_map(params![revision_id, encoded.as_slice()], |row| {
@@ -5621,7 +5783,7 @@ impl Store {
         let encoded_parent = encode_u64(parent_ino);
         let mut candidates = BTreeSet::new();
         let mut statement = self.connection().prepare(
-            "SELECT ino FROM checkpoint_refs \
+            "SELECT ino FROM path_map.checkpoint_refs \
              WHERE revision_id = ?1 AND parent_ino = ?2 AND name = ?3",
         )?;
         let rows = statement.query_map(
@@ -5640,7 +5802,7 @@ impl Store {
         drop(statement);
         for &revision_id in chain[..chain.len().saturating_sub(1)].iter().rev() {
             let mut statement = self.connection().prepare(
-                "SELECT ino, present FROM ref_overrides \
+                "SELECT ino, present FROM path_map.ref_overrides \
                  WHERE revision_id = ?1 AND parent_ino = ?2 AND name = ?3",
             )?;
             let rows = statement.query_map(
@@ -5678,7 +5840,7 @@ impl Store {
             let count = self
                 .connection()
                 .query_row(
-                    "SELECT object_count FROM owner_count_overrides \
+                    "SELECT object_count FROM path_map.owner_count_overrides \
                      WHERE revision_id = ?1 AND uid = ?2",
                     params![revision_id, encoded.as_slice()],
                     |row| row.get(0),
@@ -5694,7 +5856,7 @@ impl Store {
         Ok(self
             .connection()
             .query_row(
-                "SELECT object_count FROM checkpoint_owner_counts \
+                "SELECT object_count FROM path_map.checkpoint_owner_counts \
                  WHERE revision_id = ?1 AND uid = ?2",
                 params![checkpoint_id, encoded.as_slice()],
                 |row| row.get(0),
@@ -5815,7 +5977,7 @@ impl Store {
         let mut objects = self.connection().prepare(
             "SELECT ino, generation, mode, nlink, uid, gid, rdev, \
                     privilege_flags, security_xattr_hash \
-               FROM checkpoint_objects WHERE revision_id = ?1 ORDER BY ino",
+               FROM path_map.checkpoint_objects WHERE revision_id = ?1 ORDER BY ino",
         )?;
         let rows = objects.query_map([revision_id], |row| {
             Ok(Object {
@@ -5837,7 +5999,7 @@ impl Store {
             }
         }
         let mut references = self.connection().prepare(
-            "SELECT ino, parent_ino, name FROM checkpoint_refs \
+            "SELECT ino, parent_ino, name FROM path_map.checkpoint_refs \
               WHERE revision_id = ?1 ORDER BY ino, parent_ino, name",
         )?;
         let rows = references.query_map([revision_id], |row| {
@@ -5860,6 +6022,76 @@ impl Store {
         // the untrusted publication boundary.
         Ok(index)
     }
+}
+
+/// Restricts a kernel changed-object stream to the namespace represented by
+/// one loaded AWACS index subset.
+///
+/// Btrfs reports inode activity for the whole subvolume, including control
+/// directories which JJ deliberately does not index and files created after
+/// the last immutable cut. Such an inode cannot affect the indexed namespace
+/// unless a reference crosses from a retained parent into it. Keep every
+/// already-indexed object, every retained reference deletion, and reference
+/// additions reachable from those objects; discard only disconnected changes.
+/// A crossing addition with insufficient endpoint metadata remains in the
+/// projected manifest and therefore still fails closed in apply_manifest().
+fn project_manifest_to_indexed_subset(
+    base: &Index,
+    manifest: &ChangedObjectsManifest,
+    target_objects: &BTreeMap<u64, Object>,
+) -> (ChangedObjectsManifest, BTreeMap<u64, Object>) {
+    let mut reachable_objects: BTreeSet<u64> = base.objects.keys().copied().collect();
+    let ref_deletes: BTreeSet<_> = manifest
+        .ref_deletes
+        .iter()
+        .filter(|reference| base.references.contains(*reference))
+        .cloned()
+        .collect();
+    for reference in &ref_deletes {
+        reachable_objects.insert(reference.ino);
+        reachable_objects.insert(reference.parent_ino);
+    }
+
+    let mut remaining_adds = manifest.ref_adds.clone();
+    let mut ref_adds = BTreeSet::new();
+    loop {
+        let reachable_adds: Vec<_> = remaining_adds
+            .iter()
+            .filter(|reference| reachable_objects.contains(&reference.parent_ino))
+            .cloned()
+            .collect();
+        if reachable_adds.is_empty() {
+            break;
+        }
+        for reference in reachable_adds {
+            remaining_adds.remove(&reference);
+            reachable_objects.insert(reference.parent_ino);
+            reachable_objects.insert(reference.ino);
+            ref_adds.insert(reference);
+        }
+    }
+
+    let objects = manifest
+        .objects
+        .iter()
+        .filter(|(ino, _)| reachable_objects.contains(ino))
+        .map(|(&ino, &change)| (ino, change))
+        .collect();
+    let target_objects = target_objects
+        .iter()
+        .filter(|(ino, _)| reachable_objects.contains(ino))
+        .map(|(&ino, object)| (ino, object.clone()))
+        .collect();
+    (
+        ChangedObjectsManifest {
+            objects,
+            raw_ref_adds: ref_adds.len(),
+            raw_ref_deletes: ref_deletes.len(),
+            ref_adds,
+            ref_deletes,
+        },
+        target_objects,
+    )
 }
 
 fn full_fresh_events(index: &Index) -> Result<Vec<Event>, ManagerError> {
@@ -6372,7 +6604,7 @@ fn import_staged_revision_rows(
     revision_id: i64,
 ) -> Result<(), ManagerError> {
     transaction.execute(
-        r#"INSERT INTO object_overrides(
+        r#"INSERT INTO path_map.object_overrides(
                revision_id, ino, present, generation, mode, nlink, uid, gid,
                rdev, privilege_flags, security_xattr_hash)
            SELECT ?1, ino, present, generation, mode, nlink, uid, gid,
@@ -6381,13 +6613,13 @@ fn import_staged_revision_rows(
         [revision_id],
     )?;
     transaction.execute(
-        r#"INSERT INTO ref_overrides(revision_id, ino, parent_ino, name, present)
+        r#"INSERT INTO path_map.ref_overrides(revision_id, ino, parent_ino, name, present)
            SELECT ?1, ino, parent_ino, name, present
              FROM delta_stage_ref_overrides ORDER BY ino, parent_ino, name"#,
         [revision_id],
     )?;
     transaction.execute(
-        r#"INSERT INTO owner_count_overrides(revision_id, uid, object_count)
+        r#"INSERT INTO path_map.owner_count_overrides(revision_id, uid, object_count)
            SELECT ?1, uid, object_count
              FROM delta_stage_owner_counts ORDER BY uid"#,
         [revision_id],
@@ -6583,7 +6815,7 @@ fn apply_stored_overrides(
     let mut objects = connection.prepare(
         r#"SELECT ino, present, generation, mode, nlink, uid, gid, rdev,
                   privilege_flags, security_xattr_hash
-             FROM object_overrides WHERE revision_id = ?1 ORDER BY ino"#,
+             FROM path_map.object_overrides WHERE revision_id = ?1 ORDER BY ino"#,
     )?;
     let rows = objects.query_map([revision_id], |row| {
         let ino = decode_sql_u64(row.get_ref(0)?.as_blob()?)?;
@@ -6620,7 +6852,7 @@ fn apply_stored_overrides(
     }
     let mut references = connection.prepare(
         r#"SELECT ino, parent_ino, name, present
-             FROM ref_overrides
+             FROM path_map.ref_overrides
             WHERE revision_id = ?1 ORDER BY ino, parent_ino, name"#,
     )?;
     let rows = references.query_map([revision_id], |row| {
@@ -6752,6 +6984,11 @@ fn update_revision_summary(
     Ok(())
 }
 
+fn allocate_revision_id(transaction: &Transaction<'_>) -> Result<i64, ManagerError> {
+    transaction.execute("INSERT INTO path_map.revision_ids DEFAULT VALUES", [])?;
+    Ok(transaction.last_insert_rowid())
+}
+
 fn insert_checkpoint(
     transaction: &Transaction<'_>,
     revision_id: i64,
@@ -6759,7 +6996,7 @@ fn insert_checkpoint(
 ) -> Result<(), ManagerError> {
     {
         let mut statement = transaction.prepare_cached(
-            "INSERT INTO checkpoint_objects( \
+            "INSERT INTO path_map.checkpoint_objects( \
                  revision_id, ino, generation, mode, nlink, uid, gid, rdev, \
                  privilege_flags, security_xattr_hash \
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -6782,7 +7019,7 @@ fn insert_checkpoint(
     }
     {
         let mut statement = transaction.prepare_cached(
-            "INSERT INTO checkpoint_refs(revision_id, ino, parent_ino, name) \
+            "INSERT INTO path_map.checkpoint_refs(revision_id, ino, parent_ino, name) \
              VALUES (?1, ?2, ?3, ?4)",
         )?;
         for reference in &index.references {
@@ -6804,11 +7041,11 @@ fn replace_checkpoint_owner_counts(
     counts: &BTreeMap<u64, i64>,
 ) -> Result<(), ManagerError> {
     transaction.execute(
-        "DELETE FROM checkpoint_owner_counts WHERE revision_id = ?1",
+        "DELETE FROM path_map.checkpoint_owner_counts WHERE revision_id = ?1",
         [revision_id],
     )?;
     let mut statement = transaction.prepare_cached(
-        "INSERT INTO checkpoint_owner_counts(revision_id, uid, object_count) \
+        "INSERT INTO path_map.checkpoint_owner_counts(revision_id, uid, object_count) \
          VALUES (?1, ?2, ?3)",
     )?;
     for (&uid, &count) in counts {
@@ -7040,6 +7277,46 @@ mod tests {
         assert_eq!(first_fscrypt_path(&target).unwrap(), None);
     }
 
+    #[test]
+    fn projects_disconnected_control_inode_changes_out_of_indexed_delta() {
+        let base = index();
+        let disconnected = ObjectChange {
+            ino: 400,
+            old_generation: Some(401),
+            new_generation: Some(401),
+            change_mask: CHANGE_FILE_DATA,
+        };
+        let tracked = ObjectChange {
+            ino: 300,
+            old_generation: Some(301),
+            new_generation: Some(301),
+            change_mask: CHANGE_FILE_DATA,
+        };
+        let crossing = Reference {
+            ino: 401,
+            parent_ino: ROOT_INO,
+            name: b"new".to_vec(),
+        };
+        let manifest = ChangedObjectsManifest {
+            objects: [(300, tracked), (400, disconnected)].into(),
+            ref_adds: [crossing.clone()].into(),
+            ref_deletes: BTreeSet::new(),
+            raw_ref_adds: 1,
+            raw_ref_deletes: 0,
+        };
+        let target_objects = [(400, object(400, 0o100644, 1))].into();
+
+        let (projected, projected_target_objects) =
+            project_manifest_to_indexed_subset(&base, &manifest, &target_objects);
+
+        assert_eq!(
+            projected.objects.keys().copied().collect::<Vec<_>>(),
+            vec![300]
+        );
+        assert_eq!(projected.ref_adds, [crossing].into());
+        assert!(projected_target_objects.is_empty());
+    }
+
     fn setup() -> (tempfile::TempDir, Store, InitializeRequest) {
         let temp = tempdir().unwrap();
         let metadata = ServiceMetadata {
@@ -7173,7 +7450,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_a_snapshot_descendant_seed_without_sharing_parent_state() {
+    fn finds_a_snapshot_descendant_seed_with_shared_immutable_history() {
         let (temp, mut store, request) = setup();
         let (_reservation, initialized) = initialize_watch(&mut store, &request);
         assert_eq!(
@@ -7181,14 +7458,14 @@ mod tests {
                 .descendant_seed_revision(request.fs_uuid, [4; 16])
                 .unwrap(),
             Some(initialized.revision_id),
-            "a child of the retained baseline snapshot can clone its index"
+            "a child of the retained baseline snapshot can inherit its index"
         );
         assert_eq!(
             store
                 .descendant_seed_revision(request.fs_uuid, request.source_subvol_uuid)
                 .unwrap(),
             Some(initialized.revision_id),
-            "a child of the live watched subvolume can clone its index"
+            "a child of the live watched subvolume can inherit its index"
         );
         let seed_revision_id = store
             .descendant_seed_revision(request.fs_uuid, request.source_subvol_uuid)
@@ -7202,8 +7479,37 @@ mod tests {
             last_boot_id: [22; 16],
             created_ns: 1,
         };
-        let mut child_store =
-            Store::create(&temp.path().join("child-state.sqlite3"), &child_metadata).unwrap();
+        let child_path = temp.path().join("child-state.sqlite3");
+        let mut child_store = Store::create_descendant_seed(
+            &store,
+            &child_path,
+            &child_metadata,
+            seed_revision_id,
+            399,
+            b"/child/inherited-inert-",
+        )
+        .unwrap();
+        assert_eq!(child_store.metadata().unwrap(), child_metadata);
+        assert_eq!(
+            child_store.path_map_path(),
+            store.path_map_path(),
+            "descendants reuse immutable revision payloads without cloning them"
+        );
+        assert_eq!(
+            child_store.load_revision(seed_revision_id).unwrap(),
+            seed_index,
+            "fresh child state resolves the shared parent path-map chain"
+        );
+        assert_eq!(
+            child_store
+                .connection()
+                .query_row("SELECT count(*) FROM watches", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "fresh child state does not copy parent watch state"
+        );
+        assert!(child_store.foreign_key_violations().unwrap().is_empty());
         let mut child_request = request.clone();
         child_request.source_subvol_uuid = [42; 16];
         child_request.source_path = b"/source-descendant".to_vec();
@@ -7233,11 +7539,11 @@ mod tests {
             )
             .unwrap();
         let child = child_store
-            .publish_initial_checkpoint(
+            .publish_initial_inherited_revision(
                 &child_reservation,
                 child_request.lease_owner,
                 &child_snapshot,
-                &seed_index,
+                seed_revision_id,
                 402,
             )
             .unwrap();
@@ -7250,7 +7556,7 @@ mod tests {
         assert_eq!(
             child_store.load_revision(child.revision_id).unwrap(),
             store.load_revision(initialized.revision_id).unwrap(),
-            "descendants publish a copied map into their own checkpoint"
+            "descendants publish an empty overlay over shared immutable history"
         );
         assert_eq!(
             store
@@ -7362,7 +7668,7 @@ mod tests {
         let owner_count: i64 = store
             .connection()
             .query_row(
-                "SELECT object_count FROM checkpoint_owner_counts \
+                "SELECT object_count FROM path_map.checkpoint_owner_counts \
                  WHERE revision_id = ?1 AND uid = ?2",
                 params![initialized.revision_id, encode_u64(1000).as_slice()],
                 |row| row.get(0),
@@ -7954,10 +8260,7 @@ mod tests {
             .unwrap();
         assert_eq!(state, (0, 0, 0));
 
-        let reservation = store.reserve_initialize(&request).unwrap();
-        store
-            .start_initialize_filesystem_effect(&reservation, request.lease_owner, 250)
-            .unwrap();
+        let reservation = store.reserve_initialize_started(&request).unwrap();
         assert_eq!(store.abort_planned_operations(300).unwrap(), 0);
         let state: String = store
             .connection()

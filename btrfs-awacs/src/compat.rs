@@ -40,6 +40,9 @@ pub enum BoundaryKind {
 pub struct Projection {
     pub fresh_instance: bool,
     pub paths: Vec<Vec<u8>>,
+    /// Roots whose descendants may have changed without individual inode
+    /// events, such as a renamed directory subtree.
+    pub prefixes: Vec<Vec<u8>>,
 }
 
 /// Encodes exact immutable-boundary claims in the direct-scan cursor domain.
@@ -95,11 +98,12 @@ pub(crate) fn decode_direct_scan_cursor(
 /// Converts canonical snapshot-comparison events into direct-scan
 /// invalidations.
 ///
-/// Exact path events remain exact. A subtree move names its old and new roots;
-/// JJ's directed scanner can recurse only those roots and preserve unrelated
-/// baseline paths without widening to the whole checkout.
+/// Exact path events remain exact. A subtree move names its old and new roots
+/// as recursive prefixes: descendants keep the same inode references, so the
+/// kernel does not emit one event per moved child.
 pub fn project_events(events: &[Event]) -> Projection {
     let mut paths = BTreeSet::new();
+    let mut prefixes = BTreeSet::new();
     let mut fresh = false;
     for event in events {
         match event.kind {
@@ -109,7 +113,7 @@ pub fn project_events(events: &[Event]) -> Projection {
                     if path.is_empty() {
                         fresh = true;
                     } else {
-                        paths.insert(path.clone());
+                        prefixes.insert(path.clone());
                     }
                 }
             }
@@ -126,11 +130,13 @@ pub fn project_events(events: &[Event]) -> Projection {
         Projection {
             fresh_instance: true,
             paths: vec![b"/".to_vec()],
+            prefixes: Vec::new(),
         }
     } else {
         Projection {
             fresh_instance: false,
             paths: paths.into_iter().collect(),
+            prefixes: prefixes.into_iter().collect(),
         }
     }
 }
@@ -366,19 +372,21 @@ mod tests {
             project_events(&events),
             Projection {
                 fresh_instance: false,
-                paths: vec![b".git/index".to_vec(), b"hardlink".to_vec()]
+                paths: vec![b".git/index".to_vec(), b"hardlink".to_vec()],
+                prefixes: Vec::new(),
             }
         );
     }
 
     #[test]
-    fn subtree_move_projects_its_directed_roots() {
+    fn subtree_move_projects_recursive_roots() {
         let events = vec![event(EventKind::SubtreeMoved, b".jj/repo/op_store")];
         assert_eq!(
             project_events(&events),
             Projection {
                 fresh_instance: false,
-                paths: vec![b".jj/repo/op_store".to_vec()],
+                paths: Vec::new(),
+                prefixes: vec![b".jj/repo/op_store".to_vec()],
             }
         );
     }

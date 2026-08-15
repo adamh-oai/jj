@@ -7,6 +7,13 @@ CREATE TABLE service_metadata (
     created_ns      INTEGER NOT NULL
 );
 
+-- The immutable revision payload lives in a separate append-only database so
+-- descendants can share it without cloning the operational database.
+CREATE TABLE path_map_store (
+    singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+    path            BLOB NOT NULL
+);
+
 CREATE TABLE filesystems (
     id              INTEGER PRIMARY KEY,
     fs_uuid         BLOB NOT NULL UNIQUE CHECK (length(fs_uuid) = 16)

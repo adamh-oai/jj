@@ -48,6 +48,7 @@ use std::sync::mpsc::sync_channel;
 use std::thread::JoinHandle;
 #[cfg(debug_assertions)]
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use either::Either;
@@ -2184,7 +2185,7 @@ impl TreeState {
         if had_committed_awacs_baseline && scan_scope.requires_full_traversal() {
             return Err(SnapshotError::Other {
                 message: "Snapshot-backed working copy refused a full scan".to_owned(),
-                err: "AWACS could not prove an incremental delta from the committed baseline; run jj util subvolume enable to rebuild the committed baseline explicitly".into(),
+                err: "AWACS could not prove an incremental delta from the committed baseline; run jj util subvolume enable --rebuild-baseline to rebuild the committed baseline explicitly".into(),
             });
         }
         let mut scan_root_base_ignores = base_ignores.clone();
@@ -2601,6 +2602,38 @@ impl TreeState {
             completion,
             warning,
         })
+    }
+
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    async fn seed_awacs_baseline_without_scan(
+        &mut self,
+        input_fingerprint: [u8; 32],
+    ) -> Result<Option<PendingScan>, SnapshotError> {
+        if self.journal_phase
+            != crate::protos::local_working_copy::WorkingCopyStatePhase::NoBaseline
+            || self.baseline.is_some()
+        {
+            return Err(SnapshotError::Other {
+                message: "Failed to seed AWACS snapshot baseline".to_owned(),
+                err: "working copy already has a committed baseline".into(),
+            });
+        }
+        let SnapshotScan {
+            fsmonitor_cursor,
+            baseline,
+            completion,
+            ..
+        } = self
+            .make_snapshot_scan(&self.fsmonitor_settings, Some(input_fingerprint))
+            .await?;
+        if baseline.is_none() || completion.is_none() {
+            return Err(SnapshotError::Other {
+                message: "Failed to seed AWACS snapshot baseline".to_owned(),
+                err: "snapshot-backed worktree requires an authoritative AWACS lease".into(),
+            });
+        }
+        self.publish_scan_baseline(fsmonitor_cursor, baseline);
+        Ok(completion)
     }
 }
 
@@ -4629,18 +4662,25 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             self.tree_state_dirty
                 || self.old_tree.tree_ids_and_labels() == self.wc.tree()?.tree_ids_and_labels()
         );
-        if let Some(pending_scan) = self.pending_scan.as_mut()
-            && let Err(err) = pending_scan.prepare_to_commit()
-        {
-            // The tree produced from the immutable scan is still useful, but
-            // its cursor is no longer safe to persist. Abort the accepted
-            // lease and save the tree without a cursor so the next snapshot
-            // must request Full.
-            tracing::warn!(
-                ?err,
-                "AWACS scan lease failed before tree-state commit; clearing cursor"
+        if let Some(pending_scan) = self.pending_scan.as_mut() {
+            let started = Instant::now();
+            let result = pending_scan.prepare_to_commit();
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                succeeded = result.is_ok(),
+                "prepared pending filesystem-monitor scan for commit"
             );
-            self.abort_pending_scan()?;
+            if let Err(err) = result {
+                // The tree produced from the immutable scan is still useful,
+                // but its cursor is no longer safe to persist. Abort the
+                // accepted lease and save the tree without a cursor so the
+                // next snapshot must request Full.
+                tracing::warn!(
+                    ?err,
+                    "AWACS scan lease failed before tree-state commit; clearing cursor"
+                );
+                self.abort_pending_scan()?;
+            }
         }
         if self.old_operation_id != operation_id || self.new_workspace_name.is_some() {
             self.wc.checkout_state.operation_id = operation_id;
@@ -4649,21 +4689,36 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             }
             self.tree_state_dirty = true;
         }
-        if self.tree_state_dirty
-            && let Err(err) = self.wc.save_working_copy_state()
-        {
-            self.abort_pending_scan()?;
-            return Err(err);
-        }
-        if let Some(pending_scan) = self.pending_scan.take()
-            && let Err(err) = pending_scan.finish(ScanOutcome::Committed)
-        {
-            // Tree state already durably contains the cursor. Completion is
-            // cleanup only; a failed response is retried or expires server-side.
-            tracing::warn!(
-                ?err,
-                "failed to finish committed filesystem-monitor scan session"
+        if self.tree_state_dirty {
+            let started = Instant::now();
+            let result = self.wc.save_working_copy_state();
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                succeeded = result.is_ok(),
+                "saved working-copy state"
             );
+            if let Err(err) = result {
+                self.abort_pending_scan()?;
+                return Err(err);
+            }
+        }
+        if let Some(pending_scan) = self.pending_scan.take() {
+            let started = Instant::now();
+            let result = pending_scan.finish(ScanOutcome::Committed);
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                succeeded = result.is_ok(),
+                "finished committed filesystem-monitor scan session"
+            );
+            if let Err(err) = result {
+                // Tree state already durably contains the cursor. Completion
+                // is cleanup only; a failed response is retried or expires
+                // server-side.
+                tracing::warn!(
+                    ?err,
+                    "failed to finish committed filesystem-monitor scan session"
+                );
+            }
         }
         // TODO: Clear the "pending_checkout" file here.
         Ok(Box::new(LocalWorkingCopy {
@@ -4831,6 +4886,82 @@ pub async fn seed_local_working_copy_tree(
     // reset() deliberately rewrites the physical tracked-path baseline
     // without changing the semantic commit. Mark that state transition so
     // finish() does not mistake it for an unchecked semantic tree rewrite.
+    snapshot.tree_state_dirty = true;
+    Ok(true)
+}
+
+/// Publishes an AWACS baseline for a tree that the caller has already proved
+/// matches the immutable child snapshot, without traversing that snapshot.
+///
+/// Snapshot-backed workspace creation first clones the parent's path map into
+/// an independent child AWACS store and seeds the copied semantic tree into
+/// the child journal. At that point a full filesystem walk would only
+/// rediscover the same tree. This helper asks AWACS for an immutable child
+/// cursor, records it beside the already-seeded tree, and leaves normal later
+/// snapshots to consume incremental deltas.
+///
+/// The caller must use this only before any user-visible child mutation can
+/// occur. It is not a general way to bless arbitrary working-copy state.
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+pub async fn seed_local_working_copy_awacs_baseline(
+    locked: &mut dyn LockedWorkingCopy,
+    input_fingerprint: [u8; 32],
+) -> Result<bool, SnapshotError> {
+    let Some(snapshot) = locked.downcast_mut::<LockedLocalWorkingCopy>() else {
+        return Ok(false);
+    };
+    snapshot.abort_pending_scan()?;
+    let completion = snapshot
+        .wc
+        .tree_state_mut()?
+        .seed_awacs_baseline_without_scan(input_fingerprint)
+        .await?;
+    snapshot.pending_scan = completion;
+    snapshot.tree_state_dirty = true;
+    Ok(true)
+}
+
+/// Publishes the already-created child AWACS snapshot as the first local
+/// baseline without asking AWACS for a redundant second cut.
+///
+/// Snapshot workspace creation has just cloned the parent's path map and
+/// published an inherited child revision for this exact immutable snapshot.
+/// The local journal only needs to bind that snapshot identity to the
+/// already-seeded semantic tree. Later direct scans consume the identity and
+/// obtain a fresh authenticated cursor with their next cut.
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+pub async fn seed_local_working_copy_initialized_awacs_baseline(
+    locked: &mut dyn LockedWorkingCopy,
+    snapshot_identity: &btrfs_awacs::manager::SnapshotIdentity,
+    input_fingerprint: [u8; 32],
+) -> Result<bool, SnapshotError> {
+    let Some(snapshot) = locked.downcast_mut::<LockedLocalWorkingCopy>() else {
+        return Ok(false);
+    };
+    snapshot.abort_pending_scan()?;
+    let tree_state = snapshot.wc.tree_state_mut()?;
+    if tree_state.journal_phase
+        != crate::protos::local_working_copy::WorkingCopyStatePhase::NoBaseline
+        || tree_state.baseline.is_some()
+    {
+        return Err(SnapshotError::Other {
+            message: "Failed to seed initialized AWACS snapshot baseline".to_owned(),
+            err: "working copy already has a committed baseline".into(),
+        });
+    }
+    // Direct AWACS scans key replay from the retained snapshot identity. This
+    // non-empty marker distinguishes the bootstrap handoff from an absent
+    // baseline; the next scan replaces it with its authenticated cursor.
+    let mut continuity_token = b"c:btrfs-awacs:initialized:1:".to_vec();
+    continuity_token.extend_from_slice(&snapshot_identity.subvol_uuid);
+    let baseline = crate::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: snapshot_identity.fs_uuid.to_vec(),
+        subvolume_uuid: snapshot_identity.subvol_uuid.to_vec(),
+        continuity_token,
+        retention_token: tree_state.awacs_baseline_owner_id.clone(),
+        interpretation_input_fingerprint: input_fingerprint.to_vec(),
+    };
+    tree_state.publish_scan_baseline(None, Some(baseline));
     snapshot.tree_state_dirty = true;
     Ok(true)
 }

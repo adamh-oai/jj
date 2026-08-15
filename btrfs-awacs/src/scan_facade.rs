@@ -5,9 +5,8 @@ use crate::btrfs::{filesystem_info, subvolume_info};
 use crate::facade::{FacadeService, PreparedQueryResult};
 use crate::manager::{PERMISSION_CUT, PERMISSION_READ};
 use crate::scan::{
-    BeginScanRequest, Invalidation, ScanClient, ScanError, ScanErrorKind, ScanOutcome,
-    ScanRequestHandler, ScanSession, ServerSnapshotLease, SnapshotBaseline, SnapshotIdentity,
-    SnapshotLease,
+    BeginScanRequest, Invalidation, ScanClient, ScanError, ScanErrorKind, ScanOutcome, ScanSession,
+    SnapshotBaseline, SnapshotIdentity, SnapshotLease,
 };
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -18,21 +17,21 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const SCAN_TTL_NS: i64 = 300_000_000_000;
 #[cfg(debug_assertions)]
 const TEST_SHORT_SCAN_TTL_NS: i64 = 300_000_000;
 
-/// Direct in-process scan client for the daemon-free transition.
+/// Direct in-process scan client.
 ///
 /// The current facade/store implementation still owns the richer historical
-/// manager schema, but callers no longer need a persistent namespace daemon
-/// or scan socket. Every operation opens the root's initialized state in this
+/// manager schema, but callers do not need a persistent user process or scan
+/// socket. Every operation opens the root's initialized state in this
 /// process and serializes publication through a per-root filesystem lock.
 pub struct DirectScanClient {
-    handler: Arc<Mutex<FacadeScanHandler>>,
+    handler: Arc<Mutex<DirectScanHandler>>,
     root_lock: Arc<File>,
 }
 
@@ -63,7 +62,7 @@ impl DirectScanClient {
         };
         let facade = Arc::new(Mutex::new(FacadeService::new(service)));
         Ok(Self {
-            handler: Arc::new(Mutex::new(FacadeScanHandler::new_direct(
+            handler: Arc::new(Mutex::new(DirectScanHandler::new(
                 facade,
                 unsafe { libc::geteuid() },
                 unsafe { libc::getegid() },
@@ -85,7 +84,7 @@ impl ScanClient for DirectScanClient {
             .lock()
             .map_err(|_| other("AWACS direct scan handler lock poisoned"))?
             .begin_scan(request.clone())?;
-        let ServerSnapshotLease {
+        let PreparedScanLease {
             session_id,
             next_baseline,
             invalidation,
@@ -115,7 +114,7 @@ impl ScanClient for DirectScanClient {
 }
 
 struct DirectScanSession {
-    handler: Arc<Mutex<FacadeScanHandler>>,
+    handler: Arc<Mutex<DirectScanHandler>>,
     root_lock: Arc<File>,
     session_id: Vec<u8>,
 }
@@ -178,17 +177,15 @@ impl Drop for RootLockGuard<'_> {
     }
 }
 
-/// Durable direct-scan handler sharing one root-aware snapshot facade.
+/// In-process direct-scan handler sharing one root-aware snapshot facade.
 ///
 /// Direct continuity tokens wrap the existing authenticated cut claims under a
 /// distinct scan domain. Exact replay is accepted only when the facade can
 /// retain that same cut sequence and target snapshot UUID.
-pub struct FacadeScanHandler {
+pub struct DirectScanHandler {
     facade: Arc<Mutex<FacadeService>>,
-    precision_marker_directory: Option<PathBuf>,
     requester_uid: u32,
     requester_gid: u32,
-    retain_consumer_baselines: bool,
     sessions: HashMap<Vec<u8>, ActiveScanSession>,
     finished_sessions: HashMap<Vec<u8>, i64>,
     #[cfg(debug_assertions)]
@@ -197,48 +194,26 @@ pub struct FacadeScanHandler {
 
 struct ActiveScanSession {
     prepared: PreparedQueryResult,
-    baseline_owner_id: [u8; 16],
-    staged: bool,
     expires_ns: i64,
 }
 
-impl FacadeScanHandler {
-    /// Creates a direct handler which registers each exact requested root on
-    /// demand in the namespace daemon's shared facade.
-    pub fn new(
-        facade: Arc<Mutex<FacadeService>>,
-        precision_marker_directory: Option<PathBuf>,
-        requester_uid: u32,
-        requester_gid: u32,
-    ) -> Self {
-        Self {
-            facade,
-            precision_marker_directory,
-            requester_uid,
-            requester_gid,
-            retain_consumer_baselines: true,
-            sessions: HashMap::new(),
-            finished_sessions: HashMap::new(),
-            #[cfg(debug_assertions)]
-            test_control_dir: std::env::var_os("BTRFS_AWACS_SCAN_TEST_CONTROL_DIR")
-                .map(PathBuf::from),
-        }
-    }
+struct PreparedScanLease {
+    session_id: Vec<u8>,
+    next_baseline: SnapshotBaseline,
+    invalidation: Invalidation,
+    expires_boottime_ns: u64,
+    scan_root: File,
+}
 
-    /// Creates the daemon-free variant. Logical cursor replay replaces
+impl DirectScanHandler {
+    /// Creates the embedded direct handler. Logical cursor replay replaces
     /// durable per-consumer snapshot pins, so completed scans need not retain
     /// old physical snapshots.
-    pub fn new_direct(
-        facade: Arc<Mutex<FacadeService>>,
-        requester_uid: u32,
-        requester_gid: u32,
-    ) -> Self {
+    pub fn new(facade: Arc<Mutex<FacadeService>>, requester_uid: u32, requester_gid: u32) -> Self {
         Self {
             facade,
-            precision_marker_directory: None,
             requester_uid,
             requester_gid,
-            retain_consumer_baselines: false,
             sessions: HashMap::new(),
             finished_sessions: HashMap::new(),
             #[cfg(debug_assertions)]
@@ -248,13 +223,12 @@ impl FacadeScanHandler {
     }
 
     /// Canonicalizes, authorizes, and activates one requested root for this
-    /// daemon lifetime. Durable watch state remains in the manager store; the
+    /// process. Durable watch state remains in the manager store; the
     /// in-memory facade view is rebuilt lazily when a root is first scanned.
     fn ensure_registered_root(
         &self,
         facade: &mut FacadeService,
         requested_root: &Path,
-        now_ns: i64,
     ) -> Result<(PathBuf, [u8; 16]), ScanError> {
         let root = std::fs::canonicalize(requested_root)
             .map_err(|err| unavailable(format!("canonicalize AWACS scan root: {err}")))?;
@@ -313,17 +287,6 @@ impl FacadeScanHandler {
             None => facade
                 .activate(watch_id, grant_id, &root)
                 .map_err(|err| other(format!("activate AWACS scan root: {err}")))?,
-        }
-        if let Some(marker_directory) = &self.precision_marker_directory
-            && !facade.has_precision_guard(watch_id)
-            && let Err(err) = facade.activate_precision_guard(watch_id, marker_directory, now_ns)
-        {
-            // The optional journal may improve invalidation precision,
-            // but snapshot-correct full invalidation remains available.
-            eprintln!(
-                "btrfs-awacs: precision guard unavailable for {}: {err}; using snapshot-only invalidation",
-                root.display()
-            );
         }
         Ok((root, watch_id))
     }
@@ -432,8 +395,8 @@ impl FacadeScanHandler {
     }
 }
 
-impl ScanRequestHandler for FacadeScanHandler {
-    fn begin_scan(&mut self, request: BeginScanRequest) -> Result<ServerSnapshotLease, ScanError> {
+impl DirectScanHandler {
+    fn begin_scan(&mut self, request: BeginScanRequest) -> Result<PreparedScanLease, ScanError> {
         let now_ns = unix_time_ns()?;
         let ttl_ns = self.scan_ttl_ns();
         self.expire_sessions(now_ns)?;
@@ -441,26 +404,11 @@ impl ScanRequestHandler for FacadeScanHandler {
             .facade
             .lock()
             .map_err(|_| other("AWACS facade lock poisoned"))?;
-        // The socket is shared by one mount namespace, but each direct scan
-        // remains bound to the caller's exact canonical root.
+        // Every direct scan remains bound to the caller's exact canonical
+        // root.
         let (_requested_root, watch_id) =
-            self.ensure_registered_root(&mut facade, &request.live_root, now_ns)?;
-        let previous_baseline = if self.retain_consumer_baselines {
-            if facade
-                .reconcile_consumer_baseline(
-                    watch_id,
-                    request.baseline_owner_id,
-                    request.previous_baseline.as_ref(),
-                )
-                .map_err(|err| other(format!("reconcile AWACS baseline owner: {err}")))?
-            {
-                request.previous_baseline.as_ref()
-            } else {
-                None
-            }
-        } else {
-            request.previous_baseline.as_ref()
-        };
+            self.ensure_registered_root(&mut facade, &request.live_root)?;
+        let previous_baseline = request.previous_baseline.as_ref();
         // Root registration and the first cut can lazily index a large
         // checkout. While this synchronous Begin request still owns the
         // socket, keep its preparation fence non-expiring. Once the response
@@ -533,12 +481,10 @@ impl ScanRequestHandler for FacadeScanHandler {
             session_id.clone(),
             ActiveScanSession {
                 prepared,
-                baseline_owner_id: request.baseline_owner_id,
-                staged: false,
                 expires_ns,
             },
         );
-        Ok(ServerSnapshotLease {
+        Ok(PreparedScanLease {
             session_id,
             next_baseline: SnapshotBaseline {
                 identity,
@@ -566,12 +512,9 @@ impl ScanRequestHandler for FacadeScanHandler {
             .facade
             .lock()
             .map_err(|_| other("AWACS facade lock poisoned"))?;
-        let renewal = if self.retain_consumer_baselines {
-            facade.renew_query_response(&session.prepared, now_ns, SCAN_TTL_NS)
-        } else {
-            facade.renew_query_response_direct(&session.prepared, now_ns, SCAN_TTL_NS)
-        };
-        renewal.map_err(|err| ScanError::new(ScanErrorKind::LeaseExpired, err.to_string()))?;
+        facade
+            .renew_query_response_direct(&session.prepared, now_ns, SCAN_TTL_NS)
+            .map_err(|err| ScanError::new(ScanErrorKind::LeaseExpired, err.to_string()))?;
         session.expires_ns = now_ns
             .checked_add(SCAN_TTL_NS)
             .ok_or_else(|| other("AWACS scan lease expiration overflow"))?;
@@ -581,25 +524,13 @@ impl ScanRequestHandler for FacadeScanHandler {
     fn promote_scan(&mut self, session_id: &[u8]) -> Result<(), ScanError> {
         let now_ns = unix_time_ns()?;
         self.expire_sessions(now_ns)?;
-        let session = self
-            .sessions
-            .get_mut(session_id)
+        self.sessions
+            .get(session_id)
             .ok_or_else(|| ScanError::new(ScanErrorKind::LeaseExpired, "unknown AWACS session"))?;
-        if session.staged {
-            return Ok(());
-        }
-        if self.retain_consumer_baselines {
-            self.facade
-                .lock()
-                .map_err(|_| other("AWACS facade lock poisoned"))?
-                .stage_consumer_baseline(&session.prepared, session.baseline_owner_id)
-                .map_err(|err| other(format!("stage AWACS consumer baseline: {err}")))?;
-        }
-        session.staged = true;
         Ok(())
     }
 
-    fn finish_scan(&mut self, session_id: &[u8], outcome: ScanOutcome) -> Result<(), ScanError> {
+    fn finish_scan(&mut self, session_id: &[u8], _outcome: ScanOutcome) -> Result<(), ScanError> {
         let now_ns = unix_time_ns()?;
         self.expire_sessions(now_ns)?;
         if self.finished_sessions.contains_key(session_id) {
@@ -613,37 +544,36 @@ impl ScanRequestHandler for FacadeScanHandler {
             .facade
             .lock()
             .map_err(|_| other("AWACS facade lock poisoned"))?;
-        if session.staged && self.retain_consumer_baselines {
-            facade
-                .finish_consumer_baseline(
-                    session.baseline_owner_id,
-                    outcome == ScanOutcome::Committed,
-                )
-                .map_err(|err| other(format!("finish AWACS consumer baseline: {err}")))?;
-        }
-        if !self.retain_consumer_baselines {
-            facade
-                .release_historical_boundary_snapshots(&session.prepared)
-                .map_err(|err| other(format!("release AWACS historical snapshots: {err}")))?;
-        }
-        let finish = if self.retain_consumer_baselines {
-            facade.finish_query_response(session.prepared)
-        } else {
-            facade.finish_query_response_direct(session.prepared)
-        };
-        finish
+        let release_started = Instant::now();
+        facade
+            .release_historical_boundary_snapshots(&session.prepared)
+            .map_err(|err| other(format!("release AWACS historical snapshots: {err}")))?;
+        log::debug!(
+            "AWACS direct scan phase completed: phase=release historical boundaries elapsed={:?}",
+            release_started.elapsed()
+        );
+        let finish_started = Instant::now();
+        facade
+            .finish_query_response_direct(session.prepared)
             .map(|_| ())
             .map_err(|err| other(format!("finish AWACS scan lease: {err}")))?;
-        if !self.retain_consumer_baselines {
-            // The daemon-free path retains cursor replay through adjacent
-            // event rows, not physical baseline snapshots. Once this
-            // in-process scan drops its query fence, collect any older
-            // snapshot which is no longer the indexed head.
-            facade
-                .service_mut()
-                .garbage_collect_direct(now_ns, 64)
-                .map_err(|err| other(format!("collect completed AWACS scan: {err}")))?;
-        }
+        log::debug!(
+            "AWACS direct scan phase completed: phase=finish query response elapsed={:?}",
+            finish_started.elapsed()
+        );
+        // Direct scans retain cursor replay through adjacent event rows, not
+        // physical baseline snapshots. Once this in-process scan drops its
+        // query fence, collect any older snapshot which is no longer the
+        // indexed head.
+        let gc_started = Instant::now();
+        let deleted_snapshots = facade
+            .service_mut()
+            .garbage_collect_direct(now_ns, 64)
+            .map_err(|err| other(format!("collect completed AWACS scan: {err}")))?;
+        log::debug!(
+            "AWACS direct scan phase completed: phase=garbage collect direct elapsed={:?} deleted_snapshots={deleted_snapshots}",
+            gc_started.elapsed()
+        );
         let tombstone_expires_ns = now_ns
             .checked_add(SCAN_TTL_NS)
             .ok_or_else(|| other("AWACS finish tombstone expiration overflow"))?;
@@ -652,26 +582,24 @@ impl ScanRequestHandler for FacadeScanHandler {
         Ok(())
     }
 
-    fn release_baseline(&mut self, baseline_owner_id: [u8; 16]) -> Result<(), ScanError> {
+    fn release_baseline(&mut self, _baseline_owner_id: [u8; 16]) -> Result<(), ScanError> {
         let now_ns = unix_time_ns()?;
         self.expire_sessions(now_ns)?;
         let mut facade = self
             .facade
             .lock()
             .map_err(|_| other("AWACS facade lock poisoned"))?;
-        if self.retain_consumer_baselines {
-            facade
-                .release_consumer_baseline(baseline_owner_id)
-                .map_err(|err| other(format!("release AWACS consumer baseline: {err}")))?;
-        }
-        // Releasing the last owner makes older cuts immediately collectible.
-        // The background worker remains the crash-recovery path, but a mode
-        // switch should not leave an avoidable stack of read-only snapshots
-        // behind until its next 30-second tick.
-        facade
+        // A mode switch should not leave an avoidable stack of read-only
+        // snapshots behind until the next direct caller.
+        let gc_started = Instant::now();
+        let deleted_snapshots = facade
             .service_mut()
             .garbage_collect_direct(now_ns, 64)
             .map_err(|err| other(format!("collect released AWACS snapshots: {err}")))?;
+        log::debug!(
+            "AWACS direct scan phase completed: phase=garbage collect released baseline elapsed={:?} deleted_snapshots={deleted_snapshots}",
+            gc_started.elapsed()
+        );
         Ok(())
     }
 }
@@ -680,16 +608,33 @@ fn direct_invalidation(projection: &crate::compat::Projection) -> Invalidation {
     if projection.fresh_instance {
         return Invalidation::Full;
     }
-    let mut paths = Vec::with_capacity(projection.paths.len());
-    for path in &projection.paths {
+    let normalize = |path: &[u8]| {
         // Index events are already repository-relative. Accept the old
         // slash-prefixed representation as a compatibility input, but do not
         // turn a valid relative delta into a full invalidation.
         let path = path.strip_prefix(b"/").unwrap_or(path);
         if path.is_empty() {
-            return Invalidation::Full;
+            None
+        } else {
+            Some(path.to_vec())
         }
-        paths.push(path.to_vec());
+    };
+    if !projection.prefixes.is_empty() {
+        let mut prefixes = Vec::with_capacity(projection.paths.len() + projection.prefixes.len());
+        for path in projection.prefixes.iter().chain(&projection.paths) {
+            let Some(path) = normalize(path) else {
+                return Invalidation::Full;
+            };
+            prefixes.push(path);
+        }
+        return Invalidation::Prefixes(prefixes);
+    }
+    let mut paths = Vec::with_capacity(projection.paths.len());
+    for path in &projection.paths {
+        let Some(path) = normalize(path) else {
+            return Invalidation::Full;
+        };
+        paths.push(path);
     }
     Invalidation::ExactPaths(paths)
 }
@@ -730,6 +675,7 @@ mod tests {
         let projection = crate::compat::Projection {
             fresh_instance: false,
             paths: vec![b"dir/file".to_vec(), b"name".to_vec()],
+            prefixes: Vec::new(),
         };
         assert_eq!(
             direct_invalidation(&projection),
@@ -739,6 +685,7 @@ mod tests {
             direct_invalidation(&crate::compat::Projection {
                 fresh_instance: false,
                 paths: vec![b"/compat".to_vec()],
+                prefixes: Vec::new(),
             }),
             Invalidation::ExactPaths(vec![b"compat".to_vec()])
         );
@@ -746,8 +693,17 @@ mod tests {
             direct_invalidation(&crate::compat::Projection {
                 fresh_instance: false,
                 paths: vec![b"/".to_vec()],
+                prefixes: Vec::new(),
             }),
             Invalidation::Full
+        );
+        assert_eq!(
+            direct_invalidation(&crate::compat::Projection {
+                fresh_instance: false,
+                paths: vec![b"exact".to_vec()],
+                prefixes: vec![b"moved".to_vec()],
+            }),
+            Invalidation::Prefixes(vec![b"moved".to_vec(), b"exact".to_vec()])
         );
     }
 }

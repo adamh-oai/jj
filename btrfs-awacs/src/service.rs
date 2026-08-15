@@ -5,7 +5,7 @@
 
 use crate::broker::{
     ChangedObjectsExecution, ChangedObjectsResult, ExpectedSubvolume, MAX_CHANGED_OBJECT_OUTPUT,
-    SeqPacket,
+    NestedSubvolumesExecution, SeqPacket,
 };
 use crate::broker_protocol::{BrokerClient, BrokerDispatcher};
 use crate::btrfs::{
@@ -39,6 +39,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -72,6 +73,7 @@ struct SnapshotIndexResult {
 enum InitialIndexSource<'a> {
     Walk(&'a mut dyn FnMut(SnapshotWalkProgress)),
     Clone(Index),
+    InheritedRevision(i64),
 }
 
 const DEFAULT_LEASE_NS: i64 = 300_000_000_000;
@@ -330,6 +332,37 @@ impl Service {
         OpenedSubvolume::open(path).map_err(|error| ServiceError::context("open subvolume", error))
     }
 
+    fn reject_nested_subvolumes(
+        &self,
+        path: &Path,
+        expected: &ExpectedSubvolume,
+        fd: BorrowedFd<'_>,
+    ) -> Result<(), ServiceError> {
+        let started = Instant::now();
+        let has_nested = self
+            .broker
+            .has_nested_subvolumes(
+                &NestedSubvolumesExecution {
+                    target: expected.clone(),
+                },
+                fd,
+            )
+            .map_err(|error| ServiceError::context("query nested subvolumes", error))?;
+        log::debug!(
+            "AWACS immutable snapshot topology query completed: root={} elapsed={:?} has_nested_subvolumes={}",
+            path.display(),
+            started.elapsed(),
+            has_nested
+        );
+        if has_nested {
+            return Err(ServiceError::new(format!(
+                "immutable snapshot contains nested subvolume under {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(mut store: Store, config: ServiceConfig) -> Result<Self, ServiceError> {
         if config.broker_socket.is_some() {
             return Err(ServiceError::new(
@@ -545,13 +578,17 @@ impl Service {
                         ServiceError::context("record recovered initialize snapshot", error)
                     })?
             };
-            reject_nested_subvolumes(&operation.reserved_path)?;
             let snapshot_fd = self
                 .open_subvolume(&operation.reserved_path)
                 .map_err(|error| ServiceError::context("open recovered snapshot", error))?;
             let expected =
                 ExpectedSubvolume::from_observed(&snapshot_fd.filesystem, &snapshot_fd.subvolume);
             verify_recorded_snapshot(&recorded.identity, &expected)?;
+            self.reject_nested_subvolumes(
+                &operation.reserved_path,
+                &expected,
+                snapshot_fd.as_fd(),
+            )?;
             let full_index =
                 self.snapshot_full_index(&expected, snapshot_fd.as_fd(), &operation.live_path)?;
             self.store
@@ -998,6 +1035,21 @@ impl Service {
         self.initialize_with_index_source(source_path, options, InitialIndexSource::Clone(index))
     }
 
+    /// Creates the first child snapshot while retaining an already-shared
+    /// immutable path-map revision chain as its storage base.
+    pub fn initialize_with_inherited_revision(
+        &mut self,
+        source_path: &Path,
+        options: &InitializeOptions,
+        seed_revision_id: i64,
+    ) -> Result<InitializedWatch, ServiceError> {
+        self.initialize_with_index_source(
+            source_path,
+            options,
+            InitialIndexSource::InheritedRevision(seed_revision_id),
+        )
+    }
+
     fn initialize_with_index_source(
         &mut self,
         source_path: &Path,
@@ -1035,13 +1087,16 @@ impl Service {
         };
         let reservation = self
             .store
-            .reserve_initialize(&request)
-            .map_err(|error| ServiceError::context("reserve initialize", error))?;
-        self.store
-            .start_initialize_filesystem_effect(&reservation, self.lease_owner, options.now_ns)
-            .map_err(|error| ServiceError::context("start initialize effect", error))?;
+            .reserve_initialize_started(&request)
+            .map_err(|error| ServiceError::context("reserve initialize effect", error))?;
 
+        let phase_started = Instant::now();
         let snapshot = self.create_snapshot(&source, &destination_name, true)?;
+        log::debug!(
+            "AWACS initialize phase completed: source={} phase=create managed snapshot elapsed={:?}",
+            canonical_source.display(),
+            phase_started.elapsed()
+        );
         if self.config.fault_after_initialize_snapshot {
             return Err(ServiceError::new(
                 "injected failure after initialize snapshot effect",
@@ -1056,10 +1111,15 @@ impl Service {
             .store
             .record_initialize_snapshot(&reservation, self.lease_owner, &identity, options.now_ns)
             .map_err(|error| ServiceError::context("record initialize snapshot", error))?;
-        reject_nested_subvolumes(&destination_path)?;
+        let phase_started = Instant::now();
         let snapshot_fd = self
             .open_subvolume(&destination_path)
             .map_err(|error| ServiceError::context("reopen initialize snapshot", error))?;
+        log::debug!(
+            "AWACS initialize phase completed: source={} phase=reopen managed snapshot elapsed={:?}",
+            canonical_source.display(),
+            phase_started.elapsed()
+        );
         let expected =
             ExpectedSubvolume::from_observed(&snapshot_fd.filesystem, &snapshot_fd.subvolume);
         if expected != snapshot {
@@ -1067,6 +1127,13 @@ impl Service {
                 "initialize snapshot identity changed before indexing",
             ));
         }
+        let phase_started = Instant::now();
+        self.reject_nested_subvolumes(&destination_path, &expected, snapshot_fd.as_fd())?;
+        log::debug!(
+            "AWACS initialize phase completed: source={} phase=check managed snapshot topology elapsed={:?}",
+            canonical_source.display(),
+            phase_started.elapsed()
+        );
         let full_index = match index_source {
             InitialIndexSource::Walk(progress) => self.snapshot_full_index_with_progress(
                 &expected,
@@ -1075,6 +1142,27 @@ impl Service {
                 progress,
             )?,
             InitialIndexSource::Clone(index) => SnapshotIndexResult { index },
+            InitialIndexSource::InheritedRevision(seed_revision_id) => {
+                let phase_started = Instant::now();
+                let initialized = self
+                    .store
+                    .publish_initial_inherited_revision(
+                        &reservation,
+                        self.lease_owner,
+                        &recorded,
+                        seed_revision_id,
+                        options.now_ns,
+                    )
+                    .map_err(|error| {
+                        ServiceError::context("publish inherited initial checkpoint", error)
+                    })?;
+                log::debug!(
+                    "AWACS initialize phase completed: source={} phase=publish inherited revision metadata elapsed={:?}",
+                    canonical_source.display(),
+                    phase_started.elapsed()
+                );
+                return Ok(initialized);
+            }
         };
         self.store
             .publish_initial_checkpoint(
@@ -1481,7 +1569,11 @@ impl Service {
             // fail-closed namespace scan for them.
             if parsed.target_objects.is_none() {
                 let nested_scan_started = std::time::Instant::now();
-                reject_nested_subvolumes(&completion.destination_path)?;
+                self.reject_nested_subvolumes(
+                    &completion.destination_path,
+                    &target_expected,
+                    target_fd.as_fd(),
+                )?;
                 tracing::info!(
                     elapsed_ms = nested_scan_started.elapsed().as_millis() as u64,
                     "query cut legacy nested-subvolume scan completed"
@@ -1578,12 +1670,21 @@ impl Service {
                 Err(error)
             }
             Err(incremental_error) => {
+                tracing::warn!(
+                    error = %incremental_error,
+                    elapsed_ms = finish_cut_started.elapsed().as_millis() as u64,
+                    "query cut incremental publication failed; falling back to a full snapshot index"
+                );
                 let full_index = (|| -> Result<SnapshotIndexResult, ServiceError> {
                     discard_private_spool(&spool_path)?;
                     // The userspace snapshot walk also certifies nested
                     // subvolume boundaries. This scan is redundant for v2,
                     // but is required before accepting a possible legacy fallback.
-                    if let Err(error) = reject_nested_subvolumes(&completion.destination_path) {
+                    if let Err(error) = self.reject_nested_subvolumes(
+                        &completion.destination_path,
+                        &target_expected,
+                        target_fd.as_fd(),
+                    ) {
                         if !physical_published && is_nested_subvolume_rejection(&error) {
                             let message = format!(
                                 "incremental cut failed: {incremental_error}; full snapshot index rejected target: {error}"
@@ -2226,35 +2327,6 @@ fn reject_managed_descendant(source: &Path, managed: &Path) -> Result<(), Servic
         return Err(ServiceError::new(
             "managed snapshot directory must not be inside the watched source",
         ));
-    }
-    Ok(())
-}
-
-fn reject_nested_subvolumes(root: &Path) -> Result<(), ServiceError> {
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)
-            .map_err(|error| ServiceError::context("scan immutable snapshot", error))?
-        {
-            let entry =
-                entry.map_err(|error| ServiceError::context("read snapshot entry", error))?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| ServiceError::context("read snapshot entry type", error))?;
-            if file_type.is_symlink() || !file_type.is_dir() {
-                continue;
-            }
-            let metadata = entry
-                .metadata()
-                .map_err(|error| ServiceError::context("stat snapshot directory", error))?;
-            if metadata.ino() == crate::btrfs::ROOT_INODE {
-                return Err(ServiceError::new(format!(
-                    "immutable snapshot contains nested subvolume {}",
-                    entry.path().display()
-                )));
-            }
-            pending.push(entry.path());
-        }
     }
     Ok(())
 }

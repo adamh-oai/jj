@@ -6,13 +6,10 @@ use crate::compat::{
 use crate::manager::{FacadeActivation, QueryLeaseReservation};
 use crate::namespace::NamespaceMonitor;
 use crate::namespace::ViewBinding;
-use crate::precision::PrecisionGuard;
 use crate::service::{ChangesOptions, Service};
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fmt;
-use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -40,7 +37,6 @@ struct ActiveView {
     authorization_id: [u8; 16],
     activation: FacadeActivation,
     monitor: NamespaceMonitor,
-    precision: Option<PrecisionGuard>,
 }
 
 pub struct FacadeService {
@@ -55,7 +51,6 @@ struct PreparedScanInput {
     published: crate::manager::PublishedCut,
     previous_snapshot_uuid: Option<[u8; 16]>,
     requester_uid: u32,
-    now_ns: i64,
     lease_expires_ns: i64,
 }
 
@@ -84,12 +79,6 @@ impl FacadeService {
     /// rebound to the same subvolume at a renamed path.
     pub fn forget_view(&mut self, watch_id: [u8; 16]) {
         self.views.remove(&watch_id);
-    }
-
-    pub fn has_precision_guard(&self, watch_id: [u8; 16]) -> bool {
-        self.views
-            .get(&watch_id)
-            .is_some_and(|view| view.precision.is_some())
     }
 
     pub fn activate(
@@ -148,7 +137,6 @@ impl FacadeService {
                 authorization_id,
                 activation,
                 monitor,
-                precision: None,
             },
         );
         tracing::info!(
@@ -156,67 +144,6 @@ impl FacadeService {
             root = %root.display(),
             "facade activation completed"
         );
-        Ok(())
-    }
-
-    /// Enables the optional recursive precision journal. Failure does not
-    /// invalidate direct scans; the durable guard epoch is marked gapped and
-    /// future scans retain conservative coarse projection.
-    pub fn activate_precision_guard(
-        &mut self,
-        watch_id: [u8; 16],
-        marker_directory: &Path,
-        now_ns: i64,
-    ) -> Result<(), FacadeError> {
-        self.check_continuity_or_invalidate(watch_id, "pre-arm precision namespace check")?;
-        let activation = self
-            .views
-            .get(&watch_id)
-            .ok_or_else(|| FacadeError::new("scan facade is not active"))?
-            .activation
-            .clone();
-        let root = self
-            .views
-            .get(&watch_id)
-            .expect("checked active view")
-            .monitor
-            .binding()
-            .root_path
-            .clone();
-        let initial = self
-            .service
-            .store_mut()
-            .begin_precision_guard(&activation)
-            .map_err(|error| FacadeError::context("begin precision guard", error))?;
-        let mut guard = match PrecisionGuard::arm(
-            Path::new(&OsString::from_vec(root)),
-            marker_directory,
-            initial.epoch,
-        ) {
-            Ok(guard) => guard,
-            Err(error) => {
-                self.service
-                    .store_mut()
-                    .gap_precision_guard(&activation, initial.epoch)
-                    .map_err(|gap| {
-                        FacadeError::new(format!(
-                            "arm precision guard: {error}; persist gap: {gap}"
-                        ))
-                    })?;
-                return Err(FacadeError::context("arm precision guard", error));
-            }
-        };
-        let cursor = guard
-            .certify(self.service.store_mut(), &activation, now_ns)
-            .map_err(|error| FacadeError::context("certify precision guard", error))?;
-        self.service
-            .store_mut()
-            .complete_precision_guard(&activation, cursor)
-            .map_err(|error| FacadeError::context("complete precision guard", error))?;
-        self.views
-            .get_mut(&watch_id)
-            .expect("checked active view")
-            .precision = Some(guard);
         Ok(())
     }
 
@@ -262,7 +189,6 @@ impl FacadeService {
             published,
             previous_snapshot_uuid,
             requester_uid,
-            now_ns,
             lease_expires_ns,
         })
     }
@@ -345,17 +271,9 @@ impl FacadeService {
             published,
             previous_snapshot_uuid,
             requester_uid,
-            now_ns,
             lease_expires_ns,
         } = input;
         let watch_id = activation.watch_id;
-        let guard_cursor = {
-            let (service, views) = (&mut self.service, &mut self.views);
-            views
-                .get_mut(&watch_id)
-                .and_then(|view| view.precision.as_mut())
-                .and_then(|guard| guard.certify(service.store_mut(), &activation, now_ns).ok())
-        };
         self.check_continuity_or_invalidate(watch_id, "post-cut namespace check")?;
         let view = self.views.get(&watch_id).expect("checked active view");
         self.service
@@ -364,7 +282,7 @@ impl FacadeService {
                 &activation,
                 view.monitor.binding(),
                 published.sequence,
-                guard_cursor,
+                None,
             )
             .map_err(|error| FacadeError::context("finalize scan boundary", error))?;
         self.check_continuity_or_invalidate(watch_id, "pre-response namespace check")?;
@@ -417,6 +335,7 @@ impl FacadeService {
                     tracing::debug!(
                         event_count = changes.events.len(),
                         projected_path_count = projection.paths.len(),
+                        projected_prefix_count = projection.prefixes.len(),
                         fresh_instance = projection.fresh_instance,
                         "direct retained-event replay projected delta"
                     );
@@ -425,6 +344,7 @@ impl FacadeService {
                 Ok(_) => Projection {
                     fresh_instance: true,
                     paths: vec![b"/".to_vec()],
+                    prefixes: Vec::new(),
                 },
                 // Direct scans remain snapshot-correct without an
                 // incremental proof: retain the selected target lease and
@@ -438,6 +358,7 @@ impl FacadeService {
                     Projection {
                         fresh_instance: true,
                         paths: vec![b"/".to_vec()],
+                        prefixes: Vec::new(),
                     }
                 }
             }
@@ -445,6 +366,7 @@ impl FacadeService {
             Projection {
                 fresh_instance: true,
                 paths: vec![b"/".to_vec()],
+                prefixes: Vec::new(),
             }
         };
         let cursor = encode_direct_scan_cursor(&claims, &metadata.clock_hmac_key);

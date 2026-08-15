@@ -255,14 +255,6 @@ snapshot fd.
 **Remediate:** Prove per-request sender and namespace/root authority with a
 nondelegable transport or verifiable credentials/process handles.
 
-### C-14: The optional precision journal is not used by direct invalidation
-
-`src/facade.rs` certifies and pins precision cursors but projects direct
-historical changes without the lease-aware precision range projector.
-
-**Remediate:** Use only complete, contiguous, epoch-matched precision intervals
-to narrow direct invalidation; otherwise return conservative prefixes or Full.
-
 ### C-16: One slow direct Begin can expire unrelated active scans
 
 `src/scan.rs` and `src/scan_facade.rs` hold global/shared locks across expensive

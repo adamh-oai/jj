@@ -8,7 +8,6 @@ pub mod index;
 pub mod manager;
 pub mod manifest;
 pub mod namespace;
-pub mod precision;
 pub mod scan;
 pub mod scan_facade;
 pub mod service;

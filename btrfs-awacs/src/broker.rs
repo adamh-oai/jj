@@ -1,20 +1,21 @@
 use crate::btrfs::{
     ChangedObjectsIoctlResult, FilesystemInfo, ROOT_INODE, SubvolumeInfo, changed_objects_v2,
-    filesystem_info, send_changed_objects, subvolume_info,
+    filesystem_info, has_nested_subvolumes, send_changed_objects, subvolume_info,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::fmt;
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Condvar, Mutex};
 use uuid::Uuid;
 
-pub const BROKER_PROTOCOL_VERSION: u16 = 4;
+pub const BROKER_PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 pub const MAX_FRAME_FDS: usize = 4;
 const FRAME_MAGIC: &[u8; 4] = b"BAWB";
@@ -25,6 +26,7 @@ const FRAME_HEADER_SIZE: usize = 16;
 pub enum Opcode {
     Handshake = 1,
     ChangedObjects = 4,
+    HasNestedSubvolumes = 5,
 }
 
 impl Opcode {
@@ -32,6 +34,7 @@ impl Opcode {
         match value {
             1 => Ok(Self::Handshake),
             4 => Ok(Self::ChangedObjects),
+            5 => Ok(Self::HasNestedSubvolumes),
             _ => Err(BrokerError::new(format!("unknown broker opcode {value}"))),
         }
     }
@@ -114,6 +117,11 @@ pub struct ChangedObjectsResult {
     pub v2_ioctl: Option<ChangedObjectsIoctlResult>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NestedSubvolumesExecution {
+    pub target: ExpectedSubvolume,
+}
+
 pub const MAX_CHANGED_OBJECT_OUTPUT: u64 = 1024 * 1024 * 1024;
 
 pub fn execute_changed_objects(
@@ -174,11 +182,6 @@ pub fn execute_changed_objects(
             )));
         }
     };
-    // A successful return must be durable before the manager can promote the
-    // manifest from its fence-specific .part name.
-    if unsafe { libc::fsync(output_fd.as_raw_fd()) } != 0 {
-        return Err(BrokerError::io("fsync changed-object manifest"));
-    }
     let parent_after = verify_subvolume(parent_fd, &request.parent)?;
     let target_after = verify_subvolume(target_fd, &request.target)?;
     if parent_after != parent_before || target_after != target_before {
@@ -211,6 +214,59 @@ pub fn execute_changed_objects(
         manifest_hash,
         v2_ioctl,
     })
+}
+
+/// Answers the nested-subvolume question from Btrfs root refs while keeping
+/// the target fd and immutable identity validation inside the broker.
+pub fn execute_has_nested_subvolumes(
+    request: &NestedSubvolumesExecution,
+    target_fd: BorrowedFd<'_>,
+) -> Result<bool, BrokerError> {
+    if !request.target.readonly {
+        return Err(BrokerError::new(
+            "nested-subvolume target must be read-only",
+        ));
+    }
+    let received_before = verify_subvolume(target_fd, &request.target)?;
+    // Btrfs tree search checks the credentials attached to the open file
+    // description, not merely the broker's current credentials. Reopen "."
+    // relative to the manager-passed directory fd so the operation remains
+    // fd-anchored while the new description carries broker credentials.
+    let broker_target = reopen_directory_fd(target_fd)?;
+    let target_before = verify_subvolume(broker_target.as_fd(), &request.target)?;
+    if target_before != received_before {
+        return Err(BrokerError::new(
+            "broker-reopened nested-subvolume target changed identity",
+        ));
+    }
+    let has_nested = has_nested_subvolumes(broker_target.as_fd(), target_before.root_id)
+        .map_err(|error| BrokerError::new(format!("query nested subvolumes: {error}")))?;
+    let target_after = verify_subvolume(broker_target.as_fd(), &request.target)?;
+    let received_after = verify_subvolume(target_fd, &request.target)?;
+    if target_after != target_before || received_after != received_before {
+        return Err(BrokerError::new(
+            "nested-subvolume target metadata changed during query",
+        ));
+    }
+    Ok(has_nested)
+}
+
+fn reopen_directory_fd(fd: BorrowedFd<'_>) -> Result<OwnedFd, BrokerError> {
+    let dot = CString::new(".").expect("static directory name has no NUL");
+    // SAFETY: fd remains valid for the syscall, dot is NUL terminated, and a
+    // successful returned descriptor is uniquely adopted into OwnedFd.
+    let reopened = unsafe {
+        libc::openat(
+            fd.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if reopened < 0 {
+        return Err(BrokerError::io("reopen broker subvolume fd"));
+    }
+    // SAFETY: openat returned a new owned descriptor on success.
+    Ok(unsafe { OwnedFd::from_raw_fd(reopened) })
 }
 
 fn verify_subvolume(
@@ -841,7 +897,8 @@ mod tests {
     fn removed_broker_operations_are_not_protocol_opcodes() {
         assert!(Opcode::decode(2).is_err());
         assert!(Opcode::decode(3).is_err());
-        assert!(Opcode::decode(5).is_err());
+        assert_eq!(Opcode::decode(5).unwrap(), Opcode::HasNestedSubvolumes);
+        assert!(Opcode::decode(6).is_err());
         assert!(Opcode::decode(7).is_err());
         assert!(Opcode::decode(9).is_err());
     }

@@ -4,8 +4,9 @@
 //! for the bounded changed-object stream.
 
 use crate::broker::{
-    ChangedObjectsExecution, ChangedObjectsResult, ExpectedSubvolume, Frame, Opcode,
-    PeerCredentials, SeqPacket, SessionGate, execute_changed_objects,
+    ChangedObjectsExecution, ChangedObjectsResult, ExpectedSubvolume, Frame,
+    NestedSubvolumesExecution, Opcode, PeerCredentials, SeqPacket, SessionGate,
+    execute_changed_objects, execute_has_nested_subvolumes,
 };
 use crate::btrfs::ChangedObjectsIoctlResult;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -89,6 +90,15 @@ impl BrokerDispatcher {
                 )?;
                 Ok(encode_changed_objects_result(&result))
             }
+            Opcode::HasNestedSubvolumes => {
+                require_fd_count(fds, 1)?;
+                let request = NestedSubvolumesExecution {
+                    target: decoder.expected_subvolume()?,
+                };
+                decoder.finish()?;
+                let result = execute_has_nested_subvolumes(&request, fds[0].as_fd())?;
+                Ok(vec![u8::from(result)])
+            }
             Opcode::Handshake => unreachable!("handled before authorization envelope"),
         }
     }
@@ -159,6 +169,27 @@ impl BrokerClient {
         )?;
         let response = receive_response(&self.socket, Opcode::ChangedObjects)?;
         decode_changed_objects_result(&response)
+    }
+
+    pub fn has_nested_subvolumes(
+        &self,
+        request: &NestedSubvolumesExecution,
+        target: BorrowedFd<'_>,
+    ) -> Result<bool, BrokerError> {
+        let mut encoder = self.auth_encoder();
+        encoder.expected_subvolume(&request.target);
+        self.socket.send(
+            &Frame::new(Opcode::HasNestedSubvolumes, encoder.finish())?,
+            &[target],
+        )?;
+        let response = receive_response(&self.socket, Opcode::HasNestedSubvolumes)?;
+        match response.as_slice() {
+            [0] => Ok(false),
+            [1] => Ok(true),
+            _ => Err(BrokerError::new(
+                "broker returned an invalid nested-subvolume result",
+            )),
+        }
     }
 
     fn auth_encoder(&self) -> Encoder {
