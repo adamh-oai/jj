@@ -13,24 +13,22 @@
 // limitations under the License.
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-use std::collections::BTreeSet;
-#[cfg(all(target_os = "linux", feature = "awacs"))]
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-use std::process::Command;
 
 use jj_lib::backend::CommitId;
 use jj_lib::git;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-use jj_lib::local_working_copy::seed_local_working_copy_tree;
+use jj_lib::local_working_copy::{
+    LocalWorkingCopy, seed_local_working_copy_tree, snapshot_mode_has_committed_baseline,
+};
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-use jj_lib::lock::FileLock;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::op_store::RefTarget;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-use jj_lib::repo_path::RepoPathBuf;
+use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
 use tracing::instrument;
 
@@ -61,18 +59,22 @@ pub struct WorkspaceAdoptArgs {
 
 struct ExistingGitWorktree {
     root: PathBuf,
+    git_dir: PathBuf,
     common_dir: PathBuf,
     head_id: CommitId,
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-struct GitAwacsIndexState {
-    baseline: btrfs_awacs::scan::SnapshotBaseline,
-    force_paths: Vec<RepoPathBuf>,
-    // Keep Git from rewriting the checksummed index between validation and
-    // publication of the corresponding JJ baseline.
-    _index_lock: FileLock,
+struct PendingJjConsumerSeed {
+    owner_id: [u8; 16],
+    snapshot_identity: btrfs_awacs::manager::SnapshotIdentity,
+    working_copy_state_path: PathBuf,
 }
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+const AWACS_JJ_PENDING_CONSUMER_MARKER: &str = "awacs-jj-pending-consumer";
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+const AWACS_JJ_PENDING_WORKING_COPY_STATE: &str = "awacs-jj-pending-working-copy";
 
 #[instrument(skip_all)]
 pub async fn cmd_workspace_adopt(
@@ -115,15 +117,46 @@ pub async fn cmd_workspace_adopt(
         .hinted("Adopt a linked Git worktree whose root is already a Btrfs subvolume."));
     }
     #[cfg(all(target_os = "linux", feature = "awacs"))]
-    let git_awacs_index = if snapshot {
-        Some(read_git_awacs_index_state(
-            &worktree,
-            git_backend.git_executable_path(),
-        )?)
+    let pending_jj_seed = if snapshot {
+        Some(read_pending_jj_consumer_seed(&worktree)?)
     } else {
         None
     };
-
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    let snapshot_seed_tree = if snapshot {
+        if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+            None
+        } else {
+            let pending_state_path = &pending_jj_seed
+                .as_ref()
+                .expect("snapshot adoption validated pending seed")
+                .working_copy_state_path;
+            if !snapshot_mode_has_committed_baseline(pending_state_path).map_err(|err| {
+                user_error(format!(
+                    "Failed to validate pending JJ AWACS baseline: {err}"
+                ))
+            })? {
+                return Err(user_error(
+                    "Cannot adopt snapshot worktree without a committed source JJ AWACS baseline",
+                ));
+            }
+            let copied_working_copy = LocalWorkingCopy::load(
+                main_workspace.repo_loader().store().clone(),
+                worktree.root.clone(),
+                pending_state_path.clone(),
+                &main_settings,
+            )
+            .map_err(|err| user_error(format!("Failed to read pending JJ working copy: {err}")))?;
+            Some(
+                copied_working_copy
+                    .tree()
+                    .map_err(|err| user_error(format!("Failed to read copied JJ tree: {err}")))?
+                    .clone(),
+            )
+        }
+    } else {
+        None
+    };
     let workspace_name = workspace_name(&worktree.root, args)?;
     let op = command.resolve_operation(
         ui,
@@ -186,7 +219,7 @@ pub async fn cmd_workspace_adopt(
 
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     if snapshot {
-        let git_awacs_index = git_awacs_index.expect("snapshot adoption validated Git index");
+        let pending_jj_seed = pending_jj_seed.expect("snapshot adoption validated pending seed");
         // Workspace initialization happened before the marker existed and
         // therefore owns the ordinary working-copy implementation. Reload
         // after the marker is durable so the compact journal is selected.
@@ -194,23 +227,22 @@ pub async fn cmd_workspace_adopt(
         let mut workspace_command = command
             .workspace_helper_no_snapshot_at(ui, &worktree.root)
             .await?;
-        seed_snapshot_adopt_tree(&mut workspace_command, &wc_commit).await?;
+        let synthetic_seed_tree = wc_commit.tree();
+        seed_snapshot_adopt_tree(
+            &mut workspace_command,
+            snapshot_seed_tree.as_ref().unwrap_or(&synthetic_seed_tree),
+        )
+        .await?;
         workspace_command
-            .seed_git_index_snapshot_workspace_awacs_baseline(ui, &git_awacs_index.baseline)
+            .seed_initialized_snapshot_workspace_awacs_baseline(
+                ui,
+                &pending_jj_seed.snapshot_identity,
+                Some(pending_jj_seed.owner_id),
+            )
             .await?;
         set_subvolume_mode(&worktree.root, true)?;
-        // The index lock is only needed until its cursor and cached paths are
-        // durably bound to the compact journal. Subsequent filesystem changes
-        // are covered by AWACS' cursor delta.
-        let GitAwacsIndexState {
-            force_paths,
-            _index_lock,
-            ..
-        } = git_awacs_index;
-        drop(_index_lock);
-        workspace_command
-            .maybe_snapshot_with_force_paths(ui, force_paths)
-            .await?;
+        workspace_command.maybe_snapshot(ui).await?;
+        clear_pending_jj_consumer_seed(&worktree)?;
         writeln!(
             ui.status(),
             "Adopted Git worktree as workspace '{}'",
@@ -254,6 +286,7 @@ fn discover_linked_git_worktree(cwd: &Path) -> Result<ExistingGitWorktree, Comma
         .map_err(|err| user_error(format!("Cannot adopt a Git worktree without HEAD: {err}")))?;
     Ok(ExistingGitWorktree {
         root,
+        git_dir,
         common_dir,
         head_id,
     })
@@ -281,13 +314,13 @@ fn workspace_name(
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 async fn seed_snapshot_adopt_tree(
     workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
-    commit: &jj_lib::commit::Commit,
+    tree: &MergedTree,
 ) -> Result<(), CommandError> {
     let operation_id = workspace_command.repo().op_id().clone();
     let (mut locked_workspace, _commit) = workspace_command
         .unchecked_start_working_copy_mutation()
         .await?;
-    if !seed_local_working_copy_tree(locked_workspace.locked_wc(), &commit.tree())
+    if !seed_local_working_copy_tree(locked_workspace.locked_wc(), tree)
         .await
         .map_err(|err| internal_error_with_message("Failed to seed adopted snapshot tree", err))?
     {
@@ -301,278 +334,82 @@ async fn seed_snapshot_adopt_tree(
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-fn read_git_awacs_index_state(
+fn read_pending_jj_consumer_seed(
     worktree: &ExistingGitWorktree,
-    git_executable: &Path,
-) -> Result<GitAwacsIndexState, CommandError> {
-    let git_repo = gix::discover(&worktree.root)
-        .map_err(|err| user_error(format!("Failed to reopen Git worktree: {err}")))?;
-    let index_path = git_repo.index_path();
-    let index_lock = FileLock::lock(index_path.with_extension("lock")).map_err(|err| {
+) -> Result<PendingJjConsumerSeed, CommandError> {
+    let path = worktree.git_dir.join(AWACS_JJ_PENDING_CONSUMER_MARKER);
+    let contents = fs::read_to_string(&path).map_err(|err| {
         user_error(format!(
-            "Cannot adopt snapshot worktree while its Git index is in use: {err}"
+            "Cannot adopt snapshot worktree without a pending JJ AWACS seed: {err}"
         ))
     })?;
-    let index = git_repo
-        .index()
-        .map_err(|err| user_error(format!("Failed to validate Git index: {err}")))?;
-    if index.link().is_some() || index.is_sparse() {
+    let mut fields = contents.trim_end().split(':');
+    if fields.next() != Some("awacs-jj-pending-v2") {
         return Err(user_error(
-            "Cannot adopt snapshot worktree with a split or sparse Git index",
+            "Pending JJ AWACS seed has an unsupported format; recreate the Git worktree",
         ));
     }
-    if index.entries().iter().any(|entry| entry.stage_raw() != 0) {
-        return Err(user_error(
-            "Cannot adopt snapshot worktree with unmerged Git index entries",
-        ));
+    let parse_uuid = |field: Option<&str>, name: &str| -> Result<[u8; 16], CommandError> {
+        let value =
+            field.ok_or_else(|| user_error(format!("Pending JJ AWACS seed lacks {name}")))?;
+        parse_pending_uuid_bytes(value.as_bytes())
+            .map_err(|err| user_error(format!("Pending JJ AWACS seed has invalid {name}: {err}")))
+    };
+    let owner_id = parse_uuid(fields.next(), "consumer owner")?;
+    let fs_uuid = parse_uuid(fields.next(), "filesystem identity")?;
+    let subvol_uuid = parse_uuid(fields.next(), "snapshot identity")?;
+    if fields.next().is_some() {
+        return Err(user_error("Pending JJ AWACS seed has trailing fields"));
     }
-    let bytes = fs::read(&index_path)
-        .map_err(|err| user_error(format!("Failed to read Git index: {err}")))?;
-    let hash_len = git_repo.object_hash().len_in_bytes();
-    verify_index_checksum(&bytes, git_repo.object_hash()).map_err(user_error)?;
-    let extensions = parse_index_extensions(&bytes, hash_len).map_err(|err| {
-        user_error(format!(
-            "Cannot adopt snapshot worktree from Git index: {err}"
-        ))
-    })?;
-    let fsmonitor = extension_data(&extensions, b"FSMN")
-        .ok_or_else(|| user_error("Git index has no fsmonitor cache extension"))?;
-    let untracked = extension_data(&extensions, b"UNTR")
-        .ok_or_else(|| user_error("Git index has no untracked-cache extension"))?;
-    let (baseline, dirty_indices) = parse_git_awacs_fsmonitor(fsmonitor).map_err(user_error)?;
-    let mut force_paths = BTreeSet::new();
-    for index_position in dirty_indices {
-        let entry = index
-            .entries()
-            .get(index_position)
-            .ok_or_else(|| user_error("Git fsmonitor bitmap refers to a missing index entry"))?;
-        add_repo_path(&mut force_paths, entry.path(&index))?;
-    }
-    for path in parse_fully_valid_untracked_cache(untracked, hash_len).map_err(user_error)? {
-        add_repo_path(&mut force_paths, &path)?;
-    }
-    add_staged_paths(&mut force_paths, git_executable, &worktree.root)?;
-    Ok(GitAwacsIndexState {
-        baseline,
-        force_paths: force_paths.into_iter().collect(),
-        _index_lock: index_lock,
-    })
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn verify_index_checksum(bytes: &[u8], hash_kind: gix::hash::Kind) -> Result<(), String> {
-    let hash_len = hash_kind.len_in_bytes();
-    let body_len = bytes
-        .len()
-        .checked_sub(hash_len)
-        .ok_or_else(|| "Git index has no checksum trailer".to_owned())?;
-    let mut hasher = gix::hash::hasher(hash_kind);
-    hasher.update(&bytes[..body_len]);
-    let actual = hasher
-        .try_finalize()
-        .map_err(|err| format!("failed to hash Git index: {err}"))?;
-    if actual.as_slice() != &bytes[body_len..] {
-        return Err("Git index checksum does not match its contents".to_owned());
-    }
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn add_staged_paths(
-    paths: &mut BTreeSet<RepoPathBuf>,
-    git_executable: &Path,
-    worktree_root: &Path,
-) -> Result<(), CommandError> {
-    let output = Command::new(git_executable)
-        .arg("-C")
-        .arg(worktree_root)
-        .args([
-            "diff",
-            "--cached",
-            "--name-only",
-            "-z",
-            "--no-renames",
-            "--ignore-submodules=none",
-        ])
-        .output()
-        .map_err(|err| user_error(format!("Failed to inspect staged Git paths: {err}")))?;
-    if !output.status.success() {
-        return Err(user_error(format!(
-            "Failed to inspect staged Git paths: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    for path in output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        add_repo_path(paths, path)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn add_repo_path(paths: &mut BTreeSet<RepoPathBuf>, path: &[u8]) -> Result<(), CommandError> {
-    let path = std::str::from_utf8(path)
-        .map_err(|_| user_error("Cannot adopt snapshot worktree with non-UTF-8 Git paths"))?;
-    let path = RepoPathBuf::from_internal_string(path)
-        .map_err(|err| user_error(format!("Invalid Git index path: {err}")))?;
-    paths.insert(path);
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn extension_data<'a>(
-    extensions: &'a [([u8; 4], &'a [u8])],
-    signature: &[u8; 4],
-) -> Option<&'a [u8]> {
-    extensions
-        .iter()
-        .find_map(|(found, data)| (found == signature).then_some(*data))
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn parse_index_extensions(bytes: &[u8], hash_len: usize) -> Result<Vec<([u8; 4], &[u8])>, String> {
-    if bytes.len() < 12 + hash_len || &bytes[..4] != b"DIRC" {
-        return Err("index header is missing or malformed".to_owned());
-    }
-    let version = read_be_u32(&bytes[4..8])?;
-    if !(2..=4).contains(&version) {
-        return Err(format!("unsupported Git index version {version}"));
-    }
-    let entries = read_be_u32(&bytes[8..12])? as usize;
-    let mut offset = 12usize;
-    for _ in 0..entries {
-        let entry_start = offset;
-        offset = offset
-            .checked_add(40 + hash_len)
-            .filter(|offset| *offset + 2 <= bytes.len())
-            .ok_or_else(|| "truncated Git index entry".to_owned())?;
-        let flags = u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap());
-        offset += 2;
-        if flags & 0x4000 != 0 {
-            offset = offset
-                .checked_add(2)
-                .filter(|offset| *offset <= bytes.len())
-                .ok_or_else(|| "truncated extended Git index flags".to_owned())?;
-        }
-        if version == 4 {
-            offset = skip_leb128(bytes, offset)?;
-            offset = skip_nul(bytes, offset)?;
-        } else {
-            let path_len = (flags & 0x0fff) as usize;
-            offset = if path_len == 0x0fff {
-                skip_nul(bytes, offset)?
-            } else {
-                offset
-                    .checked_add(path_len)
-                    .filter(|offset| *offset <= bytes.len())
-                    .ok_or_else(|| "truncated Git index path".to_owned())?
-            };
-            let padded_len = (offset - entry_start + 8) & !7;
-            offset = entry_start
-                .checked_add(padded_len)
-                .filter(|offset| *offset <= bytes.len())
-                .ok_or_else(|| "truncated Git index padding".to_owned())?;
-        }
-    }
-    let extension_end = bytes
-        .len()
-        .checked_sub(hash_len)
-        .ok_or_else(|| "Git index has no checksum trailer".to_owned())?;
-    if offset > extension_end {
-        return Err("Git index entries overlap checksum trailer".to_owned());
-    }
-    let mut extensions = Vec::new();
-    while offset < extension_end {
-        if extension_end - offset < 8 {
-            return Err("truncated Git index extension header".to_owned());
-        }
-        let signature: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
-        let size = read_be_u32(&bytes[offset + 4..offset + 8])? as usize;
-        offset += 8;
-        let end = offset
-            .checked_add(size)
-            .filter(|end| *end <= extension_end)
-            .ok_or_else(|| "truncated Git index extension".to_owned())?;
-        extensions.push((signature, &bytes[offset..end]));
-        offset = end;
-    }
-    Ok(extensions)
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn parse_git_awacs_fsmonitor(
-    data: &[u8],
-) -> Result<(btrfs_awacs::scan::SnapshotBaseline, Vec<usize>), String> {
-    let mut offset = 0;
-    let version = take_be_u32(data, &mut offset)?;
-    if version != 2 {
-        return Err("Git fsmonitor cache is not protocol v2".to_owned());
-    }
-    let token = take_nul(data, &mut offset)?;
-    let baseline = decode_git_awacs_token(token)?;
-    let ewah_size = take_be_u32(data, &mut offset)? as usize;
-    let ewah_end = offset
-        .checked_add(ewah_size)
-        .filter(|end| *end == data.len())
-        .ok_or_else(|| "malformed Git fsmonitor dirty bitmap".to_owned())?;
-    let (dirty, consumed) = decode_ewah(&data[offset..ewah_end])?;
-    if consumed != ewah_size {
-        return Err("trailing bytes in Git fsmonitor dirty bitmap".to_owned());
-    }
-    Ok((
-        baseline,
-        dirty
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, dirty)| dirty.then_some(index))
-            .collect(),
-    ))
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn decode_git_awacs_token(token: &[u8]) -> Result<btrfs_awacs::scan::SnapshotBaseline, String> {
-    let mut fields = token.splitn(4, |byte| *byte == b':');
-    if fields.next() != Some(b"awacs-git-v1".as_slice()) {
-        return Err("Git fsmonitor token is not an AWACS v1 token".to_owned());
-    }
-    let filesystem_uuid = parse_uuid_bytes(
-        fields
-            .next()
-            .ok_or_else(|| "AWACS token has no filesystem UUID".to_owned())?,
-    )?;
-    let subvolume_uuid = parse_uuid_bytes(
-        fields
-            .next()
-            .ok_or_else(|| "AWACS token has no subvolume UUID".to_owned())?,
-    )?;
-    let continuity_token = fields
-        .next()
-        .filter(|token| token.starts_with(b"c:btrfs-awacs:"))
-        .ok_or_else(|| "AWACS token has no valid continuity proof".to_owned())?
-        .to_vec();
-    Ok(btrfs_awacs::scan::SnapshotBaseline {
-        identity: btrfs_awacs::scan::SnapshotIdentity {
-            filesystem_uuid,
-            subvolume_uuid,
-            read_only: true,
+    Ok(PendingJjConsumerSeed {
+        owner_id,
+        snapshot_identity: btrfs_awacs::manager::SnapshotIdentity {
+            fs_uuid,
+            subvol_uuid,
+            parent_uuid: None,
+            received_uuid: None,
+            root_id: 0,
+            ctransid: 0,
+            otransid: 0,
+            path: Vec::new(),
+            readonly: true,
+            created_ns: 0,
         },
-        continuity_token,
-        retention_token: Vec::new(),
+        working_copy_state_path: worktree.git_dir.join(AWACS_JJ_PENDING_WORKING_COPY_STATE),
     })
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-fn parse_uuid_bytes(value: &[u8]) -> Result<[u8; 16], String> {
+fn clear_pending_jj_consumer_seed(worktree: &ExistingGitWorktree) -> Result<(), CommandError> {
+    let marker = worktree.git_dir.join(AWACS_JJ_PENDING_CONSUMER_MARKER);
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(user_error(format!(
+                "Failed to remove consumed pending JJ AWACS marker: {err}"
+            )));
+        }
+    }
+    let state = worktree.git_dir.join(AWACS_JJ_PENDING_WORKING_COPY_STATE);
+    match fs::remove_dir_all(&state) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(user_error(format!(
+            "Failed to remove consumed pending JJ working-copy state: {err}"
+        ))),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn parse_pending_uuid_bytes(value: &[u8]) -> Result<[u8; 16], String> {
     if value.len() != 36
         || value.get(8) != Some(&b'-')
         || value.get(13) != Some(&b'-')
         || value.get(18) != Some(&b'-')
         || value.get(23) != Some(&b'-')
     {
-        return Err("AWACS token UUID is malformed".to_owned());
+        return Err("UUID is malformed".to_owned());
     }
     let mut bytes = [0; 16];
     let mut output = 0;
@@ -582,274 +419,17 @@ fn parse_uuid_bytes(value: &[u8]) -> Result<[u8; 16], String> {
             index += 1;
             continue;
         }
-        let high =
-            hex_nibble(value[index]).ok_or_else(|| "AWACS token UUID is malformed".to_owned())?;
-        let low = hex_nibble(value[index + 1])
-            .ok_or_else(|| "AWACS token UUID is malformed".to_owned())?;
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let high = nibble(value[index]).ok_or_else(|| "UUID is malformed".to_owned())?;
+        let low = nibble(value[index + 1]).ok_or_else(|| "UUID is malformed".to_owned())?;
         bytes[output] = high << 4 | low;
         output += 1;
         index += 2;
     }
-    if bytes == [0; 16] {
-        return Err("AWACS token UUID is zero".to_owned());
-    }
-    Ok(bytes)
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn hex_nibble(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-#[derive(Clone)]
-struct CachedUntrackedDirectory {
-    name: Vec<u8>,
-    entries: Vec<Vec<u8>>,
-    children: Vec<usize>,
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn parse_fully_valid_untracked_cache(data: &[u8], hash_len: usize) -> Result<Vec<Vec<u8>>, String> {
-    let mut offset = 0;
-    let identifier_len = take_leb128(data, &mut offset)? as usize;
-    take_bytes(data, &mut offset, identifier_len)?;
-    // UNTR stores ctime, mtime, dev, ino, uid, gid, and size, but not the
-    // regular index entry's mode field.
-    take_bytes(data, &mut offset, 2 * (36 + hash_len))?;
-    let dir_flags = take_be_u32(data, &mut offset)?;
-    if dir_flags != 0 {
-        return Err(format!(
-            "Git untracked cache was not populated with --untracked-files=all (flags {dir_flags:#x})"
-        ));
-    }
-    take_nul(data, &mut offset)?;
-    let directory_count = take_leb128(data, &mut offset)? as usize;
-    if directory_count == 0 {
-        return Err("Git untracked cache has no directory inventory".to_owned());
-    }
-    let mut directories = Vec::with_capacity(directory_count);
-    parse_untracked_directory(data, &mut offset, &mut directories)?;
-    if directories.len() != directory_count || directories[0].name != b"" {
-        return Err("Git untracked cache directory inventory is malformed".to_owned());
-    }
-    let (valid, consumed) = decode_ewah(&data[offset..])?;
-    offset += consumed;
-    let (check_only, consumed) = decode_ewah(&data[offset..])?;
-    offset += consumed;
-    let (_hash_valid, consumed) = decode_ewah(&data[offset..])?;
-    offset += consumed;
-    if valid.len() < directory_count
-        || valid.iter().take(directory_count).any(|valid| !valid)
-        || check_only
-            .iter()
-            .take(directory_count)
-            .any(|check_only| *check_only)
-    {
-        return Err("Git untracked cache has invalid or collapsed directories".to_owned());
-    }
-    // The remaining bytes are per-directory stat/hash payloads. gix already
-    // decoded and checksum-validated this same index before we inspected its
-    // cache projections, so only ensure our parser did not run past it.
-    if offset > data.len() {
-        return Err("Git untracked cache payload is malformed".to_owned());
-    }
-    let mut paths = Vec::new();
-    collect_untracked_paths(&directories, 0, &[], &mut paths)?;
-    Ok(paths)
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn parse_untracked_directory(
-    data: &[u8],
-    offset: &mut usize,
-    directories: &mut Vec<CachedUntrackedDirectory>,
-) -> Result<usize, String> {
-    let entry_count = take_leb128(data, offset)? as usize;
-    let child_count = take_leb128(data, offset)? as usize;
-    let name = take_nul(data, offset)?.to_vec();
-    let mut entries = Vec::with_capacity(entry_count);
-    for _ in 0..entry_count {
-        entries.push(take_nul(data, offset)?.to_vec());
-    }
-    let index = directories.len();
-    directories.push(CachedUntrackedDirectory {
-        name,
-        entries,
-        children: Vec::with_capacity(child_count),
-    });
-    for _ in 0..child_count {
-        let child = parse_untracked_directory(data, offset, directories)?;
-        directories[index].children.push(child);
-    }
-    Ok(index)
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn collect_untracked_paths(
-    directories: &[CachedUntrackedDirectory],
-    index: usize,
-    parent: &[u8],
-    paths: &mut Vec<Vec<u8>>,
-) -> Result<(), String> {
-    let directory = directories
-        .get(index)
-        .ok_or_else(|| "Git untracked cache child index is invalid".to_owned())?;
-    let prefix = join_git_path(parent, &directory.name);
-    for entry in &directory.entries {
-        paths.push(join_git_path(&prefix, entry));
-    }
-    for child in &directory.children {
-        collect_untracked_paths(directories, *child, &prefix, paths)?;
-    }
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn join_git_path(parent: &[u8], child: &[u8]) -> Vec<u8> {
-    if parent.is_empty() {
-        return child.to_vec();
-    }
-    if child.is_empty() {
-        return parent.to_vec();
-    }
-    let mut path = Vec::with_capacity(parent.len() + 1 + child.len());
-    path.extend_from_slice(parent);
-    path.push(b'/');
-    path.extend_from_slice(child);
-    path
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn decode_ewah(data: &[u8]) -> Result<(Vec<bool>, usize), String> {
-    if data.len() < 8 {
-        return Err("truncated Git EWAH bitmap".to_owned());
-    }
-    let bit_size = read_be_u32(&data[..4])? as usize;
-    let word_count = read_be_u32(&data[4..8])? as usize;
-    let payload_len = 8usize
-        .checked_add(
-            word_count
-                .checked_mul(8)
-                .ok_or_else(|| "Git EWAH bitmap is too large".to_owned())?,
-        )
-        .and_then(|len| len.checked_add(4))
-        .ok_or_else(|| "Git EWAH bitmap is too large".to_owned())?;
-    if payload_len > data.len() {
-        return Err("truncated Git EWAH bitmap".to_owned());
-    }
-    let mut words = Vec::with_capacity(word_count);
-    for chunk in data[8..8 + word_count * 8].chunks_exact(8) {
-        words.push(u64::from_be_bytes(chunk.try_into().unwrap()));
-    }
-    let mut bits = Vec::with_capacity(bit_size);
-    let mut word_index = 0;
-    while bits.len() < bit_size {
-        let run_length_word = *words
-            .get(word_index)
-            .ok_or_else(|| "Git EWAH bitmap ended early".to_owned())?;
-        word_index += 1;
-        let repeated = run_length_word & 1 != 0;
-        let run_words = ((run_length_word >> 1) & 0xffff_ffff) as usize;
-        let literal_words = (run_length_word >> 33) as usize;
-        for _ in 0..run_words {
-            for _ in 0..64 {
-                if bits.len() == bit_size {
-                    break;
-                }
-                bits.push(repeated);
-            }
-        }
-        for _ in 0..literal_words {
-            let literal = *words
-                .get(word_index)
-                .ok_or_else(|| "Git EWAH literal word is missing".to_owned())?;
-            word_index += 1;
-            for bit in 0..64 {
-                if bits.len() == bit_size {
-                    break;
-                }
-                bits.push(literal & (1 << bit) != 0);
-            }
-        }
-    }
-    if word_index > word_count {
-        return Err("Git EWAH bitmap overruns its payload".to_owned());
-    }
-    Ok((bits, payload_len))
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn read_be_u32(data: &[u8]) -> Result<u32, String> {
-    data.get(..4)
-        .map(|bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
-        .ok_or_else(|| "truncated Git index integer".to_owned())
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn take_be_u32(data: &[u8], offset: &mut usize) -> Result<u32, String> {
-    let bytes = take_bytes(data, offset, 4)?;
-    Ok(u32::from_be_bytes(bytes.try_into().unwrap()))
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn take_leb128(data: &[u8], offset: &mut usize) -> Result<u64, String> {
-    let mut value = 0u64;
-    let mut shift = 0;
-    loop {
-        let byte = *take_bytes(data, offset, 1)?
-            .first()
-            .expect("one byte was requested");
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err("Git index varint is too large".to_owned());
-        }
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn skip_leb128(data: &[u8], mut offset: usize) -> Result<usize, String> {
-    take_leb128(data, &mut offset)?;
-    Ok(offset)
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn take_nul<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8], String> {
-    let tail = data
-        .get(*offset..)
-        .ok_or_else(|| "truncated Git index string".to_owned())?;
-    let length = tail
-        .iter()
-        .position(|byte| *byte == 0)
-        .ok_or_else(|| "unterminated Git index string".to_owned())?;
-    let value = &tail[..length];
-    *offset += length + 1;
-    Ok(value)
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn skip_nul(data: &[u8], mut offset: usize) -> Result<usize, String> {
-    take_nul(data, &mut offset)?;
-    Ok(offset)
-}
-
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-fn take_bytes<'a>(data: &'a [u8], offset: &mut usize, length: usize) -> Result<&'a [u8], String> {
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| "Git index offset overflow".to_owned())?;
-    let bytes = data
-        .get(*offset..end)
-        .ok_or_else(|| "truncated Git index payload".to_owned())?;
-    *offset = end;
     Ok(bytes)
 }

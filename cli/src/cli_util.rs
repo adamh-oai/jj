@@ -91,12 +91,8 @@ use jj_lib::local_working_copy::effective_exec_bit_policy_for_fingerprint;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 use jj_lib::local_working_copy::seed_local_working_copy_awacs_baseline;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-use jj_lib::local_working_copy::seed_local_working_copy_git_awacs_baseline;
-#[cfg(all(target_os = "linux", feature = "awacs"))]
 use jj_lib::local_working_copy::seed_local_working_copy_initialized_awacs_baseline;
 use jj_lib::lock::FileLock;
-#[cfg(all(target_os = "linux", feature = "awacs"))]
-use jj_lib::matchers::FilesMatcher;
 use jj_lib::matchers::Matcher;
 use jj_lib::matchers::NothingMatcher;
 use jj_lib::merge::Diff;
@@ -1563,66 +1559,6 @@ impl WorkspaceCommandHelper {
         Ok(())
     }
 
-    /// Snapshots while forcing a known set of paths from an external
-    /// authoritative cache into the scan.
-    ///
-    /// Snapshot-backed Git-worktree adoption uses this for paths which Git's
-    /// checksummed fsmonitor/untracked index state already proved dirty at the
-    /// imported AWACS cursor. AWACS contributes only newer cursor deltas.
-    #[cfg(all(target_os = "linux", feature = "awacs"))]
-    pub(crate) async fn maybe_snapshot_with_force_paths(
-        &mut self,
-        ui: &Ui,
-        paths: Vec<RepoPathBuf>,
-    ) -> Result<(), CommandError> {
-        if !self.may_snapshot_working_copy {
-            return Ok(());
-        }
-        let matcher = FilesMatcher::new(paths);
-        let git_import_export_lock = self.lock_git_import_export()?;
-        let stats = self
-            .snapshot_impl(ui, &git_import_export_lock, &matcher)
-            .await
-            .map_err(|err| err.into_command_error())?;
-        print_snapshot_stats(ui, &stats, self.env().path_converter())?;
-        Ok(())
-    }
-
-    /// Binds a freshly seeded snapshot working copy to the AWACS cursor
-    /// persisted in a strictly validated Git index.
-    #[cfg(all(target_os = "linux", feature = "awacs"))]
-    pub(crate) async fn seed_git_index_snapshot_workspace_awacs_baseline(
-        &mut self,
-        ui: &Ui,
-        baseline: &btrfs_awacs::scan::SnapshotBaseline,
-    ) -> Result<(), CommandError> {
-        let auto_tracking_matcher = self.auto_tracking_matcher(ui)?;
-        let options = self.snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)?;
-        let input_fingerprint = options.awacs_input_fingerprint.ok_or_else(|| {
-            internal_error_with_message(
-                "Failed to seed Git-index AWACS baseline",
-                "AWACS input fingerprint was not provided",
-            )
-        })?;
-        let operation_id = self.repo().op_id().clone();
-        let (mut locked_workspace, _commit) = self.unchecked_start_working_copy_mutation().await?;
-        if !seed_local_working_copy_git_awacs_baseline(
-            locked_workspace.locked_wc(),
-            baseline,
-            input_fingerprint,
-        )
-        .await
-        .map_err(internal_error)?
-        {
-            return Err(internal_error_with_message(
-                "Failed to seed Git-index AWACS baseline",
-                "new workspace did not reload as snapshot-backed",
-            ));
-        }
-        locked_workspace.finish(operation_id).await?;
-        Ok(())
-    }
-
     /// Runs the first explicit snapshot after a subvolume-mode transition.
     ///
     /// Subvolume initialization starts with a no-snapshot helper so copying
@@ -1715,6 +1651,7 @@ impl WorkspaceCommandHelper {
         &mut self,
         ui: &Ui,
         snapshot_identity: &btrfs_awacs::manager::SnapshotIdentity,
+        baseline_owner_id: Option<[u8; 16]>,
     ) -> Result<(), CommandError> {
         let auto_tracking_matcher = self.auto_tracking_matcher(ui)?;
         let options = self.snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)?;
@@ -1729,6 +1666,7 @@ impl WorkspaceCommandHelper {
         if !seed_local_working_copy_initialized_awacs_baseline(
             locked_workspace.locked_wc(),
             snapshot_identity,
+            baseline_owner_id,
             input_fingerprint,
         )
         .await

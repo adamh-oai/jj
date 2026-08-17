@@ -1136,6 +1136,8 @@ pub enum TreeStateError {
 const WORKING_COPY_STATE_MAGIC: &[u8] = b"\0JJ-WORKING-COPY-STATE\0v1\n";
 const WORKING_COPY_STATE_FORMAT_VERSION: u32 = 2;
 const SUBVOLUME_MODE_MARKER: &str = "subvolume_mode";
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+const AWACS_ADOPTION_SEED_MARKER: &str = "awacs-adoption-seed";
 
 fn is_snapshot_mode(state_path: &Path) -> bool {
     state_path.join(SUBVOLUME_MODE_MARKER).is_file()
@@ -1152,6 +1154,19 @@ fn is_valid_awacs_snapshot_baseline(
     baseline.filesystem_uuid.len() == 16
         && baseline.subvolume_uuid.len() == 16
         && !baseline.continuity_token.is_empty()
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn append_uuid_text(output: &mut Vec<u8>, bytes: &[u8]) {
+    debug_assert_eq!(bytes.len(), 16);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            output.push(b'-');
+        }
+        output.push(HEX[usize::from(byte >> 4)]);
+        output.push(HEX[usize::from(byte & 0x0f)]);
+    }
 }
 
 /// Returns whether strict subvolume mode has the committed AWACS baseline
@@ -1546,6 +1561,8 @@ impl TreeState {
             source,
         };
         let proto = self.working_copy_state_proto(checkout_state)?;
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        self.clear_snapshot_adoption_seed()?;
         let mut bytes = WORKING_COPY_STATE_MAGIC.to_vec();
         bytes.extend_from_slice(&proto.encode_to_vec());
         let mut temp_file = NamedTempFile::new_in(&self.state_path).map_err(wrap_write_err)?;
@@ -1574,7 +1591,72 @@ impl TreeState {
             });
         }
         sync_state_dir(&self.state_path).map_err(wrap_write_err)?;
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        self.publish_snapshot_adoption_seed(&proto)?;
         self.journal_generation = proto.generation;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    fn clear_snapshot_adoption_seed(&self) -> Result<(), TreeStateError> {
+        let path = self.state_path.join(AWACS_ADOPTION_SEED_MARKER);
+        if let Err(source) = fs::remove_file(&path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            return Err(TreeStateError::WriteTreeState { path, source });
+        }
+        Ok(())
+    }
+
+    /// Publishes the small cross-process handoff that lets a Git-mediated
+    /// Btrfs clone become a JJ workspace later.
+    ///
+    /// The compact journal remains JJ's source of semantic tree state. This
+    /// record only says that the journal was committed at a clean immutable
+    /// AWACS baseline, and names that baseline so an external worktree helper
+    /// can reject stale or half-written state before Git creates anything.
+    /// Removing the prior record before every journal write makes concurrent
+    /// readers observe either one complete generation or no transferable
+    /// state; they never pair a new journal with an old baseline identity.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    fn publish_snapshot_adoption_seed(
+        &self,
+        proto: &crate::protos::local_working_copy::WorkingCopyState,
+    ) -> Result<(), TreeStateError> {
+        if proto.phase() != crate::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline
+        {
+            return Ok(());
+        }
+        let Some(baseline) = proto
+            .baseline
+            .as_ref()
+            .filter(|baseline| is_valid_awacs_snapshot_baseline(baseline))
+        else {
+            return Ok(());
+        };
+        let path = self.state_path.join(AWACS_ADOPTION_SEED_MARKER);
+        let mut bytes = b"jj-awacs-adoption-v2:".to_vec();
+        append_uuid_text(&mut bytes, &baseline.filesystem_uuid);
+        bytes.push(b':');
+        append_uuid_text(&mut bytes, &baseline.subvolume_uuid);
+        bytes.push(b':');
+        append_uuid_text(&mut bytes, &proto.awacs_baseline_owner_id);
+        bytes.push(b'\n');
+        let wrap_write_err = |source| TreeStateError::WriteTreeState {
+            path: path.clone(),
+            source,
+        };
+        let mut temp_file = NamedTempFile::new_in(&self.state_path).map_err(wrap_write_err)?;
+        temp_file
+            .as_file_mut()
+            .write_all(&bytes)
+            .map_err(wrap_write_err)?;
+        temp_file.as_file().sync_data().map_err(wrap_write_err)?;
+        persist_temp_file(temp_file, &path).map_err(|source| TreeStateError::PersistTreeState {
+            path: path.clone(),
+            source,
+        })?;
+        sync_state_dir(&self.state_path).map_err(wrap_write_err)?;
         Ok(())
     }
 
@@ -4975,6 +5057,7 @@ pub async fn seed_local_working_copy_awacs_baseline(
 pub async fn seed_local_working_copy_initialized_awacs_baseline(
     locked: &mut dyn LockedWorkingCopy,
     snapshot_identity: &btrfs_awacs::manager::SnapshotIdentity,
+    baseline_owner_id: Option<[u8; 16]>,
     input_fingerprint: [u8; 32],
 ) -> Result<bool, SnapshotError> {
     let Some(snapshot) = locked.downcast_mut::<LockedLocalWorkingCopy>() else {
@@ -4991,6 +5074,12 @@ pub async fn seed_local_working_copy_initialized_awacs_baseline(
             err: "working copy already has a committed baseline".into(),
         });
     }
+    if let Some(baseline_owner_id) = baseline_owner_id {
+        tree_state.awacs_baseline_owner_id = baseline_owner_id.to_vec();
+    }
+    // Direct AWACS scans key replay from the retained snapshot identity. This
+    // non-empty marker distinguishes the bootstrap handoff from an absent
+    // baseline; the next scan replaces it with its authenticated cursor.
     let mut continuity_token = b"c:btrfs-awacs:initialized:1:".to_vec();
     continuity_token.extend_from_slice(&snapshot_identity.subvol_uuid);
     let baseline = crate::protos::local_working_copy::AwacsSnapshotBaseline {
@@ -5008,14 +5097,13 @@ pub async fn seed_local_working_copy_initialized_awacs_baseline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     struct RecordingScanSession {
-        outcomes: Arc<Mutex<Vec<ScanOutcome>>>,
+        outcomes: Arc<std::sync::Mutex<Vec<ScanOutcome>>>,
     }
 
     struct FailingPrepareScanSession {
-        outcomes: Arc<Mutex<Vec<ScanOutcome>>>,
+        outcomes: Arc<std::sync::Mutex<Vec<ScanOutcome>>>,
     }
 
     impl ScanSession for RecordingScanSession {
@@ -5044,13 +5132,13 @@ mod tests {
 
     #[test]
     fn pending_scan_aborts_on_drop_and_commits_explicitly() {
-        let aborted = Arc::new(Mutex::new(Vec::new()));
+        let aborted = Arc::new(std::sync::Mutex::new(Vec::new()));
         drop(PendingScan::new(Box::new(RecordingScanSession {
             outcomes: aborted.clone(),
         })));
         assert_eq!(aborted.lock().unwrap().as_slice(), &[ScanOutcome::Aborted]);
 
-        let committed = Arc::new(Mutex::new(Vec::new()));
+        let committed = Arc::new(std::sync::Mutex::new(Vec::new()));
         PendingScan::new(Box::new(RecordingScanSession {
             outcomes: committed.clone(),
         }))
@@ -5061,7 +5149,7 @@ mod tests {
             &[ScanOutcome::Committed]
         );
 
-        let failed = Arc::new(Mutex::new(Vec::new()));
+        let failed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut pending = PendingScan::new(Box::new(FailingPrepareScanSession {
             outcomes: failed.clone(),
         }));

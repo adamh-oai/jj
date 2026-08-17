@@ -537,8 +537,6 @@ fn test_workspaces_adopt_rejects_main_git_worktree() {
 #[cfg(unix)]
 #[test]
 fn test_workspaces_adopt_existing_snapshot_git_worktree() -> TestResult {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
@@ -553,33 +551,31 @@ fn test_workspaces_adopt_existing_snapshot_git_worktree() -> TestResult {
         .current_dir(main_dir.root())
         .output()?;
     assert!(add_output.status.success());
-    let hook_path = test_env.env_root().join("git-fsmonitor-awacs");
-    std::fs::write(
-        &hook_path,
-        "#!/bin/sh\nprintf 'awacs-git-v1:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:c:btrfs-awacs:scan:1:test\\0'\n",
-    )?;
-    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
-    for args in [
-        vec!["config", "core.fsmonitor", hook_path.to_str().unwrap()],
-        vec!["config", "core.fsmonitorHookVersion", "2"],
-        vec!["config", "core.untrackedCache", "true"],
-        vec!["config", "status.showUntrackedFiles", "all"],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(worktree_dir.root())
-            .output()?;
-        assert!(output.status.success());
-    }
-    let status = std::process::Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=all"])
+    let marker = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "awacs-jj-pending-consumer"])
         .current_dir(worktree_dir.root())
         .output()?;
     assert!(
-        status.status.success(),
-        "failed to seed Git AWACS index state: {}",
-        String::from_utf8_lossy(&status.stderr)
+        marker.status.success(),
+        "failed to find pending JJ marker path: {}",
+        String::from_utf8_lossy(&marker.stderr)
     );
+    let marker_path = std::path::PathBuf::from(String::from_utf8(marker.stdout)?.trim_end());
+    let pending_state_path = marker_path
+        .parent()
+        .unwrap()
+        .join("awacs-jj-pending-working-copy");
+    std::fs::create_dir(&pending_state_path)?;
+    std::fs::write(pending_state_path.join("checkout"), b"pending")?;
+    std::fs::write(
+        pending_state_path.join("subvolume_mode"),
+        b"snapshot-backed\n",
+    )?;
+    std::fs::write(
+        &marker_path,
+        "awacs-jj-pending-v2:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222\n",
+    )?;
+    assert!(!worktree_dir.root().join(".jj").exists());
 
     let path = install_fake_btrfs(
         &test_env,
@@ -607,12 +603,15 @@ exit 1
             .join(".jj/working_copy/subvolume_mode")
             .is_file()
     );
+    assert!(worktree_dir.root().join(".jj/repo").is_file());
+    assert!(!marker_path.exists());
+    assert!(!pending_state_path.exists());
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn test_workspaces_adopt_snapshot_rejects_untracked_git_index() -> TestResult {
+fn test_workspaces_adopt_snapshot_requires_pending_awacs_seed() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
@@ -649,7 +648,7 @@ exit 1
         output
             .stderr
             .raw()
-            .contains("Git index has no fsmonitor cache extension"),
+            .contains("without a pending JJ AWACS seed"),
         "{}",
         output.stderr.raw()
     );

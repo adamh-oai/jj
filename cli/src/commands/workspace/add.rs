@@ -324,7 +324,7 @@ pub async fn cmd_workspace_add(
             .and_then(|preparation| preparation.initialized_awacs_snapshot.as_ref())
         {
             workspace_command
-                .seed_initialized_snapshot_workspace_awacs_baseline(ui, snapshot_identity)
+                .seed_initialized_snapshot_workspace_awacs_baseline(ui, snapshot_identity, None)
                 .await?;
         } else {
             workspace_command
