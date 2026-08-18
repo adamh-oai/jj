@@ -319,6 +319,7 @@ impl WorkspacePool {
         SnapshotOptions {
             base_ignores,
             scan_root_ignores: vec![],
+            external_sparse_patterns: None,
             start_tracking_matcher: self.auto_tracking_matcher.as_ref(),
             progress: None,
             // TODO: read from current wc/settings

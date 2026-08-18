@@ -3157,9 +3157,9 @@ fn test_colocated_workspace_update_stale() {
     │ ○  f562bf82f2da default@
     ├─╯
     ○  30ed2f28b710
-    │ ○  e97ad7861f78 book1 "new book1"
+    │ ○  e97ad7861f78 book1* "new book1"
     ├─╯
-    │ ○  f656b467890b "old book1"
+    │ ○  f656b467890b book1@git "old book1"
     ├─╯
     ◆  000000000000
     [EOF]

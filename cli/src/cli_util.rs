@@ -2051,9 +2051,23 @@ to the current parents may contain changes from multiple commits.
             .collect();
         #[cfg(not(feature = "git"))]
         let scan_root_ignores = vec![];
+        #[cfg(feature = "git")]
+        let external_sparse_patterns = self
+            .env
+            .git_workspace
+            .as_ref()
+            .map(|workspace| {
+                jj_lib::git::sparse_patterns_in_git_dir(self.settings(), &workspace.git_dir)
+            })
+            .transpose()
+            .map_err(internal_error)?
+            .flatten();
+        #[cfg(not(feature = "git"))]
+        let external_sparse_patterns = None;
         Ok(SnapshotOptions {
             base_ignores,
             scan_root_ignores,
+            external_sparse_patterns,
             progress: None,
             start_tracking_matcher,
             force_tracking_matcher: &NothingMatcher,

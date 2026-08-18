@@ -1941,7 +1941,16 @@ async fn reset_head_impl(
         }
         None => gix::refs::transaction::PreviousValue::Any,
     };
-    if repo_head_target != new_head_target {
+    // For the main worktree, the cached JJ target is the expected state.
+    // If the desired target is unchanged, leave an externally moved HEAD
+    // alone so a no-op export cannot overwrite it. Linked worktrees do not
+    // have a cached target, so compare their actual local HEAD instead.
+    let should_reset_head = if should_update_git_head {
+        old_head_target != new_head_target
+    } else {
+        repo_head_target != new_head_target
+    };
+    if should_reset_head {
         let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
         update_git_head(&git_repo, expected_ref, new_oid)
             .map_err(|err| GitResetHeadError::UpdateHeadRef(err.into()))?;
@@ -2061,8 +2070,16 @@ async fn reset_index(
     update_intent_to_add_impl(git_repo, &mut index, &parent_tree, &wc_tree).await?;
 
     // Match entries in the new index with entries in the old index, and copy stat
-    // information if the entry didn't change.
-    if let Some(old_index) = git_repo.try_index().map_err(GitResetHeadError::from_git)? {
+    // information if the entry didn't change. Preserve Git's sparse profile
+    // separately: rebuilding from the JJ tree expands a sparse-directory entry
+    // into files, so pairwise entry copying alone cannot retain skip-worktree.
+    let old_index = git_repo.try_index().map_err(GitResetHeadError::from_git)?;
+    let sparse_patterns = old_index
+        .as_ref()
+        .map(|index| git_sparse_patterns_from_index(git_repo, index))
+        .transpose()?
+        .flatten();
+    if let Some(old_index) = old_index.as_ref() {
         index
             .entries_mut_with_paths()
             .merge_join_by(old_index.entries(), |(entry, path), old_entry| {
@@ -2073,6 +2090,20 @@ async fn reset_index(
             .map(|((entry, _), old_entry)| (entry, old_entry))
             .filter(|(entry, old_entry)| entry.id == old_entry.id && entry.mode == old_entry.mode)
             .for_each(|(entry, old_entry)| entry.stat = old_entry.stat);
+    }
+    if let Some(sparse_patterns) = sparse_patterns {
+        for (entry, path) in index.entries_mut_with_paths() {
+            let path = path.to_str().map_err(GitResetHeadError::from_git)?;
+            let path = RepoPath::from_internal_string(path).map_err(GitResetHeadError::from_git)?;
+            if sparse_patterns
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+            {
+                entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+            } else {
+                entry.flags.insert(gix::index::entry::Flags::SKIP_WORKTREE);
+            }
+        }
     }
 
     debug_assert!(index.verify_entries().is_ok());

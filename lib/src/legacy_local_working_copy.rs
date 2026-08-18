@@ -1371,6 +1371,7 @@ impl TreeState {
     ) -> Result<(bool, SnapshotStats), SnapshotError> {
         let SnapshotOptions {
             base_ignores,
+            external_sparse_patterns,
             progress,
             start_tracking_matcher,
             force_tracking_matcher,
@@ -1393,10 +1394,14 @@ impl TreeState {
             Some(fsmonitor_matcher) => fsmonitor_matcher.as_ref(),
         };
 
-        let matcher = IntersectionMatcher::new(
-            sparse_matcher.as_ref(),
-            UnionMatcher::new(fsmonitor_matcher, force_tracking_matcher),
-        );
+        let external_sparse_matcher = external_sparse_patterns.as_ref().map(PrefixMatcher::new);
+        let scan_matcher = UnionMatcher::new(fsmonitor_matcher, force_tracking_matcher);
+        let sparse_scan_matcher = IntersectionMatcher::new(sparse_matcher.as_ref(), scan_matcher);
+        let external_sparse_matcher: &dyn Matcher = external_sparse_matcher
+            .as_ref()
+            .map(|matcher| matcher as &dyn Matcher)
+            .unwrap_or(&EverythingMatcher);
+        let matcher = IntersectionMatcher::new(external_sparse_matcher, sparse_scan_matcher);
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             self.watchman_clock = watchman_clock;
@@ -1478,14 +1483,14 @@ impl TreeState {
             })
             .await?;
         if cfg!(debug_assertions) {
-            let tree_paths: HashSet<_> = self
+            let native_tree_paths: HashSet<_> = self
                 .tree
                 .entries_matching(sparse_matcher.as_ref())
                 .filter_map(|(path, result)| result.is_ok().then_some(path))
                 .collect();
             let file_states = self.file_states.all();
             let state_paths: HashSet<_> = file_states.paths().map(|path| path.to_owned()).collect();
-            assert_eq!(state_paths, tree_paths);
+            assert!(state_paths.is_subset(&native_tree_paths));
         }
         // Since untracked paths aren't cached in the tree state, we'll need to
         // rescan the working directory changes to report or track them later.

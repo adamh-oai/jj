@@ -156,6 +156,7 @@ pub fn empty_snapshot_options() -> SnapshotOptions<'static> {
     SnapshotOptions {
         base_ignores: GitIgnoreFile::empty(),
         scan_root_ignores: vec![],
+        external_sparse_patterns: None,
         progress: None,
         start_tracking_matcher: &EverythingMatcher,
         force_tracking_matcher: &NothingMatcher,

@@ -229,6 +229,13 @@ pub struct SnapshotOptions<'a> {
     /// Ignore files whose paths are relative to the worktree. These are read
     /// after a backend selects its scan root.
     pub scan_root_ignores: Vec<PathBuf>,
+    /// Additional sparse prefixes imposed by an external worktree owner.
+    ///
+    /// A colocated Git worktree can omit tracked paths using skip-worktree
+    /// bits without changing JJ's own sparse patterns. Local working copies
+    /// intersect these prefixes with their native sparse matcher so omitted
+    /// Git paths are not mistaken for deletions.
+    pub external_sparse_patterns: Option<Vec<RepoPathBuf>>,
     /// A callback for the UI to display progress.
     pub progress: Option<&'a SnapshotProgress<'a>>,
     /// For new files that are not already tracked, start tracking them if they

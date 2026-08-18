@@ -312,6 +312,7 @@ diff editing in mind and be a little inaccurate.
             .snapshot(&SnapshotOptions {
                 base_ignores,
                 scan_root_ignores: vec![],
+                external_sparse_patterns: None,
                 progress: None,
                 start_tracking_matcher: &EverythingMatcher,
                 force_tracking_matcher: &NothingMatcher,

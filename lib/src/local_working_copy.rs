@@ -2166,6 +2166,7 @@ impl TreeState {
         let SnapshotOptions {
             base_ignores,
             scan_root_ignores,
+            external_sparse_patterns,
             progress,
             start_tracking_matcher,
             force_tracking_matcher,
@@ -2175,6 +2176,7 @@ impl TreeState {
         } = options;
 
         let sparse_matcher = self.sparse_matcher();
+        let external_sparse_matcher = external_sparse_patterns.as_ref().map(PrefixMatcher::new);
 
         // Only authoritative immutable backends publish a durable baseline
         // token. Mutable Test/Watchman scans intentionally leave NoBaseline,
@@ -2242,10 +2244,13 @@ impl TreeState {
         }
         let fsmonitor_matcher = scan_scope.matcher();
 
-        let matcher = IntersectionMatcher::new(
-            sparse_matcher.as_ref(),
-            UnionMatcher::new(fsmonitor_matcher.as_ref(), force_tracking_matcher),
-        );
+        let scan_matcher = UnionMatcher::new(fsmonitor_matcher.as_ref(), force_tracking_matcher);
+        let sparse_scan_matcher = IntersectionMatcher::new(sparse_matcher.as_ref(), scan_matcher);
+        let external_sparse_matcher: &dyn Matcher = external_sparse_matcher
+            .as_ref()
+            .map(|matcher| matcher as &dyn Matcher)
+            .unwrap_or(&EverythingMatcher);
+        let matcher = IntersectionMatcher::new(external_sparse_matcher, sparse_scan_matcher);
         self.rebuild_ephemeral_tracked_paths(&scan_scope)?;
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
