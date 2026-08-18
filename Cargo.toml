@@ -183,13 +183,24 @@ while_let_loop = "warn"
 let_underscore_drop = "warn"
 redundant_imports = "warn"
 
+[profile.dev]
+# Keep local installs reasonably fast without paying full-LTO link costs.
+lto = "thin"
+opt-level = 2
+
 [profile.dev.package."*"]
-# Compile all dependencies with opt-level=3 to help speed up tests and
-# debug builds
+# Compile dependencies with the same moderate optimization level to help
+# speed up tests and debug builds without the cost of opt-level=3.
 codegen-units = 1
 debug = "line-tables-only"
-opt-level = 3
+opt-level = 2
 
 [profile.release]
 strip = "debuginfo"
 codegen-units = 1
+
+[profile.dev-opt]
+inherits = "release"
+incremental = true
+codegen-units = 256
+opt-level = 2
