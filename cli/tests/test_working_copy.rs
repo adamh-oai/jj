@@ -35,10 +35,7 @@ fn test_watchman_query_warning_without_debug_logging() {
         stderr.contains("Warning: Failed to query filesystem monitor:"),
         "{output}"
     );
-    assert!(
-        stderr.contains("Failed to connect to Watchman: No such file or directory"),
-        "{output}"
-    );
+    assert!(stderr.contains("Failed to connect to Watchman"), "{output}");
     assert!(!stderr.contains("jj_lib::local_working_copy"), "{output}");
 }
 

@@ -124,6 +124,7 @@ use crate::working_copy::SnapshotError;
 use crate::working_copy::SnapshotOptions;
 use crate::working_copy::SnapshotProgress;
 use crate::working_copy::SnapshotStats;
+use crate::working_copy::SnapshotWarning;
 use crate::working_copy::UntrackedReason;
 use crate::working_copy::WorkingCopy;
 use crate::working_copy::WorkingCopyFactory;
@@ -958,6 +959,7 @@ fn file_state(metadata: &Metadata) -> Result<Option<FileState>, MtimeOutOfRange>
 struct FsmonitorMatcher {
     matcher: Option<Box<dyn Matcher>>,
     watchman_clock: Option<crate::protos::local_working_copy::WatchmanClock>,
+    warning: Option<SnapshotWarning>,
 }
 
 /// Settings specific to the tree state of the [`LocalWorkingCopy`] backend.
@@ -1386,6 +1388,7 @@ impl TreeState {
         let FsmonitorMatcher {
             matcher: fsmonitor_matcher,
             watchman_clock,
+            warning: snapshot_warning,
         } = self
             .make_fsmonitor_matcher(&self.fsmonitor_settings)
             .await?;
@@ -1447,7 +1450,7 @@ impl TreeState {
         })?;
 
         let stats = SnapshotStats {
-            warnings: vec![],
+            warnings: snapshot_warning.into_iter().collect(),
             untracked_paths: untracked_paths_rx.into_iter().collect(),
             invalid_utf8_paths: invalid_utf8_paths_rx.into_iter().collect(),
         };
@@ -1510,19 +1513,37 @@ impl TreeState {
         &self,
         fsmonitor_settings: &FsmonitorSettings,
     ) -> Result<FsmonitorMatcher, SnapshotError> {
-        let (watchman_clock, changed_files) = match fsmonitor_settings {
-            FsmonitorSettings::None => (None, None),
-            FsmonitorSettings::Test { changed_files, .. } => (None, Some(changed_files.clone())),
+        let (watchman_clock, changed_files, warning) = match fsmonitor_settings {
+            FsmonitorSettings::None => (None, None, None),
+            FsmonitorSettings::Test { changed_files, .. } => {
+                (None, Some(changed_files.clone()), None)
+            }
             // AWACS is selected by the explicit subvolume marker before this
             // implementation is constructed. Treat any stale setting as no
             // monitor rather than changing legacy scanning semantics.
-            FsmonitorSettings::Awacs(_) | FsmonitorSettings::TestAwacs { .. } => (None, None),
+            FsmonitorSettings::Awacs(_) | FsmonitorSettings::TestAwacs { .. } => (None, None, None),
             #[cfg(feature = "watchman")]
             FsmonitorSettings::Watchman(config) => match self.query_watchman(config).await {
-                Ok((watchman_clock, changed_files)) => (Some(watchman_clock.into()), changed_files),
+                Ok((watchman_clock, changed_files)) => {
+                    (Some(watchman_clock.into()), changed_files, None)
+                }
+                Err(TreeStateError::Fsmonitor(source)) => {
+                    let mut message = source.to_string();
+                    let mut cause = source.source();
+                    while let Some(error) = cause {
+                        message.push_str(": ");
+                        message.push_str(&error.to_string());
+                        cause = error.source();
+                    }
+                    (
+                        None,
+                        None,
+                        Some(SnapshotWarning::FileSystemMonitor { message }),
+                    )
+                }
                 Err(err) => {
                     tracing::warn!(?err, "Failed to query filesystem monitor");
-                    (None, None)
+                    (None, None, None)
                 }
             },
             #[cfg(not(feature = "watchman"))]
@@ -1572,6 +1593,7 @@ impl TreeState {
         Ok(FsmonitorMatcher {
             matcher,
             watchman_clock,
+            warning,
         })
     }
 }
