@@ -2554,6 +2554,12 @@ impl TreeState {
                             retention_token: baseline.retention_token.clone(),
                         });
                 let can_use_delta = previous_baseline.is_some();
+                // Only the explicit enabling/rebuild transition is allowed to
+                // establish a new whole-tree baseline. A committed
+                // snapshot-backed workspace must fail closed if its exact
+                // retained baseline is missing.
+                let allow_full_invalidation =
+                    !can_use_delta && !snapshot_mode_requires_baseline(&self.state_path);
                 let request = btrfs_awacs::scan::BeginScanRequest {
                     live_root: self.working_copy_path.clone(),
                     baseline_owner_id: self
@@ -2562,6 +2568,7 @@ impl TreeState {
                         .try_into()
                         .expect("AWACS baseline owner id is always 16 bytes"),
                     previous_baseline,
+                    allow_full_invalidation,
                 };
                 let mut client = client.lock().map_err(|_| SnapshotError::Other {
                     message: "Failed to begin AWACS snapshot scan".to_string(),
@@ -2588,13 +2595,23 @@ impl TreeState {
                 }
                 let scan_root =
                     PathBuf::from(format!("/proc/self/fd/{}", lease.scan_root().as_raw_fd()));
-                // AWACS replays retained adjacent cut events and returns Full
-                // whenever this cursor's retained lineage cannot be proven.
+                // A full invalidation is admitted only for the explicit
+                // enabling/rebuild transition above. Ordinary committed
+                // snapshot-backed workspaces either receive exact paths or
+                // fail without advancing their baseline.
                 let (changed_files, changed_prefixes) = if !can_use_delta {
                     (None, None)
                 } else {
                     match &lease.invalidation {
-                        btrfs_awacs::scan::Invalidation::Full => (None, None),
+                        btrfs_awacs::scan::Invalidation::Full => {
+                            let _abort_result =
+                                lease.finish(btrfs_awacs::scan::ScanOutcome::Aborted);
+                            return Err(SnapshotError::Other {
+                                message: "Failed to begin AWACS snapshot scan".to_string(),
+                                err: "AWACS returned a full invalidation for a committed baseline"
+                                    .into(),
+                            });
+                        }
                         btrfs_awacs::scan::Invalidation::ExactPaths(paths) => (
                             Some(
                                 paths
@@ -2851,11 +2868,17 @@ impl FileSnapshotter<'_> {
     /// Builds ignore context through `dir` without reading sibling entries.
     /// The boolean records that an ancestor was ignored, in which case nested
     /// `.gitignore` files are intentionally not interpreted.
+    ///
+    /// Returns `None` when an ancestor is absent or no longer a directory
+    /// and that boundary is itself covered by this authoritative delta. The
+    /// caller can then treat the descendant as deleted without following a
+    /// symlink or crossing a file boundary. If the boundary was not reported,
+    /// keep rejecting the path instead of accepting a malformed delta.
     fn ignore_context_for_directory(
         &self,
         base_ignores: Arc<GitIgnoreFile>,
         dir: &RepoPath,
-    ) -> Result<(Arc<GitIgnoreFile>, bool), SnapshotError> {
+    ) -> Result<Option<(Arc<GitIgnoreFile>, bool)>, SnapshotError> {
         let mut git_ignore =
             base_ignores.chain_with_file(RepoPath::root(), self.scan_root.join(".gitignore"))?;
         let mut current = RepoPathBuf::root();
@@ -2869,6 +2892,9 @@ impl FileSnapshotter<'_> {
             let metadata = match disk_dir.symlink_metadata() {
                 Ok(metadata) => metadata,
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    if self.matcher.matches(&current) {
+                        return Ok(None);
+                    }
                     return Err(SnapshotError::Other {
                         message: format!(
                             "Refusing directed scan through missing ancestor {}",
@@ -2885,6 +2911,9 @@ impl FileSnapshotter<'_> {
                 }
             };
             if !metadata.is_dir() {
+                if self.matcher.matches(&current) {
+                    return Ok(None);
+                }
                 return Err(SnapshotError::Other {
                     message: format!(
                         "Refusing directed scan through non-directory ancestor {}",
@@ -2912,7 +2941,7 @@ impl FileSnapshotter<'_> {
             }
             git_ignore = git_ignore.chain_with_file(&current, disk_dir.join(".gitignore"))?;
         }
-        Ok((git_ignore, ancestor_ignored))
+        Ok(Some((git_ignore, ancestor_ignored)))
     }
 
     fn emit_deleted_tracked_paths(&self, tracked_paths: TrackedPaths<'_>, keep: Option<&RepoPath>) {
@@ -2986,7 +3015,17 @@ impl FileSnapshotter<'_> {
         if Self::path_has_reserved_component(path) {
             return Ok(());
         }
+        if !self.matcher.matches(path) {
+            return Ok(());
+        }
         let tracked_paths = self.tree_state.tracked_paths.all().prefixed(path);
+        let parent = path.parent().unwrap_or(RepoPath::root());
+        let Some((git_ignore, ancestor_ignored)) =
+            self.ignore_context_for_directory(base_ignores.clone(), parent)?
+        else {
+            self.emit_deleted_tracked_paths(tracked_paths, None);
+            return Ok(());
+        };
         let disk_path = path.to_fs_path(self.scan_root)?;
         let metadata = match disk_path.symlink_metadata() {
             Ok(metadata) => metadata,
@@ -3004,12 +3043,6 @@ impl FileSnapshotter<'_> {
         if metadata.is_dir() {
             return self.visit_prefix_root(path, base_ignores, scope);
         }
-        if !self.matcher.matches(path) {
-            return Ok(());
-        }
-        let parent = path.parent().unwrap_or(RepoPath::root());
-        let (git_ignore, ancestor_ignored) =
-            self.ignore_context_for_directory(base_ignores, parent)?;
         self.emit_deleted_tracked_paths(tracked_paths, Some(path));
         let present = self
             .inspect_present_path(
@@ -3037,6 +3070,15 @@ impl FileSnapshotter<'_> {
             return Ok(());
         }
         let tracked_paths = self.tree_state.tracked_paths.all().prefixed(prefix);
+        let parent = prefix.parent().unwrap_or(RepoPath::root());
+        let Some((parent_ignores, ancestor_ignored)) = (if prefix.is_root() {
+            Some((base_ignores, false))
+        } else {
+            self.ignore_context_for_directory(base_ignores, parent)?
+        }) else {
+            self.emit_deleted_tracked_paths(tracked_paths, None);
+            return Ok(());
+        };
         let disk_path = prefix.to_fs_path(self.scan_root)?;
         let metadata = match disk_path.symlink_metadata() {
             Ok(metadata) => metadata,
@@ -3050,12 +3092,6 @@ impl FileSnapshotter<'_> {
                     err: err.into(),
                 });
             }
-        };
-        let parent = prefix.parent().unwrap_or(RepoPath::root());
-        let (parent_ignores, ancestor_ignored) = if prefix.is_root() {
-            (base_ignores, false)
-        } else {
-            self.ignore_context_for_directory(base_ignores, parent)?
         };
         if metadata.is_dir() {
             if RESERVED_DIR_NAMES
@@ -4991,14 +5027,17 @@ pub fn reset_local_working_copy_fsmonitor(
     Ok(false)
 }
 
-/// Seeds snapshot-backed state with the semantic tree already checked out on
-/// disk, without materializing or rewriting files.
+/// Seeds snapshot-backed state with the semantic tree bound to the inherited
+/// filesystem baseline, without materializing or rewriting files.
 ///
 /// A topology migration copies the working directory before the first AWACS
 /// scan. The new compact journal has no prior tree to classify tracked paths
-/// from, so callers must provide the existing checkout tree once. This is not
-/// a checkout/reset operation: local modifications and untracked files remain
-/// on disk for the subsequent snapshot to classify normally.
+/// from, so callers must provide the copied checkout tree once. The live
+/// directory may already have advanced since that immutable baseline (for
+/// example, Git may have checked out another ref before delayed workspace
+/// adoption). This is not a checkout/reset operation: those modifications and
+/// untracked files remain on disk for the subsequent snapshot to classify
+/// normally.
 pub async fn seed_local_working_copy_tree(
     locked: &mut dyn LockedWorkingCopy,
     tree: &MergedTree,
@@ -5051,8 +5090,12 @@ pub async fn seed_local_working_copy_awacs_baseline(
 /// Snapshot workspace creation has just cloned the parent's path map and
 /// published an inherited child revision for this exact immutable snapshot.
 /// The local journal only needs to bind that snapshot identity to the
-/// already-seeded semantic tree. Later direct scans consume the identity and
-/// obtain a fresh authenticated cursor with their next cut.
+/// already-seeded semantic tree. Delayed Git adoption may already have
+/// materialized a different live checkout after that snapshot; the binding
+/// still names the immutable inherited tree, and the caller must immediately
+/// run the normal snapshot to reconcile that A -> B transition. Later direct
+/// scans consume the identity and obtain a fresh authenticated cursor with
+/// their next cut.
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 pub async fn seed_local_working_copy_initialized_awacs_baseline(
     locked: &mut dyn LockedWorkingCopy,

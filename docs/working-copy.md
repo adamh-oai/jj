@@ -126,6 +126,11 @@ subvolume. Adoption records the inherited files as the initial snapshot
 baseline without rewriting them; it rejects a plain directory rather than
 silently creating a non-snapshot-backed workspace.
 
+The linked Git worktree may check out a different ref after the child
+subvolume is created. Adoption still binds the copied JJ tree to the initial
+immutable snapshot first, then its normal snapshot reconciles that baseline
+to the Git checkout through the authenticated filesystem delta.
+
 Having multiple workspaces can be useful for running long-running tests in one
 while you continue developing in another, for example. If needed,
 `jj workspace root --name <workspace>` prints the root path of the specified

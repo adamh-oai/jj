@@ -54,7 +54,6 @@ use crate::commands::btrfs::set_subvolume_mode;
 use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-use crate::progress::ProgressWriter;
 use crate::ui::Ui;
 
 struct SnapshotPreparation {
@@ -452,36 +451,13 @@ fn initialize_snapshot_awacs_root(
     if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
         return Ok(None);
     }
-    let mut progress_writer = ProgressWriter::new(ui, "AWACS worktree init");
-    let mut final_counts = None;
     let initialized =
         initialize_descendant_root(root, parent_root, None, |progress| match progress {
             InitProgress::Phase(phase) => {
-                let _status_result = writeln!(ui.status(), "AWACS worktree init: {phase}...");
-            }
-            InitProgress::Index(counts) => {
-                final_counts = Some(counts);
-                if let Some(writer) = &mut progress_writer {
-                    writer
-                        .display(&format!(
-                            "{} directories, {} objects, {} paths",
-                            counts.directories, counts.objects, counts.references,
-                        ))
-                        .ok();
-                }
+                let _status_result = writeln!(ui.status(), "awacs: {phase}...");
             }
         })
         .map_err(|err| user_error(format!("Failed to initialize AWACS worktree: {err}")))?;
-    drop(progress_writer);
-    if let Some(counts) = final_counts {
-        writeln!(
-            ui.status(),
-            "AWACS worktree init: indexed {} directories, {} objects, {} paths.",
-            counts.directories,
-            counts.objects,
-            counts.references,
-        )?;
-    }
     Ok(Some(initialized.snapshot_identity))
 }
 

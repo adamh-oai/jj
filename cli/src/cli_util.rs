@@ -5226,6 +5226,7 @@ impl<'a> CliRunner<'a> {
         config = config_env.resolve_config(&raw_config)?;
         migrate_config(&mut config)?;
         ui.reset(&config)?;
+        crate::progress::install_file_lock_wait_reporter(ui);
 
         // Print only the last migration messages to omit duplicates.
         for (source, desc) in &last_config_migration_descriptions {

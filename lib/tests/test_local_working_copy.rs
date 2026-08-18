@@ -4051,6 +4051,79 @@ fn test_test_awacs_exact_delta_rejects_symlink_ancestor() -> TestResult {
 }
 
 #[test]
+#[cfg(unix)]
+fn test_test_awacs_exact_delta_reconciles_reported_symlink_ancestor() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let scan_root = test_repo.env.root().join("scan-root");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&scan_root)?;
+    std::fs::create_dir(&state_path)?;
+    enable_snapshot_mode(&state_path)?;
+    let base_settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root,
+        state_path.clone(),
+        &base_settings,
+    )?;
+
+    let ancestor = repo_path("dir");
+    let path = repo_path("dir/file");
+    testutils::write_working_copy_file(&scan_root, path, "before\n");
+    let full_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root: scan_root.clone(),
+            changed_files: None,
+            cursor: b"baseline-a".to_vec(),
+        },
+        ..base_settings.clone()
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path.clone(),
+        &full_settings,
+    )?;
+    let options = SnapshotOptions {
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    tree_state.snapshot(&options).block_on()?;
+    tree_state.save()?;
+    seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
+
+    std::fs::remove_file(path.to_fs_path_unchecked(&scan_root))?;
+    std::fs::remove_dir(scan_root.join("dir"))?;
+    symlink_file("replacement", scan_root.join("dir"))?;
+    let exact_settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root,
+            changed_files: Some(vec![
+                ancestor.to_fs_path_unchecked(Path::new("")),
+                path.to_fs_path_unchecked(Path::new("")),
+            ]),
+            cursor: b"baseline-b".to_vec(),
+        },
+        ..base_settings
+    };
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        test_repo.env.root().join("workspace"),
+        state_path,
+        &exact_settings,
+    )?;
+    tree_state.snapshot(&options).block_on()?;
+    let expected_tree = create_tree_with(repo, |builder| {
+        builder.symlink(ancestor, "replacement");
+    });
+    assert_tree_eq!(*tree_state.current_tree(), expected_tree);
+    Ok(())
+}
+
+#[test]
 #[cfg(all(feature = "awacs", unix))]
 fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_snapshot()
 -> TestResult {

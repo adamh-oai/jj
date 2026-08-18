@@ -16,16 +16,15 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write as _;
-use std::os::fd::AsFd as _;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use btrfs_awacs::bootstrap::{InitProgress, RootInitPaths, initialize_root};
-use btrfs_awacs::btrfs::{destroy_snapshot, set_subvolume_readonly, subvolume_info};
+use btrfs_awacs::bootstrap::{
+    InitProgress, RootInitPaths, initialize_root, trash_existing_root_snapshots_for_rebuild,
+};
 use btrfs_awacs::subvolume_migration::{
     MigrationOptions, convert_subvolume_root, copy_children, copy_children_except,
 };
@@ -43,7 +42,6 @@ use crate::commands::btrfs::{
     begin_subvolume_mode, btrfs_command, btrfs_subvolume_id, delete_btrfs_subvolume, is_btrfs_path,
     is_btrfs_subvolume, is_subvolume_mode_committed, is_subvolume_mode_enabled, set_subvolume_mode,
 };
-use crate::progress::ProgressWriter;
 use crate::ui::Ui;
 
 /// Manage the Btrfs subvolume layout of the current repository.
@@ -201,7 +199,7 @@ async fn rebuild_snapshot_baseline(
 ) -> Result<(), CommandError> {
     writeln!(
         ui.status(),
-        "Rebuilding committed AWACS snapshot baseline..."
+        "awacs: rebuilding committed snapshot baseline..."
     )?;
     let workspace_root = workspace_command.workspace_root().to_owned();
     rebuild_awacs_root_state(ui, &workspace_root)?;
@@ -224,7 +222,7 @@ async fn rebuild_snapshot_baseline(
     let marker_result = set_subvolume_mode(&workspace_root, true);
     baseline_result?;
     marker_result?;
-    writeln!(ui.status(), "Rebuilt committed AWACS snapshot baseline.")?;
+    writeln!(ui.status(), "awacs: rebuilt committed snapshot baseline.")?;
     Ok(())
 }
 
@@ -242,14 +240,23 @@ fn rebuild_awacs_root_state(ui: &Ui, root: &Path) -> Result<(), CommandError> {
         .ok_or_else(|| user_error("AWACS manager database has no state directory"))?;
     writeln!(
         ui.status(),
-        "Removing existing AWACS root state at {}...",
+        "awacs: removing existing root state at {}...",
         state_dir.display()
+    )?;
+    let trashed = trash_existing_root_snapshots_for_rebuild(root).map_err(|err| {
+        user_error(format!(
+            "Failed to queue old AWACS snapshots for deletion: {err}"
+        ))
+    })?;
+    writeln!(
+        ui.status(),
+        "awacs: queued {trashed} old snapshots for asynchronous deletion..."
     )?;
     if !paths.managed_dir.starts_with(state_dir) {
         remove_btrfs_aware(&paths.managed_dir)?;
     }
     remove_btrfs_aware(state_dir)?;
-    writeln!(ui.status(), "Initializing fresh AWACS root state...")?;
+    writeln!(ui.status(), "awacs: initializing fresh root state...")?;
     seed_initial_awacs_root(ui, root)
 }
 
@@ -263,52 +270,16 @@ fn remove_btrfs_aware(path: &Path) -> Result<(), CommandError> {
         return Ok(());
     }
     if is_btrfs_subvolume(path)? {
-        delete_rebuild_snapshot(path)?;
-        return Ok(());
+        return Err(user_error(format!(
+            "Unexpected Btrfs subvolume remained after broker trash handoff: {}",
+            path.display()
+        )));
     }
     for entry in fs::read_dir(path).context(path)? {
         let entry = entry.context(path)?;
         remove_btrfs_aware(&entry.path())?;
     }
     fs::remove_dir(path).context(path)?;
-    Ok(())
-}
-
-/// Deletes one managed snapshot during a from-scratch rebuild.
-///
-/// The normal AWACS GC path makes a retained read-only snapshot writable
-/// immediately before destroying it. Rebuild has no live store left to drive
-/// GC, so it must perform the same transition directly instead of asking the
-/// btrfs CLI to remove a read-only root.
-fn delete_rebuild_snapshot(path: &Path) -> Result<(), CommandError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| user_error(format!("Btrfs subvolume has no parent: {}", path.display())))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| user_error(format!("Btrfs subvolume has no name: {}", path.display())))?;
-    let target = fs::File::open(path).context(path)?;
-    let readonly = subvolume_info(target.as_fd())
-        .map_err(|err| user_error(format!("Failed to inspect Btrfs subvolume: {err}")))?
-        .readonly();
-    if readonly {
-        set_subvolume_readonly(target.as_fd(), false).map_err(|err| {
-            user_error(format!(
-                "Failed to make Btrfs subvolume writable for deletion: {err}"
-            ))
-        })?;
-    }
-    let parent = fs::File::open(parent).context(parent)?;
-    if let Err(err) = destroy_snapshot(parent.as_fd(), name.as_bytes()) {
-        if readonly && let Err(restore_err) = set_subvolume_readonly(target.as_fd(), true) {
-            return Err(user_error(format!(
-                "Failed to delete Btrfs subvolume: {err}; also failed to restore read-only flag: {restore_err}"
-            )));
-        }
-        return Err(user_error(format!(
-            "Failed to delete Btrfs subvolume: {err}"
-        )));
-    }
     Ok(())
 }
 
@@ -462,7 +433,7 @@ async fn init_subvolume_at_inner(
             keep_temporary_on_drop: false,
         },
         |phase| {
-            let _status_result = writeln!(ui.status(), "AWACS init: {phase}...");
+            let _status_result = writeln!(ui.status(), "awacs: {phase}...");
         },
     )
     .map_err(|err| user_error(format!("Failed to publish subvolume migration: {err}")))?;
@@ -499,7 +470,7 @@ async fn init_subvolume_at_inner(
         .await?;
     writeln!(ui.status(), "Seeding snapshot-backed working-copy tree...")?;
     seed_snapshot_working_copy_tree(&mut destination_command).await?;
-    writeln!(ui.status(), "Creating initial AWACS snapshot baseline...")?;
+    writeln!(ui.status(), "awacs: creating initial snapshot baseline...")?;
     establish_initial_snapshot_baseline(ui, &mut destination_command).await?;
     set_subvolume_mode(&destination, true)?;
     writeln!(
@@ -514,38 +485,15 @@ fn seed_initial_awacs_root(ui: &Ui, root: &Path) -> Result<(), CommandError> {
     // The existing CLI test backend supplies a synthetic AWACS baseline and
     // intentionally does not provide a real Btrfs filesystem to index.
     if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
-        writeln!(ui.status(), "AWACS init: test root initialized...")?;
+        writeln!(ui.status(), "awacs: test root initialized...")?;
         return Ok(());
     }
-    let mut progress_writer = ProgressWriter::new(ui, "AWACS init");
-    let mut final_counts = None;
     initialize_root(root, |progress| match progress {
         InitProgress::Phase(phase) => {
-            let _status_result = writeln!(ui.status(), "AWACS init: {phase}...");
-        }
-        InitProgress::Index(counts) => {
-            final_counts = Some(counts);
-            if let Some(writer) = &mut progress_writer {
-                writer
-                    .display(&format!(
-                        "{} directories, {} objects, {} paths",
-                        counts.directories, counts.objects, counts.references,
-                    ))
-                    .ok();
-            }
+            let _status_result = writeln!(ui.status(), "awacs: {phase}...");
         }
     })
     .map_err(|err| user_error(format!("Failed to initialize AWACS root: {err}")))?;
-    drop(progress_writer);
-    if let Some(counts) = final_counts {
-        writeln!(
-            ui.status(),
-            "AWACS init: indexed {} directories, {} objects, {} paths.",
-            counts.directories,
-            counts.objects,
-            counts.references,
-        )?;
-    }
     Ok(())
 }
 

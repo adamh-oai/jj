@@ -92,13 +92,29 @@ impl RealBtrfsFixtureCleanup {
             if !directory.is_dir() {
                 continue;
             }
+            if directory
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".broker-trash-"))
+            {
+                // The broker owns these wrappers (and therefore they may not
+                // be traversable by the test user), but once its asynchronous
+                // drain has removed the nested snapshot they are empty and
+                // can be unlinked through the test-owned parent directory.
+                std::fs::remove_dir(&directory)?;
+                continue;
+            }
             for snapshot in std::fs::read_dir(directory)? {
                 let snapshot = snapshot?.path();
                 if snapshot
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().starts_with("cut-"))
                 {
-                    snapshots.push(snapshot);
+                    let wrapped_snapshot = snapshot.join("snapshot");
+                    snapshots.push(if wrapped_snapshot.exists() {
+                        wrapped_snapshot
+                    } else {
+                        snapshot
+                    });
                 }
             }
         }
@@ -606,6 +622,96 @@ exit 1
     assert!(worktree_dir.root().join(".jj/repo").is_file());
     assert!(!marker_path.exists());
     assert!(!pending_state_path.exists());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspaces_adopt_snapshot_rolls_back_after_initialization_failure() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let worktree_dir = test_env.work_dir("worktree");
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
+    let add_output = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(add_output.status.success());
+    let marker = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "awacs-jj-pending-consumer"])
+        .current_dir(worktree_dir.root())
+        .output()?;
+    assert!(
+        marker.status.success(),
+        "failed to find pending JJ marker path: {}",
+        String::from_utf8_lossy(&marker.stderr)
+    );
+    let marker_path = std::path::PathBuf::from(String::from_utf8(marker.stdout)?.trim_end());
+    let pending_state_path = marker_path
+        .parent()
+        .unwrap()
+        .join("awacs-jj-pending-working-copy");
+    std::fs::create_dir(&pending_state_path)?;
+    std::fs::write(pending_state_path.join("checkout"), b"pending")?;
+    std::fs::write(
+        pending_state_path.join("subvolume_mode"),
+        b"snapshot-backed\n",
+    )?;
+    std::fs::write(
+        &marker_path,
+        "awacs-jj-pending-v2:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222\n",
+    )?;
+
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    exit 0
+fi
+exit 1
+"#,
+    );
+    // Fail after workspace initialization but before the first snapshot can
+    // complete. The pending AWACS seed must remain available for a real retry,
+    // while both the JJ registration and partial .jj directory are removed.
+    let output = worktree_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env("JJ_TEST_AWACS_SCAN_ROOT", worktree_dir.root())
+            .args([
+                "workspace",
+                "adopt",
+                "--name",
+                "adopted",
+                "--config=snapshot.auto-track='glob:['",
+            ])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("Failed to parse fileset"),
+        "{output}"
+    );
+    assert!(
+        !worktree_dir.root().join(".jj").exists(),
+        "failed adoption should remove partial .jj metadata"
+    );
+    assert!(marker_path.exists());
+    assert!(pending_state_path.exists());
+    let output = main_dir
+        .run_jj(["--ignore-working-copy", "workspace", "list"])
+        .success();
+    assert!(
+        !output.stdout.raw().contains("adopted:"),
+        "failed adoption should remove the workspace registration: {output}"
+    );
     Ok(())
 }
 
@@ -1147,6 +1253,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     );
     let repo_root = btrfs_root.join(format!("jj-subvolume-e2e-{suffix}"));
     let secondary_root = btrfs_root.join(format!("jj-subvolume-secondary-e2e-{suffix}"));
+    let adopted_root = btrfs_root.join(format!("jj-subvolume-adopted-e2e-{suffix}"));
     let awacs_state = btrfs_root.join(format!(".jj-subvolume-e2e-awacs-{suffix}"));
     std::fs::create_dir(&repo_root)?;
     std::fs::create_dir(&awacs_state)?;
@@ -1158,6 +1265,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let mut fixture_cleanup =
         RealBtrfsFixtureCleanup::new(repo_root.clone(), awacs_state.clone(), runtime_dir.clone());
     fixture_cleanup.track_subvolume_root(secondary_root.clone());
+    fixture_cleanup.track_subvolume_root(adopted_root.clone());
 
     let test_env = TestEnvironment::default();
     let main_dir = test_env.work_dir(&repo_root);
@@ -1248,6 +1356,234 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         })
         .success();
 
+    // Exercise delayed adoption after Git checks out a tree different from
+    // the source snapshot. The child starts with source tree A and its JJ
+    // journal, then Git materializes target tree B before `workspace adopt`
+    // gets a chance to bind and reconcile the inherited baseline.
+    main_dir.write_file("file", "target\n");
+    main_dir.write_file("target-only", "created by target\n");
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["commit", "-m", "target"])
+        })
+        .success();
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["bookmark", "create", "target", "-r", "@-"])
+        })
+        .success();
+    let target_head = Command::new("git")
+        .args(["rev-parse", "refs/heads/target"])
+        .current_dir(&repo_root)
+        .output()?;
+    assert!(
+        target_head.status.success(),
+        "resolve target Git ref: {}",
+        String::from_utf8_lossy(&target_head.stderr)
+    );
+    let target_head = String::from_utf8(target_head.stdout)?.trim().to_owned();
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["new", "@--"])
+        })
+        .success();
+    let source_head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo_root)
+        .output()?;
+    assert!(
+        source_head.status.success(),
+        "resolve source Git HEAD: {}",
+        String::from_utf8_lossy(&source_head.stderr)
+    );
+    assert_ne!(
+        String::from_utf8(source_head.stdout)?.trim(),
+        target_head,
+        "the regression requires source HEAD A to differ from target B"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("file"))?,
+        "tracked\n"
+    );
+    assert!(!repo_root.join("target-only").exists());
+
+    // The Btrfs clone is only a transfer mechanism. Git must discard every
+    // non-ignored source-side state before exposing the requested target.
+    main_dir.write_file("file", "staged source change\n");
+    let stage_source = Command::new("git")
+        .args(["add", "file"])
+        .current_dir(&repo_root)
+        .output()?;
+    assert!(
+        stage_source.status.success(),
+        "stage source change: {}",
+        String::from_utf8_lossy(&stage_source.stderr)
+    );
+    main_dir.write_file("file", "unstaged source change\n");
+    main_dir.write_file("source-untracked", "discard me\n");
+
+    let worktree_add = Command::new(&awacs_command)
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
+        .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
+        .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
+        .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
+        .args(["git", "worktree-add", "--source"])
+        .arg(&repo_root)
+        .arg("--destination")
+        .arg(&adopted_root)
+        .args([
+            "--ref",
+            "refs/heads/target",
+            "--git",
+            "git",
+            "--required",
+            "--detach",
+        ])
+        .output()?;
+    assert!(
+        worktree_add.status.success(),
+        "create snapshot-backed Git worktree at target B failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&worktree_add.stdout),
+        String::from_utf8_lossy(&worktree_add.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(adopted_root.join("file"))?,
+        "target\n"
+    );
+    assert!(adopted_root.join("target-only").is_file());
+    assert!(
+        !adopted_root.join("source-untracked").exists(),
+        "source untracked files must not leak into the target worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(adopted_root.join("ignored-untracked"))?,
+        "leave me untracked\n",
+        "ignored source files should remain available as reusable build output"
+    );
+    // The snapshot-backed checkout deliberately strips A's FSMN token:
+    // that token belongs to the source watch, not this child. Exercise the
+    // first real hook query from B and require it to mint a child-owned token
+    // from the retained sequence-zero snapshot instead of widening to "/".
+    let git_fsmonitor_hook = runtime_dir.join("git-fsmonitor-awacs");
+    std::os::unix::fs::symlink(&awacs_command, &git_fsmonitor_hook)?;
+    let configure_hook = Command::new("git")
+        .args(["config", "core.fsmonitor"])
+        .arg(&git_fsmonitor_hook)
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        configure_hook.status.success(),
+        "configure target Git fsmonitor hook: {}",
+        String::from_utf8_lossy(&configure_hook.stderr)
+    );
+    let configure_hook_version = Command::new("git")
+        .args(["config", "core.fsmonitorHookVersion", "2"])
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        configure_hook_version.status.success(),
+        "configure target Git fsmonitor hook protocol: {}",
+        String::from_utf8_lossy(&configure_hook_version.stderr)
+    );
+    let adopted_git_status = Command::new("git")
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
+        .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
+        .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
+        .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
+        .args(["status", "--porcelain"])
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        adopted_git_status.status.success(),
+        "inspect target Git status: {}",
+        String::from_utf8_lossy(&adopted_git_status.stderr)
+    );
+    assert!(
+        adopted_git_status.stdout.is_empty(),
+        "the target Git worktree must be clean: {}",
+        String::from_utf8_lossy(&adopted_git_status.stdout)
+    );
+    let adopted_index = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        adopted_index.status.success(),
+        "resolve target Git index: {}",
+        String::from_utf8_lossy(&adopted_index.stderr)
+    );
+    let adopted_index =
+        std::path::PathBuf::from(String::from_utf8(adopted_index.stdout)?.trim().to_owned());
+    let adopted_index = std::fs::read(&adopted_index)?;
+    assert!(
+        adopted_index
+            .windows(b"awacs-git-v2:".len())
+            .any(|window| window == b"awacs-git-v2:"),
+        "the first target Git status must persist a destination-owned AWACS token"
+    );
+    let disable_hook = Command::new("git")
+        .args(["config", "--unset-all", "core.fsmonitor"])
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        disable_hook.status.success(),
+        "remove target Git fsmonitor hook: {}",
+        String::from_utf8_lossy(&disable_hook.stderr)
+    );
+    let disable_hook_version = Command::new("git")
+        .args(["config", "--unset-all", "core.fsmonitorHookVersion"])
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        disable_hook_version.status.success(),
+        "remove target Git fsmonitor hook protocol: {}",
+        String::from_utf8_lossy(&disable_hook_version.stderr)
+    );
+
+    let adopted_dir = test_env.work_dir(&adopted_root);
+    adopted_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["workspace", "adopt", "--name", "adopted"])
+        })
+        .success();
+    let adopted_status = adopted_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["status"])
+        })
+        .success();
+    assert!(
+        adopted_status
+            .stdout
+            .raw()
+            .contains("The working copy has no changes."),
+        "adoption should reconcile A -> B without synthetic changes: {adopted_status}"
+    );
+    let adopted_parent = adopted_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["log", "-r", "@-", "--no-graph", "-T", "commit_id"])
+        })
+        .success();
+    assert_eq!(
+        adopted_parent.stdout.raw().trim(),
+        target_head,
+        "the adopted working-copy commit should remain based on Git target B"
+    );
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.args(["workspace", "remove", "adopted"])
+        })
+        .success();
+    assert!(!adopted_root.exists());
+
     let workspace_add = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
@@ -1271,8 +1607,8 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         workspace_add
             .stderr
             .raw()
-            .contains("AWACS worktree init: cloning parent AWACS path map..."),
-        "workspace add must clone the parent map instead of walking the child: {workspace_add}"
+            .contains("AWACS worktree init: sharing parent AWACS path map..."),
+        "workspace add must share the parent map instead of walking the child: {workspace_add}"
     );
     assert!(
         !workspace_add
@@ -1293,6 +1629,9 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let mut child_store = None;
     for entry in std::fs::read_dir(&awacs_state)? {
         let manager_db = entry?.path().join("manager.sqlite3");
+        if !manager_db.is_file() {
+            continue;
+        }
         let store = Store::open(&manager_db)?;
         let parent_count: i64 = store.connection().query_row(
             "SELECT count(*) FROM watches WHERE live_path = ?1",

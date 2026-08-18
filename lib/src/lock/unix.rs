@@ -15,16 +15,21 @@
 #![expect(missing_docs)]
 
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 
 use rustix::fs::FlockOperation;
 use tracing::instrument;
 
 use super::FileLockError;
+use super::read_lock_owner;
+use super::start_file_lock_wait_notice;
+use super::write_lock_owner;
 
 pub struct FileLock {
     path: PathBuf,
     file: File,
+    process_id: u32,
 }
 
 impl FileLock {
@@ -41,24 +46,49 @@ impl FileLock {
     }
 
     fn lock_inner(path: PathBuf, blocking: bool) -> Result<Option<Self>, FileLockError> {
-        tracing::info!("Attempting to lock {path:?}");
-        let operation = if blocking {
-            FlockOperation::LockExclusive
-        } else {
-            FlockOperation::NonBlockingLockExclusive
-        };
+        let process_id = std::process::id();
+        tracing::info!(?path, process_id, "Attempting to lock");
         loop {
             // Create lockfile, or open pre-existing one
-            let file = File::create(&path).map_err(|err| FileLockError {
-                message: "Failed to open lock file",
-                path: path.clone(),
-                err,
-            })?;
-            // If the lock was already held, block until it's released, or (in
-            // non-blocking mode) report that it's currently unavailable.
-            match rustix::fs::flock(&file, operation) {
+            //
+            // Do not truncate a pre-existing lockfile here. Its contents
+            // identify the current holder while this process waits.
+            let mut file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|err| FileLockError {
+                    message: "Failed to open lock file",
+                    path: path.clone(),
+                    err,
+                })?;
+            // First try without blocking so we can report the current holder
+            // before waiting. In non-blocking mode, report that the lock is
+            // unavailable instead.
+            match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => {}
-                Err(rustix::io::Errno::WOULDBLOCK) if !blocking => return Ok(None),
+                Err(rustix::io::Errno::WOULDBLOCK) if blocking => {
+                    let holder = read_lock_owner(&file).unwrap_or_else(|| "<unknown>".to_owned());
+                    tracing::info!(?path, process_id, holder = %holder, "Waiting for lock");
+                    let wait_notice = start_file_lock_wait_notice(&path, &holder);
+                    let result =
+                        rustix::fs::flock(&file, FlockOperation::LockExclusive).map_err(|errno| {
+                            FileLockError {
+                                message: "Failed to lock lock file",
+                                path: path.clone(),
+                                err: errno.into(),
+                            }
+                        });
+                    drop(wait_notice);
+                    result?;
+                }
+                Err(rustix::io::Errno::WOULDBLOCK) => {
+                    let holder = read_lock_owner(&file).unwrap_or_else(|| "<unknown>".to_owned());
+                    tracing::info!(?path, process_id, holder = %holder, "Lock is held");
+                    return Ok(None);
+                }
                 Err(errno) => {
                     return Err(FileLockError {
                         message: "Failed to lock lock file",
@@ -95,8 +125,15 @@ impl FileLock {
                 }
             }
 
-            tracing::info!("Locked {path:?}");
-            return Ok(Some(Self { path, file }));
+            if let Err(err) = write_lock_owner(&mut file, process_id) {
+                tracing::warn!(?err, ?path, process_id, "Failed to record lock owner");
+            }
+            tracing::info!(?path, process_id, "Locked");
+            return Ok(Some(Self {
+                path,
+                file,
+                process_id,
+            }));
         }
     }
 }
@@ -104,11 +141,19 @@ impl FileLock {
 impl Drop for FileLock {
     #[instrument(skip_all)]
     fn drop(&mut self) {
+        tracing::info!(?self.path, process_id = self.process_id, "Releasing lock");
         // Removing the file isn't strictly necessary, but reduces confusion.
         std::fs::remove_file(&self.path).ok();
         // Unblock any processes that tried to acquire the lock while we held it.
         // They're responsible for creating and locking a new lockfile, since we
         // just deleted this one.
-        rustix::fs::flock(&self.file, FlockOperation::Unlock).ok();
+        match rustix::fs::flock(&self.file, FlockOperation::Unlock) {
+            Ok(()) => {
+                tracing::info!(?self.path, process_id = self.process_id, "Released lock");
+            }
+            Err(err) => {
+                tracing::warn!(?err, ?self.path, process_id = self.process_id, "Failed to release lock");
+            }
+        }
     }
 }

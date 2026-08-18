@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(all(target_os = "linux", feature = "awacs"))]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +29,8 @@ use jj_lib::repo::Repo as _;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
+use jj_lib::workspace_store::SimpleWorkspaceStore;
+use jj_lib::workspace_store::WorkspaceStore as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -158,6 +159,12 @@ pub async fn cmd_workspace_adopt(
         None
     };
     let workspace_name = workspace_name(&worktree.root, args)?;
+    // Adoption publishes both repository state and an on-disk workspace-store
+    // entry before its first working-copy snapshot can run. Keep that whole
+    // transition serialized so a failed snapshot can roll back the same name
+    // without racing another workspace lifecycle command.
+    let lifecycle_store = SimpleWorkspaceStore::load(main_workspace.repo_path())?;
+    let _lifecycle_lock = lifecycle_store.lock_lifecycle()?;
     let op = command.resolve_operation(
         ui,
         main_workspace.repo_loader(),
@@ -186,11 +193,38 @@ pub async fn cmd_workspace_adopt(
         workspace_name.clone(),
     )
     .await?;
+
+    macro_rules! adoption_try {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let mut error = CommandError::from(error);
+                    if let Err(rollback_error) = rollback_failed_adoption(
+                        command,
+                        &main_workspace,
+                        &lifecycle_store,
+                        &worktree.root,
+                        &workspace_name,
+                    )
+                    .await
+                    {
+                        error.add_hint(format!(
+                            "Failed to roll back partial workspace adoption: {}",
+                            rollback_error.error
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    }
+
     if snapshot {
         #[cfg(all(target_os = "linux", feature = "awacs"))]
-        begin_subvolume_mode(&worktree.root)?;
+        adoption_try!(begin_subvolume_mode(&worktree.root));
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
-        set_subvolume_mode(&worktree.root, true)?;
+        adoption_try!(set_subvolume_mode(&worktree.root, true));
     }
 
     // `init_workspace_with_existing_repo()` starts at the root commit. Replace
@@ -198,21 +232,23 @@ pub async fn cmd_workspace_adopt(
     // HEAD, then reset only jj's working-copy metadata. The files and Git index
     // are already materialized by Git and must not be checked out again.
     let mut tx = repo.start_transaction();
-    let wc_commit = tx
-        .repo_mut()
-        .check_out(workspace_name.clone(), &head_commit)
-        .await?;
+    let wc_commit = adoption_try!(
+        tx.repo_mut()
+            .check_out(workspace_name.clone(), &head_commit)
+            .await
+    );
     tx.repo_mut()
         .set_git_head_target(&workspace_name, RefTarget::normal(worktree.head_id.clone()));
-    tx.repo_mut().rebase_descendants().await?;
-    let unpublished = tx
-        .write(format!(
+    adoption_try!(tx.repo_mut().rebase_descendants().await);
+    let unpublished = adoption_try!(
+        tx.write(format!(
             "adopt existing Git worktree as workspace '{}'",
             workspace_name.as_symbol()
         ))
-        .await?;
+        .await
+    );
     let repo = if command.should_commit_transaction() {
-        unpublished.publish().await?
+        adoption_try!(unpublished.publish().await)
     } else {
         unpublished.leave_unpublished()
     };
@@ -224,24 +260,36 @@ pub async fn cmd_workspace_adopt(
         // therefore owns the ordinary working-copy implementation. Reload
         // after the marker is durable so the compact journal is selected.
         drop(workspace);
-        let mut workspace_command = command
-            .workspace_helper_no_snapshot_at(ui, &worktree.root)
-            .await?;
+        let mut workspace_command = adoption_try!(
+            command
+                .workspace_helper_no_snapshot_at(ui, &worktree.root)
+                .await
+        );
+        // The pending tree describes immutable child snapshot A. Git may have
+        // checked out a different HEAD into the live worktree after A was
+        // created; in that case the final snapshot below reconciles A -> B
+        // against the working-copy commit already based on that Git HEAD.
         let synthetic_seed_tree = wc_commit.tree();
-        seed_snapshot_adopt_tree(
-            &mut workspace_command,
-            snapshot_seed_tree.as_ref().unwrap_or(&synthetic_seed_tree),
-        )
-        .await?;
-        workspace_command
-            .seed_initialized_snapshot_workspace_awacs_baseline(
-                ui,
-                &pending_jj_seed.snapshot_identity,
-                Some(pending_jj_seed.owner_id),
+        adoption_try!(
+            seed_snapshot_adopt_tree(
+                &mut workspace_command,
+                snapshot_seed_tree.as_ref().unwrap_or(&synthetic_seed_tree),
             )
-            .await?;
-        set_subvolume_mode(&worktree.root, true)?;
-        workspace_command.maybe_snapshot(ui).await?;
+            .await
+        );
+        adoption_try!(
+            workspace_command
+                .seed_initialized_snapshot_workspace_awacs_baseline(
+                    ui,
+                    &pending_jj_seed.snapshot_identity,
+                    Some(pending_jj_seed.owner_id),
+                )
+                .await
+        );
+        adoption_try!(set_subvolume_mode(&worktree.root, true));
+        // This is also the checkout-reconciliation step for a Git worktree
+        // whose requested HEAD differs from the inherited source HEAD.
+        adoption_try!(workspace_command.maybe_snapshot(ui).await);
         clear_pending_jj_consumer_seed(&worktree)?;
         writeln!(
             ui.status(),
@@ -251,17 +299,56 @@ pub async fn cmd_workspace_adopt(
         return Ok(());
     }
 
-    let mut locked_workspace = workspace.start_working_copy_mutation().await?;
-    locked_workspace.locked_wc().reset(&wc_commit).await?;
-    locked_workspace.finish(repo.op_id().clone()).await?;
+    let mut locked_workspace = adoption_try!(workspace.start_working_copy_mutation().await);
+    adoption_try!(locked_workspace.locked_wc().reset(&wc_commit).await);
+    adoption_try!(locked_workspace.finish(repo.op_id().clone()).await);
 
-    let mut workspace_command = command.for_workable_repo(ui, workspace, repo)?;
-    workspace_command.maybe_snapshot(ui).await?;
+    let mut workspace_command = adoption_try!(command.for_workable_repo(ui, workspace, repo));
+    adoption_try!(workspace_command.maybe_snapshot(ui).await);
     writeln!(
         ui.status(),
         "Adopted Git worktree as workspace '{}'",
         workspace_name.as_symbol()
     )?;
+    Ok(())
+}
+
+async fn rollback_failed_adoption(
+    command: &CommandHelper,
+    main_workspace: &Workspace,
+    lifecycle_store: &SimpleWorkspaceStore,
+    worktree_root: &Path,
+    workspace_name: &WorkspaceNameBuf,
+) -> Result<(), CommandError> {
+    let repo = main_workspace.repo_loader().load_at_head().await?;
+    if repo.view().get_wc_commit_id(workspace_name).is_some() {
+        let mut tx = repo.start_transaction();
+        tx.repo_mut().remove_workspace(workspace_name).await?;
+        tx.repo_mut().rebase_descendants().await?;
+        let unpublished = tx
+            .write(format!(
+                "roll back failed workspace adoption '{}'",
+                workspace_name.as_symbol()
+            ))
+            .await?;
+        if command.should_commit_transaction() {
+            unpublished.publish().await?;
+        } else {
+            unpublished.leave_unpublished();
+        }
+    }
+    lifecycle_store.forget(&[workspace_name.as_ref()])?;
+    let jj_dir = worktree_root.join(".jj");
+    match fs::remove_dir_all(&jj_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(user_error(format!(
+                "Failed to remove partial workspace metadata at {}: {error}",
+                jj_dir.display()
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -28,6 +28,9 @@ use tracing::instrument;
 
 use super::FileLockError;
 use super::backoff::BackoffIterator;
+use super::read_lock_owner;
+use super::start_file_lock_wait_notice;
+use super::write_lock_owner;
 
 const FILE_SHARE_READ: u32 = 1;
 const FILE_SHARE_WRITE: u32 = 2;
@@ -37,6 +40,7 @@ pub struct FileLock {
     path: PathBuf,
     /// `Option` so `Drop` can close the handle before deleting.
     file: Option<File>,
+    process_id: u32,
 }
 
 impl FileLock {
@@ -53,40 +57,54 @@ impl FileLock {
     }
 
     fn lock_inner(path: PathBuf, blocking: bool) -> Result<Option<Self>, FileLockError> {
-        tracing::info!("Attempting to lock {path:?}");
+        let process_id = std::process::id();
+        tracing::info!(?path, process_id, "Attempting to lock");
 
-        let file = try_create_file(&path).map_err(|err| FileLockError {
+        let mut file = try_create_file(&path).map_err(|err| FileLockError {
             message: "Failed to open lock file",
             path: path.clone(),
             err,
         })?;
 
-        if blocking {
-            // Acquire exclusive lock (blocks until available)
-            file.lock().map_err(|err| FileLockError {
-                message: "Failed to lock lock file",
-                path: path.clone(),
-                err,
-            })?;
-        } else {
-            // Acquire the lock, or report that another process holds it.
-            match file.try_lock() {
-                Ok(()) => {}
-                Err(TryLockError::WouldBlock) => return Ok(None),
-                Err(TryLockError::Error(err)) => {
-                    return Err(FileLockError {
-                        message: "Failed to lock lock file",
-                        path,
-                        err,
-                    });
-                }
+        // First try without blocking so we can report the current holder
+        // before waiting. In non-blocking mode, report that the lock is
+        // unavailable instead.
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) if blocking => {
+                let holder = read_lock_owner(&file).unwrap_or_else(|| "<unknown>".to_owned());
+                tracing::info!(?path, process_id, holder = %holder, "Waiting for lock");
+                let wait_notice = start_file_lock_wait_notice(&path, &holder);
+                let result = file.lock().map_err(|err| FileLockError {
+                    message: "Failed to lock lock file",
+                    path: path.clone(),
+                    err,
+                });
+                drop(wait_notice);
+                result?;
+            }
+            Err(TryLockError::WouldBlock) => {
+                let holder = read_lock_owner(&file).unwrap_or_else(|| "<unknown>".to_owned());
+                tracing::info!(?path, process_id, holder = %holder, "Lock is held");
+                return Ok(None);
+            }
+            Err(TryLockError::Error(err)) => {
+                return Err(FileLockError {
+                    message: "Failed to lock lock file",
+                    path,
+                    err,
+                });
             }
         }
 
-        tracing::info!("Locked {path:?}");
+        if let Err(err) = write_lock_owner(&mut file, process_id) {
+            tracing::warn!(?err, ?path, process_id, "Failed to record lock owner");
+        }
+        tracing::info!(?path, process_id, "Locked");
         Ok(Some(Self {
             path,
             file: Some(file),
+            process_id,
         }))
     }
 }
@@ -94,9 +112,13 @@ impl FileLock {
 impl Drop for FileLock {
     #[instrument(skip_all)]
     fn drop(&mut self) {
+        tracing::info!(?self.path, process_id = self.process_id, "Releasing lock");
         if let Some(file) = self.file.take() {
             file.unlock()
                 .inspect_err(|err| tracing::warn!(?err, ?self.path, "Failed to unlock lock file"))
+                .map(|()| {
+                    tracing::info!(?self.path, process_id = self.process_id, "Released lock");
+                })
                 .ok();
             // file is dropped here, closing the handle so the delete below
             // can succeed. Another process holding the file open prevents
@@ -111,6 +133,7 @@ fn try_create_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options
         .create(true)
+        .read(true)
         .write(true)
         // Don't share delete access. This ensures that std::fs::remove_file
         // (which uses DeleteFileW) will fail if any other process has the file
