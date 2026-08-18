@@ -130,6 +130,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "ansi",
     "env-filter",
     "fmt",
+    "json",
 ] }
 unicode-width = "0.2.2"
 watchman_client = "0.9.0"

@@ -1414,3 +1414,33 @@ fn test_debug_logging_enabled() {
     // Luckily, insta will print this in color when reviewing.
     insta::assert_snapshot!(log_line, @"[32m INFO[0m [2mjj_cli::cli_util[0m[2m:[0m debug logging enabled");
 }
+
+#[test]
+fn test_debug_logging_to_file() -> TestResult {
+    let test_env = TestEnvironment::default();
+    let log_file = test_env.env_root().join("jj.log");
+
+    let output = test_env
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_LOG_FILE", &log_file)
+                .args(["version", "--debug"])
+        })
+        .success();
+    assert!(output.stderr.raw().is_empty());
+    let log = std::fs::read_to_string(log_file)?;
+    let event: serde_json::Value = serde_json::from_str(
+        log.lines()
+            .find(|line| line.contains("debug logging enabled"))
+            .expect("debug logging event"),
+    )?;
+    assert_eq!(event["target"], "jj_cli::cli_util");
+    assert_eq!(event["fields"]["message"], "debug logging enabled");
+    let process_span = event["spans"]
+        .as_array()
+        .expect("span list")
+        .iter()
+        .find(|span| span["name"] == "process")
+        .expect("process identity span");
+    assert!(process_span["pid"].as_u64().is_some());
+    Ok(())
+}
