@@ -3,11 +3,12 @@ title: Persistent state, one counter at a time
 description: Follow a tiny AWACS consumer that keeps a crash-safe count of files whose names start with A.
 ---
 
-Imagine we have a large directory tree of files, and want to track some state about that tree as it changes: count the number of files that contain the word "froge".   
+
 
 ## v0
 
 The brute force solution is easy:
+
 ```
 $ rg -l 'froge' | wc -l
 ```
@@ -23,12 +24,13 @@ class FrogeState:
     froge_files: set[str]
 ```
 
-`clock` is an opaque version that is passed back to `watchman`, so it can produce `files_changed_since(clock)`.
+`clock` is an opaque version that is passed back to `watchman`, so we can ask
+for `files_changed_since(clock)`.
 
 With this we can incrementally update the state, doing only `O(changes)` work instead of traversing the whole repo:
 
 ```
-def initial_count() -> FrogeState:
+def initial_state() -> FrogeState:
    files = set()
    new_clock = current_clock()
    for f in traverse_all_files():
@@ -36,11 +38,10 @@ def initial_count() -> FrogeState:
        files.add(f)
    return FrogeState(new_clock, files)
 
-def update_count(prev: FrogeState) -> FrogeState:
+def update_state(prev: FrogeState) -> FrogeState:
   new_files = set(prev.froge_files)
-  new_clock, changes = changes_since(prev.clock)
+  new_clock, changes = files_changed_since(prev.clock)
   for f in changes:
-    m = file_contains_froge(f)
     if file_contains_froge(f):
       new_files.add(f)
     else:
@@ -48,9 +49,18 @@ def update_count(prev: FrogeState) -> FrogeState:
   return FrogeState(new_clock, new_files)
 ```
 
-But there are some problems:
+But there a numerous ways that this can fail and require a full, slow scan of
+the entire repo:
 
-  * 
+  * `watchman` is implemented with `inotify`, which only detects changes while its running; if it restarts or you reboot -> rescan
+  * `inotify` watches are a finite kernel resource; if you run out -> rescan
+  * `inotify` has a fixed-size buffer for changes, if it fills up -> rescan
+  * If you create a new worktree -> rescan
+
+As a separate issue, `inotify` is asynchronous and subject to race conditions
+between what's actually in the filesystem and when you get the notification.
+
+
 
 ## Names used in the example
 
