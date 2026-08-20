@@ -37,6 +37,7 @@ This document contains the help content for the `jj` command-line program.
 * [`jj config path`↴](#jj-config-path)
 * [`jj config set`↴](#jj-config-set)
 * [`jj config unset`↴](#jj-config-unset)
+* [`jj converge`↴](#jj-converge)
 * [`jj describe`↴](#jj-describe)
 * [`jj diff`↴](#jj-diff)
 * [`jj diffedit`↴](#jj-diffedit)
@@ -155,6 +156,7 @@ To get started, see the tutorial [`jj help -k tutorial`].
 * `bookmark` — Manage bookmarks [default alias: b]
 * `commit` — Update the description and create a new change on top [default alias: ci]
 * `config` — Manage config options
+* `converge` — Converge divergent versions of a change into one canonical revision
 * `describe` — Update the change description or other metadata [default alias: desc]
 * `diff` — Compare file contents between two revisions
 * `diffedit` — Touch up the content changes in a revision with a diff editor
@@ -920,6 +922,39 @@ Update a config file to unset the given option
 * `--user` — Target the user-level config
 * `--repo` — Target the repo-level config
 * `--workspace` — Target the workspace-level config
+
+
+
+## `jj converge`
+
+Converge divergent versions of a change into one canonical revision
+
+The divergent revisions become evolution predecessors of the new revision. They do not become commit-graph parents. The solution always has exactly one commit-graph parent; use --onto to choose that parent when it cannot be inferred automatically. By default, the command never prompts or opens an editor; use --interactive to opt into that behavior.
+
+**Usage:** `jj converge [OPTIONS]`
+
+###### **Options:**
+
+* `-r`, `--revision <REVSETS>` — Revisions containing the divergent change to converge
+
+   The revset must identify exactly one divergent change ID. If omitted, all divergent revisions are considered, which succeeds only if the repository has exactly one divergent change.
+* `-o`, `--onto <REVSET>` — Canonical parent for the solution revision
+
+   This accepts exactly one revision. It is useful when divergent versions were rebased onto different parents and no unique linear parent can be inferred.
+* `--author-from <REVSET>` — Revision whose author should be used for the solution revision
+
+   This must select exactly one of the divergent revisions. The full author signature, including its timestamp, is copied from that revision.
+* `-m`, `--message <MESSAGE>` — Description for the solution revision
+
+   If the divergent descriptions cannot be merged automatically and this option is omitted, normal mode reports the unresolved choice. With --interactive, an editor opens with the competing descriptions.
+* `--message-from <REVSET>` — Revision whose description should be used for the solution revision
+
+   This must select exactly one of the divergent revisions.
+* `-i`, `--interactive` — Prompt for unresolved author, description, or parent choices
+
+   Without this option, unresolved choices are reported without changing history. Explicit options such as --onto, --author-from, --message-from, and --message take precedence over interactive choices.
+* `--dry-run` — Report the convergence plan without changing history
+* `--json` — Emit the dry-run convergence plan as JSON
 
 
 
