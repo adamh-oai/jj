@@ -1,13 +1,15 @@
-# jj converge (aka resolve-divergence) Command Design
+# jj converge Command Design
 
 Authors: [David Rieber](mailto:drieber@google.com),
 [Martin von Zweigbergk](mailto:martinvonz@google.com)
 
 **Summary:** This document is a proposal for a new `jj converge` command to help
-users resolve (or reduce) divergence. The command will use heuristics -- and
-sometimes will prompt the user for input -- to rewrite the N visible commits for
-a given change with a single new commit, without introducing new divergence in
-the process. `jj resolve-divergence` will be an alias for `jj converge`.
+users resolve (or reduce) divergence. The command uses heuristics to rewrite the
+N visible commits for a given change with a single new commit, without
+introducing new divergence in the process. By default the command is
+non-interactive: it either converges deterministically or reports every choice
+that still needs an explicit command-line argument. `--interactive` (`-i`) opts
+into prompts and an editor for human-driven resolution.
 
 ## Objective
 
@@ -21,13 +23,86 @@ scenarios with the help of this command. Solving divergence means rewriting the
 commit graph to end up with a single visible commit for the given change id. For
 the purposes of this design doc we call this commit the *"solution"*.
 
-The command should produce informative messages to summarize any changes made,
-and will prompt for user input in some situations. The user may of course not
-like the solution. `jj undo` can be used in that case.
+The command should produce informative messages to summarize any changes made.
+It must not read stdin or open an editor unless `--interactive` is passed. The
+user may of course not like the solution. `jj undo` can be used in that case.
+
+## Differences from the existing RFC
+
+This design intentionally changes the original interactive-first proposal in
+these ways:
+
+*   Normal `jj converge` never prompts or opens an editor. If author,
+    description, or canonical parent cannot be inferred, it exits without a
+    convergence transaction and reports all unresolved choices at once.
+*   `--interactive` (`-i`) preserves the original prompt/editor flow as an
+    explicit human-only mode. Explicit resolution flags always take precedence.
+*   Each promptable attribute has a deterministic override: `--onto` chooses
+    the single canonical parent, `--author-from` copies the full author
+    signature from an exact divergent commit, and `--message-from` or `-m`
+    chooses the description.
+*   `--dry-run --json` exposes a machine-readable convergence plan with exact
+    commit IDs, unresolved choices, candidates, descendant-rebase count, and
+    predicted tree-conflict state. Agents can rerun the plan with additional
+    overrides until `ready` is true, then invoke the same command without
+    `--dry-run`.
+*   A solution always has exactly one commit-graph parent. Divergent commits
+    become evolution predecessors, never multiple commit-graph parents. If no
+    safe linear parent is obvious, the caller must provide `--onto` or stop.
+*   Content conflicts are preserved in the solution and reported after a
+    successful convergence; they do not trigger an interactive merge inside
+    `jj converge`.
 
 [divergent change]: ../glossary.md#divergent-change
 [visible commits]: ../glossary.md#visible-commits
 [Handling divergent commits]: ../guides/divergence.md
+
+## Command-line contract
+
+The non-interactive form is:
+
+```sh
+jj converge -r 'change_id(<change-id>)' \
+  [--onto <parent>] \
+  [--author-from <divergent-commit>] \
+  [--message-from <divergent-commit> | -m <message>]
+```
+
+If any attribute remains unresolved, the command reports every unresolved
+attribute and exits without rewriting commits. The report names the flag that
+resolves each choice and lists exact candidate commit IDs. `/0` and `/1` are not
+stable identifiers and should not be emitted as machine-facing candidates.
+
+The planning form is:
+
+```sh
+jj converge -r 'change_id(<change-id>)' --dry-run --json
+```
+
+Dry-run never performs the convergence transaction. JSON output includes the
+change ID, divergent commit IDs, `ready`, unresolved choices with their
+`resolve_with` flags and candidates, hard `blocked` reasons,
+`would_rebase_descendants`, and `may_conflict` once all choices are resolved.
+Callers may supply only some overrides, rerun dry-run, inspect the remaining
+choices, and apply once the plan is ready. Each invocation recomputes the plan
+from current repository state; no partial convergence state is persisted.
+
+The human-driven form is:
+
+```sh
+jj converge -i -r 'change_id(<change-id>)'
+```
+
+In interactive mode, unresolved authors and parents use prompts and unresolved
+descriptions use an editor. Explicit flags still win and suppress interaction
+for their attributes. `--interactive` and `--dry-run` are mutually exclusive.
+
+Some conditions are safety failures, not promptable choices: no divergent
+change, multiple divergent change IDs without an exact `-r`, immutable commits
+that would be rewritten, root-commit convergence, or an invalid `--onto` that is
+hidden, has the divergent change ID, or descends from a divergent commit.
+Normal mode reports these as errors. Dry-run includes rewrite-immutability
+failures in `blocked`; invalid explicit arguments still fail immediately.
 
 ## Divergent changes
 
@@ -171,9 +246,12 @@ SameChange::Accept` (later on in this design doc we will tweak the merge
 algorithm a bit).
 
 The description is merged as a String value. If the description does not
-trivially resolve, the user's merge tool will be invoked, with conflict markers.
-If author does not trivially resolve, the user will be presented with the
-options to choose from. Once that's all done we have our solution commit *B*.
+trivially resolve, normal mode reports `--message-from <commit-id>` and
+`-m <message>` as the ways to resolve it. With `--interactive`, the user's
+merge tool is invoked with conflict markers. If author does not trivially
+resolve, normal mode reports exact `--author-from <commit-id>` candidates;
+interactive mode presents those options to the user. Once all choices are
+resolved we have our solution commit *B*.
 All descendants of *B/0* and *B/1* are rebased onto *B*. The command records the
 operation in the operation log with a new View where *B* is a visible commit
 with *{B/0, B/1}* as predecessors. *B/0* and *B/1* become hidden commits.
@@ -255,7 +333,7 @@ parents = P⁻ + (B/0⁻ - P⁻) + (B/1⁻ - P⁻)
 
 That expression resolves trivially to *{A}* when using SameChange::Accept.
 
-#### Example 4: divergent commits with different parents, must prompt user to choose parents
+#### Example 4: divergent commits with different parents, must choose one parent
 
 If instead *P* is a child of some other commit *X*, the story is a bit
 different:
@@ -280,8 +358,10 @@ In this case parents will be
 {X} + ({A} - {X}) + ({C} - {X}) = {A} + ({C} - {X})
 ```
 
-Since this does not trivially resolve, the command prompts the user to select
-the desired parents for the solution: either *{A}* or *{C}*.
+Since this does not trivially resolve, normal mode exits without rewriting and
+reports *A* and *C* as exact `--onto` candidates. With `--interactive`, the
+command prompts the user to select the desired parent for the solution: either
+*A* or *C*.
 
 Assume the user chooses *{C}*. The command then rebases (in memory) *B/0*, *B/1*
 and *P* onto the chosen parents:
@@ -415,10 +495,11 @@ Q /     ( foo.txt contents: "v1" )
 P       ( foo.txt contents: "v1" )
 ```
 
-In this case *try_resolve_deduplicating_same_diffs* produces none. jj converge
-cannot automatically resolve this merge so the user has to merge the
-description: the command invokes the user's merge-tool with base "v1" and sides
-"v2"/"v3".
+In this case *try_resolve_deduplicating_same_diffs* produces none. `jj converge`
+cannot automatically resolve this merge. Normal mode reports the exact commits
+that can be selected with `--message-from`, or the caller can pass a merged
+description with `-m`. With `--interactive`, the command invokes the user's
+merge tool with base "v1" and sides "v2"/"v3".
 
 ### Edge cases when choosing the parents of the solution
 
@@ -440,20 +521,21 @@ On the other hand,
     the same change-id,
 
 then we would introduce new divergence or cycles in the commit graph if we based
-on the solution on such candidate parents. In these edge cases the command will
-simply discard the candidate parents and will instead ask the user to choose
-which parents to use (or quit without making any changes). Care must be
-taken when picking the options to present to the user for choosing parents:
-essentially the user will choose between the parents of *B/0*, the parents of
-*B/1*, and so on, but we will skip any *B/i* if any of the parents of *B/i*
-descends from any *B/j*. Since the commit graph is a DAG, at least one option is
-viable.
+the solution on such candidate parents. In these edge cases the command discards
+unsafe candidates. Normal mode reports the remaining exact `--onto` candidates,
+or errors with no valid candidates if none remain. Interactive mode instead asks
+the user to choose a parent (or quit without making any changes). Care must be
+taken when picking the options to report or present: essentially the user chooses
+between the parents of *B/0*, the parents of *B/1*, and so on, but we skip any
+*B/i* if any of its parents descends from any *B/j*. Since the commit graph is a
+DAG, at least one option is viable.
 
 ## Multiple divergent change-ids
 
-If there are multiple divergent change-ids, the command could prompt the user to
-choose one, or apply heuristics to choose one programmatically. In the first
-version it is OK to prompt the user.
+If there are multiple divergent change-ids, the command errors without changing
+history and lists matching change IDs. The caller must select one explicitly
+with `-r 'change_id(<change-id>)'`; `--interactive` does not choose a change ID
+because exact target selection is part of the command's safety boundary.
 
 If the command successfully resolves divergence in the first divergent
 change-id, it could continue to process the next divergent change-id, and so on.
