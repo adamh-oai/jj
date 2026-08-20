@@ -1216,6 +1216,7 @@ exit 1
 #[test]
 #[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
+    use btrfs_awacs::bootstrap::state_root_for_root;
     use btrfs_awacs::store::Store;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
@@ -1253,6 +1254,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     );
     let repo_root = btrfs_root.join(format!("jj-subvolume-e2e-{suffix}"));
     let secondary_root = btrfs_root.join(format!("jj-subvolume-secondary-e2e-{suffix}"));
+    let failed_root = btrfs_root.join(format!("jj-subvolume-failed-e2e-{suffix}"));
     let adopted_root = btrfs_root.join(format!("jj-subvolume-adopted-e2e-{suffix}"));
     let awacs_state = btrfs_root.join(format!(".jj-subvolume-e2e-awacs-{suffix}"));
     std::fs::create_dir(&repo_root)?;
@@ -1265,6 +1267,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let mut fixture_cleanup =
         RealBtrfsFixtureCleanup::new(repo_root.clone(), awacs_state.clone(), runtime_dir.clone());
     fixture_cleanup.track_subvolume_root(secondary_root.clone());
+    fixture_cleanup.track_subvolume_root(failed_root.clone());
     fixture_cleanup.track_subvolume_root(adopted_root.clone());
 
     let test_env = TestEnvironment::default();
@@ -1291,7 +1294,9 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let configure_awacs = |cmd: &mut assert_cmd::Command| {
         cmd.env("BTRFS_AWACS_COMMAND", &awacs_command)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
+            // Keep managed snapshots and logs in a fixture-owned directory so
+            // cleanup can be deterministic, but deliberately exercise the
+            // production state-root selection below.
             .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
             .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
             .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket);
@@ -1307,7 +1312,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         output
             .stderr
             .raw()
-            .contains("Creating initial AWACS snapshot baseline...")
+            .contains("awacs: creating initial snapshot baseline...")
     );
     assert!(
         !output.stderr.raw().contains("tracked-large"),
@@ -1425,12 +1430,13 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     main_dir.write_file("file", "unstaged source change\n");
     main_dir.write_file("source-untracked", "discard me\n");
 
+    let git_trace = awacs_state.join("dirty-worktree-git-trace.json");
     let worktree_add = Command::new(&awacs_command)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
         .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
         .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
         .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
+        .env("GIT_TRACE2_EVENT", &git_trace)
         .args(["git", "worktree-add", "--source"])
         .arg(&repo_root)
         .arg("--destination")
@@ -1450,6 +1456,19 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         String::from_utf8_lossy(&worktree_add.stdout),
         String::from_utf8_lossy(&worktree_add.stderr)
     );
+    let git_trace = std::fs::read_to_string(&git_trace)?;
+    assert!(
+        git_trace.contains(r#""restore""#),
+        "dirty snapshot checkout must restore exact paths: {git_trace}"
+    );
+    assert!(
+        !git_trace.contains(r#""read-tree","--reset""#),
+        "dirty snapshot checkout must not reset the full tree: {git_trace}"
+    );
+    assert!(
+        !git_trace.contains(r#""clean","-f""#),
+        "dirty snapshot checkout must not scan the full tree: {git_trace}"
+    );
     assert_eq!(
         std::fs::read_to_string(adopted_root.join("file"))?,
         "target\n"
@@ -1459,6 +1478,12 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         !adopted_root.join("source-untracked").exists(),
         "source untracked files must not leak into the target worktree"
     );
+    assert_eq!(
+        std::fs::read_to_string(repo_root.join("file"))?,
+        "unstaged source change\n",
+        "snapshot checkout must not modify the dirty source worktree"
+    );
+    assert!(repo_root.join("source-untracked").is_file());
     assert_eq!(
         std::fs::read_to_string(adopted_root.join("ignored-untracked"))?,
         "leave me untracked\n",
@@ -1491,7 +1516,6 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     );
     let adopted_git_status = Command::new("git")
         .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
         .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
         .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
         .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
@@ -1584,6 +1608,63 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         .success();
     assert!(!adopted_root.exists());
 
+    // A failure after the Btrfs snapshot and Git worktree pointer exist must
+    // not strand either resource. Make the managed-snapshot parent a file so
+    // descendant-root initialization fails before JJ workspace registration.
+    let invalid_managed_parent = awacs_state.join("invalid-managed-parent");
+    std::fs::write(&invalid_managed_parent, "not a directory")?;
+    let failed_add = main_dir.run_jj_with(|cmd| {
+        configure_awacs(cmd);
+        cmd.env("BTRFS_AWACS_MANAGED_DIR", &invalid_managed_parent);
+        cmd.args([
+            "--ignore-working-copy",
+            "workspace",
+            "add",
+            "--name",
+            "failed",
+            failed_root.to_str().unwrap(),
+        ])
+    });
+    assert!(!failed_add.status.success(), "{failed_add}");
+    assert!(
+        failed_add
+            .stderr
+            .raw()
+            .contains("Failed to initialize AWACS worktree"),
+        "{failed_add}"
+    );
+    assert!(
+        !failed_root.exists(),
+        "failed workspace add must remove its destination subvolume"
+    );
+    let worktree_list = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repo_root)
+        .output()?;
+    assert!(
+        worktree_list.status.success(),
+        "list Git worktrees after failed add: {}",
+        String::from_utf8_lossy(&worktree_list.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&worktree_list.stdout)
+            .contains(failed_root.to_string_lossy().as_ref()),
+        "failed workspace add must prune its linked Git worktree registration"
+    );
+
+    // The OpenAI checkout enables Git's own AWACS snapshot worktree mode.
+    // JJ has already made the physical snapshot here, so its temporary
+    // no-checkout Git worktree must explicitly bypass that outer mechanism.
+    let enable_git_snapshot_mode = Command::new("git")
+        .args(["config", "worktree.btrfsSnapshot", "true"])
+        .current_dir(&repo_root)
+        .output()?;
+    assert!(
+        enable_git_snapshot_mode.status.success(),
+        "enable Git snapshot worktree mode: {}",
+        String::from_utf8_lossy(&enable_git_snapshot_mode.stderr)
+    );
+
     let workspace_add = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
@@ -1607,14 +1688,11 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         workspace_add
             .stderr
             .raw()
-            .contains("AWACS worktree init: sharing parent AWACS path map..."),
+            .contains("awacs: publishing inherited baseline..."),
         "workspace add must share the parent map instead of walking the child: {workspace_add}"
     );
     assert!(
-        !workspace_add
-            .stderr
-            .raw()
-            .contains("AWACS worktree init: indexed "),
+        !workspace_add.stderr.raw().contains("awacs: indexed "),
         "workspace add must not rebuild the child map by walking it: {workspace_add}"
     );
     let secondary_dir = test_env.work_dir(&secondary_root);
@@ -1627,26 +1705,34 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
 
     let mut parent_store = None;
     let mut child_store = None;
-    for entry in std::fs::read_dir(&awacs_state)? {
-        let manager_db = entry?.path().join("manager.sqlite3");
-        if !manager_db.is_file() {
-            continue;
-        }
-        let store = Store::open(&manager_db)?;
-        let parent_count: i64 = store.connection().query_row(
-            "SELECT count(*) FROM watches WHERE live_path = ?1",
-            [repo_root.as_os_str().as_bytes()],
-            |row| row.get(0),
-        )?;
-        let child_count: i64 = store.connection().query_row(
-            "SELECT count(*) FROM watches WHERE live_path = ?1",
-            [secondary_root.as_os_str().as_bytes()],
-            |row| row.get(0),
-        )?;
-        if parent_count == 1 {
-            parent_store = Some((manager_db.clone(), store));
-        } else if child_count == 1 {
-            child_store = Some((manager_db.clone(), store));
+    let parent_state_root = state_root_for_root(&repo_root)?;
+    let child_state_root = state_root_for_root(&secondary_root)?;
+    assert_ne!(
+        parent_state_root, child_state_root,
+        "linked worktrees must keep independent AWACS state roots"
+    );
+    for state_root in [&parent_state_root, &child_state_root] {
+        for entry in std::fs::read_dir(state_root)? {
+            let manager_db = entry?.path().join("manager.sqlite3");
+            if !manager_db.is_file() {
+                continue;
+            }
+            let store = Store::open(&manager_db)?;
+            let parent_count: i64 = store.connection().query_row(
+                "SELECT count(*) FROM watches WHERE live_path = ?1",
+                [repo_root.as_os_str().as_bytes()],
+                |row| row.get(0),
+            )?;
+            let child_count: i64 = store.connection().query_row(
+                "SELECT count(*) FROM watches WHERE live_path = ?1",
+                [secondary_root.as_os_str().as_bytes()],
+                |row| row.get(0),
+            )?;
+            if parent_count == 1 {
+                parent_store = Some((manager_db.clone(), store));
+            } else if child_count == 1 {
+                child_store = Some((manager_db.clone(), store));
+            }
         }
     }
     let (parent_db, _parent_store) = parent_store.expect("parent AWACS store should exist");
@@ -1682,7 +1768,15 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     // child cut. The no-walk bootstrap progress above proves that the child
     // map came from the parent; the current child revision proves the
     // resulting independent store remains usable after checkout.
-    child_store.load_revision(child_revision_id)?;
+    let child_revision_state: String = child_store.connection().query_row(
+        "SELECT state FROM revisions WHERE id = ?1",
+        [child_revision_id],
+        |row| row.get(0),
+    )?;
+    assert_eq!(
+        child_revision_state, "ready",
+        "the child must retain a usable indexed revision"
+    );
 
     // Removing the worktree only removes its filesystem/repo registration.
     // Its cloned baseline has no parent pins that require coordinated AWACS
@@ -1734,7 +1828,6 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
         config: PathBuf,
         tmp: PathBuf,
         runtime: PathBuf,
-        state: PathBuf,
         managed: PathBuf,
         log: PathBuf,
         broker_socket: OsString,
@@ -1763,7 +1856,6 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("BTRFS_AWACS_COMMAND", &self.awacs)
                 .env("XDG_RUNTIME_DIR", &self.runtime)
-                .env("BTRFS_AWACS_STATE_DIR", &self.state)
                 .env("BTRFS_AWACS_MANAGED_DIR", &self.managed)
                 .env("AWACS_LOG_FILE", &self.log)
                 .env("BTRFS_AWACS_BROKER_SOCKET", &self.broker_socket)
@@ -2013,7 +2105,8 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
     let configure_awacs = |cmd: &mut assert_cmd::Command| {
         cmd.env("BTRFS_AWACS_COMMAND", &awacs_command)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
-            .env("BTRFS_AWACS_STATE_DIR", &awacs_state)
+            // Keep managed snapshots and logs fixture-owned while exercising
+            // the same default state-root routing as production workspaces.
             .env("BTRFS_AWACS_MANAGED_DIR", awacs_state.join("managed"))
             .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
             .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket);
@@ -2033,7 +2126,6 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
         config: test_env.config_path().to_owned(),
         tmp: test_env.env_root().join("tmp"),
         runtime: runtime_dir.clone(),
-        state: awacs_state.clone(),
         managed: awacs_state.join("managed"),
         log: awacs_state.join("daemon.log"),
         broker_socket: broker_socket.clone(),
@@ -2213,12 +2305,12 @@ exit 1
         output
             .stderr
             .raw()
-            .contains("Creating initial AWACS snapshot baseline...")
+            .contains("awacs: creating initial snapshot baseline...")
     );
     let stderr = output.stderr.raw();
     assert!(
         stderr
-            .find("AWACS init: test root initialized...")
+            .find("awacs: test root initialized...")
             .is_some_and(|initialized| {
                 stderr
                     .find("Seeding snapshot-backed working-copy tree...")
@@ -2326,13 +2418,13 @@ exit 1
         output
             .stderr
             .raw()
-            .contains("Rebuilding committed AWACS snapshot baseline...")
+            .contains("awacs: rebuilding committed snapshot baseline...")
     );
     assert!(
         output
             .stderr
             .raw()
-            .contains("Rebuilt committed AWACS snapshot baseline.")
+            .contains("awacs: rebuilt committed snapshot baseline.")
     );
     let status = main_dir
         .run_jj_with(|cmd| {
@@ -2607,7 +2699,7 @@ exit 1
         output
             .stderr
             .raw()
-            .contains("AWACS init: preparing Btrfs subvolume conversion")
+            .contains("awacs: preparing Btrfs subvolume conversion")
     );
     assert!(!output.stderr.raw().contains("Snapshotting repository root"));
     assert!(main_dir.root().join(".compression-zstd").is_file());

@@ -988,18 +988,250 @@ fn snapshot_ineligible(options: &GitWorktreeAdd<'_>, reason: &str) -> Result<boo
     }
 }
 
-fn source_has_git_changes(options: &GitWorktreeAdd<'_>) -> Result<bool, String> {
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SourceGitChanges {
+    tracked_paths: Vec<Vec<u8>>,
+    untracked_paths: Vec<Vec<u8>>,
+}
+
+impl SourceGitChanges {
+    fn is_empty(&self) -> bool {
+        self.tracked_paths.is_empty() && self.untracked_paths.is_empty()
+    }
+
+    fn checkout_paths(&self, target_paths: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut seen = HashSet::new();
+        self.tracked_paths
+            .iter()
+            .cloned()
+            .chain(target_paths)
+            .filter(|path| seen.insert(path.clone()))
+            .collect()
+    }
+}
+
+fn source_git_changes(options: &GitWorktreeAdd<'_>) -> Result<SourceGitChanges, String> {
     let status = git_capture(
         options.git,
         options.source,
         &[
             "status",
-            "--porcelain",
+            "--porcelain=v1",
+            "-z",
             "--untracked-files=normal",
             "--ignore-submodules=none",
         ],
     )?;
-    Ok(!status.is_empty())
+    parse_source_git_changes(&status)
+}
+
+fn parse_source_git_changes(status: &[u8]) -> Result<SourceGitChanges, String> {
+    let mut changes = SourceGitChanges::default();
+    let mut records = status
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 4 || record[2] != b' ' {
+            return Err("decode Git porcelain status record".to_owned());
+        }
+        let state = &record[..2];
+        let path = record[3..].to_vec();
+        if state == b"??" {
+            changes.untracked_paths.push(path);
+            continue;
+        }
+        if state == b"!!" {
+            continue;
+        }
+        changes.tracked_paths.push(path);
+        if state.iter().any(|state| matches!(state, b'R' | b'C')) {
+            let source_path = records
+                .next()
+                .ok_or_else(|| "decode Git porcelain rename source path".to_owned())?;
+            changes.tracked_paths.push(source_path.to_vec());
+        }
+    }
+    Ok(changes)
+}
+
+fn target_changed_paths(
+    git: &Path,
+    source: &Path,
+    source_target: &str,
+    target: &str,
+) -> Result<Vec<Vec<u8>>, String> {
+    let source_target = source_target.trim_end();
+    let target = target.trim_end();
+    if source_target == target {
+        return Ok(Vec::new());
+    }
+    let output = git_capture(
+        git,
+        source,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            source_target,
+            target,
+        ],
+    )?;
+    Ok(output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+fn validated_relative_git_path(path: &[u8]) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+    {
+        return Err(format!(
+            "Git reported a path outside the worktree: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn remove_copied_untracked_paths(destination: &Path, paths: &[Vec<u8>]) -> Result<(), String> {
+    for path in paths {
+        let path = destination.join(validated_relative_git_path(path)?);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "inspect copied untracked path {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path).map_err(|error| {
+                format!(
+                    "remove copied untracked directory {}: {error}",
+                    path.display()
+                )
+            })?;
+        } else {
+            fs::remove_file(&path).map_err(|error| {
+                format!("remove copied untracked path {}: {error}", path.display())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_checkout_paths(
+    git: &Path,
+    destination: &Path,
+    target: &str,
+    paths: &[Vec<u8>],
+) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let pathspec_path = git_path(git, destination, "awacs-worktree-restore-paths")?;
+    let result = (|| {
+        let mut pathspec = File::create(&pathspec_path).map_err(|error| {
+            format!(
+                "create snapshot worktree restore pathspec {}: {error}",
+                pathspec_path.display()
+            )
+        })?;
+        for path in paths {
+            validated_relative_git_path(path)?;
+            pathspec
+                .write_all(path)
+                .and_then(|()| pathspec.write_all(&[0]))
+                .map_err(|error| {
+                    format!(
+                        "write snapshot worktree restore pathspec {}: {error}",
+                        pathspec_path.display()
+                    )
+                })?;
+        }
+        let mut source_argument = OsString::from("--source=");
+        source_argument.push(target.trim_end());
+        let mut pathspec_argument = OsString::from("--pathspec-from-file=");
+        pathspec_argument.push(pathspec_path.as_os_str());
+        let arguments = vec![
+            OsString::from("-c"),
+            OsString::from("core.fsmonitor=false"),
+            OsString::from("restore"),
+            source_argument,
+            OsString::from("--staged"),
+            OsString::from("--worktree"),
+            OsString::from("--no-overlay"),
+            pathspec_argument,
+            OsString::from("--pathspec-file-nul"),
+        ];
+        git_status(git, destination, &arguments, &[])
+    })();
+    match result {
+        Err(error) => {
+            let _ = fs::remove_file(&pathspec_path);
+            Err(error)
+        }
+        Ok(()) => match fs::remove_file(&pathspec_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "remove snapshot worktree restore pathspec {}: {error}",
+                pathspec_path.display()
+            )),
+        },
+    }
+}
+
+/// Finishes a snapshot-backed checkout without ever traversing or rewriting
+/// the whole tree.
+///
+/// The Btrfs snapshot already copied the source worktree and its stat-warm
+/// index. A dirty source is still the normal case: remove only the exact
+/// copied untracked paths, then restore only tracked source changes plus the
+/// source-HEAD -> requested-target tree delta.
+fn materialize_snapshot_checkout(
+    git: &Path,
+    source: &Path,
+    destination: &Path,
+    source_index: &Path,
+    destination_index: &Path,
+    source_target: &str,
+    target: &str,
+    source_changes: &SourceGitChanges,
+) -> Result<(), String> {
+    copy_inherited_git_index(source_index, destination_index)?;
+    // The copied source FSMN token names the source watch's Git lane.
+    // Preserve copied stat and untracked caches, but force the first child
+    // status to bootstrap from its sequence-zero baseline instead of reusing
+    // another worktree's cursor.
+    git_status(
+        git,
+        destination,
+        &[
+            OsString::from("-c"),
+            OsString::from("core.fsmonitor=false"),
+            OsString::from("update-index"),
+            OsString::from("--no-fsmonitor"),
+        ],
+        &[("GIT_INDEX_FILE", destination_index.as_os_str())],
+    )?;
+    let checkout_paths =
+        source_changes.checkout_paths(target_changed_paths(git, source, source_target, target)?);
+    // Remove only exact copied untracked paths before restoring the requested
+    // tree. Ignored build output remains available for reuse.
+    remove_copied_untracked_paths(destination, &source_changes.untracked_paths)?;
+    restore_checkout_paths(git, destination, target, &checkout_paths)
 }
 
 fn snapshot_eligibility(options: &GitWorktreeAdd<'_>) -> Result<bool, String> {
@@ -1258,22 +1490,6 @@ fn run_git_worktree_add(options: &GitWorktreeAdd<'_>) -> Result<(), String> {
             &[],
         );
     }
-    // A preflighted caller deliberately accepts the race between checking and
-    // taking the Btrfs snapshot. Treat that path as dirty so the destination
-    // still receives a forced checkout even if the source changed after its
-    // preflight.
-    let source_has_git_changes = options.no_check || source_has_git_changes(&options)?;
-
-    let source_index = git_path(options.git, &source, "index")?;
-    let target = String::from_utf8(git_capture(
-        options.git,
-        &source,
-        &["rev-parse", options.reference],
-    )?)
-    .map_err(|error| format!("decode requested worktree target: {error}"))?;
-    let source_target =
-        String::from_utf8(git_capture(options.git, &source, &["rev-parse", "HEAD"])?)
-            .map_err(|error| format!("decode source HEAD: {error}"))?;
     let pending_jj_source = read_pending_jj_source_seed(&source)?;
     if let Some(seed) = pending_jj_source {
         let source_subvolume = OpenedSubvolume::open(&source)
@@ -1290,8 +1506,31 @@ fn run_git_worktree_add(options: &GitWorktreeAdd<'_>) -> Result<(), String> {
         )
         .map_err(|error| format!("validate retained JJ adoption baseline: {error}"))?;
     }
+    // Git's new-branch path calls us once before creating the branch and once
+    // afterwards with --no-check. Static Btrfs/JJ eligibility belongs in the
+    // first call, but collecting mutable dirty paths there only duplicates an
+    // expensive status and cannot be transferred safely across the race.
+    if options.check_only {
+        return Ok(());
+    }
+
+    // Capture the exact copied paths immediately before the Btrfs snapshot.
+    // The later checkout restores only this set plus the source-HEAD -> target
+    // tree delta; it must not turn a dirty source into a full-tree reset.
+    let source_changes = source_git_changes(&options)?;
+    let source_is_clean = source_changes.is_empty();
+    let source_index = git_path(options.git, &source, "index")?;
+    let target = String::from_utf8(git_capture(
+        options.git,
+        &source,
+        &["rev-parse", options.reference],
+    )?)
+    .map_err(|error| format!("decode requested worktree target: {error}"))?;
+    let source_target =
+        String::from_utf8(git_capture(options.git, &source, &["rev-parse", "HEAD"])?)
+            .map_err(|error| format!("decode source HEAD: {error}"))?;
     let inherited_baseline = if pending_jj_source.is_none()
-        && !source_has_git_changes
+        && source_is_clean
         && target.trim_end() == source_target.trim_end()
     {
         let hash_len = git_object_hash_len(options.git, &source)?;
@@ -1299,10 +1538,6 @@ fn run_git_worktree_add(options: &GitWorktreeAdd<'_>) -> Result<(), String> {
     } else {
         None
     };
-    if options.check_only {
-        return Ok(());
-    }
-
     git_status(
         options.git,
         options.source,
@@ -1349,9 +1584,9 @@ fn run_git_worktree_add(options: &GitWorktreeAdd<'_>) -> Result<(), String> {
         // A pending JJ consumer needs immutable snapshot A before Git writes
         // target B, so delayed adoption can reconcile the authenticated A -> B
         // transition. A dirty plain-Git source has no equivalent semantic
-        // baseline: clean the child first, then initialize it with a fresh
-        // authoritative scan rather than inheriting a stale parent path map.
-        let initialized = if pending_jj_consumer.is_some() || !source_has_git_changes {
+        // baseline, so publish its child baseline after exact-path
+        // materialization rather than inheriting a stale parent path map.
+        let initialized = if pending_jj_consumer.is_some() || source_is_clean {
             Some(
                 initialize_descendant_root_with_watch_consumer(
                     &destination,
@@ -1366,119 +1601,22 @@ fn run_git_worktree_add(options: &GitWorktreeAdd<'_>) -> Result<(), String> {
             None
         };
 
-        if !source_has_git_changes && target.trim_end() == source_target.trim_end() {
-            copy_inherited_git_index(&source_index, &destination_index)?;
-            // The copied source FSMN token names the source watch's Git lane.
-            // Leave the destination index otherwise intact, but force its
-            // first status to bootstrap from the child-owned sequence-zero
-            // baseline instead of reusing another worktree's cursor.
-            git_status(
-                options.git,
-                &destination,
-                &[
-                    OsString::from("-c"),
-                    OsString::from("core.fsmonitor=false"),
-                    OsString::from("update-index"),
-                    OsString::from("--no-fsmonitor"),
-                ],
-                &[("GIT_INDEX_FILE", destination_index.as_os_str())],
-            )?;
-        } else {
-            // A pending JJ child already owns immutable snapshot A before Git
-            // materializes requested tree B. Delayed JJ workspace adoption
-            // binds A to the copied semantic tree first, then its ordinary
-            // snapshot consumes the authenticated A -> B delta and converges
-            // the JJ state to the Git checkout without a full rediscovery.
-            // A dirty plain-Git child takes the same checkout path but gets a
-            // fresh authoritative AWACS baseline only after it is clean.
-            // Build the copied A index without asking Git to verify the new
-            // worktree against stat data from the source checkout. The second
-            // read-tree then uses that destination-owned index to materialize
-            // only the A -> B delta.
-            let output_arg = format!("--index-output={}", destination_index.display());
-            let baseline_arguments = vec![
-                OsString::from("-c"),
-                OsString::from("core.splitIndex=false"),
-                OsString::from("-c"),
-                OsString::from("core.untrackedCache=false"),
-                OsString::from("-c"),
-                OsString::from("core.fsmonitor=false"),
-                OsString::from("read-tree"),
-                OsString::from("-m"),
-                OsString::from("-i"),
-                OsString::from(output_arg),
-                OsString::from(source_target.trim_end()),
-            ];
-            git_status(
-                options.git,
-                &destination,
-                &baseline_arguments,
-                &[("GIT_INDEX_FILE", source_index.as_os_str())],
-            )?;
-            let normalize_index_arguments = vec![
-                OsString::from("-c"),
-                OsString::from("core.untrackedCache=false"),
-                OsString::from("-c"),
-                OsString::from("core.fsmonitor=false"),
-                OsString::from("update-index"),
-                OsString::from("--no-split-index"),
-                OsString::from("--no-untracked-cache"),
-                OsString::from("--no-fsmonitor"),
-                OsString::from("--clear-resolve-undo"),
-            ];
-            git_status(
-                options.git,
-                &destination,
-                &normalize_index_arguments,
-                &[("GIT_INDEX_FILE", destination_index.as_os_str())],
-            )?;
-            let checkout_mode = if source_has_git_changes {
-                "--reset"
-            } else {
-                "-m"
-            };
-            let checkout_arguments = vec![
-                OsString::from("-c"),
-                OsString::from("core.splitIndex=false"),
-                OsString::from("-c"),
-                OsString::from("core.untrackedCache=false"),
-                OsString::from("-c"),
-                OsString::from("core.fsmonitor=false"),
-                OsString::from("read-tree"),
-                OsString::from(checkout_mode),
-                OsString::from("-u"),
-                OsString::from(target.trim_end()),
-            ];
-            git_status(
-                options.git,
-                &destination,
-                &checkout_arguments,
-                &[("GIT_INDEX_FILE", destination_index.as_os_str())],
-            )?;
-            if source_has_git_changes {
-                // The forced read-tree resets tracked files and overwrites
-                // untracked collisions with the requested tree. Remove other
-                // copied untracked paths afterwards so the new worktree is
-                // clean, while deliberately preserving ignored build output.
-                git_status(
-                    options.git,
-                    &destination,
-                    &[
-                        OsString::from("-c"),
-                        OsString::from("core.fsmonitor=false"),
-                        OsString::from("clean"),
-                        OsString::from("-f"),
-                        OsString::from("-f"),
-                        OsString::from("-d"),
-                    ],
-                    &[],
-                )?;
-            }
-        }
+        // One exact-path materializer handles clean and dirty sources alike.
+        // There is deliberately no whole-tree checkout or clean fallback.
+        materialize_snapshot_checkout(
+            options.git,
+            &source,
+            &destination,
+            &source_index,
+            &destination_index,
+            &source_target,
+            &target,
+            &source_changes,
+        )?;
         let initialized = match initialized {
             Some(initialized) => initialized,
             None => initialize_root_with_watch_consumer(&destination, |_| {})
-                .map_err(|error| format!("initialize clean AWACS worktree: {error}"))?,
+                .map_err(|error| format!("initialize materialized AWACS worktree: {error}"))?,
         };
         let zero = "0".repeat(target.trim_end().len());
         git_status(
@@ -2949,9 +3087,9 @@ mod tests {
         ChangedObjectsSummary, Cli, CliCommand, GitCommand, JJ_WORKING_COPY_STATE_MAGIC,
         canonical_path_for_creation, changed_paths, copy_inherited_git_index,
         decode_git_fsmonitor_token, encode_git_fsmonitor_token, inherited_git_fsmonitor_baseline,
-        is_uninitialized_awacs_root, last_two_snapshots, parse_changed_objects_manifest,
-        read_pending_jj_source_seed, require_last_two_snapshots,
-        stage_pending_jj_working_copy_state,
+        is_uninitialized_awacs_root, last_two_snapshots, materialize_snapshot_checkout,
+        parse_changed_objects_manifest, parse_source_git_changes, read_pending_jj_source_seed,
+        require_last_two_snapshots, stage_pending_jj_working_copy_state,
     };
     use btrfs_awacs::manifest::{
         CHANGE_DELETED as CHANGED_OBJECT_DELETED, CHANGE_INODE as CHANGED_OBJECT_INODE,
@@ -3054,6 +3192,135 @@ mod tests {
             index,
             "the destination index retains the source FSMN and UNTR bytes"
         );
+    }
+
+    #[test]
+    fn parses_dirty_git_paths_for_exact_snapshot_checkout() {
+        let changes = parse_source_git_changes(
+            b" M modified\0A  added\0R  renamed\0old-name\0?? untracked-dir/\0",
+        )
+        .unwrap();
+        assert_eq!(
+            changes.tracked_paths,
+            vec![
+                b"modified".to_vec(),
+                b"added".to_vec(),
+                b"renamed".to_vec(),
+                b"old-name".to_vec(),
+            ]
+        );
+        assert_eq!(changes.untracked_paths, vec![b"untracked-dir/".to_vec()]);
+        assert_eq!(
+            changes.checkout_paths([b"modified".to_vec(), b"target-only".to_vec(),]),
+            vec![
+                b"modified".to_vec(),
+                b"added".to_vec(),
+                b"renamed".to_vec(),
+                b"old-name".to_vec(),
+                b"target-only".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dirty_source_uses_exact_snapshot_fast_path() {
+        fn run_git(cwd: &Path, arguments: &[&str]) -> Vec<u8> {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {} failed: {}",
+                arguments.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        }
+
+        let root = TestDir::new("dirty-snapshot-checkout");
+        let source = root.path.join("source");
+        let destination = root.path.join("destination");
+        fs::create_dir(&source).unwrap();
+        run_git(&source, &["init"]);
+        run_git(&source, &["config", "user.name", "Test User"]);
+        run_git(&source, &["config", "user.email", "test@example.com"]);
+        fs::write(source.join("file"), b"base\n").unwrap();
+        fs::write(source.join("old-only"), b"old\n").unwrap();
+        run_git(&source, &["add", "file", "old-only"]);
+        run_git(&source, &["commit", "-m", "source"]);
+        let source_target = String::from_utf8(run_git(&source, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        fs::write(source.join("file"), b"target\n").unwrap();
+        fs::write(source.join("target-only"), b"target only\n").unwrap();
+        run_git(&source, &["add", "file", "target-only"]);
+        run_git(&source, &["commit", "-m", "target"]);
+        let target = String::from_utf8(run_git(&source, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        run_git(&source, &["checkout", "--detach", &source_target]);
+        fs::write(source.join("file"), b"staged\n").unwrap();
+        run_git(&source, &["add", "file"]);
+        fs::write(source.join("file"), b"unstaged\n").unwrap();
+        fs::write(source.join("source-untracked"), b"remove me\n").unwrap();
+
+        run_git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                destination.to_str().unwrap(),
+                &target,
+            ],
+        );
+        fs::write(destination.join("file"), b"unstaged\n").unwrap();
+        fs::write(destination.join("old-only"), b"old\n").unwrap();
+        fs::write(destination.join("source-untracked"), b"remove me\n").unwrap();
+        let source_index = super::git_path(Path::new("git"), &source, "index").unwrap();
+        let destination_index = super::git_path(Path::new("git"), &destination, "index").unwrap();
+
+        let changes = parse_source_git_changes(&run_git(
+            &source,
+            &[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
+        ))
+        .unwrap();
+        materialize_snapshot_checkout(
+            Path::new("git"),
+            &source,
+            &destination,
+            &source_index,
+            &destination_index,
+            &source_target,
+            &target,
+            &changes,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(destination.join("file")).unwrap(), b"target\n");
+        assert_eq!(
+            fs::read(destination.join("target-only")).unwrap(),
+            b"target only\n"
+        );
+        assert!(!destination.join("source-untracked").exists());
+        assert!(
+            run_git(&destination, &["status", "--porcelain"]).is_empty(),
+            "destination must be clean after exact-path restore"
+        );
+        assert_eq!(fs::read(source.join("file")).unwrap(), b"unstaged\n");
+        assert!(source.join("source-untracked").exists());
     }
 
     #[test]

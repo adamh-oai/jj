@@ -783,20 +783,31 @@ fn require_main_subvolume_mode_for_linked_workspace(
 fn disable_subvolumes(workspace_root: &Path) -> Result<(), CommandError> {
     let dot_git = workspace_root.join(".git");
     if is_btrfs_subvolume(&dot_git)? {
-        convert_subvolume_to_directory(&dot_git)?;
+        // AWACS state is keyed to the subvolume identity being discarded. It
+        // can also contain broker-private trash directories that the caller
+        // cannot read, so do not copy stale operational state into the plain
+        // Git directory.
+        convert_subvolume_to_directory(&dot_git, Some(OsStr::new("awacs")))?;
     }
     if is_btrfs_subvolume(workspace_root)? {
-        convert_subvolume_to_directory(workspace_root)?;
+        convert_subvolume_to_directory(workspace_root, None)?;
     }
     Ok(())
 }
 
-fn convert_subvolume_to_directory(path: &Path) -> Result<(), CommandError> {
+fn convert_subvolume_to_directory(
+    path: &Path,
+    excluded_name: Option<&OsStr>,
+) -> Result<(), CommandError> {
     let temporary = unique_sibling(path, "disable")?;
     fs::rename(path, &temporary).context(path)?;
     fs::create_dir(path).context(path)?;
-    if let Err(err) = copy_children(&temporary, path, true)
-        .map_err(|err| user_error(format!("Failed to copy subvolume contents: {err}")))
+    let copy_result = match excluded_name {
+        Some(excluded_name) => copy_children_except(&temporary, path, excluded_name, true),
+        None => copy_children(&temporary, path, true),
+    };
+    if let Err(err) =
+        copy_result.map_err(|err| user_error(format!("Failed to copy subvolume contents: {err}")))
     {
         rollback_created_directory(path, &temporary)?;
         return Err(err);

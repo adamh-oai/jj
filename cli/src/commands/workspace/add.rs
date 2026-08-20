@@ -48,12 +48,12 @@ use crate::command_error::user_error;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 use crate::commands::btrfs::begin_subvolume_mode;
 use crate::commands::btrfs::btrfs_command;
+use crate::commands::btrfs::delete_btrfs_subvolume;
 use crate::commands::btrfs::is_btrfs_subvolume;
 use crate::commands::btrfs::is_subvolume_mode_enabled;
 use crate::commands::btrfs::set_subvolume_mode;
 use crate::description_util::add_trailers;
 use crate::description_util::join_message_paragraphs;
-#[cfg(all(target_os = "linux", feature = "awacs"))]
 use crate::ui::Ui;
 
 struct SnapshotPreparation {
@@ -158,6 +158,29 @@ pub async fn cmd_workspace_add(
             name = workspace_name.as_symbol()
         )));
     }
+    let git_worktree_plan =
+        if crate::git_util::is_colocated_git_workspace(old_workspace_command.workspace()) {
+            let git_backend = git::get_git_backend(repo.store()).map_err(|_| {
+                internal_error_with_message(
+                    "Colocated workspace does not use a Git-backed repository",
+                    "missing Git backend",
+                )
+            })?;
+            let git_repo_path = dunce::canonicalize(git_backend.git_repo_path())
+                .unwrap_or_else(|_| git_backend.git_repo_path().to_owned());
+            let checkout_commit_id = old_workspace_command
+                .get_wc_commit_id()
+                .cloned()
+                .unwrap_or_else(|| repo.store().root_commit_id().clone());
+            Some(GitWorktreePlan {
+                git_repo_path,
+                git_executable: git_backend.git_executable_path().to_owned(),
+                checkout_commit_id,
+            })
+        } else {
+            None
+        };
+    let working_copy_factory = command.get_working_copy_factory()?;
     let mut snapshot_source_commit = None;
     #[cfg_attr(
         not(all(target_os = "linux", feature = "awacs")),
@@ -180,7 +203,6 @@ pub async fn cmd_workspace_add(
                 .unwrap_or_else(|| repo.store().root_commit_id().clone());
             let source_commit = repo.store().get_commit_async(&source_commit_id).await?;
             match create_btrfs_snapshot(
-                ui,
                 old_workspace_command.workspace().workspace_root(),
                 &destination_path,
             ) {
@@ -211,53 +233,81 @@ pub async fn cmd_workspace_add(
             fs::create_dir(&destination_path).context(&destination_path)?;
         }
     }
-    let git_worktree_plan =
-        if crate::git_util::is_colocated_git_workspace(old_workspace_command.workspace()) {
-            let git_backend = git::get_git_backend(repo.store()).map_err(|_| {
-                internal_error_with_message(
-                    "Colocated workspace does not use a Git-backed repository",
-                    "missing Git backend",
-                )
-            })?;
-            let git_repo_path = dunce::canonicalize(git_backend.git_repo_path())
-                .unwrap_or_else(|_| git_backend.git_repo_path().to_owned());
-            let checkout_commit_id = old_workspace_command
-                .get_wc_commit_id()
-                .cloned()
-                .unwrap_or_else(|| repo.store().root_commit_id().clone());
-            Some(GitWorktreePlan {
-                git_repo_path,
-                git_executable: git_backend.git_executable_path().to_owned(),
-                checkout_commit_id,
-            })
-        } else {
-            None
-        };
-    if let Some(plan) = &git_worktree_plan {
-        if snapshot {
-            create_git_worktree_with_existing_files(
-                plan,
-                &destination_path,
-                old_workspace_command.repo_path(),
-            )?;
-        } else {
-            create_git_worktree(plan, &destination_path, old_workspace_command.repo_path())?;
+    let workspace_setup_result = (|| {
+        if let Some(plan) = &git_worktree_plan {
+            if snapshot {
+                create_git_worktree_with_existing_files(
+                    plan,
+                    &destination_path,
+                    old_workspace_command.repo_path(),
+                )?;
+            } else {
+                create_git_worktree(plan, &destination_path, old_workspace_command.repo_path())?;
+            }
         }
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        if snapshot {
+            // Root snapshots omit nested subvolumes. In a colocated source, the
+            // copied `.git` path is therefore an inode-2 placeholder that rejects
+            // writes. Resolve the child state root only after replacing it with
+            // the real linked-worktree gitfile, but still before JJ metadata or a
+            // checkout mutation can make the child user-visible.
+            let preparation = snapshot_preparation
+                .as_mut()
+                .expect("snapshot workspaces always retain their preparation");
+            preparation.initialized_awacs_snapshot = initialize_snapshot_awacs_root(
+                ui,
+                &destination_path,
+                old_workspace_command.workspace().workspace_root(),
+            )?;
+        }
+        Result::<(), CommandError>::Ok(())
+    })();
+    if let Err(mut error) = workspace_setup_result {
+        if snapshot
+            && let Err(cleanup_error) = cleanup_failed_snapshot_workspace(
+                &destination_path,
+                git_worktree_plan.as_ref(),
+                old_workspace_command.repo_path(),
+            )
+        {
+            error.add_hint(format!(
+                "Failed to remove partial snapshot workspace: {cleanup_error:?}"
+            ));
+        }
+        return Err(error);
     }
 
-    let working_copy_factory = command.get_working_copy_factory()?;
     let repo_path = old_workspace_command.repo_path();
     let initialization_started = Instant::now();
     // If we add per-workspace configuration, we'll need to reload settings for
     // the new workspace.
-    let (new_workspace, repo) = Workspace::init_workspace_with_existing_repo(
+    let (new_workspace, repo) = match Workspace::init_workspace_with_existing_repo(
         &destination_path,
         repo_path,
         repo,
         working_copy_factory,
         workspace_name.clone(),
     )
-    .await?;
+    .await
+    {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            let mut error = CommandError::from(error);
+            if snapshot
+                && let Err(cleanup_error) = cleanup_failed_snapshot_workspace(
+                    &destination_path,
+                    git_worktree_plan.as_ref(),
+                    old_workspace_command.repo_path(),
+                )
+            {
+                error.add_hint(format!(
+                    "Failed to remove partial snapshot workspace: {cleanup_error:?}"
+                ));
+            }
+            return Err(error);
+        }
+    };
     if snapshot {
         #[cfg(all(target_os = "linux", feature = "awacs"))]
         begin_subvolume_mode(&destination_path)?;
@@ -303,39 +353,48 @@ pub async fn cmd_workspace_add(
         repo
     };
 
+    #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+    if snapshot {
+        return Err(user_error(
+            "Btrfs snapshot workspaces require Linux with AWACS support",
+        ));
+    }
+
     let mut new_workspace_command = if snapshot {
-        // Workspace::init_workspace_with_existing_repo() selected the ordinary
-        // working-copy implementation before the marker above existed. Reload
-        // after the marker is durable so the child gets snapshot-backed
-        // journal state, then pair that journal with the independently cloned
-        // AWACS baseline before any checkout mutation asks to advance it.
-        drop(new_workspace);
-        let mut workspace_command = command
-            .workspace_helper_no_snapshot_at(ui, &destination_path)
-            .await?;
-        let source_commit = snapshot_source_commit
-            .as_ref()
-            .expect("snapshot workspaces always retain the source commit");
-        seed_snapshot_workspace_tree(&mut workspace_command, source_commit).await?;
         #[cfg(all(target_os = "linux", feature = "awacs"))]
-        if let Some(snapshot_identity) = snapshot_preparation
-            .as_ref()
-            .and_then(|preparation| preparation.initialized_awacs_snapshot.as_ref())
         {
-            workspace_command
-                .seed_initialized_snapshot_workspace_awacs_baseline(ui, snapshot_identity, None)
+            // Workspace::init_workspace_with_existing_repo() selected the ordinary
+            // working-copy implementation before the marker above existed. Reload
+            // after the marker is durable so the child gets snapshot-backed
+            // journal state, then pair that journal with the independently cloned
+            // AWACS baseline before any checkout mutation asks to advance it.
+            drop(new_workspace);
+            let mut workspace_command = command
+                .workspace_helper_no_snapshot_at(ui, &destination_path)
                 .await?;
-        } else {
+            let source_commit = snapshot_source_commit
+                .as_ref()
+                .expect("snapshot workspaces always retain the source commit");
+            seed_snapshot_workspace_tree(&mut workspace_command, source_commit).await?;
+            if let Some(snapshot_identity) = snapshot_preparation
+                .as_ref()
+                .and_then(|preparation| preparation.initialized_awacs_snapshot.as_ref())
+            {
+                workspace_command
+                    .seed_initialized_snapshot_workspace_awacs_baseline(ui, snapshot_identity, None)
+                    .await?;
+            } else {
+                workspace_command
+                    .seed_snapshot_workspace_awacs_baseline(ui)
+                    .await?;
+                establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
+            }
+            set_subvolume_mode(&destination_path, true)?;
+            tracing::debug!("recorded snapshot tree as workspace baseline");
             workspace_command
-                .seed_snapshot_workspace_awacs_baseline(ui)
-                .await?;
-            establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
         }
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
-        establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
-        set_subvolume_mode(&destination_path, true)?;
-        tracing::debug!("recorded snapshot tree as workspace baseline");
-        workspace_command
+        unreachable!("snapshot mode was rejected above")
     } else {
         command.for_workable_repo(ui, new_workspace, repo)?
     };
@@ -497,7 +556,6 @@ async fn establish_snapshot_workspace_baseline(
 /// only if the snapshot fails. Returns `Ok(false)` when it is not so auto
 /// mode can fall back to a normal workspace.
 fn create_btrfs_snapshot(
-    ui: &Ui,
     source: &Path,
     destination: &Path,
 ) -> Result<Option<SnapshotPreparation>, CommandError> {
@@ -528,19 +586,28 @@ fn create_btrfs_snapshot(
         elapsed = ?operation_started.elapsed(),
         "created Btrfs snapshot"
     );
-    #[cfg(all(target_os = "linux", feature = "awacs"))]
-    let initialized_awacs_snapshot = initialize_snapshot_awacs_root(ui, destination, source)?;
-    #[cfg(not(all(target_os = "linux", feature = "awacs")))]
-    let _ = ui;
-
     let operation_started = Instant::now();
-    remove_copied_metadata(&destination.join(".jj"))?;
+    if let Err(mut error) = remove_copied_metadata(&destination.join(".jj")) {
+        if let Err(cleanup_error) = remove_failed_snapshot_destination(destination) {
+            error.add_hint(format!(
+                "Failed to remove partial snapshot workspace: {cleanup_error:?}"
+            ));
+        }
+        return Err(error);
+    }
     tracing::debug!(
         elapsed = ?operation_started.elapsed(),
         "removed copied .jj metadata"
     );
     let operation_started = Instant::now();
-    remove_copied_metadata(&destination.join(".git"))?;
+    if let Err(mut error) = remove_copied_metadata(&destination.join(".git")) {
+        if let Err(cleanup_error) = remove_failed_snapshot_destination(destination) {
+            error.add_hint(format!(
+                "Failed to remove partial snapshot workspace: {cleanup_error:?}"
+            ));
+        }
+        return Err(error);
+    }
     tracing::debug!(
         elapsed = ?operation_started.elapsed(),
         "removed copied .git metadata"
@@ -552,7 +619,7 @@ fn create_btrfs_snapshot(
     );
     Ok(Some(SnapshotPreparation {
         #[cfg(all(target_os = "linux", feature = "awacs"))]
-        initialized_awacs_snapshot,
+        initialized_awacs_snapshot: None,
     }))
 }
 
@@ -566,6 +633,31 @@ fn remove_copied_metadata(path: &Path) -> Result<(), CommandError> {
         fs::remove_dir_all(path).context(path)?;
     } else {
         fs::remove_file(path).context(path)?;
+    }
+    Ok(())
+}
+
+fn cleanup_failed_snapshot_workspace(
+    destination: &Path,
+    git_worktree_plan: Option<&GitWorktreePlan>,
+    lock_root: &Path,
+) -> Result<(), CommandError> {
+    remove_failed_snapshot_destination(destination)?;
+    if let Some(plan) = git_worktree_plan {
+        prune_git_worktree_metadata(plan, lock_root)?;
+    }
+    Ok(())
+}
+
+fn remove_failed_snapshot_destination(destination: &Path) -> Result<(), CommandError> {
+    if !destination.exists() {
+        return Ok(());
+    }
+    if !delete_btrfs_subvolume(destination)? {
+        return Err(user_error(format!(
+            "Failed to remove partial snapshot workspace at {}: path is not on Btrfs",
+            destination.display()
+        )));
     }
     Ok(())
 }
@@ -590,19 +682,7 @@ pub(super) fn create_git_worktree(
         ))
     })?;
 
-    let mut cmd = Command::new(&plan.git_executable);
-    cmd.arg("--git-dir")
-        .arg(&plan.git_repo_path)
-        .args([
-            "worktree",
-            "add",
-            "--force",
-            "--no-checkout",
-            "--detach",
-            "--quiet",
-        ])
-        .arg(workspace_root)
-        .arg(plan.checkout_commit_id.hex());
+    let mut cmd = git_worktree_add_command(plan, workspace_root);
     let output = cmd.output().map_err(|err| {
         user_error(format!(
             "Failed to create Git worktree using {}: {err}",
@@ -616,6 +696,82 @@ pub(super) fn create_git_worktree(
         )));
     }
     Ok(())
+}
+
+fn git_worktree_add_command(plan: &GitWorktreePlan, workspace_root: &Path) -> Command {
+    let mut cmd = Command::new(&plan.git_executable);
+    // JJ already owns the physical snapshot and only needs Git to allocate a
+    // linked-worktree identity. A source repository may enable Git's own
+    // AWACS snapshot mode, whose required path rejects this intentional
+    // no-checkout temporary worktree. Command-scoped false is accepted by
+    // stock Git as an unknown config key and bypasses the outer mechanism in
+    // snapshot-aware Git.
+    cmd.args(["-c", "worktree.btrfsSnapshot=false"])
+        .arg("--git-dir")
+        .arg(&plan.git_repo_path)
+        .args([
+            "worktree",
+            "add",
+            "--force",
+            "--no-checkout",
+            "--detach",
+            "--quiet",
+        ])
+        .arg(workspace_root)
+        .arg(plan.checkout_commit_id.hex());
+    cmd
+}
+
+fn prune_git_worktree_metadata(
+    plan: &GitWorktreePlan,
+    lock_root: &Path,
+) -> Result<(), CommandError> {
+    let lock_path = lock_root.join("git_import_export.lock");
+    let _lock = FileLock::lock(lock_path.clone()).map_err(|err| {
+        user_error(format!(
+            "Failed to take lock for Git import/export at {}: {err}",
+            lock_path.display()
+        ))
+    })?;
+    let output = Command::new(&plan.git_executable)
+        .arg("--git-dir")
+        .arg(&plan.git_repo_path)
+        .args(["worktree", "prune", "--expire", "now"])
+        .output()
+        .map_err(|err| user_error(format!("Failed to prune Git worktree metadata: {err}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(user_error(format!(
+            "Failed to prune Git worktree metadata: {stderr}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_worktree_add_disables_git_snapshot_mode() {
+        let plan = GitWorktreePlan {
+            git_repo_path: PathBuf::from("/repo/.git"),
+            git_executable: PathBuf::from("git"),
+            checkout_commit_id: CommitId::from_hex("1234"),
+        };
+
+        let command = git_worktree_add_command(&plan, Path::new("/repo/worktree"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect_vec();
+
+        assert_eq!(
+            &args[..2],
+            ["-c", "worktree.btrfsSnapshot=false"],
+            "JJ's internal no-checkout worktree must bypass Git snapshot mode"
+        );
+    }
 }
 
 /// Creates a fresh Git worktree identity without overwriting files already
