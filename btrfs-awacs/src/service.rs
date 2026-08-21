@@ -1801,7 +1801,7 @@ impl Service {
             if !physical_published {
                 incremental_phase = "publish-physical-cut";
                 self.store
-                    .publish_validated_physical_cut(
+                    .stage_validated_physical_cut(
                         reservation,
                         completion.lease_owner,
                         &recorded,
@@ -1877,22 +1877,23 @@ impl Service {
                     elapsed_ms = finish_cut_started.elapsed().as_millis() as u64,
                     "query cut incremental publication failed; refusing full snapshot recovery"
                 );
-                let failure = if physical_published {
-                    self.store.fail_cut_comparison(
-                        reservation,
-                        completion.lease_owner,
-                        &incremental_error.to_string(),
-                        completion.now_ns,
-                    )
-                } else {
-                    self.store.fail_unpublished_cut(
-                        reservation,
-                        completion.lease_owner,
-                        &recorded,
-                        &incremental_error.to_string(),
-                        completion.now_ns,
-                    )
-                };
+                if physical_published {
+                    tracing::warn!(
+                        phase = incremental_phase,
+                        watch_id = %hex_id(&reservation.watch_id),
+                        operation_id = %hex_id(&reservation.operation_id),
+                        cut_sequence = reservation.sequence,
+                        "leaving staged cut pending for atomic publication recovery"
+                    );
+                    return Err(incremental_error);
+                }
+                let failure = self.store.fail_unpublished_cut(
+                    reservation,
+                    completion.lease_owner,
+                    &recorded,
+                    &incremental_error.to_string(),
+                    completion.now_ns,
+                );
                 if let Err(failure) = failure {
                     tracing::error!(
                         error = %failure,

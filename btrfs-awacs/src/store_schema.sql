@@ -166,7 +166,7 @@ CREATE TABLE watches (
          AND last_cut_snapshot_id IS NOT NULL AND last_cut_seq IS NOT NULL
          AND replay_floor_seq IS NOT NULL
          AND replay_floor_seq <= indexed_seq
-         AND indexed_seq <= last_cut_seq)
+         AND indexed_seq = last_cut_seq)
         OR
         (state = 'deleted'
          AND indexed_revision_id IS NULL AND indexed_seq IS NULL
@@ -210,6 +210,32 @@ CREATE TABLE watches (
     FOREIGN KEY (fsmonitor_owner_grant_id, id)
         REFERENCES watch_grants(id, watch_id)
 );
+
+CREATE TRIGGER watches_published_heads_match_revision_insert
+BEFORE INSERT ON watches
+WHEN NEW.state IN ('active', 'blocked')
+ AND NOT EXISTS (
+     SELECT 1 FROM revisions r
+      WHERE r.id = NEW.indexed_revision_id
+        AND r.snapshot_id = NEW.last_cut_snapshot_id
+        AND r.state = 'ready'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'published watch heads disagree');
+END;
+
+CREATE TRIGGER watches_published_heads_match_revision_update
+BEFORE UPDATE ON watches
+WHEN NEW.state IN ('active', 'blocked')
+ AND NOT EXISTS (
+     SELECT 1 FROM revisions r
+      WHERE r.id = NEW.indexed_revision_id
+        AND r.snapshot_id = NEW.last_cut_snapshot_id
+        AND r.state = 'ready'
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'published watch heads disagree');
+END;
 
 CREATE UNIQUE INDEX watches_live_subvolume
 ON watches(filesystem_id, live_subvol_uuid)
@@ -294,6 +320,12 @@ CREATE TABLE operations (
 CREATE UNIQUE INDEX operations_active_reserved_path
 ON operations(filesystem_id, reserved_path)
 WHERE state NOT IN ('done', 'failed');
+
+-- A cut may have durable pending artifacts, but no second cut may leapfrog
+-- it. Recovery must either finish or fail that exact operation first.
+CREATE UNIQUE INDEX operations_one_active_cut_per_watch
+ON operations(watch_id)
+WHERE kind = 'cut' AND state NOT IN ('done', 'failed');
 
 -- A compatibility request joins a cut only through this writer-serialized
 -- record. This closes the read/check versus fs_started race.

@@ -2761,9 +2761,11 @@ impl Store {
         })
     }
 
-    /// Publishes the physical cut only after the caller has independently
-    /// validated the immutable snapshot's nested-subvolume and fscrypt policy.
-    pub fn publish_validated_physical_cut(
+    /// Stages a validated immutable cut without advancing either published
+    /// watch head. The target remains operation-pinned and recoverable until
+    /// publish_adjacent_broker_delta() commits the physical and indexed heads
+    /// together.
+    pub fn stage_validated_physical_cut(
         &mut self,
         reservation: &CutReservation,
         lease_owner: [u8; 16],
@@ -2795,40 +2797,6 @@ impl Store {
             ],
         )?;
         transaction.execute(
-            r#"INSERT INTO snapshot_pins(snapshot_id, owner_kind, owner_id, reason)
-               VALUES (?1, 'watch-last-cut', ?2, 'physical-head')"#,
-            params![snapshot.snapshot_id, reservation.watch_id.as_slice()],
-        )?;
-        require_one(
-            transaction.execute(
-                r#"UPDATE watches
-                      SET last_cut_snapshot_id = ?2, last_cut_seq = ?3,
-                          cut_owner = NULL, cut_expires_ns = NULL
-                    WHERE id = ?1 AND state = 'active'
-                      AND last_cut_snapshot_id = ?4 AND last_cut_seq = ?5
-                      AND cut_owner = ?6 AND cut_fence = ?7"#,
-                params![
-                    reservation.watch_id.as_slice(),
-                    snapshot.snapshot_id,
-                    reservation.sequence,
-                    reservation.base_snapshot_id,
-                    reservation.sequence - 1,
-                    lease_owner.as_slice(),
-                    reservation.cut_fence,
-                ],
-            )?,
-            "advance physical cut head",
-        )?;
-        transaction.execute(
-            r#"DELETE FROM snapshot_pins
-                WHERE snapshot_id = ?1 AND owner_kind = 'watch-last-cut'
-                  AND owner_id = ?2"#,
-            params![
-                reservation.base_snapshot_id,
-                reservation.watch_id.as_slice(),
-            ],
-        )?;
-        transaction.execute(
             "UPDATE operations SET state = 'manifest_ready', updated_ns = ?2 WHERE id = ?1",
             params![reservation.operation_id.as_slice(), now_ns],
         )?;
@@ -2848,8 +2816,10 @@ impl Store {
         replay_spool: Option<(&[u8], [u8; 32])>,
         now_ns: i64,
     ) -> Result<PublishedCut, ManagerError> {
-        let (base_revision_id, base_snapshot_id): (i64, i64) = self
-            .connection()
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (base_revision_id, base_snapshot_id): (i64, i64) = transaction
             .query_row(
                 r#"SELECT w.indexed_revision_id, r.snapshot_id
                      FROM watches w JOIN revisions r ON r.id = w.indexed_revision_id
@@ -2865,10 +2835,7 @@ impl Store {
                 "cut base snapshot differs from indexed predecessor",
             ));
         }
-        stage_broker_delta_rows(self.connection_mut(), manifest, events)?;
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        stage_broker_delta_rows_in_transaction(&transaction, manifest, events)?;
         verify_delta_publication(
             &transaction,
             reservation,
@@ -2932,21 +2899,34 @@ impl Store {
                VALUES (?1, 'watch-indexed-head', ?2, 'indexed-head')"#,
             params![snapshot.snapshot_id, reservation.watch_id.as_slice()],
         )?;
+        transaction.execute(
+            r#"INSERT INTO snapshot_pins(snapshot_id, owner_kind, owner_id, reason)
+               VALUES (?1, 'watch-last-cut', ?2, 'physical-head')"#,
+            params![snapshot.snapshot_id, reservation.watch_id.as_slice()],
+        )?;
         require_one(
             transaction.execute(
                 r#"UPDATE watches
-                      SET indexed_revision_id = ?2, indexed_seq = ?3
+                      SET indexed_revision_id = ?2, indexed_seq = ?3,
+                          last_cut_snapshot_id = ?4, last_cut_seq = ?3,
+                          cut_owner = NULL, cut_expires_ns = NULL
                     WHERE id = ?1 AND state = 'active'
-                      AND indexed_revision_id = ?4 AND indexed_seq = ?5"#,
+                      AND indexed_revision_id = ?5 AND indexed_seq = ?6
+                      AND last_cut_snapshot_id = ?7 AND last_cut_seq = ?6
+                      AND cut_owner = ?8 AND cut_fence = ?9"#,
                 params![
                     reservation.watch_id.as_slice(),
                     revision_id,
                     reservation.sequence,
+                    snapshot.snapshot_id,
                     base_revision_id,
                     reservation.sequence - 1,
+                    reservation.base_snapshot_id,
+                    lease_owner.as_slice(),
+                    reservation.cut_fence,
                 ],
             )?,
-            "advance indexed watch head",
+            "advance published watch heads",
         )?;
         require_one(
             transaction.execute(
@@ -2986,6 +2966,12 @@ impl Store {
         transaction.execute(
             r#"DELETE FROM snapshot_pins
                 WHERE snapshot_id = ?1 AND owner_kind = 'watch-indexed-head'
+                  AND owner_id = ?2"#,
+            params![base_snapshot_id, reservation.watch_id.as_slice()],
+        )?;
+        transaction.execute(
+            r#"DELETE FROM snapshot_pins
+                WHERE snapshot_id = ?1 AND owner_kind = 'watch-last-cut'
                   AND owner_id = ?2"#,
             params![base_snapshot_id, reservation.watch_id.as_slice()],
         )?;
@@ -5201,7 +5187,18 @@ fn stage_broker_delta_rows(
     manifest: &ChangedObjectsManifest,
     events: &[Event],
 ) -> Result<(), ManagerError> {
-    connection.execute_batch(
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    stage_broker_delta_rows_in_transaction(&transaction, manifest, events)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn stage_broker_delta_rows_in_transaction(
+    transaction: &Transaction<'_>,
+    manifest: &ChangedObjectsManifest,
+    events: &[Event],
+) -> Result<(), ManagerError> {
+    transaction.execute_batch(
         r#"CREATE TEMP TABLE IF NOT EXISTS delta_stage_objects (
                ino BLOB PRIMARY KEY, old_generation BLOB,
                new_generation BLOB, change_mask INTEGER NOT NULL
@@ -5220,7 +5217,6 @@ fn stage_broker_delta_rows(
            DELETE FROM delta_stage_refs;
            DELETE FROM delta_stage_events;"#,
     )?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
     {
         let mut statement = transaction.prepare_cached(
             r#"INSERT INTO delta_stage_objects(
@@ -5291,7 +5287,6 @@ fn stage_broker_delta_rows(
             ])?;
         }
     }
-    transaction.commit()?;
     Ok(())
 }
 
@@ -5877,6 +5872,184 @@ mod tests {
             readonly: true,
             created_ns: 500,
         }
+    }
+
+    #[test]
+    fn staged_cut_keeps_published_heads_unchanged_until_indexed_commit() {
+        let (_temp, mut store, request) = setup();
+        let (_initialize, initialized) = initialize_watch(&mut store, &request);
+        let cut_request = CutRequest {
+            watch_id: initialized.watch_id,
+            authorization_id: initialized.grant_id,
+            reserved_snapshot_path: b"/store/snapshots/w/atomic-cut".to_vec(),
+            requester_uid: 1000,
+            requester_gid: 1000,
+            lease_owner: [6; 16],
+            now_ns: 400,
+            lease_expires_ns: 2_000,
+        };
+        let cut = store.reserve_cut(&cut_request).unwrap();
+        store
+            .start_cut_filesystem_effect(&cut, cut_request.lease_owner, 450)
+            .unwrap();
+        let recorded = store
+            .record_cut_snapshot(
+                &cut,
+                cut_request.lease_owner,
+                &cut_snapshot(&cut_request, request.source_subvol_uuid),
+                500,
+            )
+            .unwrap();
+
+        store
+            .stage_validated_physical_cut(&cut, cut_request.lease_owner, &recorded, 550)
+            .unwrap();
+
+        let staged: (i64, i64, i64, String) = store
+            .connection()
+            .query_row(
+                r#"SELECT w.last_cut_snapshot_id, w.last_cut_seq, w.indexed_seq, o.state
+                     FROM watches w JOIN operations o ON o.watch_id = w.id
+                    WHERE w.id = ?1 AND o.id = ?2"#,
+                params![initialized.watch_id.as_slice(), cut.operation_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            staged,
+            (initialized.snapshot_id, 0, 0, "manifest_ready".to_owned())
+        );
+        let second_request = CutRequest {
+            reserved_snapshot_path: b"/store/snapshots/w/leapfrog-cut".to_vec(),
+            lease_owner: [7; 16],
+            now_ns: 600,
+            ..cut_request.clone()
+        };
+        assert!(store.reserve_cut(&second_request).is_err());
+
+        let manifest = ChangedObjectsManifest {
+            objects: std::collections::BTreeMap::new(),
+            ref_adds: BTreeSet::new(),
+            ref_deletes: BTreeSet::new(),
+            raw_ref_adds: 0,
+            raw_ref_deletes: 0,
+        };
+        store
+            .connection()
+            .execute_batch(
+                r#"CREATE TEMP TRIGGER fail_atomic_head_update
+                   BEFORE UPDATE OF indexed_seq ON watches
+                   BEGIN
+                       SELECT RAISE(ABORT, 'database or disk is full');
+                   END;"#,
+            )
+            .unwrap();
+        assert!(
+            store
+                .publish_adjacent_broker_delta(
+                    &cut,
+                    cut_request.lease_owner,
+                    &recorded,
+                    &manifest,
+                    &[],
+                    None,
+                    625,
+                )
+                .is_err()
+        );
+        let failed_commit: (i64, i64, i64, String, String) = store
+            .connection()
+            .query_row(
+                r#"SELECT w.last_cut_snapshot_id, w.last_cut_seq, w.indexed_seq,
+                           o.state, c.state
+                     FROM watches w
+                     JOIN operations o ON o.id = ?2
+                     JOIN watch_cuts c ON c.operation_id = o.id
+                    WHERE w.id = ?1"#,
+                params![initialized.watch_id.as_slice(), cut.operation_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            failed_commit,
+            (
+                initialized.snapshot_id,
+                0,
+                0,
+                "manifest_ready".to_owned(),
+                "created".to_owned()
+            )
+        );
+        store
+            .connection()
+            .execute_batch("DROP TRIGGER fail_atomic_head_update;")
+            .unwrap();
+        let published = store
+            .publish_adjacent_broker_delta(
+                &cut,
+                cut_request.lease_owner,
+                &recorded,
+                &manifest,
+                &[],
+                None,
+                650,
+            )
+            .unwrap();
+        assert_eq!(published.sequence, 1);
+        assert_eq!(published.snapshot_id, recorded.snapshot_id);
+
+        let committed: (i64, i64, i64, i64, String, String) = store
+            .connection()
+            .query_row(
+                r#"SELECT w.last_cut_snapshot_id, w.last_cut_seq, w.indexed_seq,
+                           r.snapshot_id, o.state, c.state
+                     FROM watches w
+                     JOIN revisions r ON r.id = w.indexed_revision_id
+                     JOIN operations o ON o.id = ?2
+                     JOIN watch_cuts c ON c.operation_id = o.id
+                    WHERE w.id = ?1"#,
+                params![initialized.watch_id.as_slice(), cut.operation_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            committed,
+            (
+                recorded.snapshot_id,
+                1,
+                1,
+                recorded.snapshot_id,
+                "done".to_owned(),
+                "ready".to_owned()
+            )
+        );
+        assert!(
+            store
+                .connection()
+                .execute(
+                    "UPDATE watches SET last_cut_snapshot_id = ?2 WHERE id = ?1",
+                    params![initialized.watch_id.as_slice(), initialized.snapshot_id],
+                )
+                .is_err()
+        );
+        assert!(store.foreign_key_violations().unwrap().is_empty());
     }
 
     #[test]

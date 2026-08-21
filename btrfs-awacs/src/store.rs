@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 const CONNECTION_SCHEMA: &str = include_str!("store_connection.sql");
 const MANAGER_SCHEMA: &str = include_str!("store_schema.sql");
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const MANAGER_APPLICATION_ID: i64 = 0x4241_5731; // BAW1
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,7 +239,7 @@ fn install_manager_schema(
     )?;
     transaction.execute(
         "INSERT INTO schema_migrations(version, name, applied_ns) \
-         VALUES (10, 'broker-resolved-paths-v10', ?1)",
+         VALUES (11, 'atomic-published-cut-heads-v11', ?1)",
         [metadata.created_ns],
     )?;
     transaction.pragma_update(None, "application_id", MANAGER_APPLICATION_ID)?;
