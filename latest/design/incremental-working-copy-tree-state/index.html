@@ -1,0 +1,2837 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+        <link rel="canonical" href="https://adamh-oai.github.io/jj/latest/design/incremental-working-copy-tree-state/">
+      
+      
+      
+      
+      <link rel="icon" href="../../images/favicon-96x96.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.23">
+    
+    
+      
+        <title>Snapshot-baseline working-copy state - Jujutsu docs</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.84d31ad4.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.06af60db.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CGoogle+Sans+Code:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Google Sans Code"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#snapshot-baseline-working-copy-state" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Jujutsu docs" class="md-header__button md-logo" aria-label="Jujutsu docs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Jujutsu docs
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Snapshot-baseline working-copy state
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/adamh-oai/jj" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    adamh-oai/jj
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Jujutsu docs" class="md-nav__button md-logo" aria-label="Jujutsu docs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Jujutsu docs
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/adamh-oai/jj" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    adamh-oai/jj
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Getting started
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Getting started
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../install-and-setup/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Installation and setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorial/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Tutorial and bird's eye view
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../gerrit/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working with Gerrit
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../github/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working with GitHub
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../windows/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working on Windows
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../FAQ/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    FAQ
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli-reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CLI reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../testimonials/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Testimonials
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../community_tools/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Community-built tools
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Concepts
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            Concepts
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../working-copy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working copy
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bookmarks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Bookmarks
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../conflicts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Conflicts
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../operation-log/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Operation log
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../glossary/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Glossary
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Guides
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            Guides
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/cli-revision-options/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CLI options for specifying revisions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/divergence/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Divergent changes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/multiple-remotes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Multiple remotes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_9" >
+        
+          
+          <label class="md-nav__link" for="__nav_9" id="__nav_9_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Reference
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_9_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_9">
+            <span class="md-nav__icon md-icon"></span>
+            Reference
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Configuration
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../filesets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Fileset language
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../revsets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Revset language
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../templates/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Templating language
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_10" id="__nav_10_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Comparisons
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_10">
+            <span class="md-nav__icon md-icon"></span>
+            Comparisons
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-comparison/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Git comparison
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-command-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Git command table
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-compatibility/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Git compatibility
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-experts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Jujutsu for Git experts
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../sapling-comparison/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Sapling comparison
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../related-work/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Other related work
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_11" id="__nav_11_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Technical details
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_11">
+            <span class="md-nav__icon md-icon"></span>
+            Technical details
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core_tenets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Core tenets
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Architecture
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Concurrency
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/conflicts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Conflicts
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/revset-evaluation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Revset evaluation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_12" >
+        
+          
+          <label class="md-nav__link" for="__nav_12" id="__nav_12_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Contributing
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_12">
+            <span class="md-nav__icon md-icon"></span>
+            Contributing
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Guidelines and "How to...?"
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../code-of-conduct/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Code of conduct
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../style_guide/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Style guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../design_docs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Design docs
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../design_doc_blueprint/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Design doc blueprint
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../releasing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Releasing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../governance/temporary-voting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Temporary voting for governance
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../governance/GOVERNANCE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Governance
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_13" >
+        
+          
+          <label class="md-nav__link" for="__nav_13" id="__nav_13_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Design docs
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_13_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_13">
+            <span class="md-nav__icon md-icon"></span>
+            Design docs
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../git-submodules/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    git-submodules
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../git-submodule-storage/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    git-submodule-storage
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../run/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    JJ run
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sparse-v2/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Sparse patterns v2
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tracking-branches/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Tracking branches
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../copy-tracking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Copy tracking and tracing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../secure-config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Secure config
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../managed-config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Managed config
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../jj-converge-command/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    JJ converge (aka resolve-divergence)
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../jq-compatible-queries/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    jq-compatible structured queries
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../roadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Development roadmap
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Changelog
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#objective" class="md-nav__link">
+    <span class="md-ellipsis">
+      Objective
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#current-state-and-why-it-is-insufficient" class="md-nav__link">
+    <span class="md-ellipsis">
+      Current state and why it is insufficient
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scope-and-assumptions" class="md-nav__link">
+    <span class="md-ellipsis">
+      Scope and assumptions
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#goals-and-non-goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      Goals and non-goals
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Goals and non-goals">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      Goals
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#non-goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      Non-goals
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#correctness-model" class="md-nav__link">
+    <span class="md-ellipsis">
+      Correctness model
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#durable-baseline-journal" class="md-nav__link">
+    <span class="md-ellipsis">
+      Durable baseline journal
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Durable baseline journal">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#downgrade-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      Downgrade behavior
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#authoritative-delta-contract" class="md-nav__link">
+    <span class="md-ellipsis">
+      Authoritative delta contract
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#incremental-status-algorithm" class="md-nav__link">
+    <span class="md-ellipsis">
+      Incremental status algorithm
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#crash-safe-baseline-publication" class="md-nav__link">
+    <span class="md-ellipsis">
+      Crash-safe baseline publication
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Crash-safe baseline publication">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#durable-awacs-owner" class="md-nav__link">
+    <span class="md-ellipsis">
+      Durable AWACS owner
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#working-copy-mutations" class="md-nav__link">
+    <span class="md-ellipsis">
+      Working-copy mutations
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#fallback-migration-and-cleanup" class="md-nav__link">
+    <span class="md-ellipsis">
+      Fallback, migration, and cleanup
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Fallback, migration, and cleanup">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#fallback" class="md-nav__link">
+    <span class="md-ellipsis">
+      Fallback
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#migration-from-the-legacy-protobuf" class="md-nav__link">
+    <span class="md-ellipsis">
+      Migration from the legacy protobuf
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#state-cleanup" class="md-nav__link">
+    <span class="md-ellipsis">
+      State cleanup
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alternatives-considered" class="md-nav__link">
+    <span class="md-ellipsis">
+      Alternatives considered
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Alternatives considered">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#keep-the-protobuf-and-stream-or-compress-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      Keep the protobuf and stream or compress it
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#immutable-full-blob-or-range-chunks" class="md-nav__link">
+    <span class="md-ellipsis">
+      Immutable full blob or range chunks
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#append-only-per-path-delta-journal" class="md-nav__link">
+    <span class="md-ellipsis">
+      Append-only per-path delta journal
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#treat-snapshot-identity-as-tree-identity" class="md-nav__link">
+    <span class="md-ellipsis">
+      Treat snapshot identity as tree identity
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      Implementation plan
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Implementation plan">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#concrete-implementation-seams" class="md-nav__link">
+    <span class="md-ellipsis">
+      Concrete implementation seams
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#test-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      Test plan
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Test plan">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#correctness" class="md-nav__link">
+    <span class="md-ellipsis">
+      Correctness
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#retention-and-crash-recovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      Retention and crash recovery
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#migration-and-downgrade" class="md-nav__link">
+    <span class="md-ellipsis">
+      Migration and downgrade
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#performance" class="md-nav__link">
+    <span class="md-ellipsis">
+      Performance
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#open-questions" class="md-nav__link">
+    <span class="md-ellipsis">
+      Open questions
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#future-possibilities" class="md-nav__link">
+    <span class="md-ellipsis">
+      Future possibilities
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://github.com/adamh-oai/jj/edit/main/docs/design/incremental-working-copy-tree-state.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20.71 7.04c.39-.39.39-1.04 0-1.41l-2.34-2.34c-.37-.39-1.02-.39-1.41 0l-1.84 1.83 3.75 3.75M3 17.25V21h3.75L17.81 9.93l-3.75-3.75z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="snapshot-baseline-working-copy-state">Snapshot-baseline working-copy state<a class="headerlink" href="#snapshot-baseline-working-copy-state" title="Permanent link">&para;</a></h1>
+<p>Author: <a href="mailto:adamh@openai.com">Adam Hupp</a></p>
+<p><strong>Summary:</strong> Replace both the monolithic protobuf <code>tree_state</code> and the
+intermediate SQLite <code>file_states</code> store with a small crash-safe baseline
+journal. When an authoritative backend retains immutable snapshot A, the
+journal binds A to the last durable Jujutsu working-copy tree X plus the
+sparse and ignore inputs used to interpret it. The next status obtains
+snapshot B and a complete A→B delta, inspects only changed paths from B,
+applies those changes to X, and publishes a new <code>(tree Y, snapshot B)</code>
+binding. No per-path mtime, size, type, or conflict-marker rows are persisted.
+If retention, lineage, delta completeness, or interpretation-input continuity
+cannot be proved, Jujutsu performs a full scan and establishes a new baseline.</p>
+<h2 id="objective">Objective<a class="headerlink" href="#objective" title="Permanent link">&para;</a></h2>
+<p><code>tree_state</code> is durable physical-working-copy state, not a duplicate commit.
+The commit stores semantic content and tree IDs. The old <code>tree_state</code> file
+stores scan metadata such as per-path mtime, size, type, sparse patterns, and
+the filesystem-monitor cursor so a later status can avoid hashing everything.</p>
+<p>That representation is useful for ordinary mutable filesystems, but it is the
+wrong source of truth when the filesystem backend already retains an
+authoritative immutable snapshot. If snapshot A is known to correspond to
+Jujutsu tree X, unchanged paths in A→B retain their semantic values from X.
+Only paths in a complete A→B delta need to be read from B.</p>
+<p>The SQLite prototype removes O(N) durable writes but not O(N) command startup:
+it still selects, decodes, reconstructs, and sorts every file-state row. On a
+measured 1.15-million-row working copy, a one-file incremental status remains
+about 9.6 seconds. SQLite is therefore an intermediate implementation, not
+the target architecture.</p>
+<p>The desired steady-state costs are:</p>
+<table>
+<thead>
+<tr>
+<th>Snapshot shape</th>
+<th>Target work</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No change A→B</td>
+<td>Bounded journal update; no per-path load</td>
+</tr>
+<tr>
+<td>k changed paths</td>
+<td>Complete A→B delta plus O(k) reads/hashes from B</td>
+</tr>
+<tr>
+<td>Changed directory/prefix</td>
+<td>Enumerate only the affected prefix in B and the matching subtree in X</td>
+</tr>
+<tr>
+<td>Missing or pruned A, incomplete delta, changed interpretation inputs</td>
+<td>Full scan of immutable B, then establish B as the new baseline</td>
+</tr>
+<tr>
+<td>Checkout, reset, recover, or sparse materialization</td>
+<td>Establish a new physical baseline after successful materialization, or invalidate</td>
+</tr>
+<tr>
+<td>No authoritative retained-snapshot backend</td>
+<td>Conservative full scan</td>
+</tr>
+</tbody>
+</table>
+<h2 id="current-state-and-why-it-is-insufficient">Current state and why it is insufficient<a class="headerlink" href="#current-state-and-why-it-is-insufficient" title="Permanent link">&para;</a></h2>
+<p>The legacy <code>TreeState</code> protobuf persists:</p>
+<ul>
+<li>current tree IDs and conflict labels;</li>
+<li>every tracked path's mtime, size, file type, and optional materialized
+  conflict-marker length;</li>
+<li>sparse patterns;</li>
+<li>a backend-tagged filesystem-monitor cursor.</li>
+</ul>
+<p>The SQLite implementation moves the same logical state into one metadata row
+and one row per tracked path. It makes a cursor-only or small-change save
+proportional to the durable delta, but loading still reconstructs the complete
+in-memory <code>FileStatesMap</code> before the scanner can use an incremental matcher.
+It therefore preserves the O(N) read, decode, allocation, validation, and sort
+cost on every new command.</p>
+<p>With retained immutable snapshots, those rows duplicate facts already
+available from two authoritative sources:</p>
+<ul>
+<li>tree X is the semantic truth for paths unchanged since A;</li>
+<li>snapshot A is the physical truth for the last accepted working-copy state;</li>
+<li>snapshot B plus a complete A→B delta identifies the only paths whose
+  physical state may need to be reinterpreted.</li>
+</ul>
+<p>The target removes the durable per-path cache instead of making it more
+queryable.</p>
+<h2 id="scope-and-assumptions">Scope and assumptions<a class="headerlink" href="#scope-and-assumptions" title="Permanent link">&para;</a></h2>
+<p>The O(delta) path requires an authoritative backend that can:</p>
+<ol>
+<li>retain the baseline snapshot named by the durable journal;</li>
+<li>prove that a new snapshot B descends from that exact A;</li>
+<li>return a complete Jujutsu-observable A→B delta, or explicitly return
+   <code>Full</code>;</li>
+<li>keep B available until Jujutsu durably publishes it as the next baseline;</li>
+<li>recover idempotently from crashes between backend retention and local
+   journal publication.</li>
+</ol>
+<p>AWACS is the first such backend. Ordinary <code>none</code> and Watchman backends do
+not provide an immutable retained baseline, so after the per-path table is
+removed they conservatively full-scan. They may continue to narrow a scan
+only if a future backend supplies an equivalent authoritative contract.</p>
+<p>This design removes durable per-path state. It does not require every
+working-copy backend to become incremental.</p>
+<h2 id="goals-and-non-goals">Goals and non-goals<a class="headerlink" href="#goals-and-non-goals" title="Permanent link">&para;</a></h2>
+<h3 id="goals">Goals<a class="headerlink" href="#goals" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Eliminate the persisted per-path mtime/size/type/conflict-marker table.</li>
+<li>Replace both the legacy protobuf <code>tree_state</code> payload and SQLite
+  <code>file_states</code> database with one small versioned baseline journal.</li>
+<li>Bind a semantic Jujutsu tree and an exact physical immutable snapshot in one
+  durable record.</li>
+<li>Make steady-state status reads and writes proportional to the complete
+  filesystem delta rather than total tracked-path count.</li>
+<li>Make snapshot retention handoff and local publication crash-safe.</li>
+<li>Preserve the existing working-copy lock and single-writer model.</li>
+<li>Fail conservatively on missing retention, broken lineage, incomplete
+  deltas, changed sparse/ignore interpretation, corruption, or downgrade.</li>
+<li>Make checkout, reset, recover, sparse changes, and colocated Git transitions
+  explicit physical-baseline boundaries.</li>
+</ul>
+<h3 id="non-goals">Non-goals<a class="headerlink" href="#non-goals" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Providing incremental status for <code>none</code> or ordinary Watchman without an
+  authoritative retained immutable baseline.</li>
+<li>Persisting file contents, per-path stat rows, an untracked-path catalog, or
+  a second semantic tree in the journal.</li>
+<li>Making live working-copy writes transactional with a filesystem snapshot.</li>
+<li>Replacing the existing working-copy lock with backend or database locking.</li>
+<li>Treating a snapshot UUID as semantic content equality.</li>
+<li>Silently accepting a best-effort or incomplete change list as an
+  incremental baseline transition.</li>
+</ul>
+<h2 id="correctness-model">Correctness model<a class="headerlink" href="#correctness-model" title="Permanent link">&para;</a></h2>
+<p>The durable clean state is:</p>
+<div class="highlight"><pre><span></span><code>Clean {
+  semantic_tree: X,
+  baseline_snapshot: A,
+  interpretation_inputs: I,
+}
+</code></pre></div>
+<p>X is the exact merged tree IDs and conflict labels that Jujutsu produced by
+reading A. A is the retained immutable physical snapshot plus the backend
+identity and lineage token needed to prove the next transition. I is the
+sparse view and fingerprint of inputs outside the snapshot that affect how
+paths are interpreted.</p>
+<p>The normal transition is:</p>
+<div class="highlight"><pre><span></span><code>load Clean(X, A, I)
+validate A is retained and I is unchanged
+BeginScan(A) -&gt; leased B + CompleteDelta(A→B) | Full
+if CompleteDelta:
+  apply only B reads for changed paths/prefixes to X
+else:
+  full-scan B
+produce semantic tree Y
+durably retain/promote B
+atomically publish Clean(Y, B, I)
+release A
+</code></pre></div>
+<p>The following invariants are required:</p>
+<ol>
+<li>A clean journal entry names an immutable snapshot identity plus enough
+   backend proof state to either reopen/prove that snapshot or force <code>Full</code>.
+   A hard-pinned backend additionally retains that snapshot until the next
+   clean binding is durable.</li>
+<li>The journal's semantic tree was produced only from that named snapshot and
+   the recorded interpretation inputs.</li>
+<li>A delta is used only when the backend proves complete continuity from the
+   exact retained A to B.</li>
+<li>Every Jujutsu-observable difference in A→B is either represented in the
+   delta or causes <code>Full</code>.</li>
+<li>Jujutsu never publishes B as clean until all reads used to produce Y came
+   from B and B is durably retained.</li>
+<li>Jujutsu does not release A until the clean B binding is durable.</li>
+<li>A command that may change live materialization invalidates or replaces the
+   baseline before the changed physical state can be mistaken for A.</li>
+<li><code>@</code> alone is not a physical baseline. The journal binds exact tree IDs,
+   operation identity, and snapshot identity because semantic and physical
+   state can diverge during checkout, reset, recovery, or Git import/export.</li>
+<li>No clean transition depends on persisted per-path rows.</li>
+</ol>
+<h2 id="durable-baseline-journal">Durable baseline journal<a class="headerlink" href="#durable-baseline-journal" title="Permanent link">&para;</a></h2>
+<p>The authoritative state is one small, atomically replaced record under
+<code>.jj/working_copy/</code>. It must not reuse <code>tree_state</code> as a per-path store.
+Normal local working copies replace the existing <code>checkout</code> record with a
+magic-prefixed combined journal so operation identity and baseline publication
+are committed together. Standalone <code>TreeState</code> users such as <code>jj run</code>, which
+have no checkout identity, use <code>working_copy_state</code>.</p>
+<p>Conceptually it contains:</p>
+<div class="highlight"><pre><span></span><code>format_version
+workspace_name
+working_copy_operation_id
+working_copy_root_identity
+tree_ids
+conflict_labels
+sparse_patterns
+interpretation_input_fingerprint
+backend_kind
+baseline_snapshot_identity?
+baseline_lineage_token?
+baseline_retention_token?
+generation
+phase
+</code></pre></div>
+<p><code>working_copy_root_identity</code> includes enough path, filesystem, mount, and
+subvolume identity to reject a journal copied to or opened from a different
+physical root. <code>interpretation_input_fingerprint</code> covers inputs not captured
+inside snapshot B, including global excludes and colocated Git metadata such
+as <code>.git/info/exclude</code> or sparse-checkout configuration.</p>
+<p><code>phase</code> is one of:</p>
+<div class="highlight"><pre><span></span><code>Clean {
+  tree: X,
+  baseline: A,
+}
+
+PendingBaselineCommit {
+  prior_clean: (X, A),
+  candidate_tree: Y,
+  candidate_snapshot: B,
+  transition_id,
+}
+
+PendingMaterialization {
+  prior_state: Clean(X, A) | NoBaseline(X),
+  intended_tree: Z,
+  mutation_kind,
+}
+
+NoBaseline {
+  tree: X,
+  reason,
+}
+</code></pre></div>
+<p><code>NoBaseline</code> is valid for non-authoritative backends and conservative
+fallbacks. It preserves the semantic working-copy tree but requires a full
+scan before another incremental transition. The journal stores references,
+fingerprints, and small tree metadata only; it never contains one row per
+path.</p>
+<h3 id="downgrade-behavior">Downgrade behavior<a class="headerlink" href="#downgrade-behavior" title="Permanent link">&para;</a></h3>
+<p>Removing <code>tree_state</code> outright is unsafe if an older binary treats a missing
+file as an uninitialized working copy. The new format must make older readers
+fail closed before they can initialize empty state. Acceptable mechanisms are:</p>
+<ul>
+<li>a versioned replacement for <code>checkout</code> whose first bytes are deliberately
+  invalid as the legacy Checkout protobuf; or</li>
+<li>a temporary, non-authoritative poison <code>tree_state</code> tombstone during the
+  compatibility window.</li>
+</ul>
+<p>The tombstone is a downgrade tripwire, not tree state. It can be removed once
+the working-copy format version itself prevents old readers from opening the
+workspace.</p>
+<h2 id="authoritative-delta-contract">Authoritative delta contract<a class="headerlink" href="#authoritative-delta-contract" title="Permanent link">&para;</a></h2>
+<p><code>ExactPaths</code> and <code>Prefixes</code> are not advisory hints in this design. They are
+complete delta shapes. If the backend cannot prove completeness, it returns
+<code>Full</code>.</p>
+<p>The delta must cover every change that can alter Jujutsu's interpretation:</p>
+<ul>
+<li>existence, creation, deletion, and file/directory transitions;</li>
+<li>regular-file bytes and size-affecting writes;</li>
+<li>executable-bit changes;</li>
+<li>symlink creation, deletion, and target changes;</li>
+<li>Git-submodule entries where supported;</li>
+<li>directory entry changes needed to discover additions and deletions;</li>
+<li>renames, hardlink aliases, and reference changes;</li>
+<li>ignore-file changes and the affected prefixes they can reveal or hide;</li>
+<li>nested-subvolume or mount-topology changes that require <code>Full</code>;</li>
+<li>any uncertainty, overflow, pruned lineage, daemon restart, or unsupported
+  filesystem behavior.</li>
+</ul>
+<p>An exact-path delta causes Jujutsu to read only those paths from B. A prefix
+delta causes Jujutsu to enumerate the affected prefix in B and enumerate the
+matching semantic subtree in X so additions, deletions, and type transitions
+are handled without a per-path cache. A <code>Full</code> result scans all sparse paths
+from B and establishes B as a new baseline.</p>
+<p>The semantic tree supplies tracked membership and unchanged values. It replaces
+the old file-state vector for deletion detection under changed prefixes.</p>
+<h2 id="incremental-status-algorithm">Incremental status algorithm<a class="headerlink" href="#incremental-status-algorithm" title="Permanent link">&para;</a></h2>
+<p>For an authoritative retained-snapshot backend:</p>
+<ol>
+<li>Load the journal and require <code>Clean(X, A, I)</code>.</li>
+<li>Verify root identity, backend compatibility, sparse patterns, external
+   interpretation fingerprint, and A's durable retention.</li>
+<li>Request B and a complete A→B delta.</li>
+<li>If the result is <code>Full</code>, enumerate the sparse view from B and the
+   matching tracked paths from X, then rebuild Y without per-path rows.</li>
+<li>If the result is exact paths or prefixes:<ul>
+<li>start from semantic tree X;</li>
+<li>use X to identify tracked entries under changed prefixes;</li>
+<li>read metadata/content only for affected B paths;</li>
+<li>remove paths absent from B;</li>
+<li>apply changed values to produce Y.</li>
+</ul>
+</li>
+<li>If the result contains untracked or ignored outcomes that are not
+   represented in Y and must be reported again on a later command, publish
+   <code>NoBaseline(Y, requires_full_scan)</code> rather than a reusable clean baseline.</li>
+<li>Publish Y↔B with the crash-safe handoff below.</li>
+</ol>
+<p>Conflict materialization and executable-bit preservation must not reintroduce
+durable per-path rows:</p>
+<ul>
+<li>For changed conflicted paths, derive the expected materialized conflict
+  representation from X and the active conflict-marker settings, then compare
+  only that changed path in B.</li>
+<li>For checkout, capture the old live-path executable bit before overwriting it,
+  or read it from the current retained snapshot when that snapshot is proven
+  to match the live pre-mutation state.</li>
+</ul>
+<p>For non-authoritative backends, load X from the journal and full-scan the live
+root. Such a scan may update X and sparse state, but it does not publish a
+reusable A→B baseline.</p>
+<h2 id="crash-safe-baseline-publication">Crash-safe baseline publication<a class="headerlink" href="#crash-safe-baseline-publication" title="Permanent link">&para;</a></h2>
+<p>Local file rename and backend retention cannot be one transaction. The state
+machine therefore orders them so a crash may leak a harmless retained snapshot
+but can never leave a clean journal pointing at a pruned snapshot.</p>
+<p>For accepted scan B:</p>
+<ol>
+<li>Build candidate tree Y from B while A remains retained.</li>
+<li>Ask AWACS to stage B as a pending owner pin while retaining committed A.</li>
+<li>After promotion succeeds, atomically write <code>Clean(Y, B, I)</code>.</li>
+<li>Acknowledge/finish the scan and atomically replace A with B.</li>
+</ol>
+<p>Recovery rules:</p>
+<ul>
+<li>Crash before B promotion: continue from clean A.</li>
+<li>Crash after B promotion but before clean publication: the journal still
+  names A, so the next Begin discards pending B and keeps A.</li>
+<li>Crash after clean B publication but before A release: use B and release A
+  during the next Begin reconciliation.</li>
+<li>Lost completion response after clean publication is cleanup only; it cannot
+  invalidate the durable B binding.</li>
+</ul>
+<p>The backend protocol must therefore support committed-baseline retention or an
+equivalent pin/handoff. A short-lived scan lease that releases B at
+<code>FinishScan(Committed)</code> is insufficient.</p>
+<h3 id="durable-awacs-owner">Durable AWACS owner<a class="headerlink" href="#durable-awacs-owner" title="Permanent link">&para;</a></h3>
+<p>The journal stores one random, stable <code>awacs_baseline_owner_id</code> for the JJ
+workspace. It is not the root path, workspace name, or mutable <code>@</code> commit.
+AWACS uses it to keep one committed baseline pin and, during handoff, one
+pending candidate pin. The exact snapshot UUID in the journal binds that
+physical state to the semantic tree; the owner ID only scopes retention.</p>
+<h2 id="working-copy-mutations">Working-copy mutations<a class="headerlink" href="#working-copy-mutations" title="Permanent link">&para;</a></h2>
+<p>Snapshot-backed status reads immutable B. Checkout, reset, recover, sparse
+materialization, and colocated Git import/export still mutate or reason about
+the live root. These operations are physical-baseline boundaries.</p>
+<p>Before a mutation that can change physical files or reinterpret them:</p>
+<ol>
+<li>Abort any pending scan.</li>
+<li>Atomically write <code>PendingMaterialization</code> with the prior journal state and
+   intended semantic tree/configuration.</li>
+<li>Invalidate the reusable baseline before live writes begin.</li>
+<li>Materialize against the live root.</li>
+<li>On success, either cut and publish a new authoritative baseline or write
+   <code>NoBaseline(intended_tree)</code> so the next status full-scans.</li>
+<li>On interruption, recover from <code>PendingMaterialization</code> before importing
+   Git HEAD, snapshotting, or claiming the working copy is clean.</li>
+</ol>
+<p>This journal replaces the existing <code>pending_checkout</code> TODO. It also closes
+the false-clean class where semantic state changes before physical
+materialization is proved.</p>
+<p>Sparse-pattern changes and changed external ignore inputs must invalidate the
+baseline unless the backend can prove a complete transition under the new
+interpretation. Colocated Git HEAD import/export failures and tree resets must
+do the same.</p>
+<h2 id="fallback-migration-and-cleanup">Fallback, migration, and cleanup<a class="headerlink" href="#fallback-migration-and-cleanup" title="Permanent link">&para;</a></h2>
+<h3 id="fallback">Fallback<a class="headerlink" href="#fallback" title="Permanent link">&para;</a></h3>
+<p>The safe fallback is a full scan, not reuse of an uncertain delta. Full scan is
+required when:</p>
+<ul>
+<li>A is missing, pruned, expired, or cannot be opened;</li>
+<li>filesystem, subvolume, mount, root, or lineage identity differs;</li>
+<li>the backend returns <code>Full</code> or cannot prove delta completeness;</li>
+<li>sparse patterns or external interpretation fingerprints changed;</li>
+<li>an accepted scan lease fails before publication;</li>
+<li>a pending materialization cannot be reconciled;</li>
+<li>untracked/ignored output cannot be represented by the semantic tree;</li>
+<li>the backend is <code>none</code>, ordinary Watchman, or otherwise non-authoritative.</li>
+</ul>
+<p>When an immutable B is available, full-scan B and establish it as the next
+baseline. When no immutable backend is available, full-scan the live root and
+persist <code>NoBaseline</code>.</p>
+<h3 id="migration-from-the-legacy-protobuf">Migration from the legacy protobuf<a class="headerlink" href="#migration-from-the-legacy-protobuf" title="Permanent link">&para;</a></h3>
+<p>Migration must not read or copy the O(N) file-state rows:</p>
+<ol>
+<li>Read only the old semantic tree IDs/conflict labels, sparse patterns,
+   operation identity, and backend cursor/metadata from the legacy protobuf.
+   Protobuf decoding skips the removed row field instead of allocating it.</li>
+<li>Write the new journal as <code>NoBaseline(X)</code>, unless the backend can verify
+   and durably promote the old cursor's exact snapshot as A.</li>
+<li>Force the next authoritative status to full-scan an immutable B and
+   establish a fresh clean baseline.</li>
+<li>After the new journal is durable, remove the legacy <code>tree_state</code> payload.</li>
+</ol>
+<h3 id="state-cleanup">State cleanup<a class="headerlink" href="#state-cleanup" title="Permanent link">&para;</a></h3>
+<p>The target has no database, WAL, compaction, row count, or path-range index.
+Cleanup removes:</p>
+<ul>
+<li>legacy <code>tree_state</code> protobuf payloads;</li>
+<li><code>FileStatesMap</code>, <code>FileStates</code>, and <code>TreeStateDelta</code>;</li>
+</ul>
+<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="keep-the-protobuf-and-stream-or-compress-it">Keep the protobuf and stream or compress it<a class="headerlink" href="#keep-the-protobuf-and-stream-or-compress-it" title="Permanent link">&para;</a></h3>
+<p>Streaming avoids a clone and compression reduces bytes, but both keep O(N)
+encode, write, read, and decode work. They do not use the retained physical
+baseline as the source of truth.</p>
+<h3 id="immutable-full-blob-or-range-chunks">Immutable full blob or range chunks<a class="headerlink" href="#immutable-full-blob-or-range-chunks" title="Permanent link">&para;</a></h3>
+<p>A manifest plus immutable file-state blob, or custom copy-on-write chunks,
+still persists a per-path index and needs balancing, compaction, recovery, and
+garbage collection. Snapshot retention already provides the physical index.</p>
+<h3 id="append-only-per-path-delta-journal">Append-only per-path delta journal<a class="headerlink" href="#append-only-per-path-delta-journal" title="Permanent link">&para;</a></h3>
+<p>A per-path journal makes small writes cheap but turns load and compaction into
+history management. The only durable journal needed here is the bounded
+baseline state machine.</p>
+<h3 id="treat-snapshot-identity-as-tree-identity">Treat snapshot identity as tree identity<a class="headerlink" href="#treat-snapshot-identity-as-tree-identity" title="Permanent link">&para;</a></h3>
+<p>Snapshot UUIDs identify physical cuts, not semantic Jujutsu trees. They do not
+encode content normalization, executable policy, ignore interpretation,
+conflict materialization, copy IDs, or Git-submodule semantics. The journal
+must bind snapshot identity to explicit Jujutsu tree IDs.</p>
+<h2 id="implementation-plan">Implementation plan<a class="headerlink" href="#implementation-plan" title="Permanent link">&para;</a></h2>
+<ol>
+<li>
+<p><strong>Introduce the small journal and downgrade barrier.</strong>
+   Add a versioned <code>working_copy_state</code> record, or replace <code>checkout</code> with
+   one atomic record, containing operation/workspace identity, tree IDs and
+   labels, sparse state, interpretation fingerprint, baseline identity, and
+   phase. Add a poison/version tripwire so older binaries fail closed when
+   <code>tree_state</code> disappears.</p>
+</li>
+<li>
+<p><strong>Add pending materialization recovery first.</strong>
+   Implement <code>PendingMaterialization</code> around checkout, reset, recover,
+   sparse changes, and colocated Git transitions. Recover or force full scan
+   before HEAD import/snapshot if an interrupted phase is found.</p>
+</li>
+<li>
+<p><strong>Extend the AWACS retention contract.</strong>
+   Add committed-baseline pin/handoff semantics: retain A while deriving A→B,
+   lease B during scan, idempotently promote B with a transition ID, publish
+   the local clean binding, then release A. Treat missing lineage or any
+   incomplete delta as <code>Full</code>.</p>
+</li>
+<li>
+<p><strong>Refactor snapshotting around semantic tree plus delta.</strong>
+   Replace file-state-driven tracked membership, deletion detection, and
+   mtime shortcuts with <code>MergedTree</code> lookups and B reads limited to exact
+   paths or changed prefixes. Preserve full-scan behavior as the oracle and
+   fallback.</p>
+</li>
+<li>
+<p><strong>Remove the remaining FileState-only behavior.</strong>
+   Derive conflict materialization for changed paths from the semantic tree and
+   capture/read old executable bits during checkout without persisted rows.
+   Remove public/debug consumers of <code>file_states</code>.</p>
+</li>
+<li>
+<p><strong>Migrate without loading rows.</strong>
+   Read legacy protobuf metadata only, write <code>NoBaseline(X)</code>, and establish a
+   fresh retained baseline on the next full immutable scan.</p>
+</li>
+<li>
+<p><strong>Delete the old implementations.</strong>
+   Remove per-path proto messages, <code>FileStatesMap</code>, and <code>TreeStateDelta</code>.</p>
+</li>
+<li>
+<p><strong>Roll out behind validation and measure the real target.</strong>
+   Gate the authoritative path until crash, lineage, mutation, and full-scan
+   oracle tests pass. Benchmark a million-path workspace and require one-file
+   status to perform no O(N) state load, sort, or filesystem scan.</p>
+</li>
+</ol>
+<h3 id="concrete-implementation-seams">Concrete implementation seams<a class="headerlink" href="#concrete-implementation-seams" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>lib/src/local_working_copy.rs</code>: replace <code>TreeState</code> persistence,
+  <code>FileStatesMap</code>, scanner file-state dependencies, and checkout metadata
+  dependencies.</li>
+<li><code>lib/src/working_copy.rs</code>: document and enforce baseline/pending-phase
+  semantics across <code>snapshot()</code>, <code>finish()</code>, reset, and recovery.</li>
+<li><code>lib/src/fsmonitor.rs</code> and the AWACS client boundary: expose authoritative
+  complete deltas plus committed-baseline retention.</li>
+<li><code>lib/src/protos/local_working_copy.proto</code>: replace per-path tree-state
+  messages with the small journal format or retire the file in favor of a new
+  versioned record.</li>
+<li><code>cli/src/commands/debug/local_working_copy.rs</code>: report journal phase,
+  baseline identity, and fallback reason rather than file-state rows.</li>
+<li><code>lib/tests/test_local_working_copy.rs</code> and AWACS integration tests: add
+  baseline, crash, migration, and oracle coverage.</li>
+</ul>
+<h2 id="test-plan">Test plan<a class="headerlink" href="#test-plan" title="Permanent link">&para;</a></h2>
+<h3 id="correctness">Correctness<a class="headerlink" href="#correctness" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Exact-path edits, additions, deletions, file/directory transitions,
+  symlinks, executable-bit changes, Git submodules, conflicts, renames, and
+  hardlinks match a full-scan oracle.</li>
+<li>Prefix invalidations enumerate only affected B prefixes plus matching X
+  subtrees and handle missing directories correctly.</li>
+<li>Ignore-file changes, global excludes, sparse changes, and colocated Git
+  metadata changes force the required full scan.</li>
+<li>Unchanged tracked paths are not read, hashed, decoded from rows, or sorted
+  during a complete one-path transition.</li>
+<li>Untracked/ignored output that cannot be replayed from X prevents reuse of a
+  clean baseline.</li>
+<li><code>none</code> and ordinary Watchman remain correct via conservative full scan.</li>
+</ul>
+<h3 id="retention-and-crash-recovery">Retention and crash recovery<a class="headerlink" href="#retention-and-crash-recovery" title="Permanent link">&para;</a></h3>
+<ul>
+<li>A is retained while B is scanned and until clean B publication is durable.</li>
+<li>Missing/pruned A, daemon restart, broken lineage, overflow, malformed
+  delta, or unsupported topology returns <code>Full</code>.</li>
+<li>Fault injection before pending write, after pending write, before B
+  promotion, after B promotion, before clean publication, after clean
+  publication, and before A release leaves either usable A, usable B, or an
+  explicit full-scan requirement.</li>
+<li>Retried transition IDs do not double-release A or lose B.</li>
+<li>Interrupted checkout/reset/recover/sparse/Git transitions are recovered
+  before status can claim cleanliness.</li>
+</ul>
+<h3 id="migration-and-downgrade">Migration and downgrade<a class="headerlink" href="#migration-and-downgrade" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Legacy protobuf metadata migrates without reading file-state rows; legacy
+  SQLite markers fail closed without opening a database.</li>
+<li>The first post-migration authoritative status full-scans B and establishes a
+  valid clean baseline.</li>
+<li>New-format commands never create, open, or mutate SQLite state.</li>
+<li>Older binaries fail closed instead of treating missing <code>tree_state</code> as an
+  empty working copy.</li>
+<li>No Jujutsu working-copy SQLite dependency or active <code>tree_state</code> payload
+  remains. Optional AWACS internals may independently use SQLite for their
+  service store.</li>
+</ul>
+<h3 id="performance">Performance<a class="headerlink" href="#performance" title="Permanent link">&para;</a></h3>
+<p>Measure at least:</p>
+<ul>
+<li>unchanged A→B;</li>
+<li>one-file edit, deletion, and rename;</li>
+<li>changed directory/prefix;</li>
+<li>10,000 changed paths;</li>
+<li>missing-baseline full fallback;</li>
+<li>checkout/reset/recover followed by baseline establishment;</li>
+<li>startup latency, journal bytes written, retained-snapshot count, and
+  end-to-end status latency.</li>
+</ul>
+<p>For a million-path working copy, require the steady-state one-file path to
+avoid O(N) SQLite/protobuf reads, full-vector reconstruction, full sort, and
+full filesystem traversal.</p>
+<h2 id="open-questions">Open questions<a class="headerlink" href="#open-questions" title="Permanent link">&para;</a></h2>
+<ul>
+<li>What exact AWACS API represents durable baseline promotion and idempotent
+  recovery after a lost response?</li>
+<li>Can unchanged untracked output be represented compactly, or should any such
+  output continue to force <code>NoBaseline</code>?</li>
+<li>Which external ignore/config inputs belong in the interpretation fingerprint?</li>
+<li>After a successful checkout, should Jujutsu cut a new baseline immediately
+  or defer to the next status full scan?</li>
+<li>Should a separate recovery tool for intermediate SQLite workspaces be
+  provided, or is fail-closed recovery with a compatible JJ sufficient?</li>
+</ul>
+<h2 id="future-possibilities">Future possibilities<a class="headerlink" href="#future-possibilities" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Use directory fds and <code>openat()</code> throughout snapshot traversal.</li>
+<li>Let other immutable or virtual working-copy backends implement the same
+  retained-baseline contract.</li>
+<li>Add a bounded untracked-result representation only if it preserves the
+  no-O(N)-state goal.</li>
+<li>Expose baseline generation, retention identity, phase, and fallback reason
+  in <code>jj debug local-working-copy</code>.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      <script id="__config" type="application/json">{"base": "../..", "features": ["content.action.edit", "content.code.copy", "content.tabs.link", "navigation.instant"], "search": "../../assets/javascripts/workers/search.973d3a69.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"alias": true, "provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.f55a23d4.min.js"></script>
+      
+    
+  </body>
+</html>

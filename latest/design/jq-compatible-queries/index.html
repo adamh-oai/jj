@@ -1,0 +1,3107 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+        <link rel="canonical" href="https://adamh-oai.github.io/jj/latest/design/jq-compatible-queries/">
+      
+      
+        <link rel="prev" href="../jj-converge-command/">
+      
+      
+        <link rel="next" href="../../roadmap/">
+      
+      
+      <link rel="icon" href="../../images/favicon-96x96.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.6.23">
+    
+    
+      
+        <title>jq-compatible structured queries - Jujutsu docs</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.84d31ad4.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.06af60db.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CGoogle+Sans+Code:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Google Sans Code"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#jq-compatible-structured-queries" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Jujutsu docs" class="md-header__button md-logo" aria-label="Jujutsu docs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Jujutsu docs
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              jq-compatible structured queries
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/adamh-oai/jj" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    adamh-oai/jj
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Jujutsu docs" class="md-nav__button md-logo" aria-label="Jujutsu docs" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Jujutsu docs
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/adamh-oai/jj" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    adamh-oai/jj
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Home
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Getting started
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            Getting started
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../install-and-setup/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Installation and setup
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorial/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Tutorial and bird's eye view
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../gerrit/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working with Gerrit
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../github/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working with GitHub
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../windows/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working on Windows
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../FAQ/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    FAQ
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli-reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CLI reference
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../testimonials/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Testimonials
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../community_tools/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Community-built tools
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Concepts
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            Concepts
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../working-copy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Working copy
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../bookmarks/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Bookmarks
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../conflicts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Conflicts
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../operation-log/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Operation log
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../glossary/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Glossary
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_8" >
+        
+          
+          <label class="md-nav__link" for="__nav_8" id="__nav_8_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Guides
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_8_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_8">
+            <span class="md-nav__icon md-icon"></span>
+            Guides
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/cli-revision-options/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    CLI options for specifying revisions
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/divergence/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Divergent changes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../guides/multiple-remotes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Multiple remotes
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_9" >
+        
+          
+          <label class="md-nav__link" for="__nav_9" id="__nav_9_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Reference
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_9_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_9">
+            <span class="md-nav__icon md-icon"></span>
+            Reference
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Configuration
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../filesets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Fileset language
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../revsets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Revset language
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../templates/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Templating language
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_10" >
+        
+          
+          <label class="md-nav__link" for="__nav_10" id="__nav_10_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Comparisons
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_10_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_10">
+            <span class="md-nav__icon md-icon"></span>
+            Comparisons
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-comparison/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Git comparison
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-command-table/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Git command table
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-compatibility/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Git compatibility
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../git-experts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Jujutsu for Git experts
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../sapling-comparison/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Sapling comparison
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../related-work/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Other related work
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_11" >
+        
+          
+          <label class="md-nav__link" for="__nav_11" id="__nav_11_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Technical details
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_11_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_11">
+            <span class="md-nav__icon md-icon"></span>
+            Technical details
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../core_tenets/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Core tenets
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/architecture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Architecture
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Concurrency
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/conflicts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Conflicts
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../technical/revset-evaluation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Revset evaluation
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_12" >
+        
+          
+          <label class="md-nav__link" for="__nav_12" id="__nav_12_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Contributing
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_12_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_12">
+            <span class="md-nav__icon md-icon"></span>
+            Contributing
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Guidelines and "How to...?"
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../code-of-conduct/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Code of conduct
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../style_guide/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Style guide
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../design_docs/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Design docs
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../design_doc_blueprint/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Design doc blueprint
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../releasing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Releasing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../governance/temporary-voting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Temporary voting for governance
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../governance/GOVERNANCE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Governance
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_13" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_13" id="__nav_13_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    Design docs
+    
+  </span>
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_13_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_13">
+            <span class="md-nav__icon md-icon"></span>
+            Design docs
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../git-submodules/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    git-submodules
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../git-submodule-storage/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    git-submodule-storage
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../run/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    JJ run
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../sparse-v2/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Sparse patterns v2
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tracking-branches/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Tracking branches
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../copy-tracking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Copy tracking and tracing
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../secure-config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Secure config
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../managed-config/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Managed config
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../jj-converge-command/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    JJ converge (aka resolve-divergence)
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    jq-compatible structured queries
+    
+  </span>
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    jq-compatible structured queries
+    
+  </span>
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#objective" class="md-nav__link">
+    <span class="md-ellipsis">
+      Objective
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#current-state-as-of-jj-0430" class="md-nav__link">
+    <span class="md-ellipsis">
+      Current state as of jj 0.43.0
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../roadmap/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Development roadmap
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Changelog
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#objective" class="md-nav__link">
+    <span class="md-ellipsis">
+      Objective
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#current-state-as-of-jj-0430" class="md-nav__link">
+    <span class="md-ellipsis">
+      Current state as of jj 0.43.0
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://github.com/adamh-oai/jj/edit/main/docs/design/jq-compatible-queries.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20.71 7.04c.39-.39.39-1.04 0-1.41l-2.34-2.34c-.37-.39-1.02-.39-1.41 0l-1.84 1.83 3.75 3.75M3 17.25V21h3.75L17.81 9.93l-3.75-3.75z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="jq-compatible-structured-queries">jq-compatible structured queries<a class="headerlink" href="#jq-compatible-structured-queries" title="Permanent link">&para;</a></h1>
+<p>Author: <a href="mailto:adamh@openai.com">Adam Hupp</a></p>
+<p><strong>Summary:</strong> Add a <code>--jq</code> output mode to commands such as <code>jj log</code>. The mode
+evaluates a jq-compatible filter against a stable, semantic object for each
+result and writes the filter's results as JSON Lines. Input objects compute and
+memoize fields when they are accessed, so constructing a small object does not
+first serialize all available commit data. The first implementation will embed
+the Rust <code>jaq</code> interpreter and guarantee a documented jq-compatible subset
+rather than invoking an external program or exposing jj's storage structs.</p>
+<h2 id="objective">Objective<a class="headerlink" href="#objective" title="Permanent link">&para;</a></h2>
+<p>Make jj output straightforward and reliable for programs and agents while
+retaining the flexibility which currently makes templates useful.</p>
+<p>For example, an agent should be able to request exactly the data it needs:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>jj<span class="w"> </span>log<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;ancestors(@, 2)&#39;</span><span class="w"> </span>--jq<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s1">&#39;{change_id, commit_id, description: (.description | split(&quot;\n&quot;)[0])}&#39;</span>
+<span class="go">{&quot;change_id&quot;:&quot;...&quot;,&quot;commit_id&quot;:&quot;...&quot;,&quot;description&quot;:&quot;query design&quot;}</span>
+<span class="go">{&quot;change_id&quot;:&quot;...&quot;,&quot;commit_id&quot;:&quot;...&quot;,&quot;description&quot;:&quot;previous change&quot;}</span>
+</code></pre></div>
+<p>The result has no graph characters, labels, ANSI escapes, or paging. Each line
+is one complete JSON value. The user does not have to know how to quote JSON in
+a template, remember to append a newline, or pipe a large fixed object through
+another process.</p>
+<h2 id="current-state-as-of-jj-0430">Current state as of jj 0.43.0<a class="headerlink" href="#current-state-as-of-jj-0430" title="Permanent link">&para;</a></h2>
+<p>Several jj commands accept <code>-T</code>/<code>--template</code>. The template language is a
+statically typed, functional formatting language. It has a rich semantic
+<code>Commit</code> type, including methods for bookmarks, immutable state, signatures,
+and diffs. Template properties are evaluated only when the renderer extracts
+them.</p>
+<p>The global <code>json(value)</code> template function, implemented in [PR</p>
+<h1 id="6777pr-6777-after-the-earlier-proposal-in-issue-5648">6777]<a href="https://github.com/jj-vcs/jj/pull/6777">pr-6777</a> after the earlier proposal in <a href="https://github.com/jj-vcs/jj/issues/5648">issue #5648</a>,<a class="headerlink" href="#6777pr-6777-after-the-earlier-proposal-in-issue-5648" title="Permanent link">&para;</a></h1>
+<p>serializes a value. This makes the following possible today:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>jj<span class="w"> </span>log<span class="w"> </span>--no-graph<span class="w"> </span>-T<span class="w"> </span><span class="s1">&#39;json(self) ++ &quot;\n&quot;&#39;</span>
+<span class="go">{&quot;commit_id&quot;:&quot;...&quot;,&quot;parents&quot;:[&quot;...&quot;],&quot;change_id&quot;:&quot;...&quot;,...}</span>
+</code></pre></div>
+<p>This is useful, but it has several sharp edges for machine consumers:</p>
+<ul>
+<li>Without <code>--no-graph</code>, <code>jj log</code> prefixes each value with graph characters.</li>
+<li><code>json()</code> does not add a record separator. Omitting <code>++ "\n"</code> concatenates
+  adjacent JSON values.</li>
+<li><code>json(self)</code> serializes jj's backend commit representation. It does not expose
+  the complete semantic <code>Commit</code> template interface, and its compatibility is
+  not guaranteed.</li>
+<li>Constructing a JSON object requires hand-written string concatenation and
+  escaping. The template language does not currently have general
+  heterogeneous object values.</li>
+<li>Every command defines its own top-level template evaluation model. A caller
+  must already know whether a template is evaluated once, once per commit, or
+  once per diff entry.</li>
+<li>Templates support maps over homogeneous lists, filters, conditionals, and
+  string transformations. General heterogeneous object construction,
+  dynamic values, grouping, and jq-style stream transformations still require
+  another tool and an intermediate schema.</li>
+</ul>
+<p>This proposal keeps templates focused on human-readable, labeled output.
+Machine-readable output has different defaults and needs a versioned data
+contract, explicit framing, and data-language operations.</p>
+<h2 id="prior-work">Prior work<a class="headerlink" href="#prior-work" title="Permanent link">&para;</a></h2>
+<h3 id="jj-proposals">jj proposals<a class="headerlink" href="#jj-proposals" title="Permanent link">&para;</a></h3>
+<p><a href="https://github.com/jj-vcs/jj/issues/5662">Issue #5662</a> proposes fixed <code>--json</code> output for all commands.
+<a href="https://github.com/jj-vcs/jj/issues/3814">Issue #3814</a> discusses composable commands and notes lazy
+evaluation as a possible benefit of keeping composition inside a DSL. A
+<a href="https://github.com/jj-vcs/jj/issues/3814#issuecomment-4519489318">recent comment</a> also describes the current
+<code>json(self)</code> framing and semantic-field gaps. <a href="https://github.com/jj-vcs/jj/issues/3219">Issue #3219</a>
+proposes a broader structured API and raises an important compatibility
+concern: serializing internal structures turns implementation details into a
+public API.</p>
+<p><a href="https://github.com/jj-vcs/jj/issues/3262">Issue #3262</a> tracks the design of templates. Its discussion, the
+open map-type <a href="https://github.com/jj-vcs/jj/issues/7697">issue #7697</a>, and the open object-literal proposals
+in <a href="https://github.com/jj-vcs/jj/pull/6869">PR #6869</a> and <a href="https://github.com/jj-vcs/jj/pull/8507">PR #8507</a> show that JSON construction is
+useful, but also that heterogeneous objects change the type and evaluation
+model of the template language. Merged <a href="https://github.com/jj-vcs/jj/pull/8895">PR #8895</a> made homogeneous
+list maps and conditional results serializable, which is useful without
+settling the heterogeneous-object design.</p>
+<p>Open <a href="https://github.com/jj-vcs/jj/pull/6838">PR #6838</a> proposes an <code>ndjson()</code> template alias. Its discussion
+surfaces an unresolved question about whether serialization or top-level
+iteration should own record separators. This RFC chooses top-level iteration.</p>
+<p><a href="https://github.com/jj-vcs/jj/issues/8738">Issue #8738</a> and <a href="https://github.com/jj-vcs/jj/issues/8407">issue #8407</a> discuss whether a
+template receives individual items or a collection. A recent implementation
+attempt in <a href="https://github.com/jj-vcs/jj/pull/9369">PR #9369</a> was closed without merging. This design makes
+both modes explicit: filters receive one item at a time by default, while
+<code>--slurp</code> supplies one collection.</p>
+<p>The proposals surveyed above do not embed jq or jaq.</p>
+<h3 id="jq-and-other-clis">jq and other CLIs<a class="headerlink" href="#jq-and-other-clis" title="Permanent link">&para;</a></h3>
+<p><a href="https://jqlang.github.io/jq/manual/">jq</a> combines field selection, filtering, object construction, and
+stream transformation in a compact language with well-understood semantics.
+The jq command applies a filter independently to each input JSON value and may
+emit zero, one, or many output values.</p>
+<p>The <a href="https://cli.github.com/manual/gh_help_formatting">GitHub CLI</a> exposes a related interface: commands select
+structured fields with <code>--json</code> and optionally transform the result with
+<code>--jq</code>. That two-stage design is useful prior art, but jj can avoid eagerly
+building the intermediate JSON value because its semantic objects are local to
+the same process.</p>
+<h3 id="rust-implementations">Rust implementations<a class="headerlink" href="#rust-implementations" title="Permanent link">&para;</a></h3>
+<p><a href="https://github.com/01mf02/jaq">jaq</a> is an embeddable Rust implementation of jq. It aims for jq
+compatibility in most cases and lets hosts implement its value traits for
+arbitrary value types. A host value supplies field indexing and iteration, so
+jj can expose a commit without first converting the whole commit to
+<code>serde_json::Value</code>. Evaluating a compiled filter returns a stream of results,
+which also fits the streaming behavior of <code>jj log</code>.</p>
+<p>jaq is not exactly jq. Some filters and command-line features are unsupported,
+and its engine does not defend against CPU, memory, or stack exhaustion. This
+design therefore defines a jj compatibility contract instead of promising that
+every program accepted by a particular jq binary is accepted by jj.</p>
+<p>Other implementations are less suitable. <a href="https://github.com/MiSawa/xq">xq</a> describes itself as under
+development and recommends jaq. <a href="https://github.com/onelson/jq-rs">jq-rs</a> wraps C libjq 1.6 and primarily
+accepts and returns strings. It offers exact compatibility with that older
+libjq version, but does not naturally support a custom lazy jj value and adds a
+C build or system-library dependency.</p>
+<h2 id="goals-and-non-goals">Goals and non-goals<a class="headerlink" href="#goals-and-non-goals" title="Permanent link">&para;</a></h2>
+<h3 id="goals">Goals<a class="headerlink" href="#goals" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Produce unambiguous, versioned, machine-readable output.</li>
+<li>Let users construct JSON objects and arrays with familiar jq syntax.</li>
+<li>Evaluate only the semantic fields a filter needs, where jq semantics permit.</li>
+<li>Stream selected commits and filter results without collecting the entire log.</li>
+<li>Preserve revsets and filesets as jj's optimized selection languages.</li>
+<li>Make output order, record framing, failures, and partial output explicit.</li>
+<li>Share semantic field implementations with templates where practical.</li>
+<li>Support enough jq to run common projections, filters, and reductions without
+  an external jq executable.</li>
+</ul>
+<h3 id="non-goals">Non-goals<a class="headerlink" href="#non-goals" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Replace templates for human-readable output.</li>
+<li>Make jq a repository mutation language.</li>
+<li>Expose arbitrary Rust or backend storage structures.</li>
+<li>Guarantee all jq command-line options, modules, I/O, or implementation
+  details.</li>
+<li>Make every jq operation lazy. Sorting, grouping, random access, and array
+  construction inherently retain values.</li>
+<li>Replace revsets with jq. A jq <code>select()</code> is a projection-time filter, not a
+  substitute for index-backed revision selection.</li>
+<li>Define a stable network or editor RPC protocol. That is the broader scope of
+  <a href="https://github.com/jj-vcs/jj/issues/3219">issue #3219</a>.</li>
+<li>Accept untrusted filters as safely sandboxed programs.</li>
+</ul>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>The initial command-line interface is:</p>
+<div class="highlight"><pre><span></span><code>jj log [LOG OPTIONS] --jq &lt;FILTER&gt; [--query-version v1] [--slurp]
+</code></pre></div>
+<p><code>jj log</code> performs its normal repository loading, working-copy snapshot,
+revset/fileset evaluation, ordering, and limiting. It then wraps each selected
+commit in a <code>jj.commit/v1</code> query value and evaluates the compiled filter. The
+query version selects both the jq language contract and the input schema; v1
+does not have independently moving language and data versions.</p>
+<p>Without <code>--slurp</code>, evaluation follows jq's ordinary multi-input behavior: the
+filter runs once for each selected commit. A filter invocation may emit zero,
+one, or many values. Each emitted value is encoded as compact JSON followed by
+one line feed.</p>
+<p>With <code>--slurp</code>, jj first collects the selected commit handles into an array and
+runs the filter once. The commit fields inside the array remain lazy, but the
+array of handles is not lazy. This is the same important tradeoff as jq's
+slurp mode: random access and reordering require retaining the input set.</p>
+<p>The filter is compiled before any result is written. The query engine has an
+owned, read-only view of the repository and a registry of semantic fields. A
+core field is calculated on first access. Namespaced semantic filters cache
+either their value or error for that input object.</p>
+<h2 id="detailed-design">Detailed design<a class="headerlink" href="#detailed-design" title="Permanent link">&para;</a></h2>
+<h3 id="command-line-interface">Command-line interface<a class="headerlink" href="#command-line-interface" title="Permanent link">&para;</a></h3>
+<p><code>--jq &lt;FILTER&gt;</code> selects structured query output. There is no initial short
+option. It conflicts with <code>--template</code>, <code>--patch</code>, diff-format flags, and
+<code>--count</code>, all of which select or append another output type.</p>
+<p><code>--no-graph</code> is accepted but redundant. Query mode always omits the graph. It
+also does not request a pager and never applies color or formatter labels to
+standard output, even if <code>--color=always</code> is set. Diagnostics on standard error
+continue to follow normal UI settings.</p>
+<p>Revision and path arguments select commits before query execution. <code>--limit</code>
+limits commits, not emitted results; <code>--reversed</code> reverses that limited stream;
+and <code>--ignore-working-copy</code> retains its global meaning. Thus
+<code>--limit 10 --jq 'select(.conflict)'</code> does not walk farther to backfill ten
+outputs, while a filter yielding twice per commit can emit twenty.</p>
+<p>Query mode uses exactly the ordering of <code>jj log --no-graph</code> for the same
+revset, paths, limit, and reversal options. In particular, it does not use the
+graph-only <code>revsets.log-graph-prioritize</code> setting. Existing warnings for path
+arguments which match no entries are still written to standard error.</p>
+<p><code>--query-version &lt;VERSION&gt;</code> is only valid with <code>--jq</code>. The initial and default
+value is <code>v1</code>. The option makes future language or schema revisions opt-in
+without changing existing scripts. A query version freezes the advertised
+field set, jq baseline, built-in names and arities, and host-value behavior.</p>
+<p>Versions are command-scoped bundles. For <code>jj log</code>, v1 means the shared query
+language v1 manifest plus the <code>jj.commit/v1</code> input schema. Another command can
+debut with its own v1 schema without changing <code>jj log</code>, and <code>jj log</code> can later
+add v2 without forcing other commands to do so.</p>
+<p><code>--slurp</code> is also only valid with <code>--jq</code>. It supplies one array of the selected
+commit objects rather than invoking the filter once per commit. It may use
+memory proportional to the number of selected commits and whatever data the
+filter materializes.</p>
+<p>The first version accepts the filter only as a command-line string. Query
+files, aliases, positional jq arguments, and raw-output flags can be added
+separately without changing the data model.</p>
+<h3 id="input-and-result-cardinality">Input and result cardinality<a class="headerlink" href="#input-and-result-cardinality" title="Permanent link">&para;</a></h3>
+<p>The compiled filter runs once per selected commit and can yield zero, one, or
+many results. jj preserves commit order and per-filter result order; empty
+output is successful. For example:</p>
+<div class="highlight"><pre><span></span><code><span class="gp"># </span>zero<span class="w"> </span>or<span class="w"> </span>one<span class="w"> </span>object<span class="w"> </span><span class="k">for</span><span class="w"> </span>each<span class="w"> </span>commit
+<span class="gp">$ </span>jj<span class="w"> </span>log<span class="w"> </span>--jq<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="err">&#39;</span>jj::bookmarks<span class="w"> </span>as<span class="w"> </span><span class="nv">$bookmarks</span><span class="w"> </span><span class="p">|</span>
+<span class="go">     select($bookmarks | length &gt; 0) |</span>
+<span class="go">     {commit_id, bookmarks: $bookmarks}&#39;</span>
+
+<span class="gp"># </span>one<span class="w"> </span>object<span class="w"> </span><span class="k">for</span><span class="w"> </span>each<span class="w"> </span>changed<span class="w"> </span>file<span class="w"> </span><span class="k">in</span><span class="w"> </span>each<span class="w"> </span>commit<span class="p">;</span><span class="w"> </span><span class="nb">bind</span><span class="w"> </span>the<span class="w"> </span>parent<span class="w"> </span>ID<span class="w"> </span>first
+<span class="gp">$ </span>jj<span class="w"> </span>log<span class="w"> </span>--jq<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="err">&#39;</span>.commit_id<span class="w"> </span>as<span class="w"> </span><span class="nv">$commit_id</span><span class="w"> </span><span class="p">|</span>
+<span class="go">     jj::diff_files[] | {commit_id: $commit_id, path, status}&#39;</span>
+</code></pre></div>
+<p>The filter owns value cardinality. Serialization never inserts array brackets
+around multiple values; users who need one array can construct one in
+<code>--slurp</code> mode.</p>
+<h3 id="output-framing">Output framing<a class="headerlink" href="#output-framing" title="Permanent link">&para;</a></h3>
+<p>Every yielded value is written as one compact JSON text followed by <code>\n</code>. This
+is JSON Lines rather than one top-level JSON document. Strings, numbers,
+booleans, and null are valid results and remain JSON encoded:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>jj<span class="w"> </span>log<span class="w"> </span>-r<span class="w"> </span>@<span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;.description&#39;</span>
+<span class="go">&quot;A description with an escaped newline\n&quot;</span>
+</code></pre></div>
+<p>There is no v1 equivalent of jq's <code>--raw-output</code>, <code>--join-output</code>, pretty
+printing, or color output. Those modes make stream framing dependent on value
+types and are easy for callers to misinterpret. A caller which wants text can
+decode the JSON string.</p>
+<p>jj buffers one yielded value before writing it. Conversion can reject a
+non-JSON value; buffering prevents a half-written JSON record. A successful
+earlier record can still precede a later runtime failure, so callers must check
+the process exit status before treating the stream as complete.</p>
+<p>Framing belongs to the command, not to the filter or the <code>json</code> serializer.
+This resolves the ambiguity discussed in <a href="https://github.com/jj-vcs/jj/pull/6838">PR #6838</a>: a reusable value
+serializer should not decide how a top-level iteration separates records.</p>
+<h3 id="jq-compatibility-contract">jq compatibility contract<a class="headerlink" href="#jq-compatibility-contract" title="Permanent link">&para;</a></h3>
+<p>The implementation embeds pinned versions of <code>jaq-core</code> and its standard
+library. Query v1 uses <a href="https://github.com/jqlang/jq/releases/tag/jq-1.8.2">jq 1.8.2</a> as its reference behavior. jj
+exposes a fixed jq allowlist whose names, arities, values, errors, and
+cardinality are tested against that jq release, except for the documented
+deviations below.</p>
+<p>The v1 user syntax is closed. It permits exactly:</p>
+<ul>
+<li>JSON literals, array and object constructors, object shorthand and computed
+  keys, parentheses, comments, string interpolation, and the listed <code>@</code> format
+  tokens;</li>
+<li>identity <code>.</code>, recursive descent <code>..</code>, field and array indexing, iteration,
+  slices, and the optional <code>?</code> suffix;</li>
+<li>pipes, commas, calls, simple <code>as $name</code> bindings, variable references, and
+  unqualified user <code>def</code>s with positional filter arguments;</li>
+<li><code>if</code>/<code>elif</code>/<code>else</code>, <code>try</code>/<code>catch</code>, <code>reduce</code>, and <code>foreach</code>; and</li>
+<li>jq's unary, arithmetic, comparison, boolean, alternative, assignment, and
+  update operators.</li>
+</ul>
+<p>Destructuring bindings, <code>label</code>/<code>break</code>, module declarations, and every other
+unlisted syntax form are rejected, even if the embedded jaq parser accepts
+them. The workspace pins <code>jaq-parse</code> as well as the evaluator crates. A
+post-parse validator checks the user AST before private library definitions are
+injected, and negative conformance tests cover every excluded syntax family.
+This prevents a dependency upgrade from silently expanding v1.</p>
+<p>The jq portion of the v1 built-in manifest contains these filters:</p>
+<ul>
+<li>Values and objects: <code>empty</code>, <code>type</code>, <code>values</code>, <code>nulls</code>, <code>booleans</code>,
+  <code>numbers</code>, <code>strings</code>, <code>arrays</code>, <code>objects</code>, <code>iterables</code>, <code>scalars</code>, <code>length</code>,
+  <code>keys</code>, <code>keys_unsorted</code>, <code>has</code>, <code>contains</code>, <code>inside</code>, <code>indices</code>, <code>index</code>,
+  <code>rindex</code>, <code>select</code>, <code>map</code>, <code>map_values</code>, <code>to_entries</code>, <code>from_entries</code>, and
+  <code>with_entries</code>.</li>
+<li>Sequences: <code>range</code>, <code>first</code>, <code>last</code>, <code>nth</code>, <code>limit</code>, <code>skip</code>, <code>any</code>, <code>all</code>,
+  <code>add</code>, <code>flatten</code>, <code>reverse</code>, <code>sort</code>, <code>sort_by</code>, <code>group_by</code>, <code>unique</code>,
+  <code>unique_by</code>, <code>min</code>, <code>max</code>, <code>min_by</code>, and <code>max_by</code>.</li>
+<li>Strings: <code>startswith</code>, <code>endswith</code>, <code>ltrimstr</code>, <code>rtrimstr</code>, <code>split</code>, <code>join</code>,
+  <code>ascii_downcase</code>, <code>ascii_upcase</code>, and <code>explode</code>.</li>
+<li>Conversion and formatting: <code>tostring</code>, <code>tonumber</code>, <code>tojson</code>, <code>fromjson</code>,
+  <code>@json</code>, <code>@base64</code>, <code>@uri</code>, <code>@csv</code>, and <code>@tsv</code>.</li>
+<li>Recursion: <code>recurse</code>, <code>walk</code>, <code>until</code>, and <code>while</code>.</li>
+</ul>
+<p>The implementation must check in <code>cli/src/query/v1-builtins.toml</code> as the
+normative public manifest. It records only every public jq name and supported
+arity and every synthetic <code>jj</code> export and arity. A separate checked-in loader
+table records whether an entry is native or a library definition and the
+private definitions on which it depends; that table is implementation metadata
+and may change without a query version when observable behavior does not. The
+loader follows only this dependency graph and a curated native-function table.
+Private helpers are internally renamed or otherwise unavailable to a top-level
+query; loading all definitions exported by <code>jaq-std</code> would accidentally expose
+excluded functions. Conformance tests must verify both the public manifest
+entries and that excluded names fail to compile. A debug command should print
+the effective public manifest and dependency versions for bug reports.</p>
+<p>The important exclusions are:</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>v1 behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>input</code>, <code>inputs</code>, and <code>--null-input</code></td>
+<td>Not supported in v1</td>
+</tr>
+<tr>
+<td>User modules, <code>import</code>, <code>include</code>, and search paths</td>
+<td>Not supported in v1; the host-provided <code>jj</code> namespace is not importable</td>
+</tr>
+<tr>
+<td><code>env</code>, <code>$ENV</code>, filesystem, network, or process access</td>
+<td>Not supported</td>
+</tr>
+<tr>
+<td><code>debug</code>, <code>stderr</code>, and other side-channel output</td>
+<td>Not supported in v1</td>
+</tr>
+<tr>
+<td><code>halt</code> and <code>halt_error</code></td>
+<td>Not supported; cannot terminate the host process</td>
+</tr>
+<tr>
+<td><code>now</code> and other nondeterministic filters</td>
+<td>Not supported in v1</td>
+</tr>
+<tr>
+<td>Non-finite numbers</td>
+<td>Named constructors such as <code>nan</code> and <code>infinite</code> are unavailable; a literal, conversion, parser, or arithmetic operation which would produce a non-finite number raises a catchable runtime error instead of following jq's normalization behavior</td>
+</tr>
+<tr>
+<td>Regular-expression filters</td>
+<td>Not supported in v1; jaq and jq use different regex dialects</td>
+</tr>
+<tr>
+<td><code>implode</code> and byte-oriented string construction</td>
+<td>Not supported in v1; every query string must remain valid Unicode</td>
+</tr>
+<tr>
+<td>jq CLI <code>--arg*</code>, <code>--rawfile</code>, and <code>--slurpfile</code> options</td>
+<td>Not supported in v1</td>
+</tr>
+<tr>
+<td>jq streaming-parser mode</td>
+<td>Not applicable to semantic jj inputs</td>
+</tr>
+<tr>
+<td>Unlisted jq or jaq syntax and filters</td>
+<td>Rejected by the v1 AST and built-in allowlists</td>
+</tr>
+</tbody>
+</table>
+<p>This is a jq-compatible subset, not a promise of complete jq compatibility.
+The reference is the checked-in public manifest and, for its jq entries,
+conformance tests against jq 1.8.2. Synthetic <code>jj</code> entries instead use schema
+and behavior fixtures. The contract is not whatever happens to be accepted by
+a newer jaq dependency. Adding or removing a field or public entry, changing an
+arity, or changing observable host-value behavior requires query v2. Bug fixes
+which make behavior conform to the stated jq baseline do not.</p>
+<p>jj-specific filters use the <code>jj::</code> namespace so that they cannot silently
+collide with future jq functions. jaq parses this spelling as a module-qualified
+call, so jj installs a synthetic module named <code>jj</code> during compilation. The
+module is always in scope, has no source or filesystem search path, cannot be
+imported or shadowed, and exports only the namespaced entries in the v1
+manifest. A user definition in the reserved <code>jj</code> namespace is a compile error.</p>
+<h3 id="host-values-and-jq-values">Host values and jq values<a class="headerlink" href="#host-values-and-jq-values" title="Permanent link">&para;</a></h3>
+<p>Values constructed by a filter are ordinary JSON-like jq values. Input commit
+objects are typed host values which present the bounded object interface in the
+next section.</p>
+<p>Most object operations behave as expected. <code>.commit_id</code> indexes a host object,
+<code>keys</code> lists its advertised fields, and <code>{id: .commit_id}</code> constructs an
+ordinary object. A missing key returns <code>null</code>, so standard jq fallbacks work:</p>
+<div class="highlight"><pre><span></span><code><span class="gp">$ </span>jj<span class="w"> </span>log<span class="w"> </span>-r<span class="w"> </span>@<span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;.future_field // &quot;not available&quot;&#39;</span>
+<span class="go">&quot;not available&quot;</span>
+</code></pre></div>
+<p><code>has("future_field")</code> returns false. jj may later add an opt-in strict-field
+lint for catching misspellings, but static field access will not change jq's
+missing-key semantics in v1.</p>
+<p>The advertised fields are deliberately limited to values which are bounded and
+infallible after the <code>Commit</code> has been loaded. Under standard jq object
+operations, a host commit is observationally equivalent to the ordinary JSON
+object produced by materializing those fields:</p>
+<ul>
+<li>direct field indexing computes only that field;</li>
+<li><code>keys</code>, <code>keys_unsorted</code>, <code>has</code>, and <code>length</code> use the static field registry;</li>
+<li><code>.[]</code>, <code>to_entries</code>, recursive descent, string interpolation,
+  <code>tostring</code>, <code>tojson</code>, comparison, sorting, object addition, and serialization
+  materialize the complete bounded object;</li>
+<li>the first assignment, update, or deletion through a host object materializes
+  it as an ordinary object and then follows jq's normal missing-key,
+  zero-result, and multi-result update behavior.</li>
+</ul>
+<p>Because complete materialization cannot invoke fallible repository operations,
+jaq's infallible display, equality, and ordering traits can implement structural
+jq semantics. Expensive or fallible repository computations are exposed as
+explicit <code>jj::</code> filters which either return ordinary JSON values or a jq error.</p>
+<p>Assignment never changes the repository. An expression such as
+<code>.description = "replacement"</code> produces an ordinary detached object. The query
+environment holds only a read-only repository. That detached object no longer
+has commit identity, so applying a <code>jj::</code> filter to it is a type error. A query
+which needs both forms can bind the original host value before updating it.
+Binding, cloning, slurping, reordering, or storing a host value as an element of
+an ordinary array or object preserves its identity. Extracting a core field
+produces that ordinary field value. Updating or deleting through the host,
+using it as an object-addition operand, or a <code>tojson | fromjson</code> round trip
+materializes a detached ordinary object and loses identity.</p>
+<h3 id="commit-schema-v1">Commit schema v1<a class="headerlink" href="#commit-schema-v1" title="Permanent link">&para;</a></h3>
+<p>The input object has <code>.schema == "jj.commit/v1"</code>. It exposes semantic fields,
+not the fields produced by Rust <code>Serialize</code> derives. Full IDs are used because
+shortest IDs depend on the surrounding disambiguation context.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>JSON type</th>
+<th>Meaning and cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>schema</code></td>
+<td>string</td>
+<td>Always <code>jj.commit/v1</code></td>
+</tr>
+<tr>
+<td><code>commit_id</code></td>
+<td>string</td>
+<td>Full hexadecimal commit ID; cheap</td>
+</tr>
+<tr>
+<td><code>change_id</code></td>
+<td>string</td>
+<td>Full user-facing reverse-hex change ID (<code>z</code> through <code>k</code> digits); cheap</td>
+</tr>
+<tr>
+<td><code>parent_ids</code></td>
+<td>array of strings</td>
+<td>Direct parent IDs; cheap</td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>string</td>
+<td>Stored description verbatim, including any trailing newline</td>
+</tr>
+<tr>
+<td><code>trailers</code></td>
+<td>array of trailer objects</td>
+<td>Parsed description trailers</td>
+</tr>
+<tr>
+<td><code>author</code></td>
+<td>identity object</td>
+<td>Author name, email, and timestamp</td>
+</tr>
+<tr>
+<td><code>committer</code></td>
+<td>identity object</td>
+<td>Committer name, email, and timestamp</td>
+</tr>
+<tr>
+<td><code>conflict</code></td>
+<td>boolean</td>
+<td>Whether the commit tree contains conflicts</td>
+</tr>
+<tr>
+<td><code>root</code></td>
+<td>boolean</td>
+<td>Whether this is the repository root commit</td>
+</tr>
+</tbody>
+</table>
+<p>The object intentionally uses <code>parent_ids</code>, not <code>parents</code>. If <code>parents</code> held
+commit objects, serializing <code>.</code> could recursively walk all history. Traversing
+parent commit objects can be designed later as an explicit operation.</p>
+<p>Identity objects contain <code>name</code>, <code>email</code>, and <code>timestamp</code>. The timestamp is an
+object with integer <code>millis_since_epoch</code> and <code>utc_offset_minutes</code> fields. This
+preserves every backend timestamp without the fallible conversion to a
+calendar date. Trailer objects contain <code>key</code> and <code>value</code> strings in description
+order. The word "identity" distinguishes these values from cryptographic commit
+signatures.</p>
+<p>The v1 field set is closed. Adding an enumerable field changes <code>keys</code>, <code>.[]</code>,
+comparison, serialization of <code>.</code>, execution cost, and possible failures, so it
+requires query v2 even if a JSON consumer might otherwise ignore the field.
+The table order above is also the v1 host-object insertion order, observable
+through <code>keys_unsorted</code>, <code>.[]</code>, <code>to_entries</code>, and serialization. <code>keys</code> retains
+jq's lexicographic ordering.</p>
+<p>This ordering rule applies to every schema-supplied object: tables and inline
+field lists in this document declare insertion order. All documented keys are
+present, using null where specified, unless the whole object is null. The
+<code>jj log</code> v1 contract freezes core and namespaced-filter result shapes,
+nullability, enum strings, object-key order, and documented array membership
+and order. Changing any of them requires <code>jj log</code> query v2. <code>parent_ids</code> retains
+the commit's stored parent order; trailers retain description order.</p>
+<h3 id="jj-semantic-filters">jj semantic filters<a class="headerlink" href="#jj-semantic-filters" title="Permanent link">&para;</a></h3>
+<p>Repository-derived data is exposed by explicit namespaced filters instead of
+enumerable fields. This keeps <code>.</code> bounded while retaining demand-driven
+evaluation. Every filter below expects a <code>jj.commit/v1</code> input and returns an
+ordinary JSON value or a jq error:</p>
+<table>
+<thead>
+<tr>
+<th>Filter</th>
+<th>Result</th>
+<th>Work performed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>jj::mine</code></td>
+<td>boolean</td>
+<td>Compare author email with configured user</td>
+</tr>
+<tr>
+<td><code>jj::working_copies</code></td>
+<td>array</td>
+<td>Inspect the repository view</td>
+</tr>
+<tr>
+<td><code>jj::current_working_copy</code></td>
+<td>boolean</td>
+<td>Inspect the current workspace</td>
+</tr>
+<tr>
+<td><code>jj::bookmarks</code></td>
+<td>reference array</td>
+<td>Build or consult the bookmark index</td>
+</tr>
+<tr>
+<td><code>jj::tags</code></td>
+<td>reference array</td>
+<td>Build or consult the tag index</td>
+</tr>
+<tr>
+<td><code>jj::divergent</code></td>
+<td>boolean</td>
+<td>Resolve the commit's change ID</td>
+</tr>
+<tr>
+<td><code>jj::hidden</code></td>
+<td>boolean</td>
+<td>Consult commit visibility</td>
+</tr>
+<tr>
+<td><code>jj::change_offset</code></td>
+<td>integer or null</td>
+<td>Resolve visible change versions</td>
+</tr>
+<tr>
+<td><code>jj::immutable</code></td>
+<td>boolean</td>
+<td>Evaluate the configured immutable policy</td>
+</tr>
+<tr>
+<td><code>jj::empty</code></td>
+<td>boolean</td>
+<td>Compare the commit and parent trees</td>
+</tr>
+<tr>
+<td><code>jj::signature_present</code></td>
+<td>boolean</td>
+<td>Inspect signature presence only</td>
+</tr>
+<tr>
+<td><code>jj::verify_signature</code></td>
+<td>object or null</td>
+<td>Run backend signature verification</td>
+</tr>
+<tr>
+<td><code>jj::diff_files</code></td>
+<td>array</td>
+<td>Walk structural tree changes</td>
+</tr>
+<tr>
+<td><code>jj::diff_stats</code></td>
+<td>object</td>
+<td>Read changed contents and calculate line diffstats</td>
+</tr>
+</tbody>
+</table>
+<p>Namespaced filters participate in normal jq control flow. An expensive filter
+in an unselected branch is not called:</p>
+<div class="highlight"><pre><span></span><code>if jj::signature_present then jj::verify_signature else null end
+</code></pre></div>
+<p>Results are memoized per commit and filter. Calling <code>jj::immutable</code> twice
+evaluates the policy once. Filters which share an underlying index or
+signature-verification result also share that work.</p>
+<p><code>jj::mine</code> uses exact string equality between the commit author email and the
+configured user email. <code>jj::change_offset</code> is the non-negative <a href="../../glossary/#change-offset">change
+offset</a>: zero identifies the most recent visible
+commit for that change ID and larger integers identify successively older
+versions. It is null when the input commit cannot be assigned an offset in the
+visible change.</p>
+<p><code>jj::working_copies</code> contains every workspace whose working-copy commit is the
+input commit, sorted lexicographically by workspace name. Bookmark and tag
+arrays contain every local or remote reference whose normal, removed, or added
+target terms include the input commit, rather than the display-oriented
+de-duplication used by some templates. They are sorted lexicographically by
+<code>(name, remote)</code>, with a null local remote before named remotes. Removed and
+added target ID arrays are sorted lexicographically by full commit ID. Here and
+below, lexicographic string ordering means Unicode scalar-value order.</p>
+<p>A workspace object has this shape:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="s2">&quot;default&quot;</span><span class="p">,</span><span class="nt">&quot;current&quot;</span><span class="p">:</span><span class="kc">true</span><span class="p">}</span>
+</code></pre></div>
+<p><code>current</code> is true exactly when <code>name</code> is the workspace running the command.</p>
+<p>A reference object has these fields:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>JSON type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>name</code></td>
+<td>string</td>
+<td>Local bookmark or tag name</td>
+</tr>
+<tr>
+<td><code>remote</code></td>
+<td>string or null</td>
+<td>Remote name, or null for a local reference</td>
+</tr>
+<tr>
+<td><code>present</code></td>
+<td>boolean</td>
+<td>Whether the reference has a target</td>
+</tr>
+<tr>
+<td><code>conflict</code></td>
+<td>boolean</td>
+<td>Whether the reference target is conflicted</td>
+</tr>
+<tr>
+<td><code>normal_target_id</code></td>
+<td>string or null</td>
+<td>Non-conflicted target, if present</td>
+</tr>
+<tr>
+<td><code>removed_target_ids</code></td>
+<td>array of strings</td>
+<td>Removed conflict terms</td>
+</tr>
+<tr>
+<td><code>added_target_ids</code></td>
+<td>array of strings</td>
+<td>Added conflict terms</td>
+</tr>
+<tr>
+<td><code>tracked</code></td>
+<td>boolean</td>
+<td>Whether a remote reference is tracked locally</td>
+</tr>
+<tr>
+<td><code>tracking_present</code></td>
+<td>boolean</td>
+<td>Whether its tracking local reference is present</td>
+</tr>
+<tr>
+<td><code>synced</code></td>
+<td>boolean</td>
+<td>Whether local and tracked targets are synchronized</td>
+</tr>
+</tbody>
+</table>
+<p><code>present</code> is false only for a resolved absent target; <code>conflict</code> means the
+target is unresolved. A resolved normal target has its ID in
+<code>normal_target_id</code> and empty removed and added arrays. A resolved absent target
+has a null normal ID and empty arrays. An unresolved target has a null normal ID
+and exposes its simplified, non-null negative and positive merge terms in the
+removed and added arrays respectively.</p>
+<p>For a local reference, <code>tracked</code> and <code>tracking_present</code> are false, while
+<code>synced</code> is true if its target equals every tracked remote target, including
+vacuously when there are none. For a remote reference, <code>tracked</code> reflects its
+tracking state, <code>tracking_present</code> additionally requires the local target to be
+present, and <code>synced</code> requires tracking plus exact target equality. Equality
+includes conflicted and absent target structure. Thus an untracked remote has
+all three tracking booleans false.</p>
+<p>Fields which do not apply have neutral values (<code>false</code> or <code>null</code>) rather than
+changing type. Ahead and behind counts are deliberately not part of this
+object: returning an ordinary object would calculate both graph walks even when
+a query selects only the reference name. A future explicit filter can expose
+counts and their exact-or-estimated contract.</p>
+<p><code>jj::verify_signature</code> returns null for an unsigned commit. For a signed commit
+it returns:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>JSON type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>status</code></td>
+<td>string</td>
+<td><code>good</code>, <code>bad</code>, <code>unknown</code>, or <code>invalid</code></td>
+</tr>
+<tr>
+<td><code>key</code></td>
+<td>string or null</td>
+<td>Backend key identifier, if available</td>
+</tr>
+<tr>
+<td><code>display</code></td>
+<td>string or null</td>
+<td>Backend-specific signer display text, if available</td>
+</tr>
+</tbody>
+</table>
+<p>An invalid-format result has status <code>invalid</code> and null <code>key</code> and <code>display</code>.
+Other backend failures are jq errors rather than verification objects.</p>
+<p>Callers which only need presence use <code>jj::signature_present</code>, which does not
+invoke GPG, <code>ssh-keygen</code>, or other verification work.</p>
+<p><code>jj::diff_files</code> describes structural changes from the merged parents to this
+commit. It honors path arguments passed to <code>jj log</code> and does not load file
+contents. Each result contains <code>path</code>, <code>status</code>, <code>source</code>, and <code>target</code>.
+<code>status</code> is <code>modified</code>, <code>added</code>, or <code>removed</code>; v1 deliberately does not run
+content-based copy or rename detection. Each non-null side contains <code>path</code>,
+<code>file_type</code>, <code>executable</code>, <code>conflict</code>, and <code>conflict_side_count</code>. A side is null
+when absent. For a non-null side, file type is <code>file</code>, <code>symlink</code>, <code>tree</code>,
+<code>git-submodule</code>, or <code>conflict</code>; <code>executable</code> is a boolean only for a resolved
+<code>file</code> and is null for every other type. <code>conflict</code> is true exactly when the
+simplified entry merge is unresolved, in which case <code>file_type</code> is <code>conflict</code>.
+<code>conflict_side_count</code> is the number of positive terms after simplifying that
+merge, and is one for a resolved entry. The top-level <code>path</code> is the target path
+when present and otherwise the source path. Results are sorted by target path,
+then source path, then status, using lexicographic repository-path order and
+sorting an absent path before a present path.</p>
+<p><code>jj::diff_stats</code> calculates line-oriented diffstats from the merged parents to
+this commit. It honors path arguments passed to <code>jj log</code> and reads the
+materialized contents of changed files only when the filter is evaluated. The
+result is an object with <code>files</code>, <code>total_added</code>, and <code>total_removed</code>, in that
+order. <code>files</code> is ordered by repository path and contains objects with these
+fields:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>JSON type</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>path</code></td>
+<td>string</td>
+<td>Target path, or source path for a removed file</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>string</td>
+<td><code>modified</code>, <code>added</code>, or <code>removed</code></td>
+</tr>
+<tr>
+<td><code>lines_added</code></td>
+<td>integer or null</td>
+<td>Added line count, or null for binary content</td>
+</tr>
+<tr>
+<td><code>lines_removed</code></td>
+<td>integer or null</td>
+<td>Removed line count, or null for binary content</td>
+</tr>
+<tr>
+<td><code>bytes_delta</code></td>
+<td>integer</td>
+<td>Target byte size minus source byte size</td>
+</tr>
+</tbody>
+</table>
+<p><code>total_added</code> and <code>total_removed</code> sum only non-null per-file line counts, so
+binary files do not contribute to either total. As with <code>jj::diff_files</code>, v1
+does not run content-based copy or rename detection. The per-file object-key
+order is <code>path</code>, <code>status</code>, <code>lines_added</code>, <code>lines_removed</code>, <code>bytes_delta</code>.</p>
+<h3 id="evaluation-and-materialization">Evaluation and materialization<a class="headerlink" href="#evaluation-and-materialization" title="Permanent link">&para;</a></h3>
+<p>There are three distinct kinds of laziness:</p>
+<ol>
+<li>The revset produces commit IDs as a stream in normal mode.</li>
+<li>The filter produces zero or more results as a stream.</li>
+<li>A direct field or namespaced semantic filter runs only when jq evaluates
+   that expression.</li>
+</ol>
+<p>The third property is the important difference from serializing a commit to
+JSON before querying it. For this query:</p>
+<div class="highlight"><pre><span></span><code>{change_id, author: .author.email}
+</code></pre></div>
+<p>jj loads only the change ID and author identity metadata. It does not enumerate
+bookmarks, resolve immutability, compare trees, verify cryptographic
+signatures, or calculate a tree diff.</p>
+<p>Each host object owns a shared per-commit cache for direct fields and for the
+value or error of each invoked <code>jj::</code> filter. Referring to <code>jj::empty</code> twice
+compares the trees once; <code>jj::signature_present</code> and <code>jj::verify_signature</code>
+share loaded signature metadata. Clones of a host value share this cache. In
+normal mode, jj releases it after all results for that input commit have been
+written. In <code>--slurp</code> mode, retained host values retain their caches.</p>
+<p>Laziness does not change jq semantics. These operations can force work:</p>
+<ul>
+<li>Serializing <code>.</code> enumerates the bounded core commit fields, but never invokes
+  a <code>jj::</code> filter.</li>
+<li><code>.[]</code>, <code>to_entries</code>, recursive descent, and object update may visit every
+  core field of a host object.</li>
+<li>Calling <code>jj::diff_files</code>, <code>jj::diff_stats</code>, or <code>jj::verify_signature</code>
+  explicitly performs all work documented for that filter.</li>
+<li>Array construction, <code>--slurp</code>, <code>sort</code>, <code>group_by</code>, <code>unique</code>, and random
+  indexing retain some or all input values.</li>
+<li><code>keys</code>, <code>keys_unsorted</code>, <code>has</code>, and <code>length</code> can use the field registry
+  without computing field values.</li>
+<li>Boolean short-circuiting, <code>if</code>, <code>select</code>, <code>//</code>, and <code>try</code> evaluate only the
+  branches required by jq semantics.</li>
+</ul>
+<p>Objects and arrays constructed by the jq program are ordinary jaq values. The
+RFC does not require arbitrary constructed collections to remain lazy.</p>
+<h3 id="repository-consistency">Repository consistency<a class="headerlink" href="#repository-consistency" title="Permanent link">&para;</a></h3>
+<p>All host objects for one invocation share the <code>ReadonlyRepo</code> produced during
+command initialization. A field cannot observe a later operation or a
+different working-copy snapshot merely because it was evaluated later.</p>
+<p>The working copy is snapshotted according to existing command rules before log
+selection. Query mode is an output mode and introduces no extra mutation. With
+<code>--ignore-working-copy</code>, it observes the same repository state as an ordinary
+<code>jj log --ignore-working-copy</code>.</p>
+<p>The environment also owns repository-level indexes reusable across commits and
+backend caches whose size is independently bounded. It must not retain every
+per-commit query result. Laziness determines when a cache is populated, not
+which repository state it represents.</p>
+<h3 id="errors-and-exit-status">Errors and exit status<a class="headerlink" href="#errors-and-exit-status" title="Permanent link">&para;</a></h3>
+<p>Parsing and compilation finish before the first commit is evaluated. A syntax
+error reports a source span on standard error, exits nonzero, and writes no
+standard output.</p>
+<p>Missing object keys follow jq and return null. Core commit fields are
+infallible after the commit is loaded, while a failure in a namespaced filter
+is a runtime query error. A pure jq runtime diagnostic identifies the query and
+error. An error raised while a <code>jj::</code> filter operates on a host commit also
+identifies that input commit ID and includes the underlying jj error. A pure jq
+error, or a <code>jj::</code> type error on a detached value, need not have an associated
+commit. jaq does not currently attach a source span to every runtime error, so
+v1 promises an exact span only for parse and compile errors.</p>
+<p>Catchable errors are observable query values. Pure jq operations produce the
+same caught value as jq 1.8.2. A jj-defined error produces this ordinary object,
+with keys in the shown order:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;schema&quot;</span><span class="p">:</span><span class="s2">&quot;jj.query-error/v1&quot;</span><span class="p">,</span><span class="nt">&quot;kind&quot;</span><span class="p">:</span><span class="s2">&quot;host&quot;</span><span class="p">,</span><span class="nt">&quot;filter&quot;</span><span class="p">:</span><span class="s2">&quot;jj::empty&quot;</span><span class="p">,</span><span class="nt">&quot;commit_id&quot;</span><span class="p">:</span><span class="s2">&quot;...&quot;</span><span class="p">}</span>
+</code></pre></div>
+<p><code>kind</code> is <code>host</code> for an underlying repository, configuration, or backend
+failure, <code>type</code> when a <code>jj::</code> filter receives a non-host value, and <code>non-finite</code>
+for the documented numeric deviation. A <code>host</code> object has string <code>filter</code> and
+<code>commit_id</code> values; a <code>type</code> object has a string <code>filter</code> and null <code>commit_id</code>;
+a <code>non-finite</code> object has null for both. All four keys are always present. The
+caught object deliberately omits unstable human-readable source text. If it is
+not caught, the standard-error diagnostic includes the underlying jj error
+chain. <code>try</code>, <code>catch</code>, and <code>?</code> handle these errors normally.</p>
+<p>An unhandled runtime error stops evaluation and exits nonzero. Each earlier
+line remains valid JSON, but the stream is incomplete. The current template
+behavior of rendering an inline <code>&lt;Error: ...&gt;</code> string is not used for
+structured output.</p>
+<p>A write failure caused by a closed pipe stops evaluation without materializing
+additional fields and follows jj's normal broken-pipe exit behavior.
+Revset-stream or selected-commit loading failures likewise remain command
+errors outside the filter and may occur after earlier records were written.
+Cancellation, interruption, those command errors, broken pipes, and internal
+invariant failures are host termination conditions, not catchable query errors.</p>
+<h3 id="resource-behavior">Resource behavior<a class="headerlink" href="#resource-behavior" title="Permanent link">&para;</a></h3>
+<p>Normal per-commit projections keep memory bounded by one input, the query
+state, shared repository caches, and one buffered output value. A single result
+can still be arbitrarily large.</p>
+<p>jaq does not provide a security boundary against resource exhaustion. Filters
+can recurse, construct large values, or perform expensive work across many
+commits. v1 treats the filter as trusted local input, like a revset or template.
+It must stop promptly on a closed output pipe, but it does not claim hard CPU
+or memory quotas.</p>
+<p>The public mode must still be interruptible. A phase-zero prototype must prove
+that jj's interruption check runs during a long pure filter, not only between
+yielded results. If stock jaq has no suitable hook, jj must contribute one
+upstream or carry a narrow integration patch before enabling <code>--jq</code>.</p>
+<p>Commands which accept filters from a remote or untrusted source must add their
+own policy and resource limits. A later design may add configurable execution,
+recursion, materialization, or output budgets; those limits should not silently
+truncate valid JSON Lines.</p>
+<h3 id="encoding">Encoding<a class="headerlink" href="#encoding" title="Permanent link">&para;</a></h3>
+<p>JSON strings are Unicode. The v1 schema only exposes values which jj can
+represent as Unicode strings. Repository paths use slash-separated repository
+syntax, not platform display syntax. Full file contents and arbitrary backend
+byte strings are not part of v1.</p>
+<p>Every emitted value must be representable by JSON. Object keys must be strings;
+numbers must be finite; and an unprojected commit host value serializes as its
+bounded core object. A non-representable value is a runtime error discovered
+while buffering that record, so no partial line is written. The v1 manifest
+excludes named non-finite constructors, and <code>QueryValue</code> rejects non-finite
+results from every other numeric path. It also excludes filters which decode
+arbitrary bytes.</p>
+<p>If byte-valued fields are added later, invalid UTF-8 must not be lossily
+replaced. Such a field should be an explicit base64 string or a new query
+version with documented byte-string conversion.</p>
+<h2 id="implementation-plan">Implementation plan<a class="headerlink" href="#implementation-plan" title="Permanent link">&para;</a></h2>
+<h3 id="query-engine">Query engine<a class="headerlink" href="#query-engine" title="Permanent link">&para;</a></h3>
+<p>Add pinned <code>jaq-core</code> and <code>jaq-std</code> workspace dependencies. <code>jaq-json</code> can be a
+reference implementation, but its native functions are constrained to
+<code>jaq_json::Val</code> and cannot simply be loaded for a custom value. Compile filters
+with the checked-in v1 manifest and inject the synthetic <code>jj</code> module without
+enabling jaq's user module loader. If jaq cannot currently do that through a
+public API, jj must upstream or carry a narrow compiler extension. Do not invoke
+<code>jq</code> or <code>jaq</code> as a subprocess.</p>
+<p>The CLI query module should contain three layers:</p>
+<ol>
+<li>Parsing, compilation, compatibility filtering, and diagnostics.</li>
+<li>A <code>QueryValue</code> implementation of both <a href="https://docs.rs/jaq-core/latest/jaq_core/val/trait.ValT.html"><code>jaq_core::ValT</code></a>
+   and <a href="https://docs.rs/jaq-std/latest/jaq_std/trait.ValT.html"><code>jaq_std::ValT</code></a>.</li>
+<li>Command-specific adapters such as <code>CommitQueryObject</code>.</li>
+</ol>
+<p><code>QueryValue</code> contains ordinary scalar, array, and object values plus bounded
+commit host objects. <code>ValT::index()</code> resolves only the requested key.
+<code>values()</code> and <code>key_values()</code> materialize each yielded core field to preserve
+ordinary jq object semantics. Those iterator APIs can propagate <code>ValR</code> errors,
+but v1 core getters are infallible; that stronger invariant is needed for the
+separate infallible display, equality, and ordering operations. jj-native
+implementations of <code>keys</code>, <code>keys_unsorted</code>, <code>has</code>, and <code>length</code> consult the
+static registry without forcing field values.</p>
+<p><code>jaq_std::ValT</code> additionally requires ordering, numeric conversion, sequence,
+and byte/string operations. The <a href="https://docs.rs/jaq-json/latest/jaq_json/fn.funs.html"><code>jaq-json</code> functions</a>
+implemented for <code>jaq_json::Val</code>, including <code>length</code>, <code>has</code>, <code>contains</code>,
+<code>fromjson</code>, and <code>tojson</code>, must be generalized upstream or ported to
+<code>QueryValue</code>. The checked-in manifest makes that porting work finite and
+testable.</p>
+<p>The <code>ValT::values()</code> and <code>key_values()</code> child iterators have <code>'static</code> outputs,
+so directly borrowing the current <code>CommitTemplateLanguage&lt;'repo&gt;</code> is
+impractical. This design instead lets the query environment own an
+<code>Arc&lt;ReadonlyRepo&gt;</code>, cloned commits, path conversion state, field registries,
+and shared caches. This also makes the repository-snapshot rule explicit; it is
+an integration choice, not a requirement that every jaq value own its data.</p>
+<p>jaq requires infallible display, equality, and ordering operations for host
+values. Those materialize the bounded, infallible core object and apply
+ordinary structural jq behavior. Namespaced filters return their errors
+directly from a fallible filter call.</p>
+<h3 id="sharing-semantic-fields">Sharing semantic fields<a class="headerlink" href="#sharing-semantic-fields" title="Permanent link">&para;</a></h3>
+<p>The commit template method table already defines most desired getters, and
+template properties already have a lazy, fallible <code>extract()</code> interface. The
+proposed shared registry adds explicit cost metadata. The implementation should
+extract a common semantic getter layer rather than independently reimplementing
+bookmark, immutability, diff, and signature behavior. Sharing applies only
+where the contracts match; for example, the v1 diff filters explicitly honor
+command-line paths while today's commit template <code>diff()</code> defaults to all
+paths.</p>
+<p>The existing template objects borrow repository state, while this <code>QueryValue</code>
+design owns it to satisfy its child-iterator lifetime requirements. Directly
+wrapping today's boxed template properties is therefore unlikely to work. A
+shared registry can instead describe:</p>
+<ul>
+<li>the versioned field or filter name and result type;</li>
+<li>its cost category and documentation;</li>
+<li>an owned getter accepting a query environment and host value;</li>
+<li>adapters into template methods and query fields or filters where contracts
+  are the same.</li>
+</ul>
+<p>The query schema must not be implemented by deriving <code>Serialize</code> on <code>Commit</code>.
+That repeats the current coupling to backend storage and eagerly walks the
+value.</p>
+<h3 id="async-operations">Async operations<a class="headerlink" href="#async-operations" title="Permanent link">&para;</a></h3>
+<p>jaq evaluation is synchronous, while some jj store and tree operations are
+async. The first implementation can use the same controlled blocking bridge as
+current template field extraction. Getters should retain async boundaries so a
+future engine can prefetch or await fields without changing the schema.</p>
+<h3 id="serialization">Serialization<a class="headerlink" href="#serialization" title="Permanent link">&para;</a></h3>
+<p>Convert or serialize one yielded query value into a temporary byte buffer.
+Only after the complete value succeeds should jj write the buffer and <code>\n</code> to
+standard output. This preserves record validity if conversion discovers a
+non-JSON value and bounds the extra buffering to one result.</p>
+<h3 id="delivery-order">Delivery order<a class="headerlink" href="#delivery-order" title="Permanent link">&para;</a></h3>
+<ol>
+<li>Build a phase-zero prototype without a public flag. It must demonstrate the
+   core and standard <code>ValT</code> implementations, the ported v1 built-ins, structural
+   host updates and comparison, synthetic-module resolution and shadowing
+   rejection for fallible namespaced filters, complete buffered serialization,
+   and interruption inside a non-yielding filter.</li>
+<li>Check in the jq 1.8.2 conformance corpus and exact v1 function manifest.</li>
+<li>Implement the closed <code>jj.commit/v1</code> core object and every v1 namespaced
+   filter, still behind an internal experimental command.</li>
+<li>Add <code>--slurp</code>, collection tests, and the user documentation.</li>
+<li>Expose <code>jj log --jq</code> and query version v1 only after all compatibility and
+   schema fixtures pass.</li>
+</ol>
+<p>An internal prototype may change freely, but it must not advertise itself as
+query v1. The public v1 contract consists of this document plus the exact
+<code>cli/src/query/v1-builtins.toml</code> manifest checked in before the public flag
+ships.</p>
+<h3 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">&para;</a></h3>
+<p>The conformance suite should run the jq portion of the v1 manifest through jq
+1.8.2 and jj's engine and compare values and errors. Synthetic <code>jj</code> exports use
+repository fixtures instead. Tests should cover construction, cardinality,
+updates, optional access, reductions, numeric edges, and Unicode.
+Negative cases should cover every excluded syntax family, function, and arity.
+Caught-error fixtures should separately freeze jq-compatible values and
+<code>jj.query-error/v1</code> objects. Counting getters should verify direct-field
+laziness and memoization; cached filter values and errors; non-forcing <code>keys</code>,
+<code>keys_unsorted</code>, <code>has</code>, and <code>length</code>; bounded materialization for comparison,
+serialization, and updates; and short-circuiting around expensive filters.</p>
+<p>CLI snapshots should cover clean JSON Lines for every value type and
+cardinality; selection, flat ordering, limiting, reversal, paths, and slurp;
+parse and runtime failures, invalid JSON-domain values, and broken pipes; and
+stable full IDs and raw timestamp/offset pairs.</p>
+<h2 id="alternatives-considered">Alternatives considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="fixed-json-and-two-stage-field-selection">Fixed JSON and two-stage field selection<a class="headerlink" href="#fixed-json-and-two-stage-field-selection" title="Permanent link">&para;</a></h3>
+<p>A fixed schema, as proposed by <a href="https://github.com/jj-vcs/jj/issues/5662">issue #5662</a>, is simpler and can be
+consumed by any JSON tool. The GitHub CLI's <code>--json &lt;fields&gt; --jq &lt;filter&gt;</code>
+variant also makes field costs explicit. Both remain reasonable complements to
+this proposal.</p>
+<p>On their own, they duplicate field selection or require an external step for
+renaming, filtering, flattening, and one-to-many output. A jq filter describes
+the demanded core fields and result shape together, while expensive <code>jj::</code>
+filters remain explicit.</p>
+<h3 id="extend-templates-with-object-and-array-literals">Extend templates with object and array literals<a class="headerlink" href="#extend-templates-with-object-and-array-literals" title="Permanent link">&para;</a></h3>
+<p><a href="https://github.com/jj-vcs/jj/pull/6869">PR #6869</a> and <a href="https://github.com/jj-vcs/jj/pull/8507">PR #8507</a> explore this incremental path. It
+avoids a new dependency and preserves static template type checking. Object and
+array literals would also improve templates independently of this RFC.</p>
+<p>Object construction alone does not settle filtering, reductions, dynamic
+values, update semantics, aggregate inputs, error handling, or output framing.
+Growing all of those features would create another data language for users and
+maintainers to learn. jq already has those semantics and an embeddable Rust
+implementation.</p>
+<h3 id="pipe-jsonself-to-external-jq">Pipe <code>json(self)</code> to external jq<a class="headerlink" href="#pipe-jsonself-to-external-jq" title="Permanent link">&para;</a></h3>
+<p>This works today for the backend commit fields if callers suppress the graph
+and add separators correctly. It is a useful fallback, but it exposes the wrong
+schema, lacks computed semantic fields, adds process and installation
+requirements, and must serialize the intermediate value before jq can discard
+fields.</p>
+<h3 id="embed-c-libjq-or-define-a-new-language">Embed C libjq or define a new language<a class="headerlink" href="#embed-c-libjq-or-define-a-new-language" title="Permanent link">&para;</a></h3>
+<p>libjq provides exact behavior for the library version being embedded, but the
+available Rust binding targets libjq 1.6 rather than this RFC's jq 1.8.2
+baseline. It also uses a string-oriented API, so jj would eagerly serialize
+input or need a substantial C integration for host values, in addition to a
+native C dependency and system-library or bundled build. jaq's custom value
+interface is a better fit for demand-driven semantic filters.</p>
+<p>An independent jq-inspired language could integrate tightly with jj's types,
+but small differences in null handling, cardinality, iteration, and errors
+would make familiar-looking filters surprising. jj would also own a new parser,
+evaluator, standard library, and documentation.</p>
+<h3 id="eager-json-and-a-general-api">Eager JSON and a general API<a class="headerlink" href="#eager-json-and-a-general-api" title="Permanent link">&para;</a></h3>
+<p>Eagerly converting the bounded core object would be inexpensive and would make
+interpreter integration simpler. It would lose the typed commit identity which
+<code>jj::bookmarks</code>, <code>jj::empty</code>, and other semantic filters need after jq values
+are cloned, slurped, or updated. A hidden side table or token could restore that
+identity, but would give projected ordinary objects surprising capabilities.
+The custom host value keeps identity explicit while still materializing to a
+normal object whenever jq requires it. A stable RPC API would better serve
+long-running clients, but adds transport, lifecycle, subscription, and mutation
+questions. The curated query schema can later inform such an API.</p>
+<h2 id="open-questions">Open questions<a class="headerlink" href="#open-questions" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Should the public flag be <code>--jq</code>, which identifies the language precisely,
+  or <code>--query</code>, which leaves room for other implementations? This RFC proposes
+  <code>--jq</code> because it sets the clearest user expectation.</li>
+<li>Should the custom-value functions be generalized in jaq upstream or ported
+  into jj? The behavior and conformance requirements are the same either way,
+  but upstream generalization reduces long-term maintenance.</li>
+<li>What is the narrowest jaq interruption hook that can check jj's cancellation
+  state without imposing significant overhead on every filter step?</li>
+<li>Should later versions support raw string output? If so, the mode must remain
+  explicit and must not weaken the default JSON Lines contract.</li>
+</ul>
+<h2 id="related-work">Related work<a class="headerlink" href="#related-work" title="Permanent link">&para;</a></h2>
+<p>The <a href="https://jqlang.github.io/jq/manual/">jq manual</a> defines the language model users will bring to this
+feature. <a href="https://gedenkt.at/jaq/manual/">jaq's manual</a> documents known implementation differences.
+jaq's custom-value interface has also been used to expose non-JSON host data,
+including an <a href="https://github.com/amazon-ion/ion-cli/pull/193">Amazon Ion integration</a>, which is close to jj's proposed
+semantic values.</p>
+<p>The jaq maintainer's <a href="https://github.com/01mf02/jaq/issues/276">discussion of lazy inputs</a> distinguishes
+streaming independent inputs, which jaq supports, from a generally lazy
+slurped array, which random access and sharing make impractical. That is why
+this RFC streams by default and describes <code>--slurp</code> as collecting commit
+handles while leaving only their core fields demand-driven.</p>
+<p>The GitHub CLI's <a href="https://cli.github.com/manual/gh_help_formatting"><code>--json</code> and <code>--jq</code> interface</a> demonstrates the
+value of making jq available without requiring an external executable. This
+RFC differs mainly in moving field selection into a lazy host object and in
+making JSON Lines framing explicit.</p>
+<h2 id="future-possibilities">Future possibilities<a class="headerlink" href="#future-possibilities" title="Permanent link">&para;</a></h2>
+<p>Once the query engine and schema discipline are established, the same model can
+support other item-oriented commands:</p>
+<ul>
+<li><code>jj evolog --jq</code> with a versioned evolution-entry object;</li>
+<li><code>jj op log --jq</code> with an operation object;</li>
+<li><code>jj bookmark list --jq</code> and <code>jj workspace list --jq</code>;</li>
+<li><code>jj diff --jq</code> with one top-level diff object instead of per-entry templates;</li>
+<li>content-reading copy detection with separately frozen similarity semantics;</li>
+<li>explicit bookmark tracking-count filters with frozen estimate semantics;</li>
+<li>a fixed <code>--json</code> shorthand implemented as a stable identity projection;</li>
+<li>query files, aliases, <code>--arg</code> values, and additional namespaced filters in a
+  new query version;</li>
+<li>regular-expression filters with a separately frozen dialect and a
+  Unicode-safe <code>implode</code> implementation;</li>
+<li>streaming reductions over all inputs without constructing a slurped array;</li>
+<li>a schema introspection command for agents and completion systems;</li>
+<li>cost metadata or budgets for expensive fields;</li>
+<li>editor and RPC APIs which reuse the same semantic schema.</li>
+</ul>
+<p>These commands should share the query language and framing rules, but each must
+define its own stable input schema rather than serialize an internal type.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      <script id="__config" type="application/json">{"base": "../..", "features": ["content.action.edit", "content.code.copy", "content.tabs.link", "navigation.instant"], "search": "../../assets/javascripts/workers/search.973d3a69.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"alias": true, "provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.f55a23d4.min.js"></script>
+      
+    
+  </body>
+</html>
