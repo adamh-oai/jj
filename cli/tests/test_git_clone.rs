@@ -1106,12 +1106,10 @@ fn test_git_clone_malformed() {
     // The cloned workspace isn't usable.
     let output = clone_dir.run_jj(["status"]);
     insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Error: The working copy is stale (not updated since operation 68cac63e1c80).
-    Hint: Run `jj workspace update-stale` to update it.
-    See https://docs.jj-vcs.dev/latest/working-copy/#stale-working-copy for more information.
+    The working copy has no changes.
+    Working copy  (@) : sqpuoqvx 2f428621 (empty) (no description set)
+    Parent commit (@-): tllmtmvy 9e78041b main | message
     [EOF]
-    [exit status: 1]
     ");
 
     // The error can be somehow recovered.
@@ -1119,10 +1117,8 @@ fn test_git_clone_malformed() {
     let output = clone_dir.run_jj(["workspace", "update-stale"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
-    Internal error: Failed to check out commit 2f4286212884d472a0b2013a961b695a144ac65c
-    Caused by: Reserved path component .jj in $TEST_ENV/clone/.jj
+    Attempted recovery, but the working copy is not stale.
     [EOF]
-    [exit status: 255]
     ");
     let output = clone_dir.run_jj(["new", "root()", "--ignore-working-copy"]);
     insta::assert_snapshot!(output, @"");

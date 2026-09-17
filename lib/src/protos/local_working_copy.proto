@@ -76,3 +76,11 @@ message Checkout {
   string workspace_name = 3;
   reserved 1;
 }
+
+// Durable intent written before a checkout starts. If this file survives a
+// process failure, the next load treats this tree as the semantic target but
+// forces a full filesystem reconciliation before trusting it as clean.
+message PendingCheckout {
+  repeated bytes tree_ids = 1;
+  repeated string conflict_labels = 2;
+}
