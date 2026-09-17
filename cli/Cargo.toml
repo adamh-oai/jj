@@ -66,6 +66,7 @@ harness = false
 
 [dependencies]
 ansi-to-tui = { workspace = true }
+base64 = { workspace = true }
 bstr = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -85,6 +86,9 @@ globset = { workspace = true }
 indexmap = { workspace = true }
 indoc = { workspace = true }
 itertools = { workspace = true }
+jaq-core = { workspace = true }
+jaq-json = { workspace = true }
+jaq-std = { workspace = true }
 jj-lib = { workspace = true }
 maplit = { workspace = true }
 mimalloc = { workspace = true }
@@ -115,6 +119,7 @@ tracing = { workspace = true }
 tracing-chrome = { workspace = true }
 tracing-subscriber = { workspace = true }
 unicode-width = { workspace = true }
+urlencoding = { workspace = true }
 whoami = { workspace = true }
 percent-encoding = { workspace = true }
 

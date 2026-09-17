@@ -1,0 +1,250 @@
+# Normative public query-v1 surface. Loader details are intentionally kept in
+# v1-loader.toml so compatible implementation fixes do not change this file.
+
+[[jq]]
+name = "empty"
+arities = [0]
+[[jq]]
+name = "type"
+arities = [0]
+[[jq]]
+name = "values"
+arities = [0]
+[[jq]]
+name = "nulls"
+arities = [0]
+[[jq]]
+name = "booleans"
+arities = [0]
+[[jq]]
+name = "numbers"
+arities = [0]
+[[jq]]
+name = "strings"
+arities = [0]
+[[jq]]
+name = "arrays"
+arities = [0]
+[[jq]]
+name = "objects"
+arities = [0]
+[[jq]]
+name = "iterables"
+arities = [0]
+[[jq]]
+name = "scalars"
+arities = [0]
+[[jq]]
+name = "length"
+arities = [0]
+[[jq]]
+name = "keys"
+arities = [0]
+[[jq]]
+name = "keys_unsorted"
+arities = [0]
+[[jq]]
+name = "has"
+arities = [1]
+[[jq]]
+name = "contains"
+arities = [1]
+[[jq]]
+name = "inside"
+arities = [1]
+[[jq]]
+name = "indices"
+arities = [1]
+[[jq]]
+name = "index"
+arities = [1]
+[[jq]]
+name = "rindex"
+arities = [1]
+[[jq]]
+name = "select"
+arities = [1]
+[[jq]]
+name = "map"
+arities = [1]
+[[jq]]
+name = "map_values"
+arities = [1]
+[[jq]]
+name = "to_entries"
+arities = [0]
+[[jq]]
+name = "from_entries"
+arities = [0]
+[[jq]]
+name = "with_entries"
+arities = [1]
+[[jq]]
+name = "range"
+arities = [1, 2, 3]
+[[jq]]
+name = "first"
+arities = [0, 1]
+[[jq]]
+name = "last"
+arities = [0, 1]
+[[jq]]
+name = "nth"
+arities = [1, 2]
+[[jq]]
+name = "limit"
+arities = [2]
+[[jq]]
+name = "skip"
+arities = [2]
+[[jq]]
+name = "any"
+arities = [0, 1, 2]
+[[jq]]
+name = "all"
+arities = [0, 1, 2]
+[[jq]]
+name = "add"
+arities = [0, 1]
+[[jq]]
+name = "flatten"
+arities = [0]
+[[jq]]
+name = "reverse"
+arities = [0]
+[[jq]]
+name = "sort"
+arities = [0]
+[[jq]]
+name = "sort_by"
+arities = [1]
+[[jq]]
+name = "group_by"
+arities = [1]
+[[jq]]
+name = "unique"
+arities = [0]
+[[jq]]
+name = "unique_by"
+arities = [1]
+[[jq]]
+name = "min"
+arities = [0]
+[[jq]]
+name = "max"
+arities = [0]
+[[jq]]
+name = "min_by"
+arities = [1]
+[[jq]]
+name = "max_by"
+arities = [1]
+[[jq]]
+name = "startswith"
+arities = [1]
+[[jq]]
+name = "endswith"
+arities = [1]
+[[jq]]
+name = "ltrimstr"
+arities = [1]
+[[jq]]
+name = "rtrimstr"
+arities = [1]
+[[jq]]
+name = "split"
+arities = [1]
+[[jq]]
+name = "join"
+arities = [1]
+[[jq]]
+name = "ascii_downcase"
+arities = [0]
+[[jq]]
+name = "ascii_upcase"
+arities = [0]
+[[jq]]
+name = "explode"
+arities = [0]
+[[jq]]
+name = "tostring"
+arities = [0]
+[[jq]]
+name = "tonumber"
+arities = [0]
+[[jq]]
+name = "tojson"
+arities = [0]
+[[jq]]
+name = "fromjson"
+arities = [0]
+[[jq]]
+name = "@json"
+arities = [0]
+[[jq]]
+name = "@base64"
+arities = [0]
+[[jq]]
+name = "@uri"
+arities = [0]
+[[jq]]
+name = "@csv"
+arities = [0]
+[[jq]]
+name = "@tsv"
+arities = [0]
+[[jq]]
+name = "recurse"
+arities = [0, 1]
+[[jq]]
+name = "walk"
+arities = [1]
+[[jq]]
+name = "until"
+arities = [2]
+[[jq]]
+name = "while"
+arities = [2]
+
+[[jj]]
+name = "mine"
+arity = 0
+[[jj]]
+name = "working_copies"
+arity = 0
+[[jj]]
+name = "current_working_copy"
+arity = 0
+[[jj]]
+name = "bookmarks"
+arity = 0
+[[jj]]
+name = "tags"
+arity = 0
+[[jj]]
+name = "divergent"
+arity = 0
+[[jj]]
+name = "hidden"
+arity = 0
+[[jj]]
+name = "change_offset"
+arity = 0
+[[jj]]
+name = "immutable"
+arity = 0
+[[jj]]
+name = "empty"
+arity = 0
+[[jj]]
+name = "signature_present"
+arity = 0
+[[jj]]
+name = "verify_signature"
+arity = 0
+[[jj]]
+name = "diff_files"
+arity = 0
+[[jj]]
+name = "diff_stats"
+arity = 0
