@@ -191,7 +191,6 @@ pub async fn cmd_git_clone(
         ));
     }
 
-    // will create a tree dir in case if was deleted after last check
     fs::create_dir_all(&wc_path)
         .map_err(|err| user_error_with_message(format!("Failed to create {wc_path_str}"), err))?;
 

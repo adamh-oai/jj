@@ -22,6 +22,7 @@ use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::print_large_file_hint;
+use crate::cli_util::print_snapshot_warnings;
 use crate::cli_util::print_untracked_files;
 use crate::command_error::CommandError;
 use crate::ui::Ui;
@@ -87,17 +88,21 @@ pub(crate) async fn cmd_file_track(
 
 pub fn print_track_snapshot_stats(
     ui: &Ui,
-    mut auto_stats: SnapshotStats,
+    auto_stats: SnapshotStats,
     track_stats: SnapshotStats,
     path_converter: &RepoPathUiConverter,
 ) -> io::Result<()> {
+    let mut warnings = auto_stats.warnings;
+    warnings.extend(track_stats.warnings);
+    print_snapshot_warnings(ui, &warnings)?;
+
     let mut untracked_paths = track_stats.untracked_paths;
     for (path, reason) in &mut untracked_paths {
         if !matches!(reason, UntrackedReason::FileNotAutoTracked) {
             continue;
         }
-        if let Some(old_reason) = auto_stats.untracked_paths.remove(path) {
-            *reason = old_reason;
+        if let Some(old_reason) = auto_stats.untracked_paths.get(path) {
+            *reason = old_reason.clone();
         }
     }
 

@@ -37,16 +37,25 @@ pub async fn cmd_debug_local_working_copy(
     let wc = check_local_disk_wc(workspace_command.working_copy())?;
     writeln!(ui.stdout(), "Current operation: {:?}", wc.operation_id())?;
     writeln!(ui.stdout(), "Current tree: {:?}", wc.tree()?)?;
-    for (file, state) in wc.file_states()? {
-        writeln!(
-            ui.stdout(),
-            "{:?} {:13?} {:10?} {:?} {:?}",
-            state.file_type,
-            state.size,
-            state.mtime.0,
-            state.materialized_conflict_data,
-            file
-        )?;
+    let journal = wc.journal_status()?;
+    writeln!(ui.stdout(), "Journal phase: {}", journal.phase)?;
+    writeln!(ui.stdout(), "Journal generation: {}", journal.generation)?;
+    if let (Some(backend), Some(identity)) = (
+        journal.baseline_backend.as_deref(),
+        journal.baseline_snapshot_identity.as_deref(),
+    ) {
+        writeln!(ui.stdout(), "Journal baseline: {backend} {identity:02x?}")?;
+        if let Some(retention) = journal.baseline_retention {
+            writeln!(ui.stdout(), "Journal retention: {retention}")?;
+        }
+    } else {
+        writeln!(ui.stdout(), "Journal baseline: none")?;
+    }
+    if let Some(reason) = journal.fallback_reason {
+        writeln!(ui.stdout(), "Journal fallback: {reason}")?;
+    }
+    if let Some(mutation) = journal.pending_mutation {
+        writeln!(ui.stdout(), "Journal pending mutation: {mutation}")?;
     }
     Ok(())
 }

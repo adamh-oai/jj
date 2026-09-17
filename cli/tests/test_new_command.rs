@@ -18,6 +18,80 @@ use crate::common::TestWorkDir;
 use crate::common::create_commit;
 use crate::common::create_commit_with_files;
 
+#[cfg(all(target_os = "linux", feature = "awacs", debug_assertions))]
+#[test]
+fn test_new_same_tree_preserves_awacs_adoption_seed() -> testutils::TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("file", "contents\n");
+    work_dir.run_jj(["describe", "-m", "initial"]).success();
+
+    // Establish a retained baseline without requiring a real Btrfs filesystem.
+    work_dir.write_file(".jj/working_copy/subvolume_mode", "enabling\n");
+    work_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", work_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+    let seed_path = work_dir.root().join(".jj/working_copy/awacs-adoption-seed");
+    assert!(seed_path.is_file());
+    work_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
+
+    // `new` changes Git HEAD while the file tree stays identical. `describe`
+    // also keeps the tree, but needs no checkout preparation.
+    for args in [&["new"][..], &["describe", "-m", "same tree"][..]] {
+        work_dir
+            .run_jj_with(|cmd| {
+                cmd.env("JJ_TEST_AWACS_SCAN_ROOT", work_dir.root())
+                    .args(args)
+            })
+            .success();
+        assert!(
+            seed_path.is_file(),
+            "{args:?} must leave a transferable adoption seed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work_dir.root().join("file"))?,
+            "contents\n"
+        );
+
+        // Do not snapshot here: an intervening status would hide the regression.
+        let state = work_dir
+            .run_jj_with(|cmd| {
+                cmd.env("JJ_TEST_AWACS_SCAN_ROOT", work_dir.root()).args([
+                    "--ignore-working-copy",
+                    "debug",
+                    "local-working-copy",
+                ])
+            })
+            .success();
+        assert!(state.stdout.raw().contains("Journal phase: clean-baseline"));
+        assert!(
+            state
+                .stdout
+                .raw()
+                .contains("Journal retention: hard-pinned")
+        );
+        assert!(
+            work_dir
+                .run_jj(["--ignore-working-copy", "diff", "--summary"])
+                .success()
+                .stdout
+                .raw()
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn test_new() {
     let test_env = TestEnvironment::default();

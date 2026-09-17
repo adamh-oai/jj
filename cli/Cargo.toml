@@ -120,9 +120,13 @@ percent-encoding = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-nix = { workspace = true, features = [ "signal" ] }
+nix = { workspace = true, features = [ "dir", "fs", "signal" ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+btrfs-awacs = { workspace = true, optional = true }
 
 [dev-dependencies]
+gix-index-cache = { package = "gix-index", git = "https://github.com/adamh-oai/gitoxide", rev = "ae185e5cdccd23f3cabeea83609d978f5a05b95c", features = ["sha1", "sha256"] }
 anstream = { workspace = true }
 assert_cmd = { workspace = true }
 async-trait = { workspace = true }
@@ -137,8 +141,9 @@ testutils = { workspace = true }
 jj-cli = { path = ".", features = ["test-fakes"], default-features = false }
 
 [features]
-default = ["watchman", "git"]
+default = ["watchman", "git", "awacs"]
 bench = ["dep:criterion"]
+awacs = ["jj-lib/awacs", "dep:btrfs-awacs"]
 git = ["jj-lib/git", "dep:gix"]
 test-fakes = ["jj-lib/testing"]
 watchman = ["jj-lib/watchman"]

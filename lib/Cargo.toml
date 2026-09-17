@@ -60,6 +60,7 @@ rayon = { workspace = true }
 ref-cast = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
 smallvec = { workspace = true }
 strsim = { workspace = true }
 tempfile = { workspace = true }
@@ -83,6 +84,7 @@ num_cpus = { workspace = true }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
 rustversion = { workspace = true }
+serde_json = { workspace = true }
 test-case = { workspace = true }
 testutils = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
@@ -94,7 +96,11 @@ nix = { workspace = true, features = [ "fs" ] }
 default = ["git"]
 git = ["dep:gix", "dep:filetime", "dep:gix-index-cache", "dep:gix-hash-cache", "dep:gix-object-cache", "dep:gix-validate-cache"]
 watchman = ["dep:watchman_client", "dep:tokio"]
+awacs = ["dep:btrfs-awacs"]
 testing = ["git"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+btrfs-awacs = { workspace = true, optional = true }
 
 [lints]
 workspace = true

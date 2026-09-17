@@ -12,21 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use futures::StreamExt as _;
 use jj_lib::backend::CommitId;
+use jj_lib::file_util::IoResultExt as _;
 use jj_lib::git;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::local_working_copy::LocalWorkingCopy;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::local_working_copy::seed_local_working_copy_tree;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::local_working_copy::snapshot_mode_has_committed_baseline;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::matchers::EverythingMatcher;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::matchers::FilesMatcher;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::op_store::RefTarget;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
+use jj_lib::simple_workspace_store::SimpleWorkspaceStore;
+use jj_lib::workspace_store::WorkspaceStore as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use crate::commands::btrfs::begin_subvolume_mode;
+use crate::commands::btrfs::is_btrfs_subvolume;
+use crate::commands::btrfs::is_subvolume_mode_enabled;
+use crate::commands::btrfs::remove_directory_tree;
+use crate::commands::btrfs::set_subvolume_mode;
 use crate::ui::Ui;
 
 /// Adopt the current linked Git worktree as a jj workspace.
@@ -45,9 +71,22 @@ pub struct WorkspaceAdoptArgs {
 
 struct ExistingGitWorktree {
     root: PathBuf,
+    git_dir: PathBuf,
     common_dir: PathBuf,
     head_id: CommitId,
 }
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+struct PendingJjConsumerSeed {
+    owner_id: [u8; 16],
+    snapshot_identity: btrfs_awacs::manager::SnapshotIdentity,
+    working_copy_state_path: PathBuf,
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+const AWACS_JJ_PENDING_CONSUMER_MARKER: &str = "awacs-jj-pending-consumer";
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+const AWACS_JJ_PENDING_WORKING_COPY_STATE: &str = "awacs-jj-pending-working-copy";
 
 #[instrument(skip_all)]
 pub async fn cmd_workspace_adopt(
@@ -56,6 +95,16 @@ pub async fn cmd_workspace_adopt(
     args: &WorkspaceAdoptArgs,
 ) -> Result<(), CommandError> {
     let worktree = discover_linked_git_worktree(command.cwd())?;
+    // Successful adoption consumes the pending AWACS seed. Diagnose existing
+    // metadata before checking that seed, regardless of the requested name.
+    let jj_dir = worktree.root.join(".jj");
+    match fs::symlink_metadata(&jj_dir) {
+        Ok(_) => {
+            return Err(user_error("Cannot adopt; already an jj workspace."));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).context(&jj_dir).map_err(Into::into),
+    }
     let main_workspace_root = worktree
         .common_dir
         .parent()
@@ -82,8 +131,70 @@ pub async fn cmd_workspace_adopt(
             "The linked Git worktree does not belong to the jj repository's Git backend",
         ));
     }
-
+    let snapshot = is_subvolume_mode_enabled(main_workspace_root);
+    if snapshot && !is_btrfs_subvolume(&worktree.root)? {
+        return Err(user_error(
+            "Cannot adopt a plain Git worktree while Btrfs subvolume mode is enabled",
+        )
+        .hinted("Adopt a linked Git worktree whose root is already a Btrfs subvolume."));
+    }
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    let pending_jj_seed = if snapshot {
+        Some(read_pending_jj_consumer_seed(&worktree)?)
+    } else {
+        None
+    };
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    let snapshot_seed_tree = if snapshot {
+        if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+            None
+        } else {
+            let pending_state_path = &pending_jj_seed
+                .as_ref()
+                .expect("snapshot adoption validated pending seed")
+                .working_copy_state_path;
+            if !snapshot_mode_has_committed_baseline(pending_state_path).map_err(|err| {
+                user_error(format!(
+                    "Failed to validate pending JJ AWACS baseline: {err}"
+                ))
+            })? {
+                return Err(user_error(
+                    "Cannot adopt snapshot worktree without a committed source JJ AWACS baseline",
+                ));
+            }
+            let copied_working_copy = LocalWorkingCopy::load(
+                main_workspace.repo_loader().store().clone(),
+                worktree.root.clone(),
+                pending_state_path.clone(),
+                &main_settings,
+            )
+            .map_err(|err| user_error(format!("Failed to read pending JJ working copy: {err}")))?;
+            if copied_working_copy
+                .journal_status()
+                .map_err(|err| user_error(format!("Failed to read copied JJ journal: {err}")))?
+                .has_pending_scan
+            {
+                return Err(user_error(
+                    "Cannot adopt snapshot worktree with unrecorded source filesystem changes",
+                ));
+            }
+            Some(
+                copied_working_copy
+                    .tree()
+                    .map_err(|err| user_error(format!("Failed to read copied JJ tree: {err}")))?
+                    .clone(),
+            )
+        }
+    } else {
+        None
+    };
     let workspace_name = workspace_name(&worktree.root, args)?;
+    // Adoption publishes both repository state and an on-disk workspace-store
+    // entry before its first working-copy snapshot can run. Keep that whole
+    // transition serialized so a failed snapshot can roll back the same name
+    // without racing another workspace lifecycle command.
+    let lifecycle_store = SimpleWorkspaceStore::load(main_workspace.repo_path())?;
+    let _lifecycle_lock = lifecycle_store.lock_lifecycle()?;
     let op = command.resolve_operation(
         ui,
         main_workspace.repo_loader(),
@@ -113,41 +224,173 @@ pub async fn cmd_workspace_adopt(
     )
     .await?;
 
+    macro_rules! adoption_try {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    let mut error = CommandError::from(error);
+                    if let Err(rollback_error) = rollback_failed_adoption(
+                        command,
+                        &main_workspace,
+                        &lifecycle_store,
+                        &worktree.root,
+                        &workspace_name,
+                    )
+                    .await
+                    {
+                        error.add_hint(format!(
+                            "Failed to roll back partial workspace adoption: {}",
+                            rollback_error.error
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+        };
+    }
+
+    if snapshot {
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        adoption_try!(begin_subvolume_mode(&worktree.root));
+        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+        adoption_try!(set_subvolume_mode(&worktree.root, true));
+    }
+
     // `init_workspace_with_existing_repo()` starts at the root commit. Replace
     // that placeholder with an empty working-copy commit on the existing Git
     // HEAD, then reset only jj's working-copy metadata. The files and Git index
     // are already materialized by Git and must not be checked out again.
     let mut tx = repo.start_transaction();
-    let wc_commit = tx
-        .repo_mut()
-        .check_out(workspace_name.clone(), &head_commit)
-        .await?;
+    let wc_commit = adoption_try!(
+        tx.repo_mut()
+            .check_out(workspace_name.clone(), &head_commit)
+            .await
+    );
     tx.repo_mut()
         .set_git_head_target(&workspace_name, RefTarget::normal(worktree.head_id.clone()));
-    tx.repo_mut().rebase_descendants().await?;
-    let unpublished = tx
-        .write(format!(
+    adoption_try!(tx.repo_mut().rebase_descendants().await);
+    let unpublished = adoption_try!(
+        tx.write(format!(
             "adopt existing Git worktree as workspace '{}'",
             workspace_name.as_symbol()
         ))
-        .await?;
+        .await
+    );
     let repo = if command.should_commit_transaction() {
-        unpublished.publish().await?
+        adoption_try!(unpublished.publish().await)
     } else {
         unpublished.leave_unpublished()
     };
 
-    let mut locked_workspace = workspace.start_working_copy_mutation().await?;
-    locked_workspace.locked_wc().reset(&wc_commit).await?;
-    locked_workspace.finish(repo.op_id().clone()).await?;
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    if snapshot {
+        let pending_jj_seed = pending_jj_seed.expect("snapshot adoption validated pending seed");
+        // Workspace initialization happened before the marker existed and
+        // therefore owns the ordinary working-copy implementation. Reload
+        // after the marker is durable so the compact journal is selected.
+        drop(workspace);
+        let mut workspace_command = adoption_try!(
+            command
+                .workspace_helper_no_snapshot_at(ui, &worktree.root)
+                .await
+        );
+        // The pending tree describes immutable child snapshot A. Git may have
+        // checked out a different HEAD into the live worktree after A was
+        // created; in that case the final snapshot below reconciles A -> B
+        // against the working-copy commit already based on that Git HEAD.
+        let synthetic_seed_tree = wc_commit.tree();
+        adoption_try!(
+            seed_snapshot_adopt_tree(
+                &mut workspace_command,
+                snapshot_seed_tree.as_ref().unwrap_or(&synthetic_seed_tree),
+            )
+            .await
+        );
+        adoption_try!(
+            workspace_command
+                .seed_initialized_snapshot_workspace_awacs_baseline(
+                    ui,
+                    &pending_jj_seed.snapshot_identity,
+                    Some(pending_jj_seed.owner_id),
+                )
+                .await
+        );
+        adoption_try!(set_subvolume_mode(&worktree.root, true));
+        // Preserve the inherited A -> live-worktree scan so edits made after
+        // Git's checkout remain visible. Files tracked only by target B must
+        // bypass new-file limits and ignores during that reconciliation.
+        let target_tracking_matcher = adoption_try!(
+            snapshot_adopt_tracking_matcher(
+                snapshot_seed_tree.as_ref().unwrap_or(&synthetic_seed_tree),
+                &synthetic_seed_tree,
+            )
+            .await
+        );
+        adoption_try!(
+            workspace_command
+                .maybe_snapshot_with_force_tracking(ui, &target_tracking_matcher)
+                .await
+        );
+        clear_pending_jj_consumer_seed(&worktree)?;
+        writeln!(
+            ui.status(),
+            "Adopted Git worktree as workspace '{}'",
+            workspace_name.as_symbol()
+        )?;
+        return Ok(());
+    }
 
-    let mut workspace_command = command.for_workable_repo(ui, workspace, repo)?;
-    workspace_command.maybe_snapshot(ui).await?;
+    let mut locked_workspace = adoption_try!(workspace.start_working_copy_mutation().await);
+    adoption_try!(locked_workspace.locked_wc().reset(&wc_commit).await);
+    adoption_try!(locked_workspace.finish(repo.op_id().clone()).await);
+
+    let mut workspace_command = adoption_try!(command.for_workable_repo(ui, workspace, repo));
+    adoption_try!(workspace_command.maybe_snapshot(ui).await);
     writeln!(
         ui.status(),
         "Adopted Git worktree as workspace '{}'",
         workspace_name.as_symbol()
     )?;
+    Ok(())
+}
+
+async fn rollback_failed_adoption(
+    command: &CommandHelper,
+    main_workspace: &Workspace,
+    lifecycle_store: &SimpleWorkspaceStore,
+    worktree_root: &Path,
+    workspace_name: &WorkspaceNameBuf,
+) -> Result<(), CommandError> {
+    let repo = main_workspace.repo_loader().load_at_head().await?;
+    if repo.view().get_wc_commit_id(workspace_name).is_some() {
+        let mut tx = repo.start_transaction();
+        tx.repo_mut().remove_workspace(workspace_name).await?;
+        tx.repo_mut().rebase_descendants().await?;
+        let unpublished = tx
+            .write(format!(
+                "roll back failed workspace adoption '{}'",
+                workspace_name.as_symbol()
+            ))
+            .await?;
+        if command.should_commit_transaction() {
+            unpublished.publish().await?;
+        } else {
+            unpublished.leave_unpublished();
+        }
+    }
+    lifecycle_store.forget(&[workspace_name.as_ref()])?;
+    let jj_dir = worktree_root.join(".jj");
+    match remove_directory_tree(&jj_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(user_error(format!(
+                "Failed to remove partial workspace metadata at {}: {error}",
+                jj_dir.display()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -172,6 +415,7 @@ fn discover_linked_git_worktree(cwd: &Path) -> Result<ExistingGitWorktree, Comma
         .map_err(|err| user_error(format!("Cannot adopt a Git worktree without HEAD: {err}")))?;
     Ok(ExistingGitWorktree {
         root,
+        git_dir,
         common_dir,
         head_id,
     })
@@ -194,4 +438,141 @@ fn workspace_name(
         return Err(user_error("New workspace name cannot be empty"));
     }
     Ok(name)
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+async fn snapshot_adopt_tracking_matcher(
+    source_tree: &MergedTree,
+    target_tree: &MergedTree,
+) -> Result<FilesMatcher, CommandError> {
+    let mut target_only_paths = Vec::new();
+    let mut diff = source_tree.diff_stream(target_tree, &EverythingMatcher);
+    while let Some(entry) = diff.next().await {
+        let values = entry.values?;
+        if values.before.is_absent() && values.after.is_present() {
+            target_only_paths.push(entry.path);
+        }
+    }
+    Ok(FilesMatcher::new(target_only_paths))
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+async fn seed_snapshot_adopt_tree(
+    workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
+    tree: &MergedTree,
+) -> Result<(), CommandError> {
+    let operation_id = workspace_command.repo().op_id().clone();
+    let (mut locked_workspace, _commit) = workspace_command.unchecked_start_working_copy_mutation().await?;
+    if !seed_local_working_copy_tree(locked_workspace.locked_wc(), tree)
+        .await
+        .map_err(|err| internal_error_with_message("Failed to seed adopted snapshot tree", err))?
+    {
+        return Err(internal_error_with_message(
+            "Failed to seed adopted snapshot working copy",
+            "new workspace did not reload as snapshot-backed",
+        ));
+    }
+    locked_workspace.finish(operation_id).await?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn read_pending_jj_consumer_seed(
+    worktree: &ExistingGitWorktree,
+) -> Result<PendingJjConsumerSeed, CommandError> {
+    let path = worktree.git_dir.join(AWACS_JJ_PENDING_CONSUMER_MARKER);
+    let contents = fs::read_to_string(&path).map_err(|err| {
+        user_error(format!(
+            "Cannot adopt snapshot worktree without a pending JJ AWACS seed: {err}"
+        ))
+    })?;
+    let mut fields = contents.trim_end().split(':');
+    if fields.next() != Some("awacs-jj-pending-v2") {
+        return Err(user_error(
+            "Pending JJ AWACS seed has an unsupported format; recreate the Git worktree",
+        ));
+    }
+    let parse_uuid = |field: Option<&str>, name: &str| -> Result<[u8; 16], CommandError> {
+        let value =
+            field.ok_or_else(|| user_error(format!("Pending JJ AWACS seed lacks {name}")))?;
+        parse_pending_uuid_bytes(value.as_bytes())
+            .map_err(|err| user_error(format!("Pending JJ AWACS seed has invalid {name}: {err}")))
+    };
+    let owner_id = parse_uuid(fields.next(), "consumer owner")?;
+    let fs_uuid = parse_uuid(fields.next(), "filesystem identity")?;
+    let subvol_uuid = parse_uuid(fields.next(), "snapshot identity")?;
+    if fields.next().is_some() {
+        return Err(user_error("Pending JJ AWACS seed has trailing fields"));
+    }
+    Ok(PendingJjConsumerSeed {
+        owner_id,
+        snapshot_identity: btrfs_awacs::manager::SnapshotIdentity {
+            fs_uuid,
+            subvol_uuid,
+            parent_uuid: None,
+            received_uuid: None,
+            root_id: 0,
+            ctransid: 0,
+            otransid: 0,
+            path: Vec::new(),
+            readonly: true,
+            created_ns: 0,
+        },
+        working_copy_state_path: worktree.git_dir.join(AWACS_JJ_PENDING_WORKING_COPY_STATE),
+    })
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn clear_pending_jj_consumer_seed(worktree: &ExistingGitWorktree) -> Result<(), CommandError> {
+    let marker = worktree.git_dir.join(AWACS_JJ_PENDING_CONSUMER_MARKER);
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(user_error(format!(
+                "Failed to remove consumed pending JJ AWACS marker: {err}"
+            )));
+        }
+    }
+    let state = worktree.git_dir.join(AWACS_JJ_PENDING_WORKING_COPY_STATE);
+    match remove_directory_tree(&state) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(user_error(format!(
+            "Failed to remove consumed pending JJ working-copy state: {err}"
+        ))),
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn parse_pending_uuid_bytes(value: &[u8]) -> Result<[u8; 16], String> {
+    if value.len() != 36
+        || value.get(8) != Some(&b'-')
+        || value.get(13) != Some(&b'-')
+        || value.get(18) != Some(&b'-')
+        || value.get(23) != Some(&b'-')
+    {
+        return Err("UUID is malformed".to_owned());
+    }
+    let mut bytes = [0; 16];
+    let mut output = 0;
+    let mut index = 0;
+    while index < value.len() {
+        if value[index] == b'-' {
+            index += 1;
+            continue;
+        }
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        };
+        let high = nibble(value[index]).ok_or_else(|| "UUID is malformed".to_owned())?;
+        let low = nibble(value[index + 1]).ok_or_else(|| "UUID is malformed".to_owned())?;
+        bytes[output] = high << 4 | low;
+        output += 1;
+        index += 2;
+    }
+    Ok(bytes)
 }

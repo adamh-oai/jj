@@ -162,6 +162,43 @@ fn test_gitignores_symlinked_ignore_files() -> TestResult {
 }
 
 #[test]
+fn test_gitignores_worktree_relative_excludes_file_path() -> TestResult {
+    let test_env = TestEnvironment::default();
+    let work_dir = test_env.work_dir("repo");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(work_dir.root().join(".git").join("config"))?;
+    file.write_all(b"[core]\nexcludesFile=config/ignores\n")?;
+    drop(file);
+    work_dir.write_file("config/ignores", "file1\nfile2\nfile3\nfile4\n");
+
+    // info/exclude overrides core.excludesFile, and .gitignore overrides both.
+    work_dir.write_file(".git/info/exclude", "!file2\n!file3\n");
+    work_dir.write_file(".gitignore", "file2\n!file4\n");
+    for name in ["file0", "file1", "file2", "file3", "file4"] {
+        work_dir.write_file(name, "contents");
+    }
+
+    // Resolve the excludes file relative to the workspace root when using the
+    // ordinary working copy, including when invoked from a subdirectory.
+    let sub_dir = work_dir.create_dir("sub");
+    let output = sub_dir.run_jj(["diff", "-s"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @"
+    A ../.gitignore
+    A ../config/ignores
+    A ../file0
+    A ../file3
+    A ../file4
+    [EOF]
+    ");
+    Ok(())
+}
+
+#[test]
 fn test_gitignores_ignored_file_in_target_commit() {
     let test_env = TestEnvironment::default();
     test_env

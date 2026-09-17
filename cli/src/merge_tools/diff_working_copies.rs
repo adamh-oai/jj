@@ -171,7 +171,10 @@ pub(crate) async fn check_out_trees(
             exec_change_setting: ExecChangeSetting::Auto,
             fsmonitor_settings: FsmonitorSettings::None,
         };
-        let mut state = TreeState::init(store.clone(), wc_path, state_dir, &tree_state_settings)?;
+        // These tree states live only as long as the temporary diff directory,
+        // so there is no durable working-copy journal to create or recover.
+        let mut state =
+            TreeState::init_without_saving(store.clone(), wc_path, state_dir, &tree_state_settings);
         state.set_sparse_patterns(changed_files.clone())?;
         state.check_out(tree)?;
         Ok(state)
@@ -300,10 +303,13 @@ diff editing in mind and be a little inaccurate.
             .snapshot(&SnapshotOptions {
                 external_sparse_patterns: None,
                 base_ignores,
+                scan_root_ignores: vec![],
                 progress: None,
                 start_tracking_matcher: &EverythingMatcher,
                 force_tracking_matcher: &NothingMatcher,
                 max_new_file_size: u64::MAX,
+                awacs_input_fingerprint: None,
+                awacs_compatible_input_fingerprints: vec![],
             })
             .await?;
         Ok(output_tree_state.current_tree().clone())

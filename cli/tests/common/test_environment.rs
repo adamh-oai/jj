@@ -118,12 +118,28 @@ impl TestEnvironment {
         self.work_dir("").run_jj_with(configure)
     }
 
+    /// Returns the JJ executable used by the integration tests.
+    ///
+    /// A regression can run the same test binary against an earlier JJ build
+    /// by setting `JJ_TEST_JJ_COMMAND` to its absolute path. Ordinary test runs
+    /// use the executable built by Cargo.
+    pub fn jj_executable() -> PathBuf {
+        match std::env::var_os("JJ_TEST_JJ_COMMAND") {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                assert!(path.is_absolute(), "JJ_TEST_JJ_COMMAND must be absolute");
+                path
+            }
+            None => assert_cmd::cargo::cargo_bin!("jj").to_owned(),
+        }
+    }
+
     /// Returns command builder to run `jj` in the test environment.
     ///
     /// Use `run_jj_with()` to run command within customized environment.
     #[must_use]
     pub fn new_jj_cmd(&self) -> assert_cmd::Command {
-        let jj_path = assert_cmd::cargo::cargo_bin!("jj");
+        let jj_path = Self::jj_executable();
         let mut cmd = assert_cmd::Command::new(jj_path);
         cmd.current_dir(&self.env_root);
         cmd.env_clear();

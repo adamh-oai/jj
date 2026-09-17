@@ -120,6 +120,24 @@ pub trait LockedWorkingCopy: Any + Send {
         options: &SnapshotOptions,
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError>;
 
+    /// Check whether an ordinary snapshot can proceed before any related
+    /// repository or working-copy mutation is published.
+    fn check_snapshot_ready(&mut self, _options: &SnapshotOptions) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+
+    /// Snapshot while explicitly establishing or rebuilding an AWACS baseline.
+    ///
+    /// Ordinary snapshots must not silently rebuild a missing baseline. This
+    /// entry point is reserved for commands that deliberately perform the
+    /// potentially expensive initial scan.
+    async fn snapshot_for_awacs_baseline(
+        &mut self,
+        options: &SnapshotOptions,
+    ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
+        self.snapshot(options).await
+    }
+
     /// Check out the specified commit in the working copy.
     async fn check_out(&mut self, commit: &Commit) -> Result<CheckoutStats, CheckoutError>;
 
@@ -132,6 +150,12 @@ pub trait LockedWorkingCopy: Any + Send {
 
     /// Update to another commit without touching the files in the working copy.
     async fn reset(&mut self, commit: &Commit) -> Result<(), ResetError>;
+
+    /// Records a filesystem-monitor clock after the caller has independently
+    /// established that the current tree matches the files on disk.
+    async fn mark_fsmonitor_baseline(&mut self) -> Result<(), SnapshotError> {
+        Ok(())
+    }
 
     /// Update to another commit without touching the files in the working copy,
     /// without assuming that the previous tree exists.
@@ -177,6 +201,12 @@ pub enum SnapshotError {
     /// A tracked path contained invalid component such as `..`.
     #[error(transparent)]
     InvalidRepoPath(#[from] InvalidRepoPathError),
+    /// A filesystem entry name was not valid UTF-8.
+    #[error("Path component {path:?} is not valid UTF-8")]
+    InvalidUtf8Path {
+        /// The path component that could not be represented as a repository path.
+        path: OsString,
+    },
     /// A symlink target in the working copy was not valid UTF-8.
     #[error("Symlink {path} target is not valid UTF-8")]
     InvalidUtf8SymlinkTarget {
@@ -214,7 +244,15 @@ pub struct SnapshotOptions<'a> {
     // because the TreeState may be long-lived if the library is used in a
     // long-lived process.
     pub base_ignores: Arc<GitIgnoreFile>,
-    /// Prefixes materialized by an external sparse Git checkout, if any.
+    /// Ignore files whose paths are relative to the worktree. These are read
+    /// after a backend selects its scan root.
+    pub scan_root_ignores: Vec<PathBuf>,
+    /// Additional sparse prefixes imposed by an external worktree owner.
+    ///
+    /// A colocated Git worktree can omit tracked paths using skip-worktree
+    /// bits without changing JJ's own sparse patterns. Local working copies
+    /// intersect these prefixes with their native sparse matcher so omitted
+    /// Git paths are not mistaken for deletions.
     pub external_sparse_patterns: Option<Vec<RepoPathBuf>>,
     /// A callback for the UI to display progress.
     pub progress: Option<&'a SnapshotProgress<'a>>,
@@ -230,6 +268,12 @@ pub struct SnapshotOptions<'a> {
     /// (depending on implementation)
     /// return `SnapshotError::NewFileTooLarge`.
     pub max_new_file_size: u64,
+    /// Canonical external-input fingerprint required when an immutable AWACS
+    /// cursor is persisted. Other backends ignore it.
+    pub awacs_input_fingerprint: Option<[u8; 32]>,
+    /// Older fingerprints accepted only while advancing an already-committed
+    /// AWACS baseline to the current interpretation model.
+    pub awacs_compatible_input_fingerprints: Vec<[u8; 32]>,
 }
 
 /// A callback for getting progress updates.

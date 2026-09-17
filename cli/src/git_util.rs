@@ -15,6 +15,7 @@
 //! Git utilities shared by various commands.
 
 use std::error;
+use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::iter;
@@ -83,6 +84,70 @@ pub fn is_colocated_git_workspace(workspace: &Workspace) -> Result<bool, Command
         Err(GitRepoAtWorkdirError::Unrelated { .. }) => Ok(false),
         Err(err @ GitRepoAtWorkdirError::Other(_)) => Err(user_error(err)),
     }
+}
+
+/// Checks the effective Git fsmonitor backend without changing user
+/// configuration.
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+pub(crate) fn git_uses_awacs_fsmonitor(git: &Path, root: &Path) -> Result<bool, CommandError> {
+    use std::env;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::process::Command;
+
+    let configured = Command::new(git)
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", "core.fsmonitor"])
+        .output()
+        .map_err(|err| user_error(format!("Failed to read Git fsmonitor configuration: {err}")))?;
+    if configured.status.code() == Some(1) {
+        return Ok(false);
+    }
+    if !configured.status.success() {
+        return Err(user_error("Failed to read Git fsmonitor configuration"));
+    }
+    let configured = String::from_utf8_lossy(&configured.stdout);
+    let configured = configured.trim();
+    let boolean = Command::new(git)
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--type=bool", "--get", "core.fsmonitor"])
+        .output()
+        .map_err(|err| {
+            user_error(format!(
+                "Failed to inspect Git fsmonitor configuration: {err}"
+            ))
+        })?;
+    let uses_awacs = if boolean.status.success() {
+        // Match Git's boolean-true hook selection without changing explicit
+        // false settings or taking ownership of another fsmonitor backend.
+        if boolean.stdout == b"true\n" {
+            let exec_path = Command::new(git)
+                .arg("-C")
+                .arg(root)
+                .arg("--exec-path")
+                .output()
+                .map_err(|err| {
+                    user_error(format!("Failed to resolve Git executable path: {err}"))
+                })?;
+            if !exec_path.status.success() {
+                return Err(user_error("Failed to resolve Git executable path"));
+            }
+            let exec_path = PathBuf::from(String::from_utf8_lossy(&exec_path.stdout).trim());
+            std::iter::once(exec_path)
+                .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default()))
+                .any(|directory| {
+                    fs::metadata(root.join(directory).join("git-fsmonitor-awacs"))
+                        .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o100 != 0)
+                })
+        } else {
+            false
+        }
+    } else {
+        Path::new(configured).file_name() == Some(OsStr::new("git-fsmonitor-awacs"))
+    };
+    Ok(uses_awacs)
 }
 
 /// Parses user-specified remote URL or path to absolute form.

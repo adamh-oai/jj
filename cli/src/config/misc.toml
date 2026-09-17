@@ -8,6 +8,9 @@ ci = ["commit"]
 desc = ["describe"]
 st = ["status"]
 
+[btrfs]
+enabled = false
+
 [diff.color-words]
 conflict = "materialize"
 max-inline-alternation = 3
@@ -36,7 +39,7 @@ color = "auto"
 diff-formatter = ":color-words"
 diff-instructions = true
 graph.style = "curved"
-pager = { command = ["less", "-FRXK"], env = { LESSCHARSET = "utf-8" } }
+pager = { command = ["less", "-FRX"], env = { LESSCHARSET = "utf-8" } }
 paginate = "auto"
 progress-indicator = true
 quiet = false

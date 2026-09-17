@@ -71,6 +71,7 @@ mod test_op_revert_command;
 mod test_operations;
 mod test_parallelize_command;
 mod test_rebase_command;
+mod test_recursive_snapshot;
 mod test_repo_change_report;
 mod test_resolve_command;
 mod test_restore_command;
