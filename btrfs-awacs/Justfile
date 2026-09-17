@@ -1,0 +1,22 @@
+# Publish the main JJ MkDocs site to adamh-oai/jj's gh-pages branch.
+jj-docs-push:
+    #!/bin/sh
+    set -eu
+    cd "{{justfile_directory()}}/.."
+    docs_push_urls=$(git remote get-url --push --all origin)
+    case "$docs_push_urls" in
+        https://github.com/adamh-oai/jj|https://github.com/adamh-oai/jj.git|\
+        git@github.com:adamh-oai/jj|git@github.com:adamh-oai/jj.git|\
+        ssh://git@github.com/adamh-oai/jj|ssh://git@github.com/adamh-oai/jj.git)
+            ;;
+        *)
+            printf '%s\n' 'Refusing to publish: origin must push only to adamh-oai/jj.' >&2
+            exit 1
+            ;;
+    esac
+    # Prepare both commits locally, then push even when mike finds no new changes.
+    uv run -- mike set-default latest --allow-undefined \
+        --config-file mkdocs.pages.yml --remote origin
+    .github/scripts/docs-build-deploy prerelease latest --update-aliases \
+        --config-file mkdocs.pages.yml --remote origin
+    git push --no-follow-tags origin refs/heads/gh-pages:refs/heads/gh-pages
