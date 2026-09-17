@@ -31,6 +31,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use bstr::ByteVec as _;
@@ -223,11 +225,44 @@ pub struct TracingSubscription {
         tracing_subscriber::EnvFilter,
         tracing_subscriber::Registry,
     >,
+    log_to_file: bool,
+    debug_to_stderr: Arc<AtomicBool>,
     _chrome_tracing_flush_guard: ChromeTracingFlushGuard,
 }
 
 impl TracingSubscription {
     const ENV_VAR_NAME: &str = "JJ_LOG";
+    const LOG_FILE_ENV_VAR_NAME: &str = "JJ_LOG_FILE";
+
+    fn log_writer() -> (tracing_subscriber::fmt::writer::BoxMakeWriter, bool) {
+        let Some(filename) = env::var_os(Self::LOG_FILE_ENV_VAR_NAME) else {
+            return (
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr),
+                false,
+            );
+        };
+        let path = PathBuf::from(filename);
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => (
+                tracing_subscriber::fmt::writer::BoxMakeWriter::new(file),
+                true,
+            ),
+            Err(error) => {
+                eprintln!(
+                    "Warning: Failed to open JJ_LOG_FILE {}: {error}; logging to stderr",
+                    path.display()
+                );
+                (
+                    tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr),
+                    false,
+                )
+            }
+        }
+    }
 
     /// Initializes tracing with the default configuration. This should be
     /// called as early as possible.
@@ -266,21 +301,45 @@ impl TracingSubscription {
             Err(_) => (None, ChromeTracingFlushGuard { _inner: None }),
         };
 
+        let (log_writer, log_to_file) = Self::log_writer();
+        let debug_to_stderr = Arc::new(AtomicBool::new(false));
+        let log_layer = if log_to_file {
+            let stderr_enabled = debug_to_stderr.clone();
+            let stderr_layer = tracing_subscriber::fmt::Layer::default().with_writer(
+                std::io::stderr.with_filter(move |_| stderr_enabled.load(Ordering::Acquire)),
+            );
+            tracing_subscriber::fmt::Layer::default()
+                .json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_ansi(false)
+                .with_writer(log_writer)
+                .and_then(stderr_layer)
+                .with_filter(filter)
+                .boxed()
+        } else {
+            tracing_subscriber::fmt::Layer::default()
+                .with_writer(log_writer)
+                .with_filter(filter)
+                .boxed()
+        };
         tracing_subscriber::registry()
-            .with(
-                tracing_subscriber::fmt::Layer::default()
-                    .with_writer(std::io::stderr)
-                    .with_filter(filter),
-            )
+            .with(log_layer)
             .with(chrome_tracing_layer)
             .init();
         Self {
             reload_log_filter,
+            log_to_file,
+            debug_to_stderr,
             _chrome_tracing_flush_guard: chrome_tracing_flush_guard,
         }
     }
 
     pub fn enable_debug_logging(&self) -> Result<(), CommandError> {
+        // Keep the structured log file, and also show readable diagnostics for
+        // an explicit --debug. Gate the writer per event so enabling it after
+        // argument parsing does not depend on cached callsite interest.
+        self.debug_to_stderr.store(true, Ordering::Release);
         self.reload_log_filter
             .modify(|filter| {
                 // The default is INFO.
@@ -4784,6 +4843,15 @@ impl<'a> CliRunner<'a> {
     #[must_use]
     #[instrument(skip(self))]
     pub fn run(mut self) -> u8 {
+        // File logs are newline-delimited JSON shared by concurrent JJ
+        // processes. Keep this ERROR-level span enabled under the initial
+        // filter so later `--debug`/`JJ_LOG` reloads attach pid to every
+        // command event, without changing the human-readable stderr format.
+        let process_span = self
+            .tracing_subscription
+            .log_to_file
+            .then(|| tracing::error_span!("process", pid = std::process::id()));
+        let _process_span_guard = process_span.as_ref().map(tracing::Span::enter);
         // Tell crossterm to ignore NO_COLOR (we check it ourselves)
         crossterm::style::force_color_output(true);
         let config = config_from_environment(self.config_layers.drain(..));

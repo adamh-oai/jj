@@ -1414,3 +1414,112 @@ fn test_debug_logging_enabled() {
     // Luckily, insta will print this in color when reviewing.
     insta::assert_snapshot!(log_line, @"[32m INFO[0m [2mjj_cli::cli_util[0m[2m:[0m debug logging enabled");
 }
+
+#[test]
+fn test_debug_logging_to_file() -> TestResult {
+    let test_env = TestEnvironment::default();
+    let log_file = test_env.env_root().join("jj.log");
+
+    let output = test_env
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_LOG_FILE", &log_file)
+                .args(["version", "--debug"])
+        })
+        .success();
+    let stderr = output.stderr.raw();
+    assert!(stderr.contains("INFO"), "{stderr}");
+    assert!(stderr.contains("jj_cli::cli_util"), "{stderr}");
+    assert!(stderr.contains("debug logging enabled"), "{stderr}");
+    assert!(!stderr.contains("\"fields\":"), "{stderr}");
+    let log = std::fs::read_to_string(log_file)?;
+    let events = log
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .try_collect::<_, Vec<_>, _>()?;
+    let event = events
+        .iter()
+        .find(|event| event["fields"]["message"] == "debug logging enabled")
+        .expect("debug logging event");
+    assert_eq!(event["target"], "jj_cli::cli_util");
+    assert_eq!(event["fields"]["message"], "debug logging enabled");
+    let process_span = event["spans"]
+        .as_array()
+        .expect("span list")
+        .iter()
+        .find(|span| span["name"] == "process")
+        .expect("process identity span");
+    assert!(process_span["pid"].as_u64().is_some());
+    Ok(())
+}
+
+#[test]
+fn test_debug_logging_to_file_without_debug_stays_off_stderr() -> TestResult {
+    let test_env = TestEnvironment::default();
+    let log_file = test_env.env_root().join("jj.log");
+
+    let output = test_env
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_LOG_FILE", &log_file)
+                .env("JJ_LOG", "debug")
+                .args(["git", "init", "repo", "--quiet"])
+        })
+        .success();
+    assert!(output.stderr.raw().is_empty());
+    let log = std::fs::read_to_string(log_file)?;
+    let events = log
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .try_collect::<_, Vec<_>, _>()?;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event["level"].as_str(), Some("INFO" | "DEBUG")))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_debug_logging_invalid_file_falls_back_to_stderr() {
+    let test_env = TestEnvironment::default();
+    let log_file = test_env.env_root().join("missing/jj.log");
+
+    let output = test_env
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_LOG_FILE", &log_file)
+                .args(["version", "--debug"])
+        })
+        .success();
+    let stderr = output.stderr.raw();
+    assert!(stderr.contains("Failed to open JJ_LOG_FILE"), "{stderr}");
+    assert!(stderr.contains("logging to stderr"), "{stderr}");
+    assert_eq!(stderr.matches("debug logging enabled").count(), 1);
+    assert!(!stderr.contains("\"fields\":"), "{stderr}");
+    assert!(!log_file.exists());
+}
+
+#[test]
+fn test_debug_logging_filter_does_not_filter_trace() -> TestResult {
+    let test_env = TestEnvironment::default();
+    let log_file = test_env.env_root().join("jj.log");
+    let trace_file = test_env.env_root().join("trace.json");
+
+    let output = test_env
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_LOG_FILE", &log_file)
+                .env("JJ_LOG", "off")
+                .env("JJ_TRACE", &trace_file)
+                .arg("version")
+        })
+        .success();
+    assert!(output.stderr.raw().is_empty());
+    assert!(std::fs::read_to_string(log_file)?.is_empty());
+    let trace: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(trace_file)?)?;
+    assert!(
+        trace
+            .as_array()
+            .expect("trace event array")
+            .iter()
+            .any(|event| event["name"] == "cmd_version")
+    );
+    Ok(())
+}
