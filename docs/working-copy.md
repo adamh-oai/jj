@@ -86,6 +86,50 @@ registers a distinct working-copy commit at the worktree's existing Git HEAD,
 and then snapshots any local changes without rewriting the worktree files,
 Git HEAD, or index.
 
+Run `jj util subvolume enable` in a Git-colocated workspace to build a
+snapshot-backed replacement checkout at a unique sibling path. The repository
+root, `.git` directory (when present), and `.jj` directory become separate Btrfs
+subvolumes. Root snapshots then omit both metadata stores, avoiding a recursive
+copy and deletion of `.jj` when creating another workspace. Existing metadata
+subvolumes are snapshotted separately when initializing the replacement checkout.
+
+The command does not rename the source while copying, building, or establishing
+the initial baseline. Only after initialization succeeds does it rename the
+original checkout aside and activate the initialized checkout at the original
+path. It keeps the displaced original as a visible sibling and prints both the
+command to enter the activated checkout and a command to delete the original
+after it has been verified. By default it removes partial staged checkouts
+after a failed initialization; pass `--keep` to retain a failed staging
+checkout for inspection. If initialization fails or is interrupted, the
+original path is untouched.
+Running `enable` again upgrades older enabled checkouts whose `.jj` is still a
+plain directory using the same replacement and retention procedure. A linked
+workspace requires the main workspace to have subvolume mode enabled first.
+Passing `--compress=true` or `--compress=false` sets the corresponding
+Btrfs compression property on the newly created root, `.git`, and `.jj` subvolumes
+and copies file data instead of reflinking it, so existing extents are
+rewritten under the requested policy.
+
+While that mode is enabled, `jj workspace add` creates a Btrfs snapshot of the
+current checkout automatically. This preserves already-materialized files such as
+ignored build outputs while assigning the new workspace its own `.jj` metadata.
+In a Git-colocated repo, the command also creates a new linked Git worktree
+identity without rewriting the copied files. Run `jj util subvolume disable`
+to convert `.git` and `.jj` back to ordinary directories before converting the
+repository root. Workspace deletion uses the Btrfs subvolume-destroy ioctl for
+subvolumes, removing nested subvolumes before their parent.
+
+`jj workspace adopt` can also attach an existing linked Git worktree while
+subvolume mode is enabled, but only if that worktree root is already a Btrfs
+subvolume. Adoption records the inherited files as the initial snapshot
+baseline without rewriting them; it rejects a plain directory rather than
+silently creating a non-snapshot-backed workspace.
+
+The linked Git worktree may check out a different ref after the child
+subvolume is created. Adoption still binds the copied JJ tree to the initial
+immutable snapshot first, then its normal snapshot reconciles that baseline
+to the Git checkout through the authenticated filesystem delta.
+
 Having multiple workspaces can be useful for running long-running tests in one
 while you continue developing in another, for example. If needed,
 `jj workspace root --name <workspace>` prints the root path of the specified
@@ -99,11 +143,16 @@ useful when the workspace path is no longer accessible or when you want to keep
 the files around.
 
 Use `jj workspace remove` to forget a workspace and remove its directory from
-disk. Tracked changes are snapshotted before the directory is removed, but
-ignored files in that directory are deleted. The main workspace cannot be
-removed. Removing the current workspace works on Unix, but Windows won't remove
-a directory that a process is running in; run the command from another directory
-using `jj -R` instead.
+disk. Ordinary working copies are snapshotted before removal, but ignored files
+in that directory are deleted. The main workspace cannot be removed. Removing
+an ordinary current workspace works on Unix, but Windows won't remove a directory
+that a process is running in; run the command from another directory using
+`jj -R` instead.
+
+Snapshot-backed and Btrfs-subvolume workspaces must have no unsnapshotted changes
+and cannot be removed from within the current workspace. Nested subvolumes are
+removed before their parent. Unprivileged subvolume deletion requires the Btrfs
+filesystem to be mounted with `user_subvol_rm_allowed`.
 
 ## Stale working copy
 
