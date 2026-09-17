@@ -1,3 +1,67 @@
+# List the available documentation workflows.
+default:
+    @just --list
+
+# Run the focused AWACS tests with deterministic terminal settings.
+test:
+    env -u NO_COLOR TERM=xterm-256color cargo test -p btrfs-awacs
+
+# Run the whole JJ workspace suite when changes extend beyond btrfs-awacs.
+test-workspace:
+    env -u NO_COLOR TERM=xterm-256color cargo test --workspace
+
+# Run the real-Btrfs working-copy tests against the installed broker.
+test-e2e:
+    @set -eu; \
+        test_root="${JJ_TEST_BTRFS_ROOT:-{{justfile_directory()}}/target/btrfs-awacs-e2e}"; \
+        awacs_command="${BTRFS_AWACS_COMMAND:-/opt/awacs/bin/awacs}"; \
+        broker_directory="${BTRFS_AWACS_BROKER_DIR:-/tmp/btrfs-awacs-broker}"; \
+        mkdir -p "$test_root"; \
+        unset NO_COLOR BTRFS_AWACS_STATE_DIR BTRFS_AWACS_STATE_ROOT BTRFS_AWACS_MANAGED_DIR; \
+        export TERM=xterm-256color \
+            JJ_TEST_BTRFS_ROOT="$test_root" \
+            BTRFS_AWACS_COMMAND="$awacs_command" \
+            BTRFS_AWACS_BROKER_DIR="$broker_directory" \
+            BTRFS_AWACS_BROKER_SOCKET="$broker_directory"; \
+        cargo test -p jj-cli --features awacs --test runner \
+            test_workspaces:: -- --ignored --test-threads=1; \
+        cargo test -p btrfs-awacs --lib btrfs::tests::remove_tree_ \
+            -- --ignored --test-threads=1
+
+# Build and install the live-testing toolchain in /opt/awacs with the fast dev-opt profile.
+install:
+    ./install.sh dev-opt
+
+# Build and install release binaries in /opt/awacs for final profile-specific checks.
+install-release:
+    ./install.sh release
+
+# Install the exact documentation dependencies recorded in docs/package-lock.json.
+docs-install:
+    npm ci --prefix docs --no-audit --no-fund
+
+# Check the documentation site's Astro configuration, content, and types.
+docs-check:
+    npm run --prefix docs check
+
+# Build the static Starlight site into docs/dist/.
+docs-build:
+    npm run --prefix docs build
+
+# Rebuild the complete documentation site from a clean, locked installation.
+docs-rebuild: docs-install docs-check docs-build
+
+# Rebuild the complete documentation site.
+docs: docs-rebuild
+
+# Run the local documentation development server.
+docs-dev:
+    npm run --prefix docs dev
+
+# Preview the built static documentation site locally.
+docs-preview:
+    npm run --prefix docs preview
+
 # Publish the main JJ MkDocs site to adamh-oai/jj's gh-pages branch.
 jj-docs-push:
     #!/bin/sh
