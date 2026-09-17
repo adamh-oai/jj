@@ -425,11 +425,42 @@ async fn converge_parents(
         create_value_merge(graph, &excluded_divergent_commits, get_parents_fn).await?;
     if let Some(value) = value_merge.resolve_trivial(SameChange::Accept) {
         Ok(ConvergedAttribute::Solved(value.clone()))
+    } else if let Some(parent) = infer_descendant_parent(graph, &viable_commits).await? {
+        Ok(ConvergedAttribute::Solved(vec![parent]))
     } else {
         Ok(ConvergedAttribute::Unsolved {
             base_commit,
             excluded_divergent_commits,
         })
+    }
+}
+
+/// If all viable divergent versions are based on one linear parent history,
+/// prefer its descendant-most parent.
+///
+/// This handles the common case where otherwise-equivalent divergent versions
+/// were rebased onto an older and a newer version of the same trunk.
+async fn infer_descendant_parent(
+    graph: &TruncatedEvolutionGraph,
+    viable_commits: &HashSet<CommitId>,
+) -> Result<Option<CommitId>, ConvergeError> {
+    let parent_ids = graph
+        .divergent_commits()
+        .iter()
+        .filter(|commit| viable_commits.contains(commit.id()))
+        .flat_map(|commit| commit.parent_ids().iter().cloned())
+        .unique()
+        .collect_vec();
+    if parent_ids.is_empty() {
+        return Ok(None);
+    }
+    let heads_expression = RevsetExpression::commits(parent_ids).heads();
+    let mut heads = heads_expression.evaluate(graph.repo().deref())?.stream();
+    let first_head = heads.try_next().await?;
+    if first_head.is_some() && heads.try_next().await?.is_none() {
+        Ok(first_head)
+    } else {
+        Ok(None)
     }
 }
 

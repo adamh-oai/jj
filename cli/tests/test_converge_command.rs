@@ -12,1062 +12,853 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use test_case::test_case;
-use testutils::TestResult;
-
-use crate::common::CommandOutput;
 use crate::common::TestEnvironment;
 use crate::common::TestWorkDir;
 use crate::common::create_commit_with_files;
-use crate::common::force_interactive;
 
-// `jj converge` must runs successfully when there are no divergent changes and
-// prints a message to stderr.
+fn create_simple_divergence(work_dir: &TestWorkDir) {
+    work_dir.run_jj(["describe", "-m", "left"]).success();
+    work_dir
+        .run_jj(["describe", "-m", "right", "--at-op=@-"])
+        .success();
+    // Integrate the concurrent operations before invoking converge.
+    work_dir.run_jj(["status"]).success();
+}
+
+fn create_automatic_divergence(work_dir: &TestWorkDir, description: &str) {
+    work_dir.run_jj(["describe", "-m", description]).success();
+    work_dir
+        .run_jj([
+            "metaedit",
+            "--author-timestamp",
+            "2001-02-03T04:05:14+07:00",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "metaedit",
+            "--author-timestamp",
+            "2001-02-03T04:05:15+07:00",
+            "--at-op=@-",
+        ])
+        .success();
+    // Integrate the concurrent operations before invoking converge.
+    work_dir.run_jj(["status"]).success();
+}
+
+fn create_two_automatic_divergences(work_dir: &TestWorkDir) {
+    create_automatic_divergence(work_dir, "first");
+    work_dir.run_jj(["new", "root()", "-m", "second"]).success();
+    create_automatic_divergence(work_dir, "second");
+}
+
+fn create_stacked_automatic_divergences(work_dir: &TestWorkDir) {
+    work_dir.run_jj(["describe", "-m", "parent"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "parent"])
+        .success();
+    work_dir.run_jj(["new", "-m", "child"]).success();
+    work_dir
+        .run_jj([
+            "metaedit",
+            "--author-timestamp",
+            "2001-02-03T04:05:14+07:00",
+            "parent",
+        ])
+        .success();
+    work_dir
+        .run_jj([
+            "metaedit",
+            "--author-timestamp",
+            "2001-02-03T04:05:15+07:00",
+            "parent",
+            "--at-op=@-",
+        ])
+        .success();
+    // Integrate the concurrent operations before invoking converge.
+    work_dir.run_jj(["status"]).success();
+}
+
+fn create_stacked_parent_description_divergence(work_dir: &TestWorkDir) {
+    work_dir.run_jj(["describe", "-m", "parent"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "parent"])
+        .success();
+    work_dir.run_jj(["new", "-m", "child"]).success();
+    work_dir
+        .run_jj(["describe", "-r", "parent", "-m", "left"])
+        .success();
+    work_dir
+        .run_jj(["describe", "-r", "parent", "-m", "right", "--at-op=@-"])
+        .success();
+    // Integrate the concurrent operations before invoking converge.
+    work_dir.run_jj(["status"]).success();
+}
+
+fn create_merge_parent_divergence(work_dir: &TestWorkDir) {
+    work_dir.run_jj(["describe", "-m", "first"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "first"])
+        .success();
+    work_dir.run_jj(["new", "root()", "-m", "second"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "-r@", "second"])
+        .success();
+    work_dir
+        .run_jj(["new", "first", "second", "-m", "base"])
+        .success();
+    work_dir.run_jj(["describe", "-m", "left"]).success();
+    work_dir
+        .run_jj(["describe", "-m", "right", "--at-op=@-"])
+        .success();
+    work_dir.run_jj(["status"]).success();
+}
+
+fn create_author_divergence(work_dir: &TestWorkDir) {
+    work_dir
+        .run_jj(["metaedit", "--author", "Left <left@example.com>"])
+        .success();
+    work_dir
+        .run_jj([
+            "metaedit",
+            "--author",
+            "Right <right@example.com>",
+            "--at-op=@-",
+        ])
+        .success();
+    work_dir.run_jj(["status"]).success();
+}
+
+#[test]
+fn test_converge_creates_one_linear_solution() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-m", "merged"]);
+    assert!(output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("Converged change qpvuntsm"),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj([
+        "log",
+        "-r@",
+        "--no-graph",
+        "-T",
+        "change_id.short(8) ++ \" \" ++ parents.len() ++ \" \" ++ description.first_line() ++ \"\\n\"",
+    ]);
+    assert_eq!(output.stdout.raw(), "qpvuntsm 1 merged\n");
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_eq!(output.stdout.raw(), "");
+
+    let output = work_dir.run_jj([
+        "evolog",
+        "-r@",
+        "--no-graph",
+        "-T",
+        "predecessors.len() ++ \"\\n\"",
+    ]);
+    assert_eq!(output.stdout.raw().lines().next(), Some("2"));
+}
+
+#[test]
+fn test_converge_edits_conflicting_descriptions() {
+    let mut test_env = TestEnvironment::default();
+    let edit_script = test_env.set_up_fake_editor();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+    std::fs::write(
+        edit_script,
+        ["dump converge-editor", "write\nmerged from editor"].join("\0"),
+    )
+    .unwrap();
+
+    let output = work_dir.run_jj(["converge", "-i"]);
+    assert!(output.status.success(), "{output}");
+    let editor_input =
+        std::fs::read_to_string(test_env.env_root().join("converge-editor")).unwrap();
+    assert!(
+        editor_input.contains("<<<<<<< divergent descriptions\n%%%%%%% base"),
+        "{editor_input}"
+    );
+
+    let output = work_dir.run_jj([
+        "log",
+        "-r@",
+        "--no-graph",
+        "-T",
+        "description.first_line() ++ \"\\n\"",
+    ]);
+    assert_eq!(output.stdout.raw(), "merged from editor\n");
+}
+
+#[test]
+fn test_converge_reports_unresolved_description_non_interactively() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Cannot converge non-interactively"),
+        "{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Unresolved description: use --message-from <commit-id> or -m <message>"),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_ne!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_dry_run_json_reports_unresolved_choices() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "--dry-run", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let plan: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(plan["ready"], false);
+    assert_eq!(plan["unresolved"][0]["kind"], "description");
+    assert_eq!(
+        plan["unresolved"][0]["resolve_with"],
+        "--message-from <commit-id> or -m <message>"
+    );
+    assert_eq!(plan["blocked"].as_array().unwrap().len(), 0);
+    assert_eq!(plan["divergent_commits"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_converge_dry_run_formats_needs_and_inspection_commands() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_merge_parent_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "--dry-run"]);
+    assert!(output.status.success(), "{output}");
+    assert!(output.stderr.raw().contains("  NEEDS_INPUT"), "{output}");
+    assert!(output.stderr.raw().contains("  needs:"), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("description: --message-from <commit-id> or -m <message>"),
+        "{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("parent     : --onto <commit-id>"),
+        "{output}"
+    );
+    assert!(output.stderr.raw().contains("  inspect:"), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("descriptions: jj log -r 'commit_id("),
+        "{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("parents    : jj log -r 'commit_id("),
+        "{output}"
+    );
+}
+
+#[test]
+fn test_converge_dry_run_json_reports_ready_plan_without_rewriting() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "--dry-run", "--json", "-m", "merged"]);
+    assert!(output.status.success(), "{output}");
+    let plan: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(plan["ready"], true);
+    assert_eq!(plan["may_conflict"], false);
+    assert_eq!(plan["unresolved"].as_array().unwrap().len(), 0);
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_ne!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_multiple_changes_non_interactively() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_two_automatic_divergences(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-r", "divergent()"]);
+    assert!(output.status.success(), "{output}");
+    assert_eq!(
+        output.stderr.raw().matches("Converged change").count(),
+        1,
+        "{output}"
+    );
+    let output = work_dir.run_jj(["converge", "-r", "divergent()"]);
+    assert!(output.status.success(), "{output}");
+    assert_eq!(output.stderr.raw().matches("Converged change").count(), 1);
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_eq!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_multiple_changes_processes_ancestors_first() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_stacked_automatic_divergences(&work_dir);
+
+    let output = work_dir.run_jj([
+        "log",
+        "-r",
+        "divergent()",
+        "--no-graph",
+        "-T",
+        "description.first_line() ++ \" \" ++ change_id.short(8) ++ \"\\n\"",
+    ]);
+    let parent_change_id = output
+        .stdout
+        .raw()
+        .lines()
+        .find_map(|line| line.strip_prefix("parent "))
+        .unwrap();
+    let child_change_id = output
+        .stdout
+        .raw()
+        .lines()
+        .find_map(|line| line.strip_prefix("child "))
+        .unwrap();
+
+    let output = work_dir.run_jj(["converge", "-r", "divergent()"]);
+    assert!(output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains(&format!("Converged change {parent_change_id}")),
+        "{output}"
+    );
+    assert!(
+        !output
+            .stderr
+            .raw()
+            .contains(&format!("Converged change {child_change_id}")),
+        "{output}"
+    );
+    let output = work_dir.run_jj(["converge", "-r", "divergent()"]);
+    assert!(output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains(&format!("Converged change {child_change_id}")),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_eq!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_multiple_changes_dry_run_reports_only_bottom_issue() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_stacked_automatic_divergences(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-r", "divergent()", "--dry-run"]);
+    assert!(output.status.success(), "{output}");
+    assert_eq!(
+        output.stderr.raw().matches("  DEFERRED").count(),
+        0,
+        "{output}"
+    );
+    assert_eq!(
+        output.stderr.raw().matches("  READY").count(),
+        1,
+        "{output}"
+    );
+}
+
+#[test]
+fn test_converge_multiple_changes_hides_descendants_of_unresolved_change() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_stacked_parent_description_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-r", "divergent()"]);
+    assert!(!output.status.success(), "{output}");
+    assert_eq!(
+        output.stderr.raw().matches("  DEFERRED").count(),
+        0,
+        "{output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("    description: --message-from <commit-id> or -m <message>")
+    );
+}
+
+#[test]
+fn test_converge_multiple_changes_skips_unresolved() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+    work_dir.run_jj(["new", "root()", "-m", "second"]).success();
+    create_automatic_divergence(&work_dir, "second");
+
+    let output = work_dir.run_jj(["converge"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Cannot converge non-interactively"),
+        "{output}"
+    );
+    assert_eq!(
+        output.stderr.raw().matches("Converged change").count(),
+        0,
+        "{output}"
+    );
+
+    let output = work_dir.run_jj([
+        "log",
+        "-r",
+        "divergent()",
+        "--no-graph",
+        "-T",
+        "description.first_line() ++ \"\\n\"",
+    ]);
+    let mut descriptions = output.stdout.raw().lines().collect::<Vec<_>>();
+    descriptions.sort_unstable();
+    assert_eq!(descriptions, vec!["left", "right", "second", "second"]);
+}
+
+#[test]
+fn test_converge_multiple_changes_dry_run_json() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_two_automatic_divergences(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "--dry-run", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let plan: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(plan["kind"], "divergence");
+    assert_eq!(plan["status"], "ready");
+    assert_eq!(plan["ready"], true);
+    assert!(plan.get("deferred").is_none());
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_ne!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_json_resolves_safe_divergence_then_reports_clean() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_automatic_divergence(&work_dir, "safe");
+
+    let output = work_dir.run_jj(["converge", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(result["kind"], "divergence");
+    assert_eq!(result["status"], "resolved");
+    assert_eq!(result["has_conflicts"], false);
+
+    let output = work_dir.run_jj(["converge", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(result["status"], "clean");
+}
+
+#[test]
+fn test_converge_revision_is_stack_scope() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_stacked_automatic_divergences(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-r", "@", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(result["status"], "resolved");
+    assert_eq!(result["kind"], "divergence");
+}
+
+#[test]
+fn test_converge_json_reports_bottom_conflict_instructions() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_commit_with_files(&work_dir, "base", &[], &[("file", "base\n")]);
+    create_commit_with_files(&work_dir, "a", &["base"], &[("file", "a\n")]);
+    create_commit_with_files(&work_dir, "b", &["base"], &[("file", "b\n")]);
+    create_commit_with_files(&work_dir, "conflict", &["a", "b"], &[]);
+
+    let output = work_dir.run_jj(["converge", "--json"]);
+    assert!(!output.status.success(), "{output}");
+    let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(result["kind"], "conflict");
+    assert_eq!(result["status"], "needs_manual_resolution");
+    assert_eq!(result["paths"][0], "file");
+    assert!(
+        result["resolve_with"]["start"]
+            .as_str()
+            .unwrap()
+            .starts_with("jj new ")
+    );
+    assert_eq!(
+        result["resolve_with"]["finish"],
+        "jj squash --use-destination-message"
+    );
+}
+
+#[test]
+fn test_converge_json_reports_conflict_before_divergent_descendant() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_commit_with_files(&work_dir, "base", &[], &[("file", "base\n")]);
+    create_commit_with_files(&work_dir, "a", &["base"], &[("file", "a\n")]);
+    create_commit_with_files(&work_dir, "b", &["base"], &[("file", "b\n")]);
+    create_commit_with_files(&work_dir, "conflict", &["a", "b"], &[]);
+    work_dir.run_jj(["new", "-m", "child"]).success();
+    create_automatic_divergence(&work_dir, "child");
+
+    let output = work_dir.run_jj(["converge", "--json"]);
+    assert!(!output.status.success(), "{output}");
+    let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(result["kind"], "conflict");
+    assert_eq!(result["status"], "needs_manual_resolution");
+}
+
+#[test]
+fn test_converge_multiple_changes_rejects_overrides() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_two_automatic_divergences(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-m", "merged"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("--message cannot be used with multiple divergent changes"),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj(["converge", "-i"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("--interactive cannot be used with multiple divergent changes"),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_ne!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_message_from_resolves_description() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "--message-from", "@"]);
+    assert!(output.status.success(), "{output}");
+
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_eq!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_exact_resolution_emits_json_result() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-m", "merged", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(result["kind"], "divergence");
+    assert_eq!(result["status"], "resolved");
+}
+
+#[test]
+fn test_converge_author_from_resolves_author() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_author_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Unresolved author: use --author-from <commit-id>"),
+        "{output}"
+    );
+
+    let output = work_dir.run_jj(["converge", "--author-from", "@"]);
+    assert!(output.status.success(), "{output}");
+    let output = work_dir.run_jj(["log", "-r", "divergent()", "--no-graph"]);
+    assert_eq!(output.stdout.raw(), "");
+}
+
+#[test]
+fn test_converge_reports_implicit_merge_solution_non_interactively() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_merge_parent_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-m", "merged"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Unresolved parent: use --onto <commit-id>"),
+        "{output}"
+    );
+}
+
+#[test]
+fn test_converge_onto_linearizes_merge_parent_solution() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_merge_parent_divergence(&work_dir);
+
+    let output = work_dir.run_jj(["converge", "-m", "merged", "--onto", "first"]);
+    assert!(output.status.success(), "{output}");
+
+    let output = work_dir.run_jj([
+        "log",
+        "-r@",
+        "--no-graph",
+        "-T",
+        "parents.len() ++ \" \" ++ parents.first().description().first_line() ++ \"\\n\"",
+    ]);
+    assert_eq!(output.stdout.raw(), "1 first\n");
+}
+
+#[test]
+fn test_converge_is_the_only_command_name() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    let output = work_dir.run_jj(["resolve-divergence"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("unrecognized subcommand 'resolve-divergence'"),
+        "{output}"
+    );
+}
+
+// Retain the upstream graph scenarios while asserting the local command's
+// non-interactive cleanup contract instead of upstream's interactive output.
 #[test]
 fn test_converge_no_divergence() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
-
-    // Set up commit graph (without divergent changes)
     create_commit_with_files(&work_dir, "a", &[], &[("file1", "a")]);
     create_commit_with_files(&work_dir, "b", &["a"], &[("file2", "b")]);
     create_commit_with_files(&work_dir, "c", &["a"], &[("file3", "c")]);
 
-    // Test the setup
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  c  royxmykx  78dcec21 - description: c
-    │ ○  b  zsuskuln  056564da - description: b
-    ├─╯
-    ○  a  rlvkpnrz  3b93fc14 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Run `jj converge` command and check the output.
-    let output = work_dir.run_jj(["converge"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    No revisions were found to be divergent with each other in revsets.converge: mutable() & divergent()
-    Hint: Multiple revisions in the search space must have the same change ID to be considered divergent.
-    [EOF]
-    ");
+    let before = converge_log_value(&work_dir, "all()", "commit_id ++ '\n'");
+    let output = work_dir.run_jj(["converge", "--no-interactive"]).success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("No divergent changes or content conflicts found.")
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "all()", "commit_id ++ '\n'"),
+        before
+    );
 }
 
-// A simple `jj converge` scenario where there is a single divergent change with
-// two visible commits. In this setup no user input is required.
+fn create_rebased_divergence(work_dir: &TestWorkDir) {
+    create_commit_with_files(work_dir, "a", &[], &[("file1", "1")]);
+    create_commit_with_files(work_dir, "b2", &["a"], &[("file2", "2")]);
+    create_commit_with_files(work_dir, "c", &["a"], &[("file3", "3")]);
+    work_dir.run_jj(["rebase", "-r", "b2", "-o", "c"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
+        .success();
+    create_commit_with_files(work_dir, "d", &["b1"], &[("file4", "4")]);
+}
+
+#[test]
+fn test_converge_hints_when_only_one_divergent_revision_is_selected() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_simple_divergence(&work_dir);
+
+    let output = work_dir.run_jj([
+        "converge",
+        "--revisions",
+        "latest(divergent())",
+        "--onto",
+        "root()",
+    ]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("jj converge -r 'change_id("),
+        "{output}"
+    );
+}
+
+
 #[test]
 fn test_converge_simple() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
+    create_rebased_divergence(&work_dir);
 
-    // Set up commit graph with one divergent change (with two visible commits).
-    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
-    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
-    create_commit_with_files(&work_dir, "c", &["a"], &[("file3", "3")]);
-    work_dir.run_jj(["rebase", "-r", "b2", "-o", "c"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
-        .success();
-    create_commit_with_files(&work_dir, "d", &["b1"], &[("file4", "4")]);
-
-    // Test the setup: look at the commit graph, commit B is duplicated
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d  znkkpsqq  bf5126ef - description: d
-    ○  b1  zsuskuln/1  59a77004 - description: b2
-    │ ○  b2  zsuskuln/0  2c2bd25d - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○  zsuskuln/0 2c2bd25d (divergent) b2
-    ○  zsuskuln/1 59a77004 (divergent) b2
-    ○  zsuskuln/2 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-
-    // Run `jj converge` command and check the output. In this case no user input is
-    // needed.
-    let output = work_dir.run_jj(["converge"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    Attempting to converge change zsuskulnrvyr...
-
-    Successfully converged change: created commit 6b1ce5bc4cbe.
-    Rebased 1 descendants
-    Working copy  (@) now at: znkkpsqq 696cf5e0 d | d
-    Parent commit (@-)      : zsuskuln 6b1ce5bc b1 b2 | b2
-    Added 1 files, modified 0 files, removed 0 files
-    [EOF]
-    ");
-
-    // Verify the commit graph after converge
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d  znkkpsqq  696cf5e0 - description: d
-    ○  b1 b2  zsuskuln  6b1ce5bc - description: b2
-    ○  c  royxmykx  4343fc61 - description: c
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○    zsuskuln 6b1ce5bc b2
-    ├─╮
-    ○ │  zsuskuln/1 2c2bd25d (hidden) b2
-    ├─╯
-    ○  zsuskuln/2 59a77004 (hidden) b2
-    ○  zsuskuln/3 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
+    work_dir.run_jj(["converge"]).success();
+    assert_eq!(
+        converge_log_value(&work_dir, "divergent()", "commit_id"),
+        ""
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "b1", "commit_id"),
+        converge_log_value(&work_dir, "b2", "commit_id")
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "b1-", "commit_id"),
+        converge_log_value(&work_dir, "c", "commit_id")
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "d-", "commit_id"),
+        converge_log_value(&work_dir, "b1", "commit_id")
+    );
+    assert_eq!(converge_predecessor_count(&work_dir, "b1"), "2");
+    for (path, contents) in [
+        ("file1", "1"),
+        ("file2", "2"),
+        ("file3", "3"),
+        ("file4", "4"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(work_dir.root().join(path)).unwrap(),
+            contents
+        );
+    }
 }
 
-// When there are multiple divergent changes, the command must prompt the user
-// to select one of them. When running in non-interactive mode (jj converge
-// --no-interactive) this is not possible.
-#[test]
-fn test_converge_two_divergent_changes_in_non_interactive_mode() {
-    let test_env = TestEnvironment::default();
-    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
-    let work_dir = test_env.work_dir("repo");
-
-    // Set up: first create a base commit
-    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
-
-    // Set up: create commit graph with two divergent changes
-    // First divergent change:
-    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
-    create_commit_with_files(&work_dir, "c", &["a"], &[("file3", "3")]);
-    work_dir.run_jj(["rebase", "-r", "b2", "-o", "c"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
-        .success();
-    create_commit_with_files(&work_dir, "d", &["b1"], &[("file4", "4")]);
-
-    // Second divergent change:
-    create_commit_with_files(&work_dir, "e2", &["a"], &[("file5", "5")]);
-    create_commit_with_files(&work_dir, "f", &["a"], &[("file6", "6")]);
-    work_dir.run_jj(["rebase", "-r", "e2", "-o", "f"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "e1", "-r", "at_operation(@-, e2)"])
-        .success();
-    create_commit_with_files(&work_dir, "g", &["e1"], &[("file7", "7")]);
-
-    // Test the setup: look at the commit graph (commit B is duplicated and commit E
-    // is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  g  xznxytkn  46658cae - description: g
-    ○  e1  kmkuslsw/1  15962bae - description: e2
-    │ ○  e2  kmkuslsw/0  b54f15d8 - description: e2
-    │ ○  f  lylxulpl  d50e2761 - description: f
-    ├─╯
-    │ ○  b2  zsuskuln/0  2c2bd25d - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    │ ○  d  znkkpsqq  bf5126ef - description: d
-    │ ○  b1  zsuskuln/1  59a77004 - description: b2
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Pass --non-interactive to jj converge command.
-    let output =
-        work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge", "--no-interactive"]));
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 2 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    - Change: kmkuslswpqwq with 2 commits:
-        kmkuslsw/0 b54f15d8 e2 | (divergent) e2
-        kmkuslsw/1 15962bae e1 | (divergent) e2
-
-    Error: Cannot automatically choose which change to converge
-    Hint: Run `jj converge` in interactive mode, or specify a revset that resolves to only one change ID
-    [EOF]
-    [exit status: 1]
-    ");
-
-    // Note: in the test environment jj commands run in non-interactive (quiet) mode
-    // by default, so the following also fails but for a different reason: it
-    // cannot prompt the user
-    let output = work_dir.run_jj(["converge"]);
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 2 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    - Change: kmkuslswpqwq with 2 commits:
-        kmkuslsw/0 b54f15d8 e2 | (divergent) e2
-        kmkuslsw/1 15962bae e1 | (divergent) e2
-
-    Choose which change to converge (jj converge only converges one change at a time):
-    1: zsuskulnrvyr
-    2: kmkuslswpqwq
-    q: abort
-    Error: Cannot prompt for input since the output is not connected to a terminal
-    [EOF]
-    [exit status: 1]
-    ");
-
-    // Note: the invocation also fails if stdin is not connected to a terminal
-    let output = work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge"]));
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 2 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    - Change: kmkuslswpqwq with 2 commits:
-        kmkuslsw/0 b54f15d8 e2 | (divergent) e2
-        kmkuslsw/1 15962bae e1 | (divergent) e2
-
-    Choose which change to converge (jj converge only converges one change at a time):
-    1: zsuskulnrvyr
-    2: kmkuslswpqwq
-    q: abort
-    Enter the index of the change to converge: Error: Prompt canceled by EOF
-    [EOF]
-    [exit status: 1]
-    ");
-}
-
-// This tests scenarios where there are two divergent changes. The command
-// prompts the user to choose which change to converge.
-#[test]
-fn test_converge_two_divergent_changes() {
-    let test_env = TestEnvironment::default();
-    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
-    let work_dir = test_env.work_dir("repo");
-
-    // Set up: first create a base commit
-    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
-
-    // Set up: create commit graph with two divergent changes
-    // First divergent change:
-    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
-    create_commit_with_files(&work_dir, "c", &["a"], &[("file3", "3")]);
-    work_dir.run_jj(["rebase", "-r", "b2", "-o", "c"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
-        .success();
-    create_commit_with_files(&work_dir, "d", &["b1"], &[("file4", "4")]);
-
-    // Second divergent change:
-    create_commit_with_files(&work_dir, "e2", &["a"], &[("file5", "5")]);
-    create_commit_with_files(&work_dir, "f", &["a"], &[("file6", "6")]);
-    work_dir.run_jj(["rebase", "-r", "e2", "-o", "f"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "e1", "-r", "at_operation(@-, e2)"])
-        .success();
-    create_commit_with_files(&work_dir, "g", &["e1"], &[("file7", "7")]);
-
-    // Test the setup: look at the commit graph (commit B is duplicated and commit E
-    // is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  g  xznxytkn  46658cae - description: g
-    ○  e1  kmkuslsw/1  15962bae - description: e2
-    │ ○  e2  kmkuslsw/0  b54f15d8 - description: e2
-    │ ○  f  lylxulpl  d50e2761 - description: f
-    ├─╯
-    │ ○  b2  zsuskuln/0  2c2bd25d - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    │ ○  d  znkkpsqq  bf5126ef - description: d
-    │ ○  b1  zsuskuln/1  59a77004 - description: b2
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○  zsuskuln/0 2c2bd25d (divergent) b2
-    ○  zsuskuln/1 59a77004 (divergent) b2
-    ○  zsuskuln/2 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "e2"), @"
-    ○  kmkuslsw/0 b54f15d8 (divergent) e2
-    ○  kmkuslsw/1 15962bae (divergent) e2
-    ○  kmkuslsw/2 843de29d (hidden) (empty) e2
-    [EOF]
-    ");
-
-    // If the user chooses to abort the converge operation nothing changes.
-    let output = work_dir
-        .run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("q\n"))
-        .success();
-
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 2 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    - Change: kmkuslswpqwq with 2 commits:
-        kmkuslsw/0 b54f15d8 e2 | (divergent) e2
-        kmkuslsw/1 15962bae e1 | (divergent) e2
-
-    Choose which change to converge (jj converge only converges one change at a time):
-    1: zsuskulnrvyr
-    2: kmkuslswpqwq
-    q: abort
-    Enter the index of the change to converge: 
-
-    Aborting... nothing changed.
-    [EOF]
-    ");
-
-    // Run the command again, this time the user chooses the first divergent change.
-    // This invocation succeeds to automatically converge that change. A hint is
-    // printed to inform the user that there is still one divergent change
-    // remaining.
-    let output = work_dir
-        .run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("1\n"))
-        .success();
-
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 2 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    - Change: kmkuslswpqwq with 2 commits:
-        kmkuslsw/0 b54f15d8 e2 | (divergent) e2
-        kmkuslsw/1 15962bae e1 | (divergent) e2
-
-    Choose which change to converge (jj converge only converges one change at a time):
-    1: zsuskulnrvyr
-    2: kmkuslswpqwq
-    q: abort
-    Enter the index of the change to converge: 
-
-    Attempting to converge change zsuskulnrvyr...
-
-    Successfully converged change: created commit ba447f020ee6.
-    Rebased 1 descendants
-    Hint: There are still 1 divergent changes remaining in the specified revset, you can run this command again to converge another one.
-    [EOF]
-    ");
-
-    // Verify the commit graph after converging the first divergent change
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  g  xznxytkn  46658cae - description: g
-    ○  e1  kmkuslsw/1  15962bae - description: e2
-    │ ○  e2  kmkuslsw/0  b54f15d8 - description: e2
-    │ ○  f  lylxulpl  d50e2761 - description: f
-    ├─╯
-    │ ○  d  znkkpsqq  b30d892b - description: d
-    │ ○  b1 b2  zsuskuln  ba447f02 - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converging the first divergent change
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○    zsuskuln ba447f02 b2
-    ├─╮
-    ○ │  zsuskuln/1 2c2bd25d (hidden) b2
-    ├─╯
-    ○  zsuskuln/2 59a77004 (hidden) b2
-    ○  zsuskuln/3 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-
-    // Run converge a second time to converge the other divergent change
-    let output = work_dir.run_jj(["converge"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: kmkuslswpqwq with 2 commits:
-        kmkuslsw/0 b54f15d8 e2 | (divergent) e2
-        kmkuslsw/1 15962bae e1 | (divergent) e2
-
-    Attempting to converge change kmkuslswpqwq...
-
-    Successfully converged change: created commit 3f08d00a88c4.
-    Rebased 1 descendants
-    Working copy  (@) now at: xznxytkn f9fd4e7e g | g
-    Parent commit (@-)      : kmkuslsw 3f08d00a e1 e2 | e2
-    Added 1 files, modified 0 files, removed 0 files
-    [EOF]
-    ");
-
-    // Verify the commit graph after converging the second divergent change
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  g  xznxytkn  f9fd4e7e - description: g
-    ○  e1 e2  kmkuslsw  3f08d00a - description: e2
-    ○  f  lylxulpl  d50e2761 - description: f
-    │ ○  d  znkkpsqq  b30d892b - description: d
-    │ ○  b1 b2  zsuskuln  ba447f02 - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converging the second divergent change
-    insta::assert_snapshot!(get_evolog(&work_dir, "e2"), @"
-    ○    kmkuslsw 3f08d00a e2
-    ├─╮
-    ○ │  kmkuslsw/1 b54f15d8 (hidden) e2
-    ├─╯
-    ○  kmkuslsw/2 15962bae (hidden) e2
-    ○  kmkuslsw/3 843de29d (hidden) (empty) e2
-    [EOF]
-    ");
-
-    // There are no more divergent changes now
-    let output = work_dir.run_jj(["converge"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    No revisions were found to be divergent with each other in revsets.converge: mutable() & divergent()
-    Hint: Multiple revisions in the search space must have the same change ID to be considered divergent.
-    [EOF]
-    ");
-}
-
-// This tests scenarios where the user specifies revisions to converge. More
-// precisely, the user specifies a revset that is used as the search space for
-// divergent commits.
-#[test]
-fn test_converge_simple_with_revisions_arg() {
-    let test_env = TestEnvironment::default();
-    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
-    let work_dir = test_env.work_dir("repo");
-
-    // Set up commit graph with divergent changes
-    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
-    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
-    create_commit_with_files(&work_dir, "c", &["a"], &[("file3", "3")]);
-    work_dir.run_jj(["rebase", "-r", "b2", "-o", "c"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
-        .success();
-    create_commit_with_files(&work_dir, "d", &["b1"], &[("file4", "4")]);
-
-    // Test the setup (commit B is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d  znkkpsqq  bf5126ef - description: d
-    ○  b1  zsuskuln/1  59a77004 - description: b2
-    │ ○  b2  zsuskuln/0  2c2bd25d - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○  zsuskuln/0 2c2bd25d (divergent) b2
-    ○  zsuskuln/1 59a77004 (divergent) b2
-    ○  zsuskuln/2 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-
-    // `-r a::d` resolves to {a, b1, d}. b1 IS a divergent commit, but in that
-    // revset there are no other commits with that change-id, so by design the
-    // command does nothing (we could change that in the future).
-    let output = work_dir.run_jj(["converge", "-r", "a::d"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    No revisions were found to be divergent with each other among the specified revisions.
-    Hint: Try again by selecting all revisions to converge for some divergent change ID, such as: jj converge -r 'change_id(zsuskulnrvyr)'
-    [EOF]
-    ");
-
-    // `-r a::` resolves to {a, b1, b2, c, d}. Now the command "sees" two commits
-    // with the same change-id and converges them.
-    let output = work_dir.run_jj(["converge", "-r", "a::"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    Attempting to converge change zsuskulnrvyr...
-
-    Successfully converged change: created commit 5b9d32498e06.
-    Rebased 1 descendants
-    Working copy  (@) now at: znkkpsqq 4080edbe d | d
-    Parent commit (@-)      : zsuskuln 5b9d3249 b1 b2 | b2
-    Added 1 files, modified 0 files, removed 0 files
-    [EOF]
-    ");
-
-    // Verify the commit graph after converge
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d  znkkpsqq  4080edbe - description: d
-    ○  b1 b2  zsuskuln  5b9d3249 - description: b2
-    ○  c  royxmykx  4343fc61 - description: c
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○    zsuskuln 5b9d3249 b2
-    ├─╮
-    ○ │  zsuskuln/1 2c2bd25d (hidden) b2
-    ├─╯
-    ○  zsuskuln/2 59a77004 (hidden) b2
-    ○  zsuskuln/3 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-}
-
-// This tests scenarios where the user specifies revisions to converge. More
-// precisely, the user specifies a revset that is used as the search space for
-// divergent commits. This is a variation of
-// test_converge_simple_with_revisions_arg: in that test there was a single
-// divergent change, here there are two.
-#[test]
-fn test_converge_simple_with_revisions_arg_and_two_divergent_changes() {
-    let test_env = TestEnvironment::default();
-    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
-    let work_dir = test_env.work_dir("repo");
-
-    // Set up: first create a base commit
-    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
-
-    // Set up: create commit graph with two divergent changes
-    // First divergent change:
-    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
-    create_commit_with_files(&work_dir, "c", &["a"], &[("file3", "3")]);
-    work_dir.run_jj(["rebase", "-r", "b2", "-o", "c"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
-        .success();
-    create_commit_with_files(&work_dir, "d", &["b1"], &[("file4", "4")]);
-
-    // Second divergent change:
-    create_commit_with_files(&work_dir, "e3", &["a"], &[("file5", "5")]);
-    create_commit_with_files(&work_dir, "f", &["a"], &[("file6", "6")]);
-    work_dir.run_jj(["rebase", "-r", "e3", "-o", "f"]).success();
-    work_dir
-        .run_jj(["bookmark", "create", "e2", "-r", "at_operation(@-, e3)"])
-        .success();
-    work_dir
-        .run_jj(["describe", "-r", "e2", "-m", "blah blah blah"])
-        .success();
-    work_dir
-        .run_jj(["bookmark", "create", "e1", "-r", "at_operation(@-, e2)"])
-        .success();
-    create_commit_with_files(&work_dir, "g", &["e2"], &[("file7", "7")]);
-
-    // Test the setup: look at the commit graph (commit B is duplicated and commit E
-    // is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  g  nmzmmopx  7e4fac7e - description: g
-    ○  e2  kmkuslsw/0  c8976369 - description: blah blah blah
-    │ ○  e3  kmkuslsw/1  d34ec64c - description: e3
-    │ ○  f  lylxulpl  d50e2761 - description: f
-    ├─╯
-    │ ○  e1  kmkuslsw/2  faebbd68 - description: e3
-    ├─╯
-    │ ○  b2  zsuskuln/0  2c2bd25d - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    │ ○  d  znkkpsqq  bf5126ef - description: d
-    │ ○  b1  zsuskuln/1  59a77004 - description: b2
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○  zsuskuln/0 2c2bd25d (divergent) b2
-    ○  zsuskuln/1 59a77004 (divergent) b2
-    ○  zsuskuln/2 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "e3"), @"
-    ○  kmkuslsw/1 d34ec64c (divergent) e3
-    ○  kmkuslsw/2 faebbd68 (divergent) e3
-    ○  kmkuslsw/3 8f5eb314 (hidden) (empty) e3
-    [EOF]
-    ");
-
-    // `-r a::d` resolves to {a, b1, d}. b1 IS a divergent commit, but in that
-    // revset there are no other commits with that change-id, so by design the
-    // command does nothing (we could change that in the future).
-    let output = work_dir.run_jj(["converge", "-r", "a::d"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    No revisions were found to be divergent with each other among the specified revisions.
-    Hint: Try again by selecting all revisions to converge for some divergent change ID, such as: jj converge -r 'change_id(zsuskulnrvyr)'
-    [EOF]
-    ");
-
-    // `-r a::` does resolve to both divergent changes. In this test we simulate the
-    // user aborts at the prompt.
-    let output = work_dir
-        .run_jj_with(|cmd| {
-            force_interactive(cmd)
-                .args(["converge", "-r", "a::"])
-                .write_stdin("q\n")
-        })
-        .success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 2 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    - Change: kmkuslswpqwq with 3 commits:
-        kmkuslsw/0 c8976369 e2 | (divergent) blah blah blah
-        kmkuslsw/1 d34ec64c e3 | (divergent) e3
-        kmkuslsw/2 faebbd68 e1 | (divergent) e3
-
-    Choose which change to converge (jj converge only converges one change at a time):
-    1: zsuskulnrvyr
-    2: kmkuslswpqwq
-    q: abort
-    Enter the index of the change to converge: 
-
-    Aborting... nothing changed.
-    [EOF]
-    ");
-
-    // `-r b1|e3` resolve to those two commits. Both ARE divergent commits, but in
-    // the search space there are no other commits with either change-id so the
-    // command does nothing.
-    let output = work_dir
-        .run_jj_with(|cmd| {
-            force_interactive(cmd)
-                .args(["converge", "-r", "b1|e3"])
-                .write_stdin("q\n")
-        })
-        .success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    No revisions were found to be divergent with each other among the specified revisions.
-    Hint: Try again by selecting all revisions to converge for some divergent change ID, such as: jj converge -r 'change_id(kmkuslswpqwq)'
-    [EOF]
-    ");
-
-    // Specifying `-r b1|b2` resolves to that divergent change and only that one.
-    // There should not be any prompt.
-    let output = work_dir
-        .run_jj_with(|cmd| {
-            force_interactive(cmd)
-                .args(["converge", "-r", "b1|b2"])
-                .write_stdin("q\n")
-        })
-        .success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 2c2bd25d b2 | (divergent) b2
-        zsuskuln/1 59a77004 b1 | (divergent) b2
-
-    Attempting to converge change zsuskulnrvyr...
-
-    Successfully converged change: created commit 32d4597c081c.
-    Rebased 1 descendants
-    [EOF]
-    ");
-
-    // Look at the resulting commit graph
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  g  nmzmmopx  7e4fac7e - description: g
-    ○  e2  kmkuslsw/0  c8976369 - description: blah blah blah
-    │ ○  e3  kmkuslsw/1  d34ec64c - description: e3
-    │ ○  f  lylxulpl  d50e2761 - description: f
-    ├─╯
-    │ ○  e1  kmkuslsw/2  faebbd68 - description: e3
-    ├─╯
-    │ ○  d  znkkpsqq  5aecbdd4 - description: d
-    │ ○  b1 b2  zsuskuln  32d4597c - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○    zsuskuln 32d4597c b2
-    ├─╮
-    ○ │  zsuskuln/1 2c2bd25d (hidden) b2
-    ├─╯
-    ○  zsuskuln/2 59a77004 (hidden) b2
-    ○  zsuskuln/3 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-
-    // Lets undo the previous converge operation to try a different scenario.
-    work_dir.run_jj(["undo"]).success();
-
-    // The next invocation shows that specifying `-r e1|e3` converges those two
-    // divergent commits, but leaves e1 around (by design).
-    let output = work_dir
-        .run_jj_with(|cmd| {
-            force_interactive(cmd)
-                .args(["converge", "-r", "e1|e3"])
-                .write_stdin("q\n")
-        })
-        .success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: kmkuslswpqwq with 2 commits:
-        kmkuslsw/1 d34ec64c e3 | (divergent) e3
-        kmkuslsw/2 faebbd68 e1 | (divergent) e3
-
-    Attempting to converge change kmkuslswpqwq...
-
-    Successfully converged change: created commit b5ce73ed2a0d.
-    [EOF]
-    ");
-
-    // Look at the resulting commit graph
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  g  nmzmmopx  7e4fac7e - description: g
-    ○  e2  kmkuslsw/1  c8976369 - description: blah blah blah
-    │ ○  e1 e3  kmkuslsw/0  b5ce73ed - description: e3
-    │ ○  f  lylxulpl  d50e2761 - description: f
-    ├─╯
-    │ ○  b2  zsuskuln/1  2c2bd25d - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    │ ○  d  znkkpsqq  bf5126ef - description: d
-    │ ○  b1  zsuskuln/2  59a77004 - description: b2
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "e3"), @"
-    ○    kmkuslsw/0 b5ce73ed (divergent) e3
-    ├─╮
-    ○ │  kmkuslsw/2 d34ec64c (hidden) e3
-    ├─╯
-    ○  kmkuslsw/3 faebbd68 (hidden) e3
-    ○  kmkuslsw/4 8f5eb314 (hidden) (empty) e3
-    [EOF]
-    ");
-}
-
-// In this scenario there are two divergent commits. One side changed the
-// description, the other side was rebased. In such simple cases `jj converge`
-// should be able to automatically combine the new description with the new
-// parents.
 #[test]
 fn test_converge_one_side_rebased_one_side_description_changed() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
-
-    // Set up commit graph with divergent changes
-    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
-    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
-    create_commit_with_files(&work_dir, "c", &["a"], &[("file3", "3")]);
-    work_dir.run_jj(["rebase", "-r", "b2", "-o", "c"]).success();
+    create_rebased_divergence(&work_dir);
     work_dir
-        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
+        .run_jj(["describe", "-r", "b1", "-m", "new description"])
         .success();
-    work_dir
-        .run_jj(["describe", "-r", "b1", "-m", "blah blah blah"])
-        .success();
-    create_commit_with_files(&work_dir, "d", &["b1"], &[("file4", "4")]);
 
-    // Test the setup (commit B is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d  kpqxywon  16d29671 - description: d
-    ○  b1  zsuskuln/0  d471c689 - description: blah blah blah
-    │ ○  b2  zsuskuln/1  2c2bd25d - description: b2
-    │ ○  c  royxmykx  4343fc61 - description: c
-    ├─╯
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○  zsuskuln/1 2c2bd25d (divergent) b2
-    ○  zsuskuln/2 59a77004 (hidden) b2
-    ○  zsuskuln/3 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
-
-    let output = work_dir.run_jj(["converge"]).success();
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: zsuskulnrvyr with 2 commits:
-        zsuskuln/0 d471c689 b1 | (divergent) blah blah blah
-        zsuskuln/1 2c2bd25d b2 | (divergent) b2
-
-    Attempting to converge change zsuskulnrvyr...
-
-    Successfully converged change: created commit 65226e3f7378.
-    Rebased 1 descendants
-    Working copy  (@) now at: kpqxywon 405941e7 d | d
-    Parent commit (@-)      : zsuskuln 65226e3f b1 b2 | blah blah blah
-    Added 1 files, modified 0 files, removed 0 files
-    [EOF]
-    ");
-
-    // Verify the commit graph after converge
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d  kpqxywon  405941e7 - description: d
-    ○  b1 b2  zsuskuln  65226e3f - description: blah blah blah
-    ○  c  royxmykx  4343fc61 - description: c
-    ○  a  rlvkpnrz  e9a731d9 - description: a
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○    zsuskuln 65226e3f blah blah blah
-    ├─╮
-    │ ○  zsuskuln/2 2c2bd25d (hidden) b2
-    ○ │  zsuskuln/1 d471c689 (hidden) blah blah blah
-    ├─╯
-    ○  zsuskuln/3 59a77004 (hidden) b2
-    ○  zsuskuln/4 b2852eb2 (hidden) (empty) b2
-    [EOF]
-    ");
+    work_dir.run_jj(["converge"]).success();
+    assert_eq!(
+        converge_log_value(&work_dir, "b1", "description"),
+        "new description\n"
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "b1-", "commit_id"),
+        converge_log_value(&work_dir, "c", "commit_id")
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "divergent()", "commit_id"),
+        ""
+    );
 }
 
-#[test_case(false; "dont_invoke_text_editor")]
-#[test_case(true; "invoke_text_editor")]
-fn test_converge_description_changed_inconsistently(invoke_text_editor: bool) -> TestResult {
-    let mut test_env = TestEnvironment::default();
-    let edit_script = test_env.set_up_fake_editor();
+#[test]
+fn test_converge_simple_with_revisions_arg_and_two_divergent_changes() {
+    let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
-
-    // Set up commit graph with divergent changes
-    create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
-    create_commit_with_files(&work_dir, "b2", &["a"], &[("file2", "2")]);
+    create_rebased_divergence(&work_dir);
+    create_commit_with_files(&work_dir, "e2", &["a"], &[("file5", "5")]);
+    create_commit_with_files(&work_dir, "f", &["a"], &[("file6", "6")]);
+    work_dir.run_jj(["rebase", "-r", "e2", "-o", "f"]).success();
     work_dir
-        .run_jj(["describe", "-r", "b2", "-m", "foo"])
+        .run_jj(["bookmark", "create", "e1", "-r", "at_operation(@-, e2)"])
         .success();
-    work_dir
-        .run_jj(["bookmark", "create", "b1", "-r", "at_operation(@-, b2)"])
-        .success();
-    work_dir
-        .run_jj(["describe", "-r", "b1", "-m", "bar"])
-        .success();
-    create_commit_with_files(&work_dir, "d", &["b1"], &[("file3", "3")]);
+    let untouched = converge_log_value(&work_dir, "e1 | e2", "commit_id ++ '\n'");
 
-    // Test the setup (commit B is duplicated)
-    insta::allow_duplicates! {
-        insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-        @  d  yostqsxw  a906f67a - description: d
-        ○  b1  zsuskuln/0  0ec69b7a - description: bar
-        │ ○  b2  zsuskuln/1  08117b18 - description: foo
-        ├─╯
-        ○  a  rlvkpnrz  e9a731d9 - description: a
-        ◆    zzzzzzzz  00000000
-        [EOF]
-        ");
-    }
-
-    insta::allow_duplicates! {
-        insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-        ○  zsuskuln/1 08117b18 (divergent) foo
-        ○  zsuskuln/2 59a77004 (hidden) b2
-        ○  zsuskuln/3 b2852eb2 (hidden) (empty) b2
-        [EOF]
-        ");
-    }
-
-    // First check behavior in non-interactive mode.
-    let output =
-        work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge", "--no-interactive"]));
-    insta::allow_duplicates! {
-        insta::assert_snapshot!(output, @"
-        ------- stderr -------
-        Found 1 divergent change(s) in the specified revset:
-        - Change: zsuskulnrvyr with 2 commits:
-            zsuskuln/0 0ec69b7a b1 | (divergent) bar
-            zsuskuln/1 08117b18 b2 | (divergent) foo
-
-        Attempting to converge change zsuskulnrvyr...
-
-        Could not determine which description to use.
-        Error: Could not converge change
-        [EOF]
-        [exit status: 1]
-        ");
-    }
-
-    // Now check behavior in interactive mode.
-    if invoke_text_editor {
-        std::fs::write(
-            &edit_script,
-            ["dump editor0", "write\nmy-merged-description"].join("\0"),
-        )?;
-        let output = work_dir
-            .run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("y\n"))
-            .success();
-        insta::assert_snapshot!(
-        std::fs::read_to_string(test_env.env_root().join("editor0"))?, @r#"
-        <<<<<<< conflict 1 of 1
-        %%%%%%% diff from: zsuskuln 59a77004 "b2"
-        \\\\\\\        to: zsuskuln 0ec69b7a "bar"
-        -b2
-        +bar
-        +++++++ zsuskuln 08117b18 "foo"
-        foo
-        >>>>>>> conflict 1 of 1 ends
-        "#);
-        insta::assert_snapshot!(output.stdout.normalized(), @"");
-        insta::assert_snapshot!(output.stderr.normalized(), @"
-        Found 1 divergent change(s) in the specified revset:
-        - Change: zsuskulnrvyr with 2 commits:
-            zsuskuln/0 0ec69b7a b1 | (divergent) bar
-            zsuskuln/1 08117b18 b2 | (divergent) foo
-
-        Attempting to converge change zsuskulnrvyr...
-
-        There are divergent descriptions. You can choose to merge them now in a
-        text editor, or skip merging and use the conflicted description (with
-        conflict markers). Do you want to merge them now? (Yn): 
-
-        Successfully converged change: created commit a393891bef3b.
-        Rebased 1 descendants
-        Working copy  (@) now at: yostqsxw a9dd817f d | d
-        Parent commit (@-)      : zsuskuln a393891b b1 b2 | my-merged-description
-        ");
-
-        // Verify the commit graph after converge
-        insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-        @  d  yostqsxw  a9dd817f - description: d
-        ○  b1 b2  zsuskuln  a393891b - description: my-merged-des...
-        ○  a  rlvkpnrz  e9a731d9 - description: a
-        ◆    zzzzzzzz  00000000
-        [EOF]
-        ");
-
-        // Verify the evolution history after converge
-        insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-        ○    zsuskuln a393891b my-merged-description
-        ├─╮
-        │ ○  zsuskuln/2 08117b18 (hidden) foo
-        ○ │  zsuskuln/1 0ec69b7a (hidden) bar
-        ├─╯
-        ○  zsuskuln/3 59a77004 (hidden) b2
-        ○  zsuskuln/4 b2852eb2 (hidden) (empty) b2
-        [EOF]
-        ");
-    } else {
-        let output = work_dir
-            .run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("n\n"))
-            .success();
-        insta::assert_snapshot!(output, @"
-        ------- stderr -------
-        Found 1 divergent change(s) in the specified revset:
-        - Change: zsuskulnrvyr with 2 commits:
-            zsuskuln/0 0ec69b7a b1 | (divergent) bar
-            zsuskuln/1 08117b18 b2 | (divergent) foo
-
-        Attempting to converge change zsuskulnrvyr...
-
-        There are divergent descriptions. You can choose to merge them now in a
-        text editor, or skip merging and use the conflicted description (with
-        conflict markers). Do you want to merge them now? (Yn): 
-
-        Successfully converged change: created commit 6fdb1551f127.
-        Rebased 1 descendants
-        Working copy  (@) now at: yostqsxw 6b108e95 d | d
-        Parent commit (@-)      : zsuskuln 6fdb1551 b1 b2 | <<<<<<< conflict 1 of 1
-        [EOF]
-        ");
-
-        // Verify the commit graph after converge
-        insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-        @  d  yostqsxw  6b108e95 - description: d
-        ○  b1 b2  zsuskuln  6fdb1551 - description: <<<<<<< confl...
-        ○  a  rlvkpnrz  e9a731d9 - description: a
-        ◆    zzzzzzzz  00000000
-        [EOF]
-        ");
-
-        // Verify the evolution history after converge
-        insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-        ○    zsuskuln 6fdb1551 <<<<<<< conflict 1 of 1
-        ├─╮
-        │ ○  zsuskuln/2 08117b18 (hidden) foo
-        ○ │  zsuskuln/1 0ec69b7a (hidden) bar
-        ├─╯
-        ○  zsuskuln/3 59a77004 (hidden) b2
-        ○  zsuskuln/4 b2852eb2 (hidden) (empty) b2
-        [EOF]
-        ");
-
-        // Verify the description after converge (it should have conflict markers)
-        let output = work_dir.run_jj(["log", "-T", "description", "-r", "b1", "--no-graph"]);
-        insta::assert_snapshot!(output, @r#"
-        <<<<<<< conflict 1 of 1
-        %%%%%%% diff from: zsuskuln 59a77004 "b2"
-        \\\\\\\        to: zsuskuln 0ec69b7a "bar"
-        -b2
-        +bar
-        +++++++ zsuskuln 08117b18 "foo"
-        foo
-        >>>>>>> conflict 1 of 1 ends
-        [EOF]
-        "#);
-    }
-    Ok(())
+    // Only b1 is an ancestor of d. Cleanup must include its other divergent
+    // version while leaving the unrelated divergent family unchanged.
+    work_dir.run_jj(["converge", "--revisions", "d"]).success();
+    assert_eq!(
+        converge_log_value(&work_dir, "b1", "commit_id"),
+        converge_log_value(&work_dir, "b2", "commit_id")
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "e1 | e2", "commit_id ++ '\n'"),
+        untouched
+    );
+    assert_ne!(
+        converge_log_value(&work_dir, "divergent() & (e1 | e2)", "commit_id"),
+        ""
+    );
 }
 
-// In this scenario there are two divergent commits. Each side rebased their
-// common predecessor on top of different parents. In this case `jj converge`
-// cannot automatically determine which parents to use, so it should prompt the
-// user.
 #[test]
 fn test_converge_with_inconsistent_parents() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
-
-    // Set up commit graph with divergent changes
     create_commit_with_files(&work_dir, "a", &[], &[("file1", "1")]);
     create_commit_with_files(&work_dir, "b", &[], &[("file2", "2")]);
     create_commit_with_files(&work_dir, "c", &[], &[("file3", "3")]);
@@ -1077,157 +868,47 @@ fn test_converge_with_inconsistent_parents() {
         .run_jj(["bookmark", "create", "d1", "-r", "at_operation(@-, d2)"])
         .success();
     work_dir.run_jj(["rebase", "-r", "d1", "-o", "c"]).success();
+    let before = converge_log_value(&work_dir, "d1 | d2", "commit_id ++ '\n'");
 
-    // Test the setup (commit D is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d2  vruxwmqv/1  c3de3020 - description: d2
-    ○  b  zsuskuln  38bded60 - description: b
-    │ ○  d1  vruxwmqv/0  4bcd1134 - description: d2
-    │ ○  c  royxmykx  b616a3ce - description: c
-    ├─╯
-    │ ○  a  rlvkpnrz  e9a731d9 - description: a
-    ├─╯
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    insta::assert_snapshot!(get_evolog(&work_dir, "d1"), @"
-    ○  vruxwmqv/0 4bcd1134 (divergent) d2
-    ○  vruxwmqv/2 459038a5 (hidden) d2
-    ○  vruxwmqv/3 b31c58cf (hidden) (empty) d2
-    [EOF]
-    ");
-
-    insta::assert_snapshot!(get_evolog(&work_dir, "d2"), @"
-    @  vruxwmqv/1 c3de3020 (divergent) d2
-    ○  vruxwmqv/2 459038a5 (hidden) d2
-    ○  vruxwmqv/3 b31c58cf (hidden) (empty) d2
-    [EOF]
-    ");
-
-    // First check behavior in non-interactive mode. The command cannot determine
-    // which parents to use, so it should fail.
-    let output =
-        work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge", "--no-interactive"]));
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: vruxwmqvtpmx with 2 commits:
-        vruxwmqv/0 4bcd1134 d1 | (divergent) d2
-        vruxwmqv/1 c3de3020 d2 | (divergent) d2
-
-    Attempting to converge change vruxwmqvtpmx...
-
-    Could not determine which parents to use.
-    Error: Could not converge change
-    [EOF]
-    [exit status: 1]
-    ");
-
-    // Run the command again, but this time choose to abort at the prompt.
-    let output =
-        work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("q\n"));
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: vruxwmqvtpmx with 2 commits:
-        vruxwmqv/0 4bcd1134 d1 | (divergent) d2
-        vruxwmqv/1 c3de3020 d2 | (divergent) d2
-
-    Attempting to converge change vruxwmqvtpmx...
-
-    Could not determine automatically which parents to use
-    1: 4bcd1134ba57:
-          Parent: royxmykx b616a3ce c | c
-    2: c3de3020707a:
-          Parent: zsuskuln 38bded60 b | b
-    q: abort
-    Enter the index of one of the divergent commits whose parent(s) will be the parents of the solution: 
-
-    Error: Aborting... nothing changed.
-    [EOF]
-    [exit status: 1]
-    ");
-
-    // Run the command one more time, this time the user chooses parents.
-    let output =
-        work_dir.run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("2\n"));
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Found 1 divergent change(s) in the specified revset:
-    - Change: vruxwmqvtpmx with 2 commits:
-        vruxwmqv/0 4bcd1134 d1 | (divergent) d2
-        vruxwmqv/1 c3de3020 d2 | (divergent) d2
-
-    Attempting to converge change vruxwmqvtpmx...
-
-    Could not determine automatically which parents to use
-    1: 4bcd1134ba57:
-          Parent: royxmykx b616a3ce c | c
-    2: c3de3020707a:
-          Parent: zsuskuln 38bded60 b | b
-    q: abort
-    Enter the index of one of the divergent commits whose parent(s) will be the parents of the solution: 
-
-    Successfully converged change: created commit 5a4258f7aa61.
-    Working copy  (@) now at: vruxwmqv 5a4258f7 d1 d2 | d2
-    Parent commit (@-)      : zsuskuln 38bded60 b | b
-    [EOF]
-    ");
-
-    // Verify the commit graph after converge
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  d1 d2  vruxwmqv  5a4258f7 - description: d2
-    ○  b  zsuskuln  38bded60 - description: b
-    │ ○  c  royxmykx  b616a3ce - description: c
-    ├─╯
-    │ ○  a  rlvkpnrz  e9a731d9 - description: a
-    ├─╯
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "d2"), @"
-    @    vruxwmqv 5a4258f7 d2
-    ├─╮
-    │ ○  vruxwmqv/2 c3de3020 (hidden) d2
-    ○ │  vruxwmqv/1 4bcd1134 (hidden) d2
-    ├─╯
-    ○  vruxwmqv/3 459038a5 (hidden) d2
-    ○  vruxwmqv/4 b31c58cf (hidden) (empty) d2
-    [EOF]
-    ");
+    let output = work_dir.run_jj(["converge", "--no-interactive", "--json"]);
+    assert!(!output.status.success(), "{output}");
+    let plan: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert!(
+        plan["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|choice| choice["kind"] == "parent")
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "d1 | d2", "commit_id ++ '\n'"),
+        before
+    );
+    work_dir.run_jj(["converge", "--onto", "b"]).success();
+    assert_eq!(
+        converge_log_value(&work_dir, "d1-", "commit_id"),
+        converge_log_value(&work_dir, "b", "commit_id")
+    );
+    assert_eq!(
+        converge_log_value(&work_dir, "divergent()", "commit_id"),
+        ""
+    );
 }
 
-// It is possible that a divergent commit is a child of another divergent commit
-// (with the same change-id or a different one). Consider the case where both
-// parent and child have the same change-id. When converging that change-id the
-// algorithm --or the user-- must choose the parent commit(s) of the solution.
-// To be concrete, say commit A is the parent of commit B, both with the same
-// change-id.
-//
-// Whether automatically or by user choice, `jj converge` is (currently)
-// designed such that the parent(s) of the solution is the parent(s) of one of
-// the divergent commits. BUT `jj converge` is "smart" and only considers
-// divergent commits that are not descendants of other divergent commits during
-// this parent selection process. Please see the implementation for more
-// details.
-//
-// This test is to ensure that the above behavior is correct.
 #[test]
-fn test_converge_one_divergent_commit_is_a_descendant_of_another_divergent_commit() -> TestResult {
-    let mut test_env = TestEnvironment::default();
-    let edit_script = test_env.set_up_fake_editor();
+fn test_converge_one_divergent_commit_is_a_descendant_of_another_divergent_commit() {
+    check_converge_related_divergent_commits(false);
+}
+
+#[test]
+fn test_converge_two_divergent_commits_with_unrelated_commit_in_between() {
+    check_converge_related_divergent_commits(true);
+}
+
+fn check_converge_related_divergent_commits(with_intermediate: bool) {
+    let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();
     let work_dir = test_env.work_dir("repo");
-
-    // Start by setting description to "message 1", then simulate two concurrent
-    // operations, one changing the description to "message 2" and the other
-    // changing it to "message 3" (--at-op=@- is what allows us to pretend these two
-    // operations happen concurrently). At this point we have two divergent commits.
-    // Then we set up bookmarks b2 and b3 to point to the commits. Finally we rebase
-    // b2 onto b3. This sets the stage for this test's scenario.
     work_dir.run_jj(["describe", "-m", "message 1"]).success();
     work_dir.run_jj(["describe", "-m", "message 2"]).success();
     work_dir
@@ -1251,392 +932,74 @@ fn test_converge_one_divergent_commit_is_a_descendant_of_another_divergent_commi
             "b3",
         ])
         .success();
-    work_dir
-        .run_jj(["rebase", "-r", "b2", "-d", "b3", "--keep-divergent"])
-        .success();
+    if with_intermediate {
+        work_dir.run_jj(["new", "-r", "b3", "-m", "foo"]).success();
+        work_dir.run_jj(["bookmark", "create", "middle"]).success();
+        work_dir
+            .run_jj(["rebase", "-r", "b2", "-o", "middle", "--keep-divergent"])
+            .success();
+        work_dir.run_jj(["new", "-r", "b2", "-m", "bar"]).success();
+        work_dir.run_jj(["bookmark", "create", "child"]).success();
+    } else {
+        work_dir
+            .run_jj(["rebase", "-r", "b2", "-o", "b3", "--keep-divergent"])
+            .success();
+    }
 
-    // Test the setup: look at the operation log.
-    insta::assert_snapshot!(get_op_log_output(&work_dir), @r"
-    @  rebase commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj rebase -r b2 -d b3 --keep-divergent
-    ○  create bookmark b3 pointing to commit 4734557e78fe9ccdb827e03e71602c685bfe8b53
-    │  args: jj bookmark create -r 'description(\'message 3*\')' b3
-    ○  create bookmark b2 pointing to commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○    reconcile divergent operations
-    ├─╮  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○ │  describe commit a289638d100c5af526559dfafb99f062631771c4
-    │ │  args: jj describe -m 'message 2'
-    │ ○  describe commit a289638d100c5af526559dfafb99f062631771c4
-    ├─╯  args: jj describe -m 'message 3' --at-op @-
-    ○  describe commit e8849ae12c709f2321908879bc724fdb2ab8a781
-    │  args: jj describe -m 'message 1'
-    ○  add workspace 'default'
-    ○
-    [EOF]
-    ");
-
-    // Test the setup: look at the commit graph (commit B is duplicated and commit E
-    // is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  b2  qpvuntsm/0  cca75b59 - description: message 2
-    ○  b3  qpvuntsm/1  4734557e - description: message 3
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    @  qpvuntsm/0 cca75b59 (divergent) (empty) message 2
-    ○  qpvuntsm/2 59df0df7 (hidden) (empty) message 2
-    ○  qpvuntsm/3 a289638d (hidden) (empty) message 1
-    ○  qpvuntsm/4 e8849ae1 (hidden) (empty) (no description set)
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "b3"), @"
-    ○  qpvuntsm/1 4734557e (divergent) (empty) message 3
-    ○  qpvuntsm/3 a289638d (hidden) (empty) message 1
-    ○  qpvuntsm/4 e8849ae1 (hidden) (empty) (no description set)
-    [EOF]
-    ");
-
-    // Run `jj converge` command and check the output. In this case the user must
-    // merge the descriptions in a text editor. However, the parents are chosen
-    // automatically (b2 is ignored because it is a descendant of b3).
-    std::fs::write(
-        &edit_script,
-        ["dump editor0", "write\nmy-merged-description"].join("\0"),
-    )?;
-    let output = work_dir
-        .run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("y\n"))
-        .success();
-    insta::assert_snapshot!(
-        std::fs::read_to_string(test_env.env_root().join("editor0"))?, @r#"
-    <<<<<<< conflict 1 of 1
-    %%%%%%% diff from: qpvuntsm a289638d "message 1"
-    \\\\\\\        to: qpvuntsm cca75b59 "message 2"
-    -message 1
-    +message 2
-    +++++++ qpvuntsm 4734557e "message 3"
-    message 3
-    >>>>>>> conflict 1 of 1 ends
-    "#);
-    insta::assert_snapshot!(output.stdout.normalized(), @"");
-    insta::assert_snapshot!(output.stderr.normalized(), @"
-    Found 1 divergent change(s) in the specified revset:
-    - Change: qpvuntsmwlqt with 2 commits:
-        qpvuntsm/0 cca75b59 b2 | (divergent) (empty) message 2
-        qpvuntsm/1 4734557e b3 | (divergent) (empty) message 3
-
-    Attempting to converge change qpvuntsmwlqt...
-
-    There are divergent descriptions. You can choose to merge them now in a
-    text editor, or skip merging and use the conflicted description (with
-    conflict markers). Do you want to merge them now? (Yn): 
-
-    Successfully converged change: created commit ae6fe4a3240c.
-    Working copy  (@) now at: qpvuntsm ae6fe4a3 b2 b3 | (empty) my-merged-description
-    Parent commit (@-)      : zzzzzzzz 00000000 (empty) (no description set)
-    ");
-
-    // Verify the commit graph after converge
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @  b2 b3  qpvuntsm  ae6fe4a3 - description: my-merged-des...
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the operation log after converge
-    insta::assert_snapshot!(get_op_log_output(&work_dir), @r"
-    @  converge qpvuntsmwlqt with 2 predecessors
-    │  args: jj converge
-    ○  rebase commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj rebase -r b2 -d b3 --keep-divergent
-    ○  create bookmark b3 pointing to commit 4734557e78fe9ccdb827e03e71602c685bfe8b53
-    │  args: jj bookmark create -r 'description(\'message 3*\')' b3
-    ○  create bookmark b2 pointing to commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○    reconcile divergent operations
-    ├─╮  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○ │  describe commit a289638d100c5af526559dfafb99f062631771c4
-    │ │  args: jj describe -m 'message 2'
-    │ ○  describe commit a289638d100c5af526559dfafb99f062631771c4
-    ├─╯  args: jj describe -m 'message 3' --at-op @-
-    ○  describe commit e8849ae12c709f2321908879bc724fdb2ab8a781
-    │  args: jj describe -m 'message 1'
-    ○  add workspace 'default'
-    ○
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    @    qpvuntsm ae6fe4a3 (empty) my-merged-description
-    ├─╮
-    │ ○  qpvuntsm/2 4734557e (hidden) (empty) message 3
-    ○ │  qpvuntsm/1 cca75b59 (hidden) (empty) message 2
-    ○ │  qpvuntsm/3 59df0df7 (hidden) (empty) message 2
-    ├─╯
-    ○  qpvuntsm/4 a289638d (hidden) (empty) message 1
-    ○  qpvuntsm/5 e8849ae1 (hidden) (empty) (no description set)
-    [EOF]
-    ");
-
-    Ok(())
+    work_dir.run_jj(["converge", "-m", "merged"]).success();
+    let solution = converge_log_value(&work_dir, "b2", "commit_id");
+    assert_eq!(converge_log_value(&work_dir, "b3", "commit_id"), solution);
+    assert_eq!(
+        converge_log_value(&work_dir, "b2-", "commit_id"),
+        converge_log_value(&work_dir, "root()", "commit_id")
+    );
+    assert_eq!(converge_predecessor_count(&work_dir, "b2"), "2");
+    assert_eq!(
+        converge_log_value(&work_dir, "divergent()", "commit_id"),
+        ""
+    );
+    if with_intermediate {
+        assert_eq!(
+            converge_log_value(&work_dir, "middle-", "commit_id"),
+            solution
+        );
+        assert_eq!(
+            converge_log_value(&work_dir, "child-", "commit_id"),
+            solution
+        );
+        assert_eq!(
+            converge_log_value(&work_dir, "middle", "description"),
+            "foo\n"
+        );
+        assert_eq!(
+            converge_log_value(&work_dir, "child", "description"),
+            "bar\n"
+        );
+    }
 }
 
-// Similar to
-// test_converge_one_divergent_commit_is_a_descendant_of_another_divergent_commit,
-// but with a few variations:
-// * There is an related commit "in between" the two divergent commits
-// * There are other unrelated commits
-#[test]
-fn test_converge_two_divergent_commits_with_unrelated_commit_in_between() -> TestResult {
-    let mut test_env = TestEnvironment::default();
-    let edit_script = test_env.set_up_fake_editor();
-    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
-    let work_dir = test_env.work_dir("repo");
-
-    // Start by setting description to "message 1", then simulate two concurrent
-    // operations, one changing the description to "message 2" and the other
-    // changing it to "message 3" (--at-op=@- is what allows us to pretend these two
-    // operations happen concurrently). At this point we have two divergent commits.
-    // Then we set up bookmarks b2 and b3 to point to the commits. After that we
-    // create foo as a child of b3, then we rebase b2 onto foo. This sets the
-    // stage for this test's scenario. We create two other commits (bar and baz)
-    // to observe how descendants are rebased.
-    work_dir.run_jj(["describe", "-m", "message 1"]).success();
-    work_dir.run_jj(["describe", "-m", "message 2"]).success();
+fn converge_log_value(work_dir: &TestWorkDir, revision: &str, template: &str) -> String {
     work_dir
-        .run_jj(["describe", "-m", "message 3", "--at-op", "@-"])
-        .success();
+        .run_jj(["log", "-r", revision, "--no-graph", "-T", template])
+        .success()
+        .stdout
+        .raw()
+        .to_owned()
+}
+
+fn converge_predecessor_count(work_dir: &TestWorkDir, revision: &str) -> String {
     work_dir
         .run_jj([
-            "bookmark",
-            "create",
+            "evolog",
             "-r",
-            "description('message 2*')",
-            "b2",
+            revision,
+            "--no-graph",
+            "--limit=1",
+            "-T",
+            "predecessors.len()",
         ])
-        .success();
-    work_dir
-        .run_jj([
-            "bookmark",
-            "create",
-            "-r",
-            "description('message 3*')",
-            "b3",
-        ])
-        .success();
-    work_dir.run_jj(["new", "-r", "b3", "-m", "foo"]).success();
-    work_dir
-        .run_jj(["rebase", "-r", "b2", "-d", "@", "--keep-divergent"])
-        .success();
-    work_dir.run_jj(["new", "-r", "b2", "-m", "bar"]).success();
-    work_dir.run_jj(["new", "-r", "b3", "-m", "baz"]).success();
-
-    // Test the setup: look at the operation log.
-    insta::assert_snapshot!(get_op_log_output(&work_dir), @r"
-    @  new empty commit
-    │  args: jj new -r b3 -m baz
-    ○  new empty commit
-    │  args: jj new -r b2 -m bar
-    ○  rebase commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj rebase -r b2 -d @ --keep-divergent
-    ○  new empty commit
-    │  args: jj new -r b3 -m foo
-    ○  create bookmark b3 pointing to commit 4734557e78fe9ccdb827e03e71602c685bfe8b53
-    │  args: jj bookmark create -r 'description(\'message 3*\')' b3
-    ○  create bookmark b2 pointing to commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○    reconcile divergent operations
-    ├─╮  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○ │  describe commit a289638d100c5af526559dfafb99f062631771c4
-    │ │  args: jj describe -m 'message 2'
-    │ ○  describe commit a289638d100c5af526559dfafb99f062631771c4
-    ├─╯  args: jj describe -m 'message 3' --at-op @-
-    ○  describe commit e8849ae12c709f2321908879bc724fdb2ab8a781
-    │  args: jj describe -m 'message 1'
-    ○  add workspace 'default'
-    ○
-    [EOF]
-    ");
-
-    // Test the setup: look at the commit graph (commit B is duplicated and commit E
-    // is duplicated)
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @    znkkpsqq  aac9c864 - description: baz
-    │ ○    yostqsxw  38a29791 - description: bar
-    │ ○  b2  qpvuntsm/0  2a258b0d - description: message 2
-    │ ○    yqosqzyt  f658f253 - description: foo
-    ├─╯
-    ○  b3  qpvuntsm/1  4734557e - description: message 3
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○  qpvuntsm/0 2a258b0d (divergent) (empty) message 2
-    ○  qpvuntsm/2 59df0df7 (hidden) (empty) message 2
-    ○  qpvuntsm/3 a289638d (hidden) (empty) message 1
-    ○  qpvuntsm/4 e8849ae1 (hidden) (empty) (no description set)
-    [EOF]
-    ");
-
-    // Test the setup: look at the evolog
-    insta::assert_snapshot!(get_evolog(&work_dir, "b3"), @"
-    ○  qpvuntsm/1 4734557e (divergent) (empty) message 3
-    ○  qpvuntsm/3 a289638d (hidden) (empty) message 1
-    ○  qpvuntsm/4 e8849ae1 (hidden) (empty) (no description set)
-    [EOF]
-    ");
-
-    // Run `jj converge` command and check the output. In this case the user must
-    // merge the descriptions in a text editor. However, the parents are chosen
-    // automatically (b2 is ignored because it is a descendant of b3).
-    std::fs::write(
-        &edit_script,
-        ["dump editor0", "write\nmy-merged-description"].join("\0"),
-    )?;
-    let output = work_dir
-        .run_jj_with(|cmd| force_interactive(cmd).args(["converge"]).write_stdin("y\n"))
-        .success();
-    insta::assert_snapshot!(
-        std::fs::read_to_string(test_env.env_root().join("editor0"))?, @r#"
-    <<<<<<< conflict 1 of 1
-    %%%%%%% diff from: qpvuntsm a289638d "message 1"
-    \\\\\\\        to: qpvuntsm 2a258b0d "message 2"
-    -message 1
-    +message 2
-    +++++++ qpvuntsm 4734557e "message 3"
-    message 3
-    >>>>>>> conflict 1 of 1 ends
-    "#);
-    insta::assert_snapshot!(output.stdout.normalized(), @"");
-    insta::assert_snapshot!(output.stderr.normalized(), @"
-    Found 1 divergent change(s) in the specified revset:
-    - Change: qpvuntsmwlqt with 2 commits:
-        qpvuntsm/0 2a258b0d b2 | (divergent) (empty) message 2
-        qpvuntsm/1 4734557e b3 | (divergent) (empty) message 3
-
-    Attempting to converge change qpvuntsmwlqt...
-
-    There are divergent descriptions. You can choose to merge them now in a
-    text editor, or skip merging and use the conflicted description (with
-    conflict markers). Do you want to merge them now? (Yn): 
-
-    Successfully converged change: created commit 605808281071.
-    Rebased 3 descendants
-    Working copy  (@) now at: znkkpsqq 3ea044e0 (empty) baz
-    Parent commit (@-)      : qpvuntsm 60580828 b2 b3 | (empty) my-merged-description
-    ");
-
-    insta::assert_snapshot!(work_dir.run_jj(["op", "show"]).success(), @"
-    23ae9388893c test-username@host.example.com default@ 2001-02-03 04:05:21.000 +07:00 - 2001-02-03 04:05:21.000 +07:00
-    converge qpvuntsmwlqt with 2 predecessors
-    args: jj converge
-
-    Changed commits:
-    ○  + znkkpsqq 3ea044e0 (empty) baz
-    │  - znkkpsqq/1 aac9c864 (hidden) (empty) baz
-    │ ○  + yostqsxw a4dd040e (empty) bar
-    ├─╯  - yostqsxw/1 38a29791 (hidden) (empty) bar
-    │ ○  + yqosqzyt e85707a5 (empty) foo
-    ├─╯  - yqosqzyt/1 f658f253 (hidden) (empty) foo
-    ○  + qpvuntsm 60580828 b2 b3 | (empty) my-merged-description
-       - qpvuntsm/1 2a258b0d (hidden) (empty) message 2
-       - qpvuntsm/2 4734557e (hidden) (empty) message 3
-
-    Changed working copy default@:
-    + znkkpsqq 3ea044e0 (empty) baz
-    - znkkpsqq/1 aac9c864 (hidden) (empty) baz
-
-    Changed local bookmarks:
-    b2:
-    + qpvuntsm 60580828 b2 b3 | (empty) my-merged-description
-    - qpvuntsm/1 2a258b0d (hidden) (empty) message 2
-    b3:
-    + qpvuntsm 60580828 b2 b3 | (empty) my-merged-description
-    - qpvuntsm/2 4734557e (hidden) (empty) message 3
-    [EOF]
-    ");
-
-    // Verify the commit graph after converge; notice the commit that was
-    // "sandwiched" between b2 and b3 (foo) is now a child of the solution commit.
-    insta::assert_snapshot!(get_long_log_output(&work_dir), @"
-    @    znkkpsqq  3ea044e0 - description: baz
-    │ ○    yostqsxw  a4dd040e - description: bar
-    ├─╯
-    │ ○    yqosqzyt  e85707a5 - description: foo
-    ├─╯
-    ○  b2 b3  qpvuntsm  60580828 - description: my-merged-des...
-    ◆    zzzzzzzz  00000000
-    [EOF]
-    ");
-
-    // Verify the operation log after converge
-    insta::assert_snapshot!(get_op_log_output(&work_dir), @r"
-    @  converge qpvuntsmwlqt with 2 predecessors
-    │  args: jj converge
-    ○  new empty commit
-    │  args: jj new -r b3 -m baz
-    ○  new empty commit
-    │  args: jj new -r b2 -m bar
-    ○  rebase commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj rebase -r b2 -d @ --keep-divergent
-    ○  new empty commit
-    │  args: jj new -r b3 -m foo
-    ○  create bookmark b3 pointing to commit 4734557e78fe9ccdb827e03e71602c685bfe8b53
-    │  args: jj bookmark create -r 'description(\'message 3*\')' b3
-    ○  create bookmark b2 pointing to commit 59df0df7968367d456d4438cc68ebe6a316ef8ce
-    │  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○    reconcile divergent operations
-    ├─╮  args: jj bookmark create -r 'description(\'message 2*\')' b2
-    ○ │  describe commit a289638d100c5af526559dfafb99f062631771c4
-    │ │  args: jj describe -m 'message 2'
-    │ ○  describe commit a289638d100c5af526559dfafb99f062631771c4
-    ├─╯  args: jj describe -m 'message 3' --at-op @-
-    ○  describe commit e8849ae12c709f2321908879bc724fdb2ab8a781
-    │  args: jj describe -m 'message 1'
-    ○  add workspace 'default'
-    ○
-    [EOF]
-    ");
-
-    // Verify the evolution history after converge
-    insta::assert_snapshot!(get_evolog(&work_dir, "b2"), @"
-    ○    qpvuntsm 60580828 (empty) my-merged-description
-    ├─╮
-    │ ○  qpvuntsm/2 4734557e (hidden) (empty) message 3
-    ○ │  qpvuntsm/1 2a258b0d (hidden) (empty) message 2
-    ○ │  qpvuntsm/3 59df0df7 (hidden) (empty) message 2
-    ├─╯
-    ○  qpvuntsm/4 a289638d (hidden) (empty) message 1
-    ○  qpvuntsm/5 e8849ae1 (hidden) (empty) (no description set)
-    [EOF]
-    ");
-
-    Ok(())
-}
-
-#[must_use]
-fn get_long_log_output(work_dir: &TestWorkDir) -> CommandOutput {
-    let template = "bookmarks ++ '  ' ++ format_short_change_id_with_change_offset(self) ++ '  ' \
-                    ++ commit_id.shortest(8) ++ surround(' - description: ', '', truncate_end(16, \
-                    description.first_line(), '...'))";
-    work_dir.run_jj(["log", "-T", template])
-}
-
-#[must_use]
-fn get_op_log_output(work_dir: &TestWorkDir) -> CommandOutput {
-    work_dir.run_jj(["op", "log", "-T", "description ++ '\n' ++ attributes"])
-}
-
-#[must_use]
-fn get_evolog<S: AsRef<str>>(work_dir: &TestWorkDir, revision: S) -> CommandOutput {
-    let template = "format_commit_summary_with_refs(commit, '')";
-    work_dir.run_jj(["evolog", "-r", revision.as_ref(), "-T", template])
+        .success()
+        .stdout
+        .raw()
+        .to_owned()
 }
