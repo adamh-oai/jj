@@ -2245,6 +2245,12 @@ The working-copy commit is indicated by a `@` symbol in the graph. [Immutable re
    [templates]: https://docs.jj-vcs.dev/latest/templates/
 * `-p`, `--patch` — Show patch
 * `--count` — Print the number of commits instead of showing them
+* `--jq <FILTER>` — Evaluate a jq-compatible structured query for each revision
+* `--query-version <VERSION>` — Select the structured query language and schema version
+
+  Possible values: `v1`
+
+* `--slurp` — Supply one array of revisions to the structured query
 * `-s`, `--summary` — For each path, show only whether it was modified, added, or deleted
 * `--stat` — Show a histogram of the changes
 * `--types` — For each path, show only its type before and after
