@@ -1,0 +1,4 @@
+INHERIT: mkdocs.yml
+site_url: https://adamh-oai.github.io/jj/
+repo_url: https://github.com/adamh-oai/jj
+repo_name: adamh-oai/jj
