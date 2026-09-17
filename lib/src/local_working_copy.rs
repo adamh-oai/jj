@@ -125,6 +125,7 @@ use crate::working_copy::SnapshotError;
 use crate::working_copy::SnapshotOptions;
 use crate::working_copy::SnapshotProgress;
 use crate::working_copy::SnapshotStats;
+use crate::working_copy::SnapshotWarning;
 use crate::working_copy::UntrackedReason;
 use crate::working_copy::WorkingCopy;
 use crate::working_copy::WorkingCopyFactory;
@@ -961,6 +962,7 @@ struct FsmonitorMatcher {
     matcher: Option<Box<dyn Matcher>>,
     watchman_clock: Option<crate::protos::local_working_copy::WatchmanClock>,
     should_update_watchman_clock: bool,
+    warning: Option<SnapshotWarning>,
 }
 
 /// Settings specific to the tree state of the [`LocalWorkingCopy`] backend.
@@ -1311,6 +1313,7 @@ impl TreeState {
             matcher: fsmonitor_matcher,
             watchman_clock,
             should_update_watchman_clock,
+            warning: snapshot_warning,
         } = self
             .make_fsmonitor_matcher(&self.fsmonitor_settings)
             .await?;
@@ -1372,6 +1375,7 @@ impl TreeState {
         })?;
 
         let stats = SnapshotStats {
+            warnings: snapshot_warning.into_iter().collect(),
             untracked_paths: untracked_paths_rx.into_iter().collect(),
             invalid_utf8_paths: invalid_utf8_paths_rx.into_iter().collect(),
         };
@@ -1439,15 +1443,31 @@ impl TreeState {
         &self,
         fsmonitor_settings: &FsmonitorSettings,
     ) -> Result<FsmonitorMatcher, SnapshotError> {
-        let (watchman_clock, changed_files) = match fsmonitor_settings {
-            FsmonitorSettings::None => (None, None),
-            FsmonitorSettings::Test { changed_files } => (None, Some(changed_files.clone())),
+        let (watchman_clock, changed_files, warning) = match fsmonitor_settings {
+            FsmonitorSettings::None => (None, None, None),
+            FsmonitorSettings::Test { changed_files } => (None, Some(changed_files.clone()), None),
             #[cfg(feature = "watchman")]
             FsmonitorSettings::Watchman(config) => match self.query_watchman(config).await {
-                Ok((watchman_clock, changed_files)) => (Some(watchman_clock.into()), changed_files),
+                Ok((watchman_clock, changed_files)) => {
+                    (Some(watchman_clock.into()), changed_files, None)
+                }
+                Err(TreeStateError::Fsmonitor(source)) => {
+                    let mut message = source.to_string();
+                    let mut cause = source.source();
+                    while let Some(error) = cause {
+                        message.push_str(": ");
+                        message.push_str(&error.to_string());
+                        cause = error.source();
+                    }
+                    (
+                        None,
+                        None,
+                        Some(SnapshotWarning::FileSystemMonitor { message }),
+                    )
+                }
                 Err(err) => {
                     tracing::warn!(?err, "Failed to query filesystem monitor");
-                    (None, None)
+                    (None, None, None)
                 }
             },
             #[cfg(not(feature = "watchman"))]
@@ -1505,6 +1525,7 @@ impl TreeState {
             matcher,
             watchman_clock,
             should_update_watchman_clock,
+            warning,
         })
     }
 }
