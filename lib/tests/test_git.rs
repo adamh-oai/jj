@@ -3783,6 +3783,52 @@ fn test_reset_head_detached_out_of_sync() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_reset_head_index_lock_failure_preserves_head() -> TestResult {
+    let settings = testutils::user_settings();
+    let temp_dir = testutils::new_temp_dir();
+    let workspace_root = temp_dir.path().join("repo");
+    let git_repo = testutils::git::init(&workspace_root);
+    let (_workspace, repo) =
+        Workspace::init_external_git(&settings, &workspace_root, &workspace_root.join(".git"))
+            .block_on()?;
+
+    let mut tx = repo.start_transaction();
+    let commit1 = write_random_commit(tx.repo_mut());
+    let commit2 = write_random_commit_with_parents(tx.repo_mut(), &[&commit1]);
+    let commit3 = write_random_commit_with_parents(tx.repo_mut(), &[&commit2]);
+
+    git::reset_head(
+        tx.repo_mut(),
+        WorkspaceName::DEFAULT,
+        &workspace_root,
+        &commit2,
+    )
+    .block_on()?;
+    assert_eq!(git_repo.head_id()?.detach(), git_id(&commit1));
+
+    // Simulate another Git process, or a sandboxed linked worktree, making
+    // index.lock unavailable. The preflight reservation must fail before HEAD
+    // is moved from commit1 to commit2.
+    fs::write(git_repo.index_path().with_extension("lock"), b"held")?;
+    assert!(
+        git::reset_head(
+            tx.repo_mut(),
+            WorkspaceName::DEFAULT,
+            &workspace_root,
+            &commit3,
+        )
+        .block_on()
+        .is_err()
+    );
+    assert_eq!(git_repo.head_id()?.detach(), git_id(&commit1));
+    assert_eq!(
+        tx.repo().git_head(WorkspaceName::DEFAULT),
+        &RefTarget::normal(commit1.id().clone())
+    );
+    Ok(())
+}
+
 fn get_index_state(workspace_root: &Path) -> String {
     let git_repo = gix::open(workspace_root).unwrap();
     let index = git_repo.index().unwrap();
@@ -3834,6 +3880,190 @@ fn test_reset_head_with_index() -> TestResult {
     // Reset head and the Git index
     reset_head(tx.repo_mut(), &test_workspace.workspace, &commit2)?;
     insta::assert_snapshot!(get_index_state(workspace_root), @"");
+    Ok(())
+}
+
+#[test]
+fn test_reset_head_preserves_fsmonitor_cursor_and_dirty_entries() -> TestResult {
+    let settings = testutils::user_settings();
+    let temp_dir = testutils::new_temp_dir();
+    let workspace_root = temp_dir.path().join("repo");
+    let git_repo = testutils::git::init(&workspace_root);
+    let (_workspace, repo) =
+        Workspace::init_external_git(&settings, &workspace_root, &workspace_root.join(".git"))
+            .block_on()?;
+    let mut tx = repo.start_transaction();
+
+    let original_tree = testutils::create_tree_with(&repo, |builder| {
+        builder.file(repo_path("changed"), "before");
+        builder.file(repo_path("previously-dirty"), "retained");
+        builder.file(repo_path("stable"), "retained");
+    });
+    let original_parent = tx
+        .repo_mut()
+        .new_commit(
+            vec![repo.store().root_commit_id().clone()],
+            original_tree.clone(),
+        )
+        .write_unwrap();
+    let original_wc = tx
+        .repo_mut()
+        .new_commit(vec![original_parent.id().clone()], original_tree)
+        .write_unwrap();
+    git::reset_head(
+        tx.repo_mut(),
+        WorkspaceName::DEFAULT,
+        &workspace_root,
+        &original_wc,
+    )
+    .block_on()?;
+
+    let mut index = git_repo.open_index()?;
+    let dirty = index
+        .entries()
+        .iter()
+        .map(|entry| entry.path(&index) == "previously-dirty")
+        .collect::<Vec<_>>();
+    index.set_fs_monitor(
+        gix::index::extension::FsMonitor::from_token("awacs-git-v2:test-cursor", &dirty)
+            .expect("test index must fit the fsmonitor bitmap"),
+    );
+    index.write(gix::index::write::Options::default())?;
+
+    let updated_tree = testutils::create_tree_with(&repo, |builder| {
+        builder.file(repo_path("added"), "new");
+        builder.file(repo_path("changed"), "after");
+        builder.file(repo_path("previously-dirty"), "retained");
+        builder.file(repo_path("stable"), "retained");
+    });
+    let updated_parent = tx
+        .repo_mut()
+        .new_commit(vec![original_parent.id().clone()], updated_tree.clone())
+        .write_unwrap();
+    let updated_wc = tx
+        .repo_mut()
+        .new_commit(vec![updated_parent.id().clone()], updated_tree)
+        .write_unwrap();
+    git::reset_head(
+        tx.repo_mut(),
+        WorkspaceName::DEFAULT,
+        &workspace_root,
+        &updated_wc,
+    )
+    .block_on()?;
+
+    let index = git_repo.open_index()?;
+    let cache_tree = index
+        .tree()
+        .expect("resetting a colocated Git index must retain its cache-tree extension");
+    assert_eq!(
+        cache_tree.num_entries,
+        u32::try_from(index.entries().len()).ok(),
+        "a rebuilt index must retain a valid cache-tree covering every tracked entry"
+    );
+    let monitor = index
+        .fs_monitor()
+        .expect("resetting a colocated Git index must retain its fsmonitor extension");
+    assert_eq!(monitor.token(), Some("awacs-git-v2:test-cursor".into()));
+    let mut dirty_paths = Vec::new();
+    monitor
+        .for_each_dirty_entry(|idx| {
+            dirty_paths.push(index.entries()[idx].path(&index).to_string());
+            Some(())
+        })
+        .expect("rewritten fsmonitor dirty bitmap must be valid");
+    assert_eq!(dirty_paths, ["added", "changed", "previously-dirty"]);
+    Ok(())
+}
+
+#[test]
+fn test_intent_to_add_preserves_fsmonitor_and_skips_unchanged_index() -> TestResult {
+    let settings = testutils::user_settings();
+    let temp_dir = testutils::new_temp_dir();
+    let workspace_root = temp_dir.path().join("repo");
+    let git_repo = testutils::git::init(&workspace_root);
+    let (_workspace, repo) =
+        Workspace::init_external_git(&settings, &workspace_root, &workspace_root.join(".git"))
+            .block_on()?;
+    let mut tx = repo.start_transaction();
+    let tree = testutils::create_tree_with(&repo, |builder| {
+        builder.file(repo_path("stable/retained"), "unchanged");
+        builder.file(repo_path("tracked"), "contents");
+    });
+    let parent = tx
+        .repo_mut()
+        .new_commit(vec![repo.store().root_commit_id().clone()], tree.clone())
+        .write_unwrap();
+    let wc = tx
+        .repo_mut()
+        .new_commit(vec![parent.id().clone()], tree.clone())
+        .write_unwrap();
+    git::reset_head(tx.repo_mut(), WorkspaceName::DEFAULT, &workspace_root, &wc).block_on()?;
+
+    let mut index = git_repo.open_index()?;
+    let preserved_subtree = index
+        .tree()
+        .and_then(|tree| {
+            tree.children
+                .iter()
+                .find(|child| child.name.as_slice() == b"stable")
+        })
+        .expect("resetting the initial parent must populate the stable cached subtree")
+        .clone();
+    index.set_fs_monitor(
+        gix::index::extension::FsMonitor::from_token("awacs-git-v2:unchanged", &[false, false])
+            .expect("test index must fit the fsmonitor bitmap"),
+    );
+    index.write(gix::index::write::Options::default())?;
+    let before = fs::read(git_repo.index_path())?;
+
+    // Holding index.lock makes an accidental write fail, while a genuine no-op
+    // needs neither a writer nor an fsmonitor query.
+    let lock_path = git_repo.index_path().with_extension("lock");
+    fs::write(&lock_path, b"held")?;
+    git::update_intent_to_add(repo.as_ref(), &workspace_root, &tree, &tree).block_on()?;
+    assert_eq!(fs::read(git_repo.index_path())?, before);
+
+    fs::remove_file(lock_path)?;
+    let updated_tree = testutils::create_tree_with(&repo, |builder| {
+        builder.file(repo_path("added"), "new contents");
+        builder.file(repo_path("stable/retained"), "unchanged");
+        builder.file(repo_path("tracked"), "contents");
+    });
+    git::update_intent_to_add(repo.as_ref(), &workspace_root, &tree, &updated_tree).block_on()?;
+
+    let updated_index = git_repo.open_index()?;
+    let monitor = updated_index
+        .fs_monitor()
+        .expect("adding an intent-to-add entry must preserve the fsmonitor extension");
+    assert_eq!(monitor.token(), Some("awacs-git-v2:unchanged".into()));
+    let mut dirty_paths = Vec::new();
+    monitor
+        .for_each_dirty_entry(|idx| {
+            dirty_paths.push(
+                updated_index.entries()[idx]
+                    .path(&updated_index)
+                    .to_string(),
+            );
+            Some(())
+        })
+        .expect("updated fsmonitor dirty bitmap must be valid");
+    assert_eq!(dirty_paths, ["added"]);
+    let cache_tree = updated_index
+        .tree()
+        .expect("adding an intent-to-add entry must preserve the cache-tree extension");
+    assert_eq!(
+        cache_tree.num_entries, None,
+        "the changed root cache-tree must be invalidated"
+    );
+    assert_eq!(
+        cache_tree
+            .children
+            .iter()
+            .find(|child| child.name.as_slice() == b"stable"),
+        Some(&preserved_subtree),
+        "unaffected cached subtrees must retain their valid object IDs"
+    );
     Ok(())
 }
 
@@ -4046,22 +4276,13 @@ fn run_git_allow_failure(dir: &Path, args: &[&str]) -> (String, bool) {
     (combined, output.status.success())
 }
 
-/// Whether `.git/index` currently carries a cache-tree (TREE) extension.
-fn index_has_cache_tree(workspace_root: &Path) -> bool {
-    testutils::git::open(workspace_root)
-        .index()
-        .unwrap()
-        .tree()
-        .is_some()
-}
-
 /// Regression test for colocated cache-tree corruption (#9711, one cause of
 /// #8884): `update_intent_to_add` mutates entries in an index that git wrote,
 /// whose cache-tree (TREE) extension stays loaded and valid-looking, so writing
 /// it back leaves stale subtree counts that a later external `git add` turns
 /// into a doubled subtree entry (`git fsck: duplicateEntries`).
 #[test]
-fn test_update_intent_to_add_drops_stale_cache_tree() -> TestResult {
+fn test_update_intent_to_add_invalidates_stale_cache_tree() -> TestResult {
     let settings = testutils::user_settings();
     let temp_dir = testutils::new_temp_dir();
     let workspace_root = temp_dir.path().join("repo");
@@ -4092,8 +4313,7 @@ fn test_update_intent_to_add_drops_stale_cache_tree() -> TestResult {
     );
 
     // Materialize old_tree in the workdir and bake a valid, fully-populated
-    // cache-tree into .git/index using the real git binary. jj's own index
-    // writes use tree:None and would not produce one.
+    // cache-tree into .git/index using the real git binary.
     for (path, content) in old_files {
         let p = workspace_root.join(path);
         fs::create_dir_all(p.parent().unwrap())?;
@@ -4104,20 +4324,48 @@ fn test_update_intent_to_add_drops_stale_cache_tree() -> TestResult {
         &["add", "d/e/f/w0.txt", "d/e/y.txt", "sib/seed.txt"],
     );
     run_git(&workspace_root, &["write-tree"]);
-    assert!(
-        index_has_cache_tree(&workspace_root),
-        "setup did not bake a cache-tree into .git/index, so the corruption this test checks for \
-         could never be produced",
-    );
+    let original_index = testutils::git::open(&workspace_root).open_index()?;
+    let original_cache_tree = original_index
+        .tree()
+        .expect("setup must populate the cache-tree to exercise stale subtree counts");
+    let preserved_sibling = original_cache_tree
+        .children
+        .iter()
+        .find(|child| child.name.as_slice() == b"sib")
+        .expect("setup must populate the unrelated sibling cache-tree")
+        .clone();
 
     // The jj snapshot path under test: add the new file into d/e/f as
     // intent-to-add.
     fs::write(workspace_root.join("d/e/f/w1.txt"), "1\n")?;
     git::update_intent_to_add(repo.as_ref(), &workspace_root, &old_tree, &new_tree).block_on()?;
-    assert!(
-        !index_has_cache_tree(&workspace_root),
-        "update_intent_to_add wrote back a cache-tree that its own entry mutations had already \
-         invalidated",
+    let updated_index = testutils::git::open(&workspace_root).open_index()?;
+    let updated_cache_tree = updated_index
+        .tree()
+        .expect("adding an intent-to-add entry must retain reusable cache-tree subtrees");
+    assert_eq!(
+        updated_cache_tree.num_entries, None,
+        "the changed root cache-tree must be invalidated",
+    );
+    let mut changed_subtree = updated_cache_tree;
+    for component in ["d", "e", "f"] {
+        changed_subtree = changed_subtree
+            .children
+            .iter()
+            .find(|child| child.name.as_slice() == component.as_bytes())
+            .expect("the changed subtree must remain in the cache-tree");
+        assert_eq!(
+            changed_subtree.num_entries, None,
+            "the changed directory {component} must not retain a valid-looking entry count",
+        );
+    }
+    assert_eq!(
+        updated_cache_tree
+            .children
+            .iter()
+            .find(|child| child.name.as_slice() == b"sib"),
+        Some(&preserved_sibling),
+        "the unrelated sibling cache-tree must remain reusable",
     );
 
     // An external git op touching an unrelated sibling invalidates only the

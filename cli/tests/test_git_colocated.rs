@@ -1996,3 +1996,87 @@ fn get_colocation_status(work_dir: &TestWorkDir) -> CommandOutput {
         "--quiet", // suppress hint
     ])
 }
+
+#[test]
+fn test_git_colocated_preserves_fsmonitor_cursor() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "repo"])
+        .success();
+    let work_dir = test_env.work_dir("repo");
+
+    work_dir.write_file("tracked", "contents");
+    work_dir.run_jj(["new"]).success();
+
+    let git_repo = git::open(work_dir.root());
+    let output = std::process::Command::new("git")
+        .current_dir(work_dir.root())
+        .args(["-c", "core.untrackedCache=true", "status", "--porcelain"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Git could not initialize its untracked cache: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut index = git_repo.open_index()?;
+    assert!(
+        index.untracked().is_some(),
+        "Git must seed a genuine UNTR extension before colocated operations"
+    );
+    let clean_entries = vec![false; index.entries().len()];
+    index.set_fs_monitor(
+        gix::index::extension::FsMonitor::from_token("awacs-git-v2:cli-cursor", &clean_entries)
+            .expect("test index must fit the fsmonitor bitmap"),
+    );
+    index.write(gix::index::write::Options::default())?;
+    assert!(
+        git_repo.open_index()?.untracked().is_some(),
+        "adding FSMN must not discard the existing UNTR extension"
+    );
+
+    // Snapshotting a newly added file updates the existing index in place.
+    work_dir.write_file("added", "new contents");
+    work_dir.run_jj(["status"]).success();
+    let index = git_repo.open_index()?;
+    let monitor = index
+        .fs_monitor()
+        .expect("intent-to-add updates must retain the fsmonitor extension");
+    assert_eq!(monitor.token(), Some("awacs-git-v2:cli-cursor".into()));
+    assert!(
+        index.untracked().is_some(),
+        "intent-to-add updates must retain the untracked-cache extension"
+    );
+    let mut dirty_paths = Vec::new();
+    monitor
+        .for_each_dirty_entry(|idx| {
+            dirty_paths.push(index.entries()[idx].path(&index).to_string());
+            Some(())
+        })
+        .expect("updated fsmonitor dirty bitmap must be valid");
+    assert_eq!(dirty_paths, ["added"]);
+
+    // Advancing the Git HEAD rebuilds the index from its new parent tree.
+    work_dir.run_jj(["new"]).success();
+    let index = git_repo.open_index()?;
+    let monitor = index
+        .fs_monitor()
+        .expect("rebuilding the Git index must retain the fsmonitor extension");
+    assert_eq!(monitor.token(), Some("awacs-git-v2:cli-cursor".into()));
+    assert!(
+        index.untracked().is_some(),
+        "rebuilding the Git index must retain the untracked-cache extension"
+    );
+
+    // The extension and EWAH bitmap must also be accepted by C Git, not just
+    // round-trip through gitoxide's own decoder.
+    let output = std::process::Command::new("git")
+        .current_dir(work_dir.root())
+        .args(["--no-optional-locks", "ls-files", "--stage"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "Git rejected the rewritten index: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}

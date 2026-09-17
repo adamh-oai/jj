@@ -39,11 +39,9 @@ use futures::StreamExt as _;
 use futures::io::Cursor;
 use futures::stream::BoxStream;
 use gix::bstr::BString;
-use gix::objs::CommitRefIter;
 use gix::objs::Exists as _;
 use gix::objs::Write as _;
 use gix::objs::WriteTo as _;
-use gix::objs::commit::signature_field_name;
 use itertools::Itertools as _;
 use once_cell::sync::OnceCell as OnceLock;
 use pollster::FutureExt as _;
@@ -413,6 +411,11 @@ impl GitBackend {
         self.base_repo.path()
     }
 
+    /// Path to the git executable configured for this backend.
+    pub fn git_executable_path(&self) -> &Path {
+        &self.git_executable
+    }
+
     fn shallow_root_ids(&self, git_repo: &gix::Repository) -> BackendResult<&[CommitId]> {
         // The list of shallow roots is cached by gix, but it's still expensive
         // to stat file on every read_object() call. Refreshing shallow roots is
@@ -586,11 +589,10 @@ impl GitBackend {
 
         let locked_repo = self.lock_git_repo();
         if !locked_repo.objects.exists(&oid) {
-            // reuse the precomputed hash, since Gitoxide provides an API for it (otherwise
-            // Gitoxide recomputes it).
+            // write_buf recomputes the hash; gix does the same in write_blob.
             let write_oid = locked_repo
                 .objects
-                .write_buf_with_known_id(gix::objs::Kind::Blob, bytes, oid)
+                .write_buf(gix::objs::Kind::Blob, bytes)
                 .map_err(|err| BackendError::WriteObject {
                     object_type,
                     source: err.into(),
@@ -719,24 +721,8 @@ fn commit_from_git_without_root_parent(
     let author = signature_from_git(commit.author().map_err(decode_err)?);
     let committer = signature_from_git(commit.committer().map_err(decode_err)?);
 
-    // If the commit is signed, extract both the signature and the signed data
-    // (which is the commit buffer with the gpgsig header omitted).
-    // We have to re-parse the raw commit data because gix CommitRef does not give
-    // us the sogned data, only the signature.
-    // Ideally, we could use try_to_commit_ref_iter at the beginning of this
-    // function and extract everything from that. For now, this works
-    let secure_sig = commit
-        .extra_headers
-        .iter()
-        .any(|(k, _)| *k == signature_field_name(git_object.id.kind()))
-        .then(|| CommitRefIter::signature(&git_object.data, git_object.id.kind()))
-        .transpose()
-        .map_err(decode_err)?
-        .flatten()
-        .map(|(sig, data)| SecureSig {
-            data: data.to_bstring().into(),
-            sig: sig.into_owned().into(),
-        });
+    let secure_sig = extract_secure_sig(&commit, &git_object.data, git_object.id.kind())
+        .map_err(|err| to_read_object_err(err, id))?;
 
     Ok(Commit {
         parents,
@@ -750,6 +736,59 @@ fn commit_from_git_without_root_parent(
         committer,
         secure_sig,
     })
+}
+
+// Compatibility with the pinned gitoxide version: its signature iterator only
+// recognizes gpgsig, and its raw token byte ranges are private.
+fn signature_field_name(object_hash: gix::hash::Kind) -> &'static str {
+    match object_hash {
+        gix::hash::Kind::Sha1 => "gpgsig",
+        gix::hash::Kind::Sha256 => "gpgsig-sha256",
+        _ => unreachable!("unsupported Git object hash"),
+    }
+}
+
+fn extract_secure_sig(
+    commit: &gix::objs::CommitRef<'_>,
+    raw_data: &[u8],
+    object_hash: gix::hash::Kind,
+) -> io::Result<Option<SecureSig>> {
+    let field = signature_field_name(object_hash);
+    let Some((_, signature)) = commit.extra_headers.iter().find(|(name, _)| *name == field) else {
+        return Ok(None);
+    };
+
+    // CommitRef has already validated the headers and unfolded the signature.
+    // Locate that first header in the original bytes, including every space-
+    // prefixed continuation line. Re-encoding the decoded commit could change
+    // the signed bytes (for example, whitespace in author/committer fields).
+    let mut lines = raw_data.split_inclusive(|byte| *byte == b'\n').peekable();
+    let mut start = 0;
+    while let Some(line) = lines.next() {
+        if line == b"\n" {
+            break;
+        }
+        let mut end = start + line.len();
+        if line
+            .strip_prefix(field.as_bytes())
+            .is_some_and(|rest| rest.starts_with(b" "))
+        {
+            while lines.peek().is_some_and(|line| line.starts_with(b" ")) {
+                end += lines.next().unwrap().len();
+            }
+            let mut data = Vec::with_capacity(raw_data.len() - (end - start));
+            data.extend_from_slice(&raw_data[..start]);
+            data.extend_from_slice(&raw_data[end..]);
+            return Ok(Some(SecureSig {
+                data,
+                sig: signature.as_ref().to_vec(),
+            }));
+        }
+        start = end;
+    }
+    Err(io::Error::other(
+        "Decoded Git signature header is missing from the raw commit",
+    ))
 }
 
 /// Extracts change id from commit headers.
@@ -1672,6 +1711,7 @@ mod tests {
     use gix::date::parse::TimeBuf;
     use gix::objs::CommitRef;
     use indoc::indoc;
+    use pollster::FutureExt as _;
     use test_case::test_case;
 
     use super::*;
@@ -2012,6 +2052,68 @@ mod tests {
         // converting to string for nicer assert diff
         assert_eq!(str::from_utf8(&sig.sig)?, secure_sig);
         assert_eq!(str::from_utf8(&sig.data)?, commit_str);
+        Ok(())
+    }
+
+    #[test_case(gix::hash::Kind::Sha1, false; "sha1_single_line")]
+    #[test_case(gix::hash::Kind::Sha1, true; "sha1_multiline")]
+    #[test_case(gix::hash::Kind::Sha256, false; "sha256_single_line")]
+    #[test_case(gix::hash::Kind::Sha256, true; "sha256_multiline")]
+    fn signed_git_commit_preserves_raw_bytes(
+        object_hash: gix::hash::Kind,
+        multiline: bool,
+    ) -> TestResult {
+        let field = signature_field_name(object_hash);
+        let other_field = match object_hash {
+            gix::hash::Kind::Sha1 => "gpgsig-sha256",
+            gix::hash::Kind::Sha256 => "gpgsig",
+            _ => unreachable!(),
+        };
+        let prefix = format!(
+            "tree {}\nauthor A  B <a@example.com> 12345 +0000\n\
+             committer C <c@example.com> 12345 -0100\n\
+             {other_field} retain this signature\n and its continuation\n\
+             {field}-extra retain this header\n",
+            "0".repeat(object_hash.len_in_hex()),
+        );
+        let suffix = b"x-raw non-UTF8 \xff\r\n continuation\n\nmessage\n\ngpgsig body text\n \xff";
+        let signature_header = if multiline {
+            format!("{field} first line\n second line\n \n")
+        } else {
+            format!("{field} single line\n")
+        };
+        let raw = [prefix.as_bytes(), signature_header.as_bytes(), suffix].concat();
+        let commit = CommitRef::from_bytes(&raw, object_hash)?;
+        let secure_sig = extract_secure_sig(&commit, &raw, object_hash)?.unwrap();
+        assert_eq!(secure_sig.data, [prefix.as_bytes(), suffix].concat());
+        assert_eq!(
+            secure_sig.sig,
+            if multiline {
+                b"first line\nsecond line\n\n".as_slice()
+            } else {
+                b"single line".as_slice()
+            },
+        );
+        Ok(())
+    }
+
+    #[test_case(gix::hash::Kind::Sha1; "sha1")]
+    #[test_case(gix::hash::Kind::Sha256; "sha256")]
+    fn signed_git_commit_ignores_other_hash_signature(object_hash: gix::hash::Kind) -> TestResult {
+        let other_field = match object_hash {
+            gix::hash::Kind::Sha1 => "gpgsig-sha256",
+            gix::hash::Kind::Sha256 => "gpgsig",
+            _ => unreachable!(),
+        };
+        let raw = format!(
+            "tree {}\nauthor A <a@example.com> 12345 +0000\n\
+             committer C <c@example.com> 12345 +0000\n\
+             {other_field} other signature\n\n{} body text\n",
+            "0".repeat(object_hash.len_in_hex()),
+            signature_field_name(object_hash),
+        );
+        let commit = CommitRef::from_bytes(raw.as_bytes(), object_hash)?;
+        assert!(extract_secure_sig(&commit, raw.as_bytes(), object_hash)?.is_none());
         Ok(())
     }
 

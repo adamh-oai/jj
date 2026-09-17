@@ -20,6 +20,7 @@ use std::io::Write as _;
 use std::iter;
 use std::mem;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -63,6 +64,14 @@ use crate::formatter::FormatterExt as _;
 use crate::revset_util::parse_remote_auto_track_bookmarks_map;
 use crate::ui::ProgressOutput;
 use crate::ui::Ui;
+
+pub fn workspace_git_dir(workspace: &Workspace) -> Option<PathBuf> {
+    let git_backend = git::get_git_backend(workspace.repo_loader().store()).ok()?;
+    let git_repo = git_backend
+        .open_git_repo_at_workdir(workspace.workspace_root())
+        .ok()?;
+    dunce::canonicalize(git_repo.path()).ok()
+}
 
 pub fn is_colocated_git_workspace(workspace: &Workspace) -> Result<bool, CommandError> {
     let Ok(git_backend) = git::get_git_backend(workspace.repo_loader().store()) else {

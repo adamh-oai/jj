@@ -2713,3 +2713,300 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     "#;
     work_dir.run_jj(["log", "-T", template, "-r", "all()"])
 }
+
+#[test]
+fn test_workspaces_add_colocated_git_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+
+    main_dir.create_dir("../secondary");
+    let output = main_dir.run_jj(["workspace", "add", "--colocate", "../secondary"]);
+    insta::assert_snapshot!(output.normalize_backslash(), @r#"
+    ------- stderr -------
+    Created Git worktree for the new workspace.
+    Created workspace in "../secondary"
+    Working copy  (@) now at: pmmvwywv 058f604d (empty) (no description set)
+    Parent commit (@-)      : qpvuntsm 7b22a8cb initial
+    Added 1 files, modified 0 files, removed 0 files
+    [EOF]
+    "#);
+    assert!(secondary_dir.root().join(".git").exists());
+
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(secondary_dir.root().to_str().unwrap()),
+        "worktree list should mention secondary workspace: {stdout}"
+    );
+
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(secondary_dir.root())
+        .output()
+        .unwrap();
+    let git_status = String::from_utf8_lossy(&status_output.stdout);
+    assert!(
+        git_status.is_empty() || git_status.trim() == "?? .jj/",
+        "git status should be clean in the new worktree; got {git_status:?}"
+    );
+}
+
+#[test]
+fn test_workspaces_adopt_existing_colocated_git_worktree() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let worktree_dir = test_env.work_dir("worktree");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let add_output = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(
+        add_output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+    worktree_dir.write_file("file", "changed in worktree\n");
+    worktree_dir.write_file("untracked", "new\n");
+
+    let output = worktree_dir
+        .run_jj(["workspace", "adopt", "--name", "adopted"])
+        .success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Adopted Git worktree as workspace 'adopted'")
+    );
+
+    let output = worktree_dir.run_jj(["status"]).success();
+    assert!(output.stdout.raw().contains("M file"));
+    assert!(output.stdout.raw().contains("A untracked"));
+
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(worktree_dir.root().to_str().unwrap()),
+        "worktree list should mention adopted workspace: {stdout}"
+    );
+
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(worktree_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        status_output.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(output.stdout.raw().contains("adopted:"));
+
+    Ok(())
+}
+
+#[test]
+fn test_workspaces_adopt_rejects_main_git_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    let output = main_dir.run_jj(["workspace", "adopt"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: Cannot adopt the main Git worktree; run this from a linked Git worktree
+    [EOF]
+    [exit status: 1]
+    ");
+}
+
+#[test_case(false, false; "main worktree with full git index")]
+#[test_case(false, true; "main worktree with sparse git index")]
+#[test_case(true, false; "linked worktree with full git index")]
+#[test_case(true, true; "linked worktree with sparse git index")]
+fn test_workspaces_colocated_git_worktree_preserves_git_sparse_checkout(
+    linked_worktree: bool,
+    sparse_index: bool,
+) {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+
+    main_dir.write_file(".gitignore", ".jj/\n");
+    main_dir.create_dir("included");
+    main_dir.write_file("included/visible", "original\n");
+    main_dir.create_dir("excluded");
+    main_dir.write_file("excluded/hidden", "hidden\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let sparse_dir = if linked_worktree {
+        main_dir
+            .run_jj(["workspace", "add", "--colocate", "../secondary"])
+            .success();
+        &secondary_dir
+    } else {
+        &main_dir
+    };
+    let initial_git_status = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        initial_git_status.status.success(),
+        "initial git status failed: {}",
+        String::from_utf8_lossy(&initial_git_status.stderr)
+    );
+    assert!(
+        initial_git_status.stdout.is_empty(),
+        "the linked Git worktree must start clean: {}",
+        String::from_utf8_lossy(&initial_git_status.stdout)
+    );
+
+    let index_mode = if sparse_index {
+        "--sparse-index"
+    } else {
+        "--no-sparse-index"
+    };
+    let sparse_checkout = std::process::Command::new("git")
+        .args(["sparse-checkout", "set", "--cone", index_mode, "included"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        sparse_checkout.status.success(),
+        "git sparse-checkout failed: {}",
+        String::from_utf8_lossy(&sparse_checkout.stderr)
+    );
+    let sparse_git_status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        !sparse_dir.root().join("excluded/hidden").exists(),
+        "Git must omit the excluded path when setting the sparse profile; sparse-checkout stderr: \
+         {}; git status: {}; git status stderr: {}",
+        String::from_utf8_lossy(&sparse_checkout.stderr),
+        String::from_utf8_lossy(&sparse_git_status.stdout),
+        String::from_utf8_lossy(&sparse_git_status.stderr)
+    );
+
+    let status = sparse_dir.run_jj(["status"]).success();
+    assert!(
+        !status.stdout.raw().contains("excluded/hidden"),
+        "jj must not snapshot a sparse-excluded path as deleted: {}",
+        status.stdout.raw()
+    );
+    assert!(!sparse_dir.root().join("excluded/hidden").exists());
+
+    sparse_dir.write_file("included/visible", "modified\n");
+    let status = sparse_dir.run_jj(["status"]).success();
+    assert!(
+        status.stdout.raw().contains("included/visible"),
+        "jj must continue tracking changes inside the sparse profile: {}",
+        status.stdout.raw()
+    );
+    assert!(
+        !status.stdout.raw().contains("excluded/hidden"),
+        "jj must preserve the sparse-excluded tree: {}",
+        status.stdout.raw()
+    );
+
+    sparse_dir
+        .run_jj(["describe", "-m", "preserve sparse Git worktree"])
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(sparse_dir.root().join("included/visible")).unwrap(),
+        "modified\n",
+        "jj must not discard changes inside the sparse profile"
+    );
+    let jj_diff = sparse_dir.run_jj(["diff", "--name-only"]).success();
+    assert!(
+        jj_diff.stdout.raw().contains("included/visible"),
+        "jj must retain the real included-path change: {}",
+        jj_diff.stdout.raw()
+    );
+    assert!(
+        !jj_diff.stdout.raw().contains("excluded/hidden"),
+        "jj must not record a sparse-excluded deletion: {}",
+        jj_diff.stdout.raw()
+    );
+
+    let git_files = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "-t",
+            "--",
+            "included/visible",
+            "excluded/hidden",
+        ])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        git_files.status.success(),
+        "git ls-files failed: {}",
+        String::from_utf8_lossy(&git_files.stderr)
+    );
+    let git_files = String::from_utf8_lossy(&git_files.stdout);
+    assert!(
+        git_files.contains("H included/visible\n"),
+        "jj must not mark an included path skip-worktree: {git_files}"
+    );
+    assert!(
+        git_files.contains("S excluded/hidden\n"),
+        "jj must preserve the Git skip-worktree flag: {git_files}"
+    );
+
+    let git_status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        git_status.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&git_status.stderr)
+    );
+    let git_status = String::from_utf8_lossy(&git_status.stdout);
+    assert!(
+        !git_status.contains("excluded/hidden"),
+        "Git must not report sparse-excluded paths as deleted: {git_status}"
+    );
+
+    assert!(!sparse_dir.root().join("excluded/hidden").exists());
+    if linked_worktree {
+        assert!(
+            main_dir.root().join("excluded/hidden").exists(),
+            "a linked-worktree sparse profile must not change the main worktree"
+        );
+    }
+}

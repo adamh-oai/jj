@@ -210,6 +210,13 @@ pub struct SnapshotOptions<'a> {
     // because the TreeState may be long-lived if the library is used in a
     // long-lived process.
     pub base_ignores: Arc<GitIgnoreFile>,
+    /// Additional sparse prefixes imposed by an external worktree owner.
+    ///
+    /// A colocated Git worktree can omit tracked paths using skip-worktree
+    /// bits without changing JJ's own sparse patterns. Local working copies
+    /// intersect these prefixes with their native sparse matcher so omitted
+    /// Git paths are not mistaken for deletions.
+    pub external_sparse_patterns: Option<Vec<RepoPathBuf>>,
     /// A callback for the UI to display progress.
     pub progress: Option<&'a SnapshotProgress<'a>>,
     /// For new files that are not already tracked, start tracking them if they

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 mod add;
+#[cfg(feature = "git")]
+mod adopt;
 mod forget;
 mod list;
 mod remove;
@@ -26,6 +28,10 @@ use tracing::instrument;
 pub(crate) use self::add::SparseInheritance;
 use self::add::WorkspaceAddArgs;
 use self::add::cmd_workspace_add;
+#[cfg(feature = "git")]
+use self::adopt::WorkspaceAdoptArgs;
+#[cfg(feature = "git")]
+use self::adopt::cmd_workspace_adopt;
 use self::forget::WorkspaceForgetArgs;
 use self::forget::cmd_workspace_forget;
 use self::list::WorkspaceListArgs;
@@ -56,6 +62,8 @@ use crate::ui::Ui;
 #[derive(Subcommand, Clone, Debug)]
 pub(crate) enum WorkspaceCommand {
     Add(WorkspaceAddArgs),
+    #[cfg(feature = "git")]
+    Adopt(WorkspaceAdoptArgs),
     Forget(WorkspaceForgetArgs),
     List(WorkspaceListArgs),
     Remove(WorkspaceRemoveArgs),
@@ -72,6 +80,8 @@ pub(crate) async fn cmd_workspace(
 ) -> Result<(), CommandError> {
     match subcommand {
         WorkspaceCommand::Add(args) => cmd_workspace_add(ui, command, args).await,
+        #[cfg(feature = "git")]
+        WorkspaceCommand::Adopt(args) => cmd_workspace_adopt(ui, command, args).await,
         WorkspaceCommand::Forget(args) => cmd_workspace_forget(ui, command, args).await,
         WorkspaceCommand::List(args) => cmd_workspace_list(ui, command, args).await,
         WorkspaceCommand::Remove(args) => cmd_workspace_remove(ui, command, args).await,

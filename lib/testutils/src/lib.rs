@@ -161,6 +161,7 @@ pub fn user_settings_from_config(config: StackedConfig) -> UserSettings {
 pub fn empty_snapshot_options() -> SnapshotOptions<'static> {
     SnapshotOptions {
         base_ignores: GitIgnoreFile::empty(),
+        external_sparse_patterns: None,
         progress: None,
         start_tracking_matcher: &EverythingMatcher,
         force_tracking_matcher: &NothingMatcher,

@@ -299,6 +299,7 @@ diff editing in mind and be a little inaccurate.
         output_tree_state
             .snapshot(&SnapshotOptions {
                 base_ignores,
+                external_sparse_patterns: None,
                 progress: None,
                 start_tracking_matcher: &EverythingMatcher,
                 force_tracking_matcher: &NothingMatcher,
