@@ -187,6 +187,34 @@ enum CleanupIssue {
     Conflict(Commit),
 }
 
+#[derive(Debug)]
+enum CleanupSelection {
+    Clean,
+    Next(CleanupIssue),
+    Blocked(CleanupBlockedPlan),
+}
+
+#[derive(Debug, Serialize)]
+struct CleanupBlockedPlan {
+    kind: &'static str,
+    status: &'static str,
+    reason: &'static str,
+    cycle: Vec<CleanupDependency>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CleanupDependency {
+    ancestor: CleanupDependencyEndpoint,
+    descendant: CleanupDependencyEndpoint,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CleanupDependencyEndpoint {
+    kind: &'static str,
+    change_id: String,
+    commit_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct UnresolvedChoice {
     kind: &'static str,
@@ -510,17 +538,27 @@ async fn converge_cleanup(
     let issue_expr = cleanup_issue_expression(ui, workspace_command, args).await?;
     let divergent_changes = find_scoped_divergent_changes(ui, workspace_command, args).await?;
     let issues = find_cleanup_issues(workspace_command, issue_expr, &divergent_changes).await?;
-    let Some(issue) = bottom_cleanup_issue(workspace_command, &issues, &divergent_changes).await?
-    else {
-        if args.json {
-            writeln!(ui.stdout(), "{{\"status\":\"clean\"}}")?;
-        } else {
-            writeln!(
-                ui.status(),
-                "No divergent changes or content conflicts found."
-            )?;
+    let issue = match bottom_cleanup_issue(workspace_command, &issues, &divergent_changes).await? {
+        CleanupSelection::Clean => {
+            if args.json {
+                writeln!(ui.stdout(), "{{\"status\":\"clean\"}}")?;
+            } else {
+                writeln!(
+                    ui.status(),
+                    "No divergent changes or content conflicts found."
+                )?;
+            }
+            return Ok(());
         }
-        return Ok(());
+        CleanupSelection::Next(issue) => issue,
+        CleanupSelection::Blocked(plan) => {
+            write_cleanup_blocked_plan(ui, &plan, args.json)?;
+            return if args.dry_run {
+                Ok(())
+            } else {
+                Err(cleanup_cycle_error(&plan))
+            };
+        }
     };
 
     match issue {
@@ -653,34 +691,87 @@ async fn bottom_cleanup_issue(
     workspace_command: &crate::cli_util::WorkspaceCommandHelper,
     issues: &[CleanupIssue],
     divergent_changes: &CommitsByChangeId,
-) -> Result<Option<CleanupIssue>, CommandError> {
-    let mut bottom = vec![];
-    for candidate in issues {
-        let mut has_issue_ancestor = false;
-        for other in issues {
-            if same_cleanup_issue(candidate, other) {
+) -> Result<CleanupSelection, CommandError> {
+    if issues.is_empty() {
+        return Ok(CleanupSelection::Clean);
+    }
+
+    let issues = issues
+        .iter()
+        .sorted_by_key(|issue| cleanup_issue_sort_key(issue))
+        .collect_vec();
+    let mut blockers = vec![];
+    for (candidate_index, candidate) in issues.iter().enumerate() {
+        let mut blocker = None;
+        for (other_index, other) in issues.iter().enumerate() {
+            if candidate_index == other_index {
                 continue;
             }
-            if cleanup_issue_is_ancestor(workspace_command, other, candidate, divergent_changes)
-                .await?
+            if let Some((ancestor_id, descendant_id)) = cleanup_issue_ancestry_witness(
+                workspace_command,
+                other,
+                candidate,
+                divergent_changes,
+            )
+            .await?
             {
-                has_issue_ancestor = true;
+                blocker = Some((
+                    other_index,
+                    CleanupDependency {
+                        ancestor: cleanup_dependency_endpoint(other, &ancestor_id),
+                        descendant: cleanup_dependency_endpoint(candidate, &descendant_id),
+                    },
+                ));
                 break;
             }
         }
-        if !has_issue_ancestor {
-            bottom.push(candidate.clone());
-        }
+        let Some(blocker) = blocker else {
+            return Ok(CleanupSelection::Next((*candidate).clone()));
+        };
+        blockers.push(blocker);
     }
-    bottom.sort_by_key(cleanup_issue_sort_key);
-    Ok(bottom.into_iter().next())
+
+    // The commit graph is acyclic, but grouping divergent versions into one
+    // issue can create a dependency cycle. Every remaining issue has a blocker,
+    // so following one blocker per issue must eventually repeat an issue.
+    let mut visited = vec![None; issues.len()];
+    let mut path = vec![];
+    let mut current = 0;
+    let cycle_start = loop {
+        if let Some(position) = visited[current] {
+            break position;
+        }
+        visited[current] = Some(path.len());
+        path.push(current);
+        current = blockers[current].0;
+    };
+    // Blocker traversal follows descendant-to-ancestor edges. Reverse them so
+    // the witness follows ancestor-to-descendant edges around the cycle.
+    let cycle = path[cycle_start..]
+        .iter()
+        .rev()
+        .map(|&index| blockers[index].1.clone())
+        .collect();
+    Ok(CleanupSelection::Blocked(CleanupBlockedPlan {
+        kind: "ordering",
+        status: "blocked",
+        reason: "cyclic_issue_dependencies",
+        cycle,
+    }))
 }
 
-fn same_cleanup_issue(left: &CleanupIssue, right: &CleanupIssue) -> bool {
-    match (left, right) {
-        (CleanupIssue::Divergence(left), CleanupIssue::Divergence(right)) => left == right,
-        (CleanupIssue::Conflict(left), CleanupIssue::Conflict(right)) => left.id() == right.id(),
-        _ => false,
+fn cleanup_dependency_endpoint(
+    issue: &CleanupIssue,
+    commit_id: &CommitId,
+) -> CleanupDependencyEndpoint {
+    let (kind, change_id) = match issue {
+        CleanupIssue::Divergence(change_id) => ("divergence", change_id),
+        CleanupIssue::Conflict(commit) => ("conflict", commit.change_id()),
+    };
+    CleanupDependencyEndpoint {
+        kind,
+        change_id: change_id.reverse_hex(),
+        commit_id: commit_id.hex(),
     }
 }
 
@@ -691,12 +782,12 @@ fn cleanup_issue_sort_key(issue: &CleanupIssue) -> String {
     }
 }
 
-async fn cleanup_issue_is_ancestor(
+async fn cleanup_issue_ancestry_witness(
     workspace_command: &crate::cli_util::WorkspaceCommandHelper,
     ancestor: &CleanupIssue,
     descendant: &CleanupIssue,
     divergent_changes: &CommitsByChangeId,
-) -> Result<bool, CommandError> {
+) -> Result<Option<(CommitId, CommitId)>, CommandError> {
     for ancestor_id in cleanup_issue_commit_ids(ancestor, divergent_changes) {
         for descendant_id in cleanup_issue_commit_ids(descendant, divergent_changes) {
             if ancestor_id == descendant_id {
@@ -709,11 +800,11 @@ async fn cleanup_issue_is_ancestor(
                 .await
                 .map_err(internal_error)?
             {
-                return Ok(true);
+                return Ok(Some((ancestor_id, descendant_id)));
             }
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 fn cleanup_issue_commit_ids(
@@ -724,6 +815,7 @@ fn cleanup_issue_commit_ids(
         CleanupIssue::Divergence(change_id) => divergent_changes[change_id]
             .iter()
             .map(|commit| commit.id().clone())
+            .sorted()
             .collect(),
         CleanupIssue::Conflict(commit) => vec![commit.id().clone()],
     }
@@ -1321,6 +1413,68 @@ fn write_conflict_plan(ui: &mut Ui, plan: &ConflictPlan, json: bool) -> Result<(
     Ok(())
 }
 
+fn write_cleanup_blocked_plan(
+    ui: &mut Ui,
+    plan: &CleanupBlockedPlan,
+    json: bool,
+) -> Result<(), CommandError> {
+    if json {
+        let output = serde_json::to_string_pretty(plan).map_err(internal_error)?;
+        writeln!(ui.stdout(), "{output}")?;
+        return Ok(());
+    }
+    writeln!(
+        ui.status(),
+        "Cannot order cleanup issues: cyclic dependencies"
+    )?;
+    for dependency in &plan.cycle {
+        let ancestor = &dependency.ancestor;
+        let descendant = &dependency.descendant;
+        writeln!(
+            ui.status(),
+            "  {} {} (commit {}) is an ancestor of {} {} (commit {})",
+            ancestor.kind,
+            ancestor.change_id,
+            ancestor.commit_id,
+            descendant.kind,
+            descendant.change_id,
+            descendant.commit_id,
+        )?;
+    }
+    writeln!(
+        ui.status(),
+        "Inspect these exact commits and choose the intended stack order."
+    )?;
+    writeln!(ui.status(), "{}", cleanup_cycle_resolution_hint(plan))?;
+    Ok(())
+}
+
+fn cleanup_cycle_resolution_hint(plan: &CleanupBlockedPlan) -> String {
+    // A cycle must contain divergence: ancestry between individual conflicted
+    // commits alone cannot cycle in a valid commit graph.
+    let divergence = plan
+        .cycle
+        .iter()
+        .map(|dependency| &dependency.ancestor)
+        .find(|endpoint| endpoint.kind == "divergence")
+        .expect("a cleanup dependency cycle must contain a divergent change");
+    format!(
+        "Resolve one change explicitly with jj converge -r 'change_id({})' --interactive, or \
+         supply --onto <chosen-parent> and any other required resolution options.",
+        divergence.change_id,
+    )
+}
+
+fn cleanup_cycle_error(plan: &CleanupBlockedPlan) -> CommandError {
+    let mut err = user_error("Cannot order cleanup issues: cyclic dependencies");
+    err.add_hint(
+        "Divergent versions impose conflicting cleanup orders; inspect the exact commits in the \
+         cycle.",
+    );
+    err.add_hint(cleanup_cycle_resolution_hint(plan));
+    err
+}
+
 fn write_resolved_divergence(
     ui: &mut Ui,
     applied: &AppliedConvergence,
@@ -1415,13 +1569,15 @@ fn inspect_choice_command(choice: &UnresolvedChoice) -> Option<(&'static str, St
         "description" => Some((
             "descriptions",
             format!(
-                "jj log -r '{revset}' --no-graph -T 'commit_id ++ \"\\n\" ++ description ++ \"\\n\"'"
+                "jj log -r '{revset}' --no-graph -T 'commit_id ++ \"\\n\" ++ description ++ \
+                 \"\\n\"'"
             ),
         )),
         "parent" => Some((
             "parents",
             format!(
-                "jj log -r '{revset}' --no-graph -T 'commit_id ++ \" \" ++ change_id ++ \"\\n\" ++ description ++ \"\\n\"'"
+                "jj log -r '{revset}' --no-graph -T 'commit_id ++ \" \" ++ change_id ++ \"\\n\" \
+                 ++ description ++ \"\\n\"'"
             ),
         )),
         _ => None,
@@ -1684,8 +1840,8 @@ async fn edit_merged_description(
         .get_commit_async(base_commit_id)
         .await?;
     let mut template = String::from(
-        "JJ: Resolve the divergent descriptions below into one description.\n\
-         JJ: Remove every conflict-marker line before saving.\n",
+        "JJ: Resolve the divergent descriptions below into one description.\nJJ: Remove every \
+         conflict-marker line before saving.\n",
     );
     template.push_str("<<<<<<< divergent descriptions\n");
     template.push_str(&format!(

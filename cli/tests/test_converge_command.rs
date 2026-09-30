@@ -129,6 +129,201 @@ fn create_author_divergence(work_dir: &TestWorkDir) {
     work_dir.run_jj(["status"]).success();
 }
 
+fn create_crossed_cleanup_dependencies(work_dir: &TestWorkDir) {
+    create_commit_with_files(work_dir, "a", &[], &[]);
+    create_commit_with_files(work_dir, "b", &["a"], &[]);
+    let original_op = work_dir.current_operation_id();
+    work_dir
+        .run_jj(["rebase", "-r", "b", "-o", "root()"])
+        .success();
+    work_dir.run_jj(["rebase", "-r", "a", "-o", "b"]).success();
+    work_dir
+        .run_jj([
+            "bookmark",
+            "create",
+            "old-b",
+            "-r",
+            &format!("at_operation({original_op}, b)"),
+        ])
+        .success();
+    // Both A0 -> B0 and B1 -> A1 are now visible. The commit graph is
+    // acyclic, but the dependency graph of divergent changes has a cycle.
+    work_dir.run_jj(["status"]).success();
+}
+
+fn create_divergence_conflict_cleanup_dependencies(work_dir: &TestWorkDir) {
+    create_commit_with_files(work_dir, "a", &[], &[("file", "base\n")]);
+    create_commit_with_files(work_dir, "left", &["a"], &[("file", "left\n")]);
+    create_commit_with_files(work_dir, "right", &["a"], &[("file", "right\n")]);
+    create_commit_with_files(work_dir, "conflict", &["left", "right"], &[]);
+    let conflict_id = converge_log_value(work_dir, "conflict", "commit_id");
+
+    // Rebase A after its descendants, then reconnect it to the original
+    // conflict. Discard the rewritten side branch to leave A0 -> C -> A1.
+    work_dir
+        .run_jj(["rebase", "-r", "a", "-o", "conflict"])
+        .success();
+    let rewritten_side =
+        converge_log_value(work_dir, "left | right | conflict", "commit_id ++ '\n'");
+    work_dir
+        .run_jj(["rebase", "-r", "a", "-o", &conflict_id])
+        .success();
+    work_dir
+        .run_jj(["bookmark", "delete", "left", "right", "conflict"])
+        .success();
+    work_dir
+        .run_jj_with(|cmd| cmd.arg("abandon").args(rewritten_side.lines()))
+        .success();
+    work_dir
+        .run_jj(["bookmark", "create", "conflict", "-r", &conflict_id])
+        .success();
+    work_dir
+        .run_jj(["new", "a", "-m", "working copy"])
+        .success();
+    work_dir.run_jj(["status"]).success();
+}
+
+fn cleanup_log_value(work_dir: &TestWorkDir, revision: &str, template: &str) -> String {
+    work_dir
+        .run_jj([
+            "log",
+            "--ignore-working-copy",
+            "-r",
+            revision,
+            "--no-graph",
+            "-T",
+            template,
+        ])
+        .success()
+        .stdout
+        .raw()
+        .to_owned()
+}
+
+fn cleanup_repository_state(work_dir: &TestWorkDir) -> (String, String, String, Option<Vec<u8>>) {
+    (
+        work_dir.current_operation_id(),
+        cleanup_log_value(
+            work_dir,
+            "all()",
+            "commit_id ++ ' ' ++ change_id ++ ' ' ++ parents.map(|p| p.commit_id()).join(' ') ++ \
+             ' ' ++ bookmarks ++ '\n'",
+        ),
+        cleanup_log_value(work_dir, "@", "commit_id"),
+        std::fs::read(work_dir.root().join("file")).ok(),
+    )
+}
+
+fn cleanup_endpoint_key(endpoint: &serde_json::Value) -> (&str, &str) {
+    let kind = endpoint["kind"].as_str().unwrap();
+    let identity = match kind {
+        "divergence" => endpoint["change_id"].as_str().unwrap(),
+        "conflict" => endpoint["commit_id"].as_str().unwrap(),
+        _ => panic!("unexpected cleanup issue kind: {endpoint}"),
+    };
+    (kind, identity)
+}
+
+fn assert_cleanup_cycle(work_dir: &TestWorkDir, plan: &serde_json::Value) {
+    assert_eq!(plan["kind"], "ordering");
+    assert_eq!(plan["status"], "blocked");
+    assert_eq!(plan["reason"], "cyclic_issue_dependencies");
+    let cycle = plan["cycle"].as_array().unwrap();
+    assert_eq!(cycle.len(), 2, "{plan}");
+    for (index, edge) in cycle.iter().enumerate() {
+        let ancestor = &edge["ancestor"];
+        let descendant = &edge["descendant"];
+        let ancestor_id = ancestor["commit_id"].as_str().unwrap();
+        let descendant_id = descendant["commit_id"].as_str().unwrap();
+        assert_ne!(ancestor_id, descendant_id, "{plan}");
+        assert_eq!(
+            cleanup_log_value(
+                work_dir,
+                &format!("{ancestor_id} & ancestors({descendant_id})"),
+                "commit_id",
+            ),
+            ancestor_id,
+            "cycle edge must report exact commits with real ancestry: {plan}"
+        );
+        for endpoint in [ancestor, descendant] {
+            let commit_id = endpoint["commit_id"].as_str().unwrap();
+            assert_eq!(commit_id.len(), 40, "{endpoint}");
+            assert_eq!(
+                cleanup_log_value(work_dir, commit_id, "change_id"),
+                endpoint["change_id"].as_str().unwrap()
+            );
+            let issue_revset = match endpoint["kind"].as_str().unwrap() {
+                "divergence" => "divergent()",
+                "conflict" => "conflicts()",
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                cleanup_log_value(
+                    work_dir,
+                    &format!("{issue_revset} & {commit_id}"),
+                    "commit_id"
+                ),
+                commit_id,
+                "cycle witness must belong to the reported issue: {plan}"
+            );
+        }
+        let next_edge = &cycle[(index + 1) % cycle.len()];
+        assert_eq!(
+            cleanup_endpoint_key(descendant),
+            cleanup_endpoint_key(&next_edge["ancestor"]),
+            "cycle edges must connect by cleanup issue identity: {plan}"
+        );
+    }
+}
+
+fn assert_cleanup_is_blocked_without_mutation(work_dir: &TestWorkDir) -> serde_json::Value {
+    let before = cleanup_repository_state(work_dir);
+    let mut previous_json = None;
+    let mut blocked_plan = None;
+    for dry_run in [false, true] {
+        for json in [false, true, true] {
+            let mut args = vec!["converge"];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            if json {
+                args.push("--json");
+            }
+            let output = work_dir.run_jj(args);
+            assert_eq!(output.status.success(), dry_run, "{output}");
+            if json {
+                let plan: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+                assert_cleanup_cycle(work_dir, &plan);
+                if let Some(previous) = &previous_json {
+                    assert_eq!(output.stdout.raw(), previous);
+                }
+                previous_json = Some(output.stdout.raw().to_owned());
+                blocked_plan = Some(plan);
+            } else {
+                assert!(
+                    output
+                        .stderr
+                        .raw()
+                        .contains("Cannot order cleanup issues: cyclic dependencies"),
+                    "{output}"
+                );
+                assert!(
+                    !output.stderr.raw().contains("No divergent changes"),
+                    "{output}"
+                );
+            }
+            assert_eq!(cleanup_repository_state(work_dir), before, "{output}");
+        }
+    }
+    // An explicit ancestor scope containing the same issues must preserve
+    // the blocked result, as well as the repository state.
+    let output = work_dir.run_jj(["converge", "-r", "heads(all())", "--json"]);
+    assert!(!output.status.success(), "{output}");
+    assert_eq!(output.stdout.raw(), previous_json.as_ref().unwrap());
+    assert_eq!(cleanup_repository_state(work_dir), before, "{output}");
+    blocked_plan.unwrap()
+}
+
 #[test]
 fn test_converge_creates_one_linear_solution() {
     let test_env = TestEnvironment::default();
@@ -148,7 +343,8 @@ fn test_converge_creates_one_linear_solution() {
         "-r@",
         "--no-graph",
         "-T",
-        "change_id.short(8) ++ \" \" ++ parents.len() ++ \" \" ++ description.first_line() ++ \"\\n\"",
+        "change_id.short(8) ++ \" \" ++ parents.len() ++ \" \" ++ description.first_line() ++ \
+         \"\\n\"",
     ]);
     assert_eq!(output.stdout.raw(), "qpvuntsm 1 merged\n");
 
@@ -516,6 +712,120 @@ fn test_converge_revision_is_stack_scope() {
     let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
     assert_eq!(result["status"], "resolved");
     assert_eq!(result["kind"], "divergence");
+}
+
+#[test]
+fn test_converge_reports_crossed_change_order_without_mutation() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_crossed_cleanup_dependencies(&work_dir);
+    create_commit_with_files(&work_dir, "left", &["a"], &[("file", "left\n")]);
+    create_commit_with_files(&work_dir, "right", &["a"], &[("file", "right\n")]);
+    create_commit_with_files(&work_dir, "conflict", &["left", "right"], &[]);
+    work_dir.run_jj(["status"]).success();
+
+    // The conflict is blocked downstream of the cycle. The reported cycle
+    // must exclude that noncyclic prefix and identify only the two changes.
+    let plan = assert_cleanup_is_blocked_without_mutation(&work_dir);
+    for edge in plan["cycle"].as_array().unwrap() {
+        assert_eq!(edge["ancestor"]["kind"], "divergence");
+        assert_eq!(edge["descendant"]["kind"], "divergence");
+    }
+}
+
+#[test]
+fn test_converge_reports_divergence_conflict_cycle_without_mutation() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_divergence_conflict_cleanup_dependencies(&work_dir);
+
+    let plan = assert_cleanup_is_blocked_without_mutation(&work_dir);
+    let mut issue_kinds = plan["cycle"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|edge| edge["ancestor"]["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    issue_kinds.sort_unstable();
+    assert_eq!(issue_kinds, ["conflict", "divergence"]);
+}
+
+#[test]
+fn test_converge_processes_independent_issue_before_reporting_cycle() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    create_crossed_cleanup_dependencies(&work_dir);
+    work_dir
+        .run_jj(["new", "root()", "-m", "independent"])
+        .success();
+    create_automatic_divergence(&work_dir, "independent");
+    let independent_change_id = cleanup_log_value(&work_dir, "@", "change_id");
+
+    let before = cleanup_repository_state(&work_dir);
+    let output = work_dir.run_jj(["converge", "--dry-run", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let plan: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(plan["kind"], "divergence");
+    assert_eq!(plan["status"], "ready");
+    assert_eq!(plan["change_id"], independent_change_id);
+    assert_eq!(cleanup_repository_state(&work_dir), before);
+
+    let output = work_dir.run_jj(["converge", "--json"]);
+    assert!(output.status.success(), "{output}");
+    let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+    assert_eq!(result["kind"], "divergence");
+    assert_eq!(result["status"], "resolved");
+    assert_eq!(result["change_id"], independent_change_id);
+    assert_eq!(
+        cleanup_log_value(
+            &work_dir,
+            &format!("divergent() & {independent_change_id}"),
+            "commit_id"
+        ),
+        ""
+    );
+    assert_cleanup_is_blocked_without_mutation(&work_dir);
+}
+
+#[test]
+fn test_converge_reports_clean_only_for_empty_issue_scope() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    for dry_run in [false, true] {
+        let mut args = vec!["converge", "--json"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = work_dir.run_jj(args);
+        assert!(output.status.success(), "{output}");
+        let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+        assert_eq!(result, serde_json::json!({ "status": "clean" }));
+    }
+
+    create_crossed_cleanup_dependencies(&work_dir);
+    work_dir
+        .run_jj(["new", "root()", "-m", "clean tip"])
+        .success();
+    work_dir.run_jj(["status"]).success();
+    let before = cleanup_repository_state(&work_dir);
+    for dry_run in [false, true] {
+        let mut args = vec!["converge", "-r", "@", "--json"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = work_dir.run_jj(args);
+        assert!(output.status.success(), "{output}");
+        let result: serde_json::Value = serde_json::from_str(output.stdout.raw()).unwrap();
+        assert_eq!(result, serde_json::json!({ "status": "clean" }));
+        assert_eq!(cleanup_repository_state(&work_dir), before);
+    }
+    // The excluded branches still contain the cycle.
+    assert_cleanup_is_blocked_without_mutation(&work_dir);
 }
 
 #[test]
