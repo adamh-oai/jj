@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::Write as _;
 
 use clap_complete::ArgValueCompleter;
@@ -998,8 +999,8 @@ async fn change_id_is_ancestor(
     ancestor_change_id: &ChangeId,
     descendant_change_id: &ChangeId,
 ) -> Result<bool, CommandError> {
-    for ancestor_commit in divergent_changes[ancestor_change_id].iter() {
-        for descendant_commit in divergent_changes[descendant_change_id].iter() {
+    for ancestor_commit in &divergent_changes[ancestor_change_id] {
+        for descendant_commit in &divergent_changes[descendant_change_id] {
             if workspace_command
                 .repo()
                 .index()
@@ -1844,20 +1845,24 @@ async fn edit_merged_description(
          conflict-marker line before saving.\n",
     );
     template.push_str("<<<<<<< divergent descriptions\n");
-    template.push_str(&format!(
-        "%%%%%%% base {}\n",
+    writeln!(
+        template,
+        "%%%%%%% base {}",
         short_commit_hash(base_commit_id)
-    ));
+    )
+    .unwrap();
     push_description(&mut template, base.description());
     for commit in graph
         .divergent_commits()
         .iter()
         .filter(|commit| !excluded_divergent_commits.contains(commit.id()))
     {
-        template.push_str(&format!(
-            "+++++++ version {}\n",
+        writeln!(
+            template,
+            "+++++++ version {}",
             short_commit_hash(commit.id())
-        ));
+        )
+        .unwrap();
         push_description(&mut template, commit.description());
     }
     template.push_str(">>>>>>>\n");

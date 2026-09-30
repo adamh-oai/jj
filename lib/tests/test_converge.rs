@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::slice;
 use std::sync::Arc;
 
-use futures::executor::block_on_stream;
 use futures::StreamExt as _;
+use futures::executor::block_on_stream;
 use itertools::Itertools as _;
 use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
@@ -29,14 +29,14 @@ use jj_lib::backend::TreeId;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
 use jj_lib::conflict_labels::ConflictLabels;
-use jj_lib::converge::apply_solution;
-use jj_lib::converge::converge_change;
-use jj_lib::converge::find_divergent_changes;
-use jj_lib::converge::remove_descendants;
 use jj_lib::converge::CommitsByChangeId;
 use jj_lib::converge::ConvergedAttribute;
 use jj_lib::converge::TreeIdsAndLabels;
 use jj_lib::converge::TruncatedEvolutionGraph;
+use jj_lib::converge::apply_solution;
+use jj_lib::converge::converge_change;
+use jj_lib::converge::find_divergent_changes;
+use jj_lib::converge::remove_descendants;
 use jj_lib::evolution::walk_predecessors;
 use jj_lib::merge::Merge;
 use jj_lib::merge::MergeBuilder;
@@ -48,6 +48,9 @@ use jj_lib::revset::RevsetExpression;
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
 use pollster::FutureExt as _;
+use testutils::CommitBuilderExt as _;
+use testutils::TestRepo;
+use testutils::TestResult;
 use testutils::commit_transactions;
 use testutils::create_random_tree;
 use testutils::create_tree_with;
@@ -56,9 +59,6 @@ use testutils::repo_path;
 use testutils::repo_path_buf;
 use testutils::write_random_commit;
 use testutils::write_random_commit_with_parents;
-use testutils::CommitBuilderExt as _;
-use testutils::TestRepo;
-use testutils::TestResult;
 
 fn make_change_id(repo: &TestRepo, byte: u8) -> ChangeId {
     ChangeId::new(vec![byte; repo.repo.store().change_id_length()])
@@ -371,20 +371,24 @@ fn test_build_truncated_evolution_graph() -> TestResult {
             .collect::<Vec<_>>(),
         &[commit2.id(), commit3.id()]
     );
-    assert!(truncated_evolution_graph
-        .flow_graph
-        .graph
-        .adjacent_nodes(commit2.id())
-        .unwrap()
-        .collect::<Vec<_>>()
-        .is_empty(),);
-    assert!(truncated_evolution_graph
-        .flow_graph
-        .graph
-        .adjacent_nodes(commit3.id())
-        .unwrap()
-        .collect::<Vec<_>>()
-        .is_empty(),);
+    assert!(
+        truncated_evolution_graph
+            .flow_graph
+            .graph
+            .adjacent_nodes(commit2.id())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .is_empty(),
+    );
+    assert!(
+        truncated_evolution_graph
+            .flow_graph
+            .graph
+            .adjacent_nodes(commit3.id())
+            .unwrap()
+            .collect::<Vec<_>>()
+            .is_empty(),
+    );
 
     Ok(())
 }
