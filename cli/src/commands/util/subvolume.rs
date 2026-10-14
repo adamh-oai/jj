@@ -204,8 +204,11 @@ async fn cmd_util_subvolume_impl(
             // baseline. Rebuild in place for both marker states so the
             // suggested repair works without replacing the user's checkout.
             if *rebuild_baseline && is_subvolume_mode_enabled(&workspace_root) {
+                #[cfg(feature = "git")]
                 let colocated =
                     crate::git_util::is_colocated_git_workspace(workspace_command.workspace())?;
+                #[cfg(not(feature = "git"))]
+                let colocated = false;
                 if colocated && !require_colocated_workspace(&workspace_command)? {
                     require_main_subvolume_mode_for_linked_workspace(&workspace_command)?;
                 }
@@ -855,6 +858,7 @@ fn finalize_subvolume_root(ui: &Ui, root: &Path, colocated: bool) -> Result<(), 
     Ok(())
 }
 
+#[cfg(feature = "git")]
 fn refresh_git_awacs_baseline(ui: &Ui, root: &Path) -> Result<(), CommandError> {
     use std::process::Command;
 
@@ -932,6 +936,11 @@ fn refresh_git_awacs_baseline(ui: &Ui, root: &Path) -> Result<(), CommandError> 
         "Git did not publish a valid AWACS fsmonitor baseline after two index refreshes; check \
          the configured Git fsmonitor hook and its protocol version",
     ))
+}
+
+#[cfg(not(feature = "git"))]
+fn refresh_git_awacs_baseline(_ui: &Ui, _root: &Path) -> Result<(), CommandError> {
+    Ok(())
 }
 
 fn finish_retained_checkout(
@@ -1291,7 +1300,13 @@ fn subvolume_status_git_directory(
     workspace_root: &Path,
 ) -> Option<PathBuf> {
     if let Some(workspace_command) = workspace_command {
+        #[cfg(feature = "git")]
         return crate::git_util::workspace_git_dir(workspace_command.workspace());
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = workspace_command;
+            return None;
+        }
     }
     let dot_git = workspace_root.join(".git");
     if dot_git.is_dir() {
@@ -1452,6 +1467,7 @@ fn format_bytes(bytes: &[u8]) -> String {
     formatted
 }
 
+#[cfg(feature = "git")]
 fn require_colocated_workspace(
     workspace_command: &crate::cli_util::WorkspaceCommandHelper,
 ) -> Result<bool, CommandError> {
@@ -1473,6 +1489,15 @@ fn require_colocated_workspace(
         ));
     }
     Ok(main_workspace)
+}
+
+#[cfg(not(feature = "git"))]
+fn require_colocated_workspace(
+    _workspace_command: &crate::cli_util::WorkspaceCommandHelper,
+) -> Result<bool, CommandError> {
+    Err(user_error(
+        "This command requires a Git-colocated repository",
+    ))
 }
 
 fn require_main_subvolume_mode_for_linked_workspace(

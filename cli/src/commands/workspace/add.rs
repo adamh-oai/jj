@@ -36,6 +36,7 @@ use jj_lib::backend::CommitId;
 use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::file_util;
 use jj_lib::file_util::IoResultExt as _;
+#[cfg(feature = "git")]
 use jj_lib::git;
 #[cfg(feature = "git")]
 use jj_lib::git::GitSubprocessOptions;
@@ -257,8 +258,7 @@ async fn cmd_workspace_add_impl(
         old_workspace_command.working_copy_shared_with_git()
             && old_workspace_command.settings().get_bool("git.colocate")?
     };
-    #[cfg(not(feature = "git"))]
-    let should_colocate = false;
+    #[cfg(feature = "git")]
     let git_worktree_plan = if should_colocate {
         let git_backend = git::get_git_backend(repo.store()).map_err(|_| {
             internal_error_with_message(
@@ -280,6 +280,8 @@ async fn cmd_workspace_add_impl(
     } else {
         None
     };
+    #[cfg(not(feature = "git"))]
+    let git_worktree_plan: Option<GitWorktreePlan> = None;
     let working_copy_factory = command.get_working_copy_factory()?;
     let mut snapshot_source_commit = None;
     #[cfg_attr(
