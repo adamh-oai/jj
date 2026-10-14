@@ -4855,10 +4855,14 @@ fn test_util_subvolume_rebuild_missing_baseline(marker: &str, colocated: bool) -
 #[test_case("snapshot-backed", false, 2; "committed_missing_v2")]
 #[test_case("snapshot-backed", true, 3; "committed_retained_v3")]
 #[test_case("snapshot-backed", false, 3; "committed_missing_v3")]
+#[test_case("snapshot-backed", true, 4; "committed_retained_v4")]
+#[test_case("snapshot-backed", false, 4; "committed_missing_v4")]
 #[test_case("enabling", true, 2; "enabling_retained_v2")]
 #[test_case("enabling", false, 2; "enabling_missing_v2")]
 #[test_case("enabling", true, 3; "enabling_retained_v3")]
 #[test_case("enabling", false, 3; "enabling_missing_v3")]
+#[test_case("enabling", true, 4; "enabling_retained_v4")]
+#[test_case("enabling", false, 4; "enabling_missing_v4")]
 fn test_interrupted_sparse_contraction_is_not_rebuilt(
     marker: &str,
     has_baseline: bool,
