@@ -881,6 +881,14 @@ impl PendingScan {
 struct NoopScanSession;
 
 impl ScanSession for NoopScanSession {
+    fn prepare_to_commit(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("JJ_TEST_AWACS_FAIL_LEASE_PREPARE").is_some() {
+            return Err("injected AWACS lease prepare failure".into());
+        }
+        Ok(())
+    }
+
     fn finish(self: Box<Self>, _outcome: ScanOutcome) -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok(())
     }
@@ -2774,6 +2782,25 @@ impl TreeState {
                 changed_files,
                 cursor,
             } => {
+                // Let a test publish an operation while this synthetic scan is
+                // in progress, then release it by removing the signal file.
+                #[cfg(debug_assertions)]
+                if let Some(path) = std::env::var_os("JJ_TEST_AWACS_REBUILD_PAUSE") {
+                    std::fs::write(&path, b"ready").map_err(|err| SnapshotError::Other {
+                        message: "Failed to signal the AWACS scan test".to_owned(),
+                        err: Box::new(err),
+                    })?;
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while Path::new(&path).exists() {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(SnapshotError::Other {
+                                message: "Timed out waiting for the AWACS scan test".to_owned(),
+                                err: "scan was not resumed".into(),
+                            });
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
                 let input_fingerprint = awacs_input_fingerprint.unwrap_or([0; 32]);
                 (
                     scan_root.clone(),

@@ -701,7 +701,14 @@ impl CommandHelper {
                 // merged repo wouldn't change because the old one wins, but it's probably
                 // fine if we picked the new wc_commit_id.
                 let stale_stats = workspace_command
-                    .snapshot_working_copy(ui, git_import_export_lock, false, &NothingMatcher)
+                    .snapshot_working_copy(
+                        ui,
+                        git_import_export_lock,
+                        false,
+                        &NothingMatcher,
+                        None,
+                        None,
+                    )
                     .await
                     .map_err(|err| err.into_command_error())?;
 
@@ -817,6 +824,40 @@ impl CommandHelper {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Establish a baseline against the stale journal's original operation.
+    /// Leave the checkout and Git state untouched; choosing how to reconcile
+    /// the saved snapshot with the newer operation is a separate action.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    pub(crate) async fn snapshot_stale_working_copy_for_subvolume_rebuild(
+        &self,
+        ui: &Ui,
+        git_import_export_lock: &GitImportExportLock,
+        expected_published_operation: &OperationId,
+        expected_working_copy_operation: &OperationId,
+    ) -> Result<(WorkspaceCommandHelper, SnapshotStats), CommandError> {
+        let workspace = self.load_workspace()?;
+        let env = self.workspace_environment(ui, &workspace)?;
+        let op = workspace
+            .repo_loader()
+            .load_operation(expected_working_copy_operation)
+            .await?;
+        let repo = workspace.repo_loader().load_at(&op).await?;
+        let mut helper = WorkspaceCommandHelper::new(ui, workspace, repo, env, true)?;
+        helper.check_working_copy_writable()?;
+        let stats = helper
+            .snapshot_working_copy(
+                ui,
+                git_import_export_lock,
+                true,
+                &NothingMatcher,
+                Some(expected_published_operation),
+                Some(expected_working_copy_operation),
+            )
+            .await
+            .map_err(|err| err.into_command_error())?;
+        Ok((helper, stats))
     }
 
     /// Loads command environment for the given `workspace`.
@@ -1507,7 +1548,14 @@ impl WorkspaceCommandHelper {
         // In that situation, the ref would be conflicted anyway, so export
         // failure is okay.
         let stats = self
-            .snapshot_working_copy(ui, git_import_export_lock, false, force_tracking_matcher)
+            .snapshot_working_copy(
+                ui,
+                git_import_export_lock,
+                false,
+                force_tracking_matcher,
+                None,
+                None,
+            )
             .await?;
 
         // import_git_refs() can rebase the working-copy commit.
@@ -1558,10 +1606,24 @@ impl WorkspaceCommandHelper {
         &mut self,
         ui: &Ui,
         report_phase: &dyn Fn(&'static str) -> Result<(), CommandError>,
+        expected_published_operation: Option<&OperationId>,
     ) -> Result<(), CommandError> {
         self.may_snapshot_working_copy = true;
         report_phase("acquiring the colocated Git import lock")?;
         let git_import_export_lock = self.lock_git_import_export()?;
+        if let Some(expected) = expected_published_operation {
+            let op = self.env.command.resolve_operation(
+                ui,
+                self.repo().loader(),
+                self.workspace_name(),
+            )?;
+            if op.id() != expected {
+                return Err(user_error(
+                    "The repository changed while preparing the AWACS baseline rebuild. Retry \
+                     `jj util subvolume enable --rebuild-baseline`.",
+                ));
+            }
+        }
 
         // Establish A before any colocated-Git import can materialize a
         // different tree. A new snapshot-backed worktree starts with no
@@ -1571,7 +1633,14 @@ impl WorkspaceCommandHelper {
         // materialization".
         report_phase("snapshotting the working copy and committing the AWACS baseline")?;
         let stats = self
-            .snapshot_working_copy(ui, &git_import_export_lock, true, &NothingMatcher)
+            .snapshot_working_copy(
+                ui,
+                &git_import_export_lock,
+                true,
+                &NothingMatcher,
+                expected_published_operation,
+                None,
+            )
             .await
             .map_err(|err| err.into_command_error())?;
 
@@ -2563,6 +2632,8 @@ to the current parents may contain changes from multiple commits.
         git_import_export_lock: &GitImportExportLock,
         force_awacs_input_fingerprint: bool,
         force_tracking_matcher: &dyn Matcher,
+        expected_published_operation: Option<&OperationId>,
+        expected_working_copy_operation: Option<&OperationId>,
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         let workspace_name = self.workspace_name().to_owned();
         let repo = self.repo().clone();
@@ -2595,6 +2666,32 @@ to the current parents may contain changes from multiple commits.
             .await
             .map_err(snapshot_command_error)?;
 
+        if let Some(expected) = expected_working_copy_operation {
+            let locked_wc = locked_ws.locked_wc();
+            if locked_wc.old_operation_id() != expected {
+                return Err(snapshot_command_error(user_error(
+                    "The working copy changed while preparing the AWACS baseline rebuild. \
+                     Retry `jj util subvolume enable --rebuild-baseline`.",
+                )));
+            }
+            let commit_id = repo.view().get_wc_commit_id(&workspace_name).ok_or_else(|| {
+                snapshot_command_error(user_error(
+                    "Cannot rebuild AWACS baseline: the recorded operation has no workspace commit.",
+                ))
+            })?;
+            let commit = repo
+                .store()
+                .get_commit_async(commit_id)
+                .await
+                .map_err(snapshot_command_error)?;
+            if locked_wc.old_tree().tree_ids_and_labels() != commit.tree().tree_ids_and_labels() {
+                return Err(snapshot_command_error(user_error(
+                    "The working-copy tree changed while preparing the AWACS baseline rebuild. \
+                     Preserve the files and resolve the journal state before retrying.",
+                )));
+            }
+        }
+
         let Some((repo, wc_commit)) =
             handle_stale_working_copy(locked_ws.locked_wc(), repo, &workspace_name).await?
         else {
@@ -2603,7 +2700,7 @@ to the current parents may contain changes from multiple commits.
             return Ok(SnapshotStats::default());
         };
 
-        self.user_repo = ReadonlyUserRepo::new(repo);
+        self.user_repo = ReadonlyUserRepo::new(repo.clone());
         let (new_tree, stats) = {
             let mut options = options;
             let progress = crate::progress::snapshot_progress(ui);
@@ -2616,6 +2713,22 @@ to the current parents may contain changes from multiple commits.
             }
             .map_err(snapshot_command_error)?
         };
+        // Some commands publish operations without the shared Git lock.
+        // Catch changes during the explicit rebuild's full scan before
+        // publishing it, so the user can retry against the new operation.
+        if let Some(expected) = expected_published_operation {
+            let op = self
+                .env
+                .command
+                .resolve_operation(ui, repo.loader(), &workspace_name)
+                .map_err(snapshot_command_error)?;
+            if op.id() != expected {
+                return Err(snapshot_command_error(user_error(
+                    "The repository changed during AWACS baseline rebuilding. Retry \
+                     `jj util subvolume enable --rebuild-baseline`.",
+                )));
+            }
+        }
         if new_tree.tree_ids_and_labels() != wc_commit.tree().tree_ids_and_labels() {
             let mut tx = start_repo_transaction(
                 &self.user_repo.repo,
@@ -2673,7 +2786,9 @@ to the current parents may contain changes from multiple commits.
             }
 
             #[cfg(feature = "git")]
-            if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction()
+            if self.env.working_copy_shared_with_git
+                && self.env.command.should_commit_transaction()
+                && expected_working_copy_operation.is_none()
             {
                 let workspace_root = self.env.workspace_root();
                 if wc_immutable {
@@ -2728,6 +2843,37 @@ to the current parents may contain changes from multiple commits.
             }
         }
 
+        // The snapshot operation is already published, but committing its
+        // AWACS lease and journal can still fail. Report it now so the user
+        // can find the saved edits even if that later step fails.
+        if let (Some(_), Some(newer)) = (
+            expected_working_copy_operation,
+            expected_published_operation,
+        ) {
+            let saved = self.user_repo.repo.op_id().hex();
+            let newer = newer.hex();
+            let workspace_revset = format!("{}@", workspace_name.as_symbol());
+            let workspace_revset = shell_quote(&workspace_revset);
+            writeln!(
+                ui.warning_default(),
+                "The stale working copy has not been reconciled. Its files remain unchanged.\n\
+                 Review the saved working-copy snapshot with:\n\
+                   jj --at-operation {saved} diff -r {workspace_revset}\n\
+                 Review the newer workspace with:\n\
+                   jj --at-operation {newer} log -r {workspace_revset}\n\
+                 If this workspace cannot load, run these commands from another workspace in \
+                 the same repository. If rebuild fails, retrying it may require manually \
+                 reconciling operations. Ordinary jj commands may reconcile automatically \
+                 when snapshot.auto-update-stale is enabled; use --ignore-working-copy to \
+                 inspect without changing files. Preserve untracked and ignored files before \
+                 reconciling. After deciding how to reconcile changes, run \
+                 `jj workspace update-stale`. That command may move edits out of the working \
+                 copy; changes included in the saved snapshot remain in operation history. \
+                 This rebuild does not refresh the Git fsmonitor baseline while the workspace \
+                 is stale."
+            )
+            .map_err(snapshot_command_error)?;
+        }
         #[cfg(feature = "git")]
         if self.env.working_copy_shared_with_git
             && let Ok(resolved_tree) = new_tree

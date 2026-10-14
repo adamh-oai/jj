@@ -1427,7 +1427,7 @@ async fn establish_snapshot_workspace_baseline(
     workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
 ) -> Result<(), CommandError> {
     workspace_command
-        .snapshot_for_subvolume_enable(ui, &|_| Ok(()))
+        .snapshot_for_subvolume_enable(ui, &|_| Ok(()), None)
         .await
 }
 

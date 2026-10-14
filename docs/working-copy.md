@@ -110,7 +110,13 @@ If a snapshot-backed workspace has no usable baseline, commands that snapshot
 the working copy fail with a recovery hint. Run
 `jj util subvolume enable --rebuild-baseline` in that workspace to explicitly
 rebuild its baseline; this may require a full scan. The command reuses the
-existing AWACS root state and rejects stale or ambiguous working-copy state.
+existing AWACS root state and rejects ambiguous working-copy state. If the
+workspace is stale but its journal matches the recorded operation, the rebuild
+snapshots against that operation without changing the files or reconciling the
+workspace. It prints commands to inspect the saved snapshot and the newer
+workspace before running `jj workspace update-stale`. Preserve untracked and
+ignored files separately, since they may not be included in the snapshot. A
+stale rebuild does not refresh the Git fsmonitor baseline.
 
 Passing `--compress=true` or `--compress=false` sets the corresponding
 Btrfs compression property on the newly created root, `.git`, and `.jj` subvolumes

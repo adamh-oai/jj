@@ -4931,7 +4931,243 @@ exit 1
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]
-fn test_util_subvolume_rebuild_refuses_stale_working_copy() -> TestResult {
+fn test_stale_rebuild_preserves_files_normal() -> TestResult {
+    test_stale_rebuild_preserves_files(false, false)
+}
+
+#[cfg(all(unix, feature = "awacs", debug_assertions))]
+#[test]
+fn test_stale_rebuild_preserves_files_after_lease_failure() -> TestResult {
+    test_stale_rebuild_preserves_files(true, false)
+}
+
+#[cfg(all(unix, feature = "awacs"))]
+#[test]
+fn test_stale_rebuild_preserves_git_head_for_immutable_commit() -> TestResult {
+    test_stale_rebuild_preserves_files(false, true)
+}
+
+#[cfg(all(unix, feature = "awacs"))]
+fn test_stale_rebuild_preserves_files(fail_lease: bool, immutable: bool) -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    let workspace_name = "main 'spaced' @tree";
+    main_dir
+        .run_jj(["workspace", "rename", workspace_name])
+        .success();
+    main_dir.write_file("file", "original\n");
+    main_dir.write_file("ignored-tracked", "original\n");
+    main_dir.write_file("oversized-tracked", "original\n");
+    main_dir.run_jj(["new"]).success();
+    main_dir.write_file(".gitignore", "ignored-tracked\nignored-new\n");
+    main_dir.run_jj(["new"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--no-colocate", "../secondary"])
+        .success();
+
+    // Rewrite the main workspace's parent from a different workspace. Its
+    // journal still identifies the tree which tracks the local files.
+    secondary_dir.write_file("file", "changed in secondary\n");
+    secondary_dir.run_jj(["squash"]).success();
+    let expected = [
+        ("file", "unsnapshotted local edit\n"),
+        ("added", "newly tracked\n"),
+        ("ignored-tracked", "unsnapshotted ignored edit\n"),
+        (
+            "oversized-tracked",
+            "unsnapshotted oversized edit exceeding the configured limit\n",
+        ),
+    ];
+    for (path, contents) in &expected {
+        main_dir.write_file(path, contents);
+    }
+    let excluded = [
+        ("ignored-new", "ignored and not tracked\n"),
+        (
+            "oversized-new",
+            "untracked contents exceeding the configured size limit\n",
+        ),
+    ];
+    for (path, contents) in &excluded {
+        main_dir.write_file(path, contents);
+    }
+    let marker_path = main_dir.root().join(".jj/working_copy/subvolume_mode");
+    let head_path = main_dir.root().join(".git/HEAD");
+    let index_path = main_dir.root().join(".git/index");
+    let head_before = std::fs::read(&head_path)?;
+    let index_before = std::fs::read(&index_path).ok();
+    std::fs::write(&marker_path, b"enabling\n")?;
+
+    // Ordinary commands still reject the missing baseline.
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+            .args(["--config=snapshot.max-new-file-size=32", "status"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("--rebuild-baseline"),
+        "{output}"
+    );
+
+    if immutable {
+        test_env.add_config(r#"revset-aliases."immutable_heads()" = "@""#);
+    }
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root());
+        if fail_lease {
+            cmd.env("JJ_TEST_AWACS_FAIL_LEASE_PREPARE", "1");
+        }
+        cmd.args([
+            "--config=snapshot.max-new-file-size=32",
+            "util",
+            "subvolume",
+            "enable",
+            "--rebuild-baseline",
+        ])
+    });
+    let stderr = output.stderr.raw();
+    if fail_lease {
+        assert!(!output.status.success(), "{output}");
+        assert!(
+            stderr.contains("AWACS did not publish a committed snapshot baseline"),
+            "{output}"
+        );
+        assert!(
+            stderr.contains("may require manual operation reconciliation"),
+            "{output}"
+        );
+    } else {
+        assert!(output.status.success(), "{output}");
+    }
+    assert!(
+        stderr.contains("stale working copy has not been reconciled"),
+        "{output}"
+    );
+    assert!(stderr.contains("jj workspace update-stale"), "{output}");
+    assert!(
+        stderr.contains("snapshot.auto-update-stale is enabled"),
+        "{output}"
+    );
+    assert!(stderr.contains("from another workspace"), "{output}");
+    assert!(
+        stderr.contains("Preserve untracked and ignored files"),
+        "{output}"
+    );
+    assert!(
+        stderr.contains("does not refresh the Git fsmonitor baseline"),
+        "{output}"
+    );
+    assert_eq!(std::fs::read(&marker_path)?, b"snapshot-backed\n");
+    assert_eq!(std::fs::read(head_path)?, head_before);
+    assert_eq!(std::fs::read(index_path).ok(), index_before);
+    if fail_lease {
+        let status = main_dir.run_jj(["util", "subvolume", "status"]).success();
+        assert!(
+            status
+                .stdout
+                .raw()
+                .contains("JJ journal: missing committed baseline"),
+            "{status}"
+        );
+    }
+    for (path, contents) in &expected {
+        assert_eq!(main_dir.read_file(path), *contents, "{path}");
+    }
+    for (path, contents) in &excluded {
+        assert_eq!(main_dir.read_file(path), *contents, "{path}");
+    }
+
+    // The snapshot was based on the old journal tree, preserving ignored and
+    // oversized tracked edits, but the newer workspace has not been checked out.
+    let inspection_commands: Vec<_> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("jj --at-operation "))
+        .collect();
+    assert_eq!(inspection_commands.len(), 2, "{output}");
+
+    // Run the exact printed commands through a shell from another workspace.
+    // The name exercises both revset and shell quoting, including apostrophes.
+    let bin_dir = test_env.env_root().join("inspection-bin");
+    std::fs::create_dir(&bin_dir)?;
+    std::os::unix::fs::symlink(TestEnvironment::jj_executable(), bin_dir.join("jj"))?;
+    let mut paths = vec![bin_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths)?;
+    for (i, command) in inspection_commands.iter().enumerate() {
+        let result = std::process::Command::new("sh")
+            .args(["-c", command])
+            .current_dir(secondary_dir.root())
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", test_env.home_dir())
+            .env("JJ_CONFIG", test_env.config_path())
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()?;
+        assert!(
+            result.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if i == 0 {
+            let diff = String::from_utf8(result.stdout)?;
+            assert!(diff.contains("unsnapshotted local edit"), "{diff}");
+            assert!(diff.contains("newly tracked"), "{diff}");
+        }
+    }
+    let snapshot_operation = stderr
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("jj --at-operation ")?
+                .split_once(' ')
+                .map(|(id, _)| id)
+        })
+        .expect("missing saved operation in rebuild output");
+    for (path, contents) in &expected {
+        // Another workspace can inspect the operation even when the failed
+        // lease leaves this workspace's compact journal unloadable.
+        let saved = secondary_dir
+            .run_jj([
+                "--at-operation",
+                snapshot_operation,
+                "file",
+                "show",
+                "-r",
+                r#""main 'spaced' @tree"@"#,
+                path,
+            ])
+            .success();
+        assert_eq!(saved.stdout.raw(), *contents, "{path}");
+        assert_eq!(main_dir.read_file(path), *contents, "{path}");
+    }
+    for (path, contents) in &excluded {
+        let omitted = secondary_dir.run_jj([
+            "--at-operation",
+            snapshot_operation,
+            "file",
+            "show",
+            "-r",
+            r#""main 'spaced' @tree"@"#,
+            path,
+        ]);
+        assert!(!omitted.status.success(), "{omitted}");
+        assert_eq!(main_dir.read_file(path), *contents, "{path}");
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "awacs", debug_assertions))]
+#[test]
+fn test_stale_rebuild_preserves_files_when_operation_changes_during_scan() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();
     let main_dir = test_env.work_dir("main");
@@ -4939,53 +5175,66 @@ fn test_util_subvolume_rebuild_refuses_stale_working_copy() -> TestResult {
     main_dir.write_file("file", "original\n");
     main_dir.run_jj(["new"]).success();
     main_dir
-        .run_jj(["workspace", "add", "../secondary"])
+        .run_jj(["workspace", "add", "--no-colocate", "../secondary"])
         .success();
-
-    // Squashing from the other workspace rewrites the main workspace's
-    // commit, leaving its files and journal at the previous operation.
     secondary_dir.write_file("file", "changed in secondary\n");
     secondary_dir.run_jj(["squash"]).success();
     main_dir.write_file("file", "unsnapshotted local edit\n");
-    let marker_path = main_dir.root().join(".jj/working_copy/subvolume_mode");
-    let checkout_path = main_dir.root().join(".jj/working_copy/checkout");
-    let tree_state_path = main_dir.root().join(".jj/working_copy/tree_state");
-    std::fs::write(&marker_path, b"enabling\n")?;
-    let checkout_before = std::fs::read(&checkout_path)?;
-    let tree_state_before = std::fs::read(&tree_state_path)?;
-    let read_working_copy = || {
-        secondary_dir
-            .run_jj([
-                "--ignore-working-copy",
-                "log",
-                "-r",
-                "default@",
-                "--no-graph",
-                "-T",
-                "commit_id",
-            ])
-            .success()
-            .stdout
-            .raw()
-            .to_owned()
-    };
-    let working_copy_before = read_working_copy();
-    let operation_before = main_dir.current_operation_id();
-    let output = main_dir.run_jj_with(|cmd| {
-        cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
-            "util",
-            "subvolume",
-            "enable",
-            "--rebuild-baseline",
+    std::fs::write(
+        main_dir.root().join(".jj/working_copy/subvolume_mode"),
+        b"enabling\n",
+    )?;
+
+    let signal = test_env.env_root().join("awacs-scan-paused");
+    let base_cmd = test_env.new_jj_cmd();
+    let env_vars: Vec<_> = base_cmd
+        .get_envs()
+        .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+        .collect();
+    let mut child = std::process::Command::new(base_cmd.get_program())
+        .current_dir(main_dir.root())
+        .env_clear()
+        .envs(env_vars)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+        .env("JJ_TEST_AWACS_REBUILD_PAUSE", &signal)
+        .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !signal.exists() && std::time::Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            let output = child.wait_with_output()?;
+            panic!(
+                "rebuild exited before pausing: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(signal.exists(), "rebuild did not enter its scan");
+    secondary_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "describe",
+            "-r",
+            "@",
+            "-m",
+            "concurrent",
         ])
-    });
-    assert!(!output.status.success(), "{output}");
-    assert!(output.stderr.raw().contains("stale"), "{output}");
-    assert_eq!(read_working_copy(), working_copy_before);
-    assert_eq!(main_dir.current_operation_id(), operation_before);
-    assert_eq!(std::fs::read(checkout_path)?, checkout_before);
-    assert_eq!(std::fs::read(tree_state_path)?, tree_state_before);
-    assert_eq!(std::fs::read(marker_path)?, b"enabling\n");
+        .success();
+    let published_operation = main_dir.current_operation_id();
+    std::fs::remove_file(&signal)?;
+    let output = child.wait_with_output()?;
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("repository changed during AWACS baseline rebuilding"),
+        "{stderr}"
+    );
+    assert_eq!(main_dir.current_operation_id(), published_operation);
     assert_eq!(main_dir.read_file("file"), "unsnapshotted local edit\n");
     Ok(())
 }
