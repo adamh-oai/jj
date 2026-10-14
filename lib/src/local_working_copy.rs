@@ -1283,6 +1283,16 @@ fn awacs_baseline_rebuild_error(reason: &str) -> SnapshotError {
     }
 }
 
+fn interrupted_sparse_materialization_error() -> SnapshotError {
+    SnapshotError::Other {
+        message: "Cannot snapshot an interrupted sparse update".to_owned(),
+        err: "Some tracked files may have been removed or not yet materialized. Preserve the \
+              working-copy files and journal, and reconcile the interrupted sparse update before \
+              retrying."
+            .into(),
+    }
+}
+
 fn invalid_working_copy_state(path: &Path, message: impl Into<String>) -> TreeStateError {
     TreeStateError::InvalidWorkingCopyState {
         path: path.to_owned(),
@@ -1350,6 +1360,20 @@ impl TreeState {
             paths: self.untracked_scan_paths.clone(),
             input_fingerprint: baseline.interpretation_input_fingerprint.clone(),
         })
+    }
+
+    fn has_interrupted_sparse_materialization(&self) -> bool {
+        is_snapshot_mode(&self.state_path)
+            && self.journal_phase
+                == crate::protos::local_working_copy::WorkingCopyStatePhase::PendingMaterialization
+            && self.mutation_kind == "sparse-patterns"
+    }
+
+    fn check_interrupted_sparse_materialization(&self) -> Result<(), SnapshotError> {
+        if self.has_interrupted_sparse_materialization() {
+            return Err(interrupted_sparse_materialization_error());
+        }
+        Ok(())
     }
 
     /// Returns the last committed A baseline retained by an interrupted
@@ -1538,7 +1562,9 @@ impl TreeState {
                 | crate::protos::local_working_copy::WorkingCopyStatePhase::PendingBaselineCommit
         ) {
             self.fsmonitor_cursor = None;
-            if !recoverable_pending_materialization {
+            if !recoverable_pending_materialization
+                && !self.has_interrupted_sparse_materialization()
+            {
                 // A non-strict transition has no retained immutable A, so
                 // keep the intended tree if it was durably recorded and force
                 // the next snapshot to reconcile by a full scan.
@@ -1586,6 +1612,13 @@ impl TreeState {
                 != crate::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline
             && !recoverable_pending_materialization
         {
+            if self.has_interrupted_sparse_materialization() {
+                return Err(invalid_working_copy_state(
+                    state_path,
+                    "an interrupted sparse update must be reconciled before rebuilding the \
+                     AWACS baseline; preserve the working-copy files and journal",
+                ));
+            }
             return Err(invalid_working_copy_state(
                 state_path,
                 "subvolume mode requires a committed AWACS snapshot baseline; run jj util \
@@ -2522,6 +2555,7 @@ impl TreeState {
         if !is_snapshot_mode(&self.state_path) {
             return Ok(());
         }
+        self.check_interrupted_sparse_materialization()?;
         if !self.cursor_matches_settings() || self.scan_baseline().is_none() {
             return Err(awacs_baseline_rebuild_error(
                 "the working copy has no committed AWACS baseline",
@@ -2612,6 +2646,11 @@ impl TreeState {
         allow_awacs_baseline_rebuild: bool,
         explicit_tracking: bool,
     ) -> Result<(bool, SnapshotStats, Option<PendingScan>), SnapshotError> {
+        // Rebuilding cannot distinguish files removed by an interrupted
+        // sparse contraction from user deletions, or files not yet written
+        // by an interrupted expansion from user deletions. Do not scan or
+        // discard the durable sparse intent until it has been reconciled.
+        self.check_interrupted_sparse_materialization()?;
         let SnapshotOptions {
             base_ignores,
             scan_root_ignores,
@@ -5652,6 +5691,11 @@ impl LockedLocalWorkingCopy {
     }
 
     pub fn reset_watchman(&mut self) -> Result<(), SnapshotError> {
+        // This reset is also used by explicit baseline rebuilds. Check
+        // before releasing the retained AWACS baseline or clearing intent.
+        self.wc
+            .tree_state()?
+            .check_interrupted_sparse_materialization()?;
         #[cfg(all(target_os = "linux", feature = "awacs"))]
         self.release_awacs_baseline()?;
         self.clear_fsmonitor_cursor()?;

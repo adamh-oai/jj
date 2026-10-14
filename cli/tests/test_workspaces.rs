@@ -4850,6 +4850,143 @@ fn test_util_subvolume_rebuild_missing_baseline(marker: &str, colocated: bool) -
     Ok(())
 }
 
+#[cfg(all(unix, feature = "awacs"))]
+#[test_case("snapshot-backed", true, 2; "committed_retained_v2")]
+#[test_case("snapshot-backed", false, 2; "committed_missing_v2")]
+#[test_case("snapshot-backed", true, 3; "committed_retained_v3")]
+#[test_case("snapshot-backed", false, 3; "committed_missing_v3")]
+#[test_case("enabling", true, 2; "enabling_retained_v2")]
+#[test_case("enabling", false, 2; "enabling_missing_v2")]
+#[test_case("enabling", true, 3; "enabling_retained_v3")]
+#[test_case("enabling", false, 3; "enabling_missing_v3")]
+fn test_interrupted_sparse_contraction_is_not_rebuilt(
+    marker: &str,
+    has_baseline: bool,
+    format_version: u8,
+) -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("keep/file", "keep\n");
+    main_dir.write_file("removed/file", "tracked\n");
+    main_dir.run_jj(["new"]).success();
+    let state_dir = main_dir.root().join(".jj/working_copy");
+    let marker_path = state_dir.join("subvolume_mode");
+    std::fs::write(&marker_path, b"snapshot-backed\n")?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+
+    // Simulate a crash after a sparse contraction has recorded its intent
+    // and removed one tracked file, but before it could commit the new sparse
+    // patterns. The compact state is protobuf after its identifying header.
+    fn read_varint(bytes: &[u8], pos: &mut usize) -> u64 {
+        let mut value = 0;
+        for shift in (0..70).step_by(7) {
+            let byte = bytes[*pos];
+            *pos += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+        }
+        panic!("invalid protobuf varint")
+    }
+    fn write_varint(bytes: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            bytes.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+    }
+    fn write_field(bytes: &mut Vec<u8>, tag: u64, value: &[u8]) {
+        write_varint(bytes, (tag << 3) | 2);
+        write_varint(bytes, value.len() as u64);
+        bytes.extend(value);
+    }
+
+    const MAGIC: &[u8] = b"\0JJ-WORKING-COPY-STATE\0v1\n";
+    let journal_path = state_dir.join("checkout");
+    let clean_journal = std::fs::read(&journal_path)?;
+    let payload = clean_journal.strip_prefix(MAGIC).expect("compact journal");
+    let mut journal = MAGIC.to_vec();
+    let mut tree_ids = Vec::new();
+    let mut baseline = None;
+    let mut pos = 0;
+    while pos < payload.len() {
+        let start = pos;
+        let tag = read_varint(payload, &mut pos);
+        match tag & 7 {
+            0 => {
+                read_varint(payload, &mut pos);
+            }
+            2 => {
+                let len = read_varint(payload, &mut pos) as usize;
+                let value = &payload[pos..pos + len];
+                if tag >> 3 == 4 {
+                    tree_ids.push(value.to_vec());
+                } else if tag >> 3 == 12 {
+                    baseline = Some(value.to_vec());
+                }
+                pos += len;
+            }
+            wire => panic!("unexpected protobuf wire type {wire}"),
+        }
+        // The writer moves the clean baseline to pending and changes phase.
+        if !matches!(tag >> 3, 1 | 9 | 12) {
+            journal.extend_from_slice(&payload[start..pos]);
+        }
+    }
+    assert_eq!(tree_ids.len(), 1);
+    journal.extend([0x08, format_version]);
+    journal.extend([0x48, 0x02]); // phase: PendingMaterialization
+    write_field(&mut journal, 10, &tree_ids[0]); // pending tree
+    if has_baseline {
+        write_field(&mut journal, 13, &baseline.expect("committed baseline"));
+    }
+    write_field(&mut journal, 16, b"sparse-patterns");
+    write_field(&mut journal, 17, b"keep");
+    std::fs::write(&journal_path, &journal)?;
+    std::fs::write(&marker_path, format!("{marker}\n"))?;
+    main_dir.remove_file("removed/file");
+    main_dir.write_file("keep/file", "unsnapshotted edit\n");
+    let operation_before = main_dir.current_operation_id();
+
+    for args in [
+        vec!["status"],
+        vec!["util", "subvolume", "enable", "--rebuild-baseline"],
+        vec!["util", "subvolume", "disable"],
+    ] {
+        let output = main_dir.run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(args)
+        });
+        assert!(!output.status.success(), "{output}");
+        assert!(
+            output.stderr.raw().contains("interrupted sparse update"),
+            "{output}"
+        );
+        assert_eq!(std::fs::read(&journal_path)?, journal);
+        assert_eq!(
+            std::fs::read(&marker_path)?,
+            format!("{marker}\n").as_bytes()
+        );
+        assert_eq!(main_dir.current_operation_id(), operation_before);
+        assert_eq!(main_dir.read_file("keep/file"), "unsnapshotted edit\n");
+        assert!(!main_dir.root().join("removed/file").exists());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]
