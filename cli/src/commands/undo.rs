@@ -15,6 +15,7 @@
 use itertools::Itertools as _;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::OperationId;
+use jj_lib::repo::Repo as _;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::short_operation_hash;
@@ -188,6 +189,9 @@ pub async fn cmd_undo(
     }
 
     let mut tx = workspace_command.start_transaction();
+    if jj_lib::simple_op_store::SimpleOpStore::is_sync_name(tx.base_repo().op_store().name()) {
+        tx.record_empty_operation();
+    }
     let new_view = view_with_desired_portions_restored(
         target_op_parent.view().await?.store_view(),
         tx.base_repo().view().store_view(),

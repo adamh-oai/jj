@@ -15,7 +15,7 @@
 use std::io::Write as _;
 
 use clap_complete::ArgValueCompleter;
-use jj_lib::merge::Merge;
+use futures::StreamExt as _;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
 use tracing::instrument;
@@ -67,8 +67,9 @@ pub(crate) async fn cmd_file_delete(
     print_unmatched_explicit_paths(ui, &workspace_command, &fileset_expression, [&tree]).await?;
 
     let mut tree_builder = MergedTreeBuilder::new(commit.tree());
-    for (path, _value) in tree.entries_matching(matcher.as_ref()) {
-        tree_builder.set_or_remove(path, Merge::absent());
+    let mut entries = tree.entries_stream_matching(matcher.as_ref());
+    while let Some((path, _value)) = entries.next().await {
+        tree_builder.set_or_remove(path, None);
     }
     let new_tree = tree_builder.write_tree().await?;
 

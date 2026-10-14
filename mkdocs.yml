@@ -135,6 +135,7 @@ nav: # This lists all the files that become part of the documentation
       - Bookmarks: 'bookmarks.md'
       - Conflicts: 'conflicts.md'
       - Operation log: 'operation-log.md'
+      - Repository synchronization: 'repository-sync.md'
       - Glossary: 'glossary.md'
 
   - Guides:

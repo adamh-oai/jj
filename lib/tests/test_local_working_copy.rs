@@ -29,6 +29,7 @@ use std::time::SystemTime;
 
 use bstr::BString;
 use futures::AsyncReadExt as _;
+use futures::StreamExt as _;
 use gix::odb::pack::FindExt as _;
 use indoc::indoc;
 use itertools::Itertools as _;
@@ -43,6 +44,7 @@ use jj_lib::file_util::check_symlink_support;
 use jj_lib::file_util::symlink_dir;
 use jj_lib::file_util::symlink_file;
 use jj_lib::files::FileMergeHunkLevel;
+use jj_lib::files::MergeOptions;
 #[cfg(all(feature = "awacs", unix))]
 use jj_lib::fsmonitor::AwacsConfig;
 use jj_lib::fsmonitor::FsmonitorSettings;
@@ -69,7 +71,6 @@ use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::secret_backend::SecretBackend;
 use jj_lib::tree_builder::TreeBuilder;
-use jj_lib::tree_merge::MergeOptions;
 use jj_lib::working_copy::CheckoutError;
 use jj_lib::working_copy::CheckoutStats;
 use jj_lib::working_copy::SnapshotOptions;
@@ -434,7 +435,7 @@ fn test_checkout_file_transitions(backend: TestRepoBackend) -> TestResult {
                     executable: false,
                     copy_id: copy_id.clone(),
                 };
-                tree_builder.set_or_remove(file_path, Merge::normal(value));
+                tree_builder.set_or_remove(file_path, Some(value));
                 return;
             }
             Kind::GitSubmodule => {
@@ -444,7 +445,9 @@ fn test_checkout_file_transitions(backend: TestRepoBackend) -> TestResult {
                 Merge::normal(TreeValue::GitSubmodule(id))
             }
         };
-        tree_builder.set_or_remove(path.to_owned(), value);
+        tree_builder
+            .set_or_remove_merge(path.to_owned(), value)
+            .unwrap();
     }
 
     let mut kinds = vec![
@@ -460,8 +463,15 @@ fn test_checkout_file_transitions(backend: TestRepoBackend) -> TestResult {
     if backend == TestRepoBackend::Git {
         kinds.push(Kind::GitSubmodule);
     }
-    let mut left_tree_builder = MergedTreeBuilder::new(store.empty_merged_tree());
-    let mut right_tree_builder = MergedTreeBuilder::new(store.empty_merged_tree());
+    // Some of the paths are 2-sided conflicts, so the builders need a base tree
+    // with the same number of sides.
+    let base_tree = MergedTree::new(
+        store.clone(),
+        Merge::repeated(store.empty_tree_id().clone(), 2),
+        ConflictLabels::unlabeled(),
+    );
+    let mut left_tree_builder = MergedTreeBuilder::new(base_tree.clone());
+    let mut right_tree_builder = MergedTreeBuilder::new(base_tree);
     let mut files = vec![];
     for left_kind in &kinds {
         for right_kind in &kinds {
@@ -1629,7 +1639,10 @@ fn test_snapshot_special_file() -> TestResult {
         .block_on()?;
     // Only the regular files should be in the tree
     assert_eq!(
-        tree.entries().map(|(path, _value)| path).collect_vec(),
+        tree.entries_stream()
+            .map(|(path, _value)| path)
+            .collect::<Vec<_>>()
+            .block_on(),
         to_owned_path_vec(&[file1_path, file2_path])
     );
     // Replace a regular file by a socket and snapshot the working copy again
@@ -1638,9 +1651,71 @@ fn test_snapshot_special_file() -> TestResult {
     let tree = test_workspace.snapshot()?;
     // Only the regular file should be in the tree
     assert_eq!(
-        tree.entries().map(|(path, _value)| path).collect_vec(),
+        tree.entries_stream()
+            .map(|(path, _value)| path)
+            .collect::<Vec<_>>()
+            .block_on(),
         to_owned_path_vec(&[file2_path])
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_snapshot_non_utf8_path() -> TestResult {
+    // Tests that paths that can't be represented as RepoPaths are skipped
+    // instead of failing the whole snapshot. #9774
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut test_workspace = TestWorkspace::init();
+    let workspace_root = test_workspace.workspace.workspace_root().to_owned();
+
+    if testutils::check_strict_utf8_fs(&workspace_root) {
+        eprintln!(
+            "Skipping test \"test_snapshot_non_utf8_path\" due to strict UTF-8 filesystem for \
+             path {workspace_root:?}"
+        );
+        return Ok(());
+    }
+
+    let file_path = repo_path("file");
+    std::fs::write(file_path.to_fs_path_unchecked(&workspace_root), "contents")?;
+    let bad_file_name = OsStr::from_bytes(b"file\xe0");
+    std::fs::write(workspace_root.join(bad_file_name), "contents")?;
+    let bad_dir_name = OsStr::from_bytes(b"dir\xe0");
+    let bad_dir_disk_path = workspace_root.join(bad_dir_name);
+    std::fs::create_dir(&bad_dir_disk_path)?;
+    std::fs::write(bad_dir_disk_path.join("file"), "contents")?;
+
+    let ws = &mut test_workspace.workspace;
+    let mut locked_ws = ws.start_working_copy_mutation().block_on()?;
+    let (tree, stats) = locked_ws
+        .locked_wc()
+        .snapshot(&empty_snapshot_options())
+        .block_on()?;
+    locked_ws
+        .finish(OperationId::from_hex("abc123"))
+        .block_on()?;
+
+    // Only the path with a valid UTF-8 name should be in the tree. The
+    // directory isn't descended into, so it's reported as a single path.
+    assert_eq!(
+        tree.entries_stream()
+            .map(|(path, _value)| path)
+            .collect::<Vec<_>>()
+            .block_on(),
+        to_owned_path_vec(&[file_path])
+    );
+    assert_eq!(
+        stats.invalid_utf8_paths,
+        [
+            (RepoPathBuf::root(), bad_dir_name.to_owned()),
+            (RepoPathBuf::root(), bad_file_name.to_owned()),
+        ]
+        .into()
+    );
+    assert!(stats.untracked_paths.is_empty());
     Ok(())
 }
 
@@ -1666,7 +1741,11 @@ fn test_gitignores() -> TestResult {
     testutils::write_working_copy_file(&workspace_root, subdir_modified_path, "1");
 
     let tree1 = test_workspace.snapshot()?;
-    let files1 = tree1.entries().map(|(name, _value)| name).collect_vec();
+    let files1 = tree1
+        .entries_stream()
+        .map(|(name, _value)| name)
+        .collect::<Vec<_>>()
+        .block_on();
     assert_eq!(
         files1,
         to_owned_path_vec(&[
@@ -1690,7 +1769,11 @@ fn test_gitignores() -> TestResult {
     testutils::write_working_copy_file(&workspace_root, subdir_ignored_path, "2");
 
     let tree2 = test_workspace.snapshot()?;
-    let files2 = tree2.entries().map(|(name, _value)| name).collect_vec();
+    let files2 = tree2
+        .entries_stream()
+        .map(|(name, _value)| name)
+        .collect::<Vec<_>>()
+        .block_on();
     assert_eq!(
         files2,
         to_owned_path_vec(&[
@@ -1733,7 +1816,11 @@ fn test_gitignores_walk() -> TestResult {
     testutils::write_working_copy_file(&workspace_root, nested_path, "2");
 
     let tree1 = test_workspace.snapshot()?;
-    let files1 = tree1.entries().map(|(name, _value)| name).collect_vec();
+    let files1 = tree1
+        .entries_stream()
+        .map(|(name, _value)| name)
+        .collect::<Vec<_>>()
+        .block_on();
     assert_eq!(
         files1,
         to_owned_path_vec(&[
@@ -1978,7 +2065,7 @@ fn test_git_submodule(gitignore_content: &str) -> TestResult {
 
     tree_builder.set_or_remove(
         added_path.to_owned(),
-        Merge::normal(TreeValue::File {
+        Some(TreeValue::File {
             id: testutils::write_file(repo.store(), added_path, "added\n"),
             executable: false,
             copy_id: CopyId::new(vec![]),
@@ -1989,7 +2076,7 @@ fn test_git_submodule(gitignore_content: &str) -> TestResult {
 
     tree_builder.set_or_remove(
         submodule_path.to_owned(),
-        Merge::normal(TreeValue::GitSubmodule(submodule_id1)),
+        Some(TreeValue::GitSubmodule(submodule_id1)),
     );
 
     let tree_id1 = tree_builder.write_tree().block_on()?;
@@ -1999,7 +2086,7 @@ fn test_git_submodule(gitignore_content: &str) -> TestResult {
     let submodule_id2 = write_random_commit(tx.repo_mut()).id().clone();
     tree_builder.set_or_remove(
         submodule_path.to_owned(),
-        Merge::normal(TreeValue::GitSubmodule(submodule_id2)),
+        Some(TreeValue::GitSubmodule(submodule_id2)),
     );
     let tree_id2 = tree_builder.write_tree().block_on()?;
     let commit2 = commit_with_tree(repo.store(), tree_id2.clone());
@@ -2008,7 +2095,7 @@ fn test_git_submodule(gitignore_content: &str) -> TestResult {
     let mut tree_builder = MergedTreeBuilder::new(store.empty_merged_tree());
     tree_builder.set_or_remove(
         submodule_path.to_owned(),
-        Merge::normal(TreeValue::File {
+        Some(TreeValue::File {
             id: testutils::write_file(
                 repo.store(),
                 submodule_path,
@@ -3164,11 +3251,7 @@ fn test_fsmonitor_cursor_migrates_legacy_watchman_clock() -> TestResult {
         #[expect(deprecated)]
         {
             proto.watchman_clock = Some(jj_lib::protos::local_working_copy::WatchmanClock {
-                watchman_clock: Some(
-                    WatchmanClock::StringClock(
-                        "legacy-clock".to_owned(),
-                    ),
-                ),
+                watchman_clock: Some(WatchmanClock::StringClock("legacy-clock".to_owned())),
             });
         }
     })?;
@@ -4117,7 +4200,9 @@ fn test_clean_subvolume_journal_with_invalid_baseline_requires_rebuild(
         Err(error) => error,
     };
     assert!(
-        error.to_string().contains("jj util subvolume enable --rebuild-baseline"),
+        error
+            .to_string()
+            .contains("jj util subvolume enable --rebuild-baseline"),
         "{error}"
     );
 
@@ -4146,7 +4231,9 @@ fn test_clean_subvolume_journal_with_invalid_baseline_requires_rebuild(
     let error = tree_state.snapshot(&options).block_on().unwrap_err();
     assert!(format!("{error:?}").contains("jj util subvolume enable --rebuild-baseline"));
     assert_tree_eq!(*tree_state.current_tree(), repo.store().empty_merged_tree());
-    tree_state.snapshot_for_awacs_baseline(&options).block_on()?;
+    tree_state
+        .snapshot_for_awacs_baseline(&options)
+        .block_on()?;
     let expected = create_tree(repo, &[(repo_path("file"), "contents\n")]);
     assert_tree_eq!(*tree_state.current_tree(), expected);
     Ok(())
@@ -4270,7 +4357,9 @@ fn test_test_awacs_exact_delta_uses_retained_semantic_baseline() -> TestResult {
         awacs_input_fingerprint: Some([3; 32]),
         ..empty_snapshot_options()
     };
-    tree_state.snapshot_for_awacs_baseline(&options).block_on()?;
+    tree_state
+        .snapshot_for_awacs_baseline(&options)
+        .block_on()?;
     tree_state.save()?;
 
     // Direct TreeState snapshots intentionally abort their lease. Seed the
@@ -4630,7 +4719,9 @@ fn test_test_awacs_exact_delta_respects_sparse_patterns() -> TestResult {
         awacs_input_fingerprint: Some([3; 32]),
         ..empty_snapshot_options()
     };
-    tree_state.snapshot_for_awacs_baseline(&options).block_on()?;
+    tree_state
+        .snapshot_for_awacs_baseline(&options)
+        .block_on()?;
     tree_state.save()?;
 
     let mut journal = read_compact_working_copy_state(&state_path)?;
@@ -4706,7 +4797,9 @@ fn test_test_awacs_exact_delta_rejects_symlink_ancestor() -> TestResult {
         awacs_input_fingerprint: Some([3; 32]),
         ..empty_snapshot_options()
     };
-    tree_state.snapshot_for_awacs_baseline(&options).block_on()?;
+    tree_state
+        .snapshot_for_awacs_baseline(&options)
+        .block_on()?;
     tree_state.save()?;
     seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
 
@@ -4779,7 +4872,9 @@ fn test_test_awacs_exact_delta_reconciles_reported_symlink_ancestor() -> TestRes
         awacs_input_fingerprint: Some([3; 32]),
         ..empty_snapshot_options()
     };
-    tree_state.snapshot_for_awacs_baseline(&options).block_on()?;
+    tree_state
+        .snapshot_for_awacs_baseline(&options)
+        .block_on()?;
     tree_state.save()?;
     seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
 
@@ -4860,7 +4955,9 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
         awacs_input_fingerprint: Some([3; 32]),
         ..empty_snapshot_options()
     };
-    tree_state.snapshot_for_awacs_baseline(&options).block_on()?;
+    tree_state
+        .snapshot_for_awacs_baseline(&options)
+        .block_on()?;
     tree_state.save()?;
 
     // No durable A is paired with X yet, so the first Prefixes response must
@@ -5056,11 +5153,7 @@ fn test_fsmonitor_cursor_cleared_by_sparse_change() -> TestResult {
             cursor: Some(
                 jj_lib::protos::local_working_copy::fsmonitor_cursor::Cursor::Watchman(
                     jj_lib::protos::local_working_copy::WatchmanClock {
-                        watchman_clock: Some(
-                            WatchmanClock::StringClock(
-                                "cursor".to_owned(),
-                            ),
-                        ),
+                        watchman_clock: Some(WatchmanClock::StringClock("cursor".to_owned())),
                     },
                 ),
             ),

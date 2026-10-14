@@ -109,6 +109,7 @@ This document contains the help content for the `jj` command-line program.
 * [`jj split`↴](#jj-split)
 * [`jj squash`↴](#jj-squash)
 * [`jj status`↴](#jj-status)
+* [`jj sync`↴](#jj-sync)
 * [`jj tag`↴](#jj-tag)
 * [`jj tag delete`↴](#jj-tag-delete)
 * [`jj tag list`↴](#jj-tag-list)
@@ -199,6 +200,7 @@ To get started, see the tutorial at [`jj help -k tutorial`][tutorial].
 * `split` — Split a revision in two
 * `squash` — Move changes from a revision into another revision
 * `status` — Show high-level repo status [default alias: st]
+* `sync` — Exchange repository data and operation history with another jj repository
 * `tag` — Manage tags
 * `undo` — Undo the last operation
 * `unsign` — Drop a cryptographic signature
@@ -1364,8 +1366,6 @@ List files in a revision
 Search for content in files
 
 Prints each line that matches the specified pattern, prefixed by the file path. Use `--name-only` to print only the file paths.
-
-This is an early version of the command. It does not search files concurrently.
 
 **Usage:** `jj file search [OPTIONS] --pattern <PATTERN> [FILESETS]...`
 
@@ -3086,7 +3086,9 @@ By default, `jj redo` refuses to redo an undo-operation that was performed in an
 
 Resolve conflicted files with an external merge tool
 
-Only conflicts that can be resolved with a 3-way merge are supported. See docs for merge tool configuration instructions. External merge tools will be invoked for each conflicted file one-by-one until all conflicts are resolved. To stop resolving conflicts, exit the merge tool without making any changes.
+Only conflicts that can be resolved with a 3-way merge are supported by most merge tools. See docs for merge tool configuration instructions. External merge tools will be invoked for each conflicted file one-by-one until all conflicts are resolved. To stop resolving conflicts, exit the merge tool without making any changes.
+
+The built-in `:editor` tool opens the conflicted file with conflict markers in your text editor (`ui.editor`). Conflicts with any number of sides are supported, and conflict markers left in the file are kept as a partially resolved conflict.
 
 Note that conflicts can also be resolved without using this command. You may edit the conflict markers in the conflicted file directly with a text editor.
 
@@ -3104,7 +3106,7 @@ Note that conflicts can also be resolved without using this command. You may edi
 * `-l`, `--list` — Instead of resolving conflicts, list all the conflicts
 * `--tool <NAME>` — Specify 3-way merge tool to be used
 
-   The built-in merge tools `:ours` and `:theirs` can be used to choose side #1 and side #2 of the conflict respectively.
+   The built-in merge tool `:editor` opens the conflict markers in your text editor. The built-in merge tools `:ours` and `:theirs` can be used to choose side #1 and side #2 of the conflict respectively.
 
 
 
@@ -3542,6 +3544,32 @@ Note: You can use `jj diff --summary -r <rev>` to see the changed files for a sp
 ###### **Arguments:**
 
 * `<FILESETS>` — Restrict the status display to these paths
+
+
+
+## `jj sync`
+
+Exchange repository data and operation history with another jj repository
+
+The peer is a workspace path or an SSH URL such as ssh://user@host/home/user/repository. SSH URL paths are absolute on the remote machine. A missing destination is initialized as a colocated Git repository before synchronization. To receive into a new local destination, select it with -R; this also works with --bidi. At least one endpoint must already contain a repository. The destination's parent directory must already exist.
+
+Select exactly one direction. Both endpoints snapshot their selected working copies by default; use --ignore-working-copy to skip snapshots and checkout updates at both ends. Workspace names, checkout pointers, and local Git observations stay local.
+
+Receiving publishes an ordinary merge operation. Workspace state stays local, while received operations become ancestors in the local operation log. Use `jj op restore` with the previous local operation to recover the earlier view; ordinary `jj undo` does not undo merge operations.
+
+Both endpoints must support native operation-graph synchronization. First use enables a repository format that older jj versions reject, and upgrades repositories using the earlier sync format while retaining their history. This transition waits for other commands using updated jj versions to finish. Already-running older binaries do not participate in the lock and can race with the first transition.
+
+**Usage:** `jj sync <--receive|--send|--bidi> <PEER>`
+
+###### **Arguments:**
+
+* `<PEER>` — Peer workspace path or ssh://[user@]host[:port]/path
+
+###### **Options:**
+
+* `--receive` — Receive the peer's captured repository history
+* `--send` — Send local captured repository history to the peer
+* `--bidi` — Exchange histories and apply one shared captured result at both ends
 
 
 

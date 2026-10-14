@@ -55,6 +55,7 @@ use either::Either;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
+use futures::TryStreamExt as _;
 use futures::io::AllowStdIo;
 use itertools::Itertools as _;
 use once_cell::unsync::OnceCell;
@@ -1843,7 +1844,7 @@ impl TreeState {
 
     /// Drops whole ignored root directories when neither the semantic tree nor
     /// an explicit force-tracking request can observe anything beneath them.
-    fn prune_ignored_changed_paths(
+    async fn prune_ignored_changed_paths(
         &self,
         scope: &mut ScanScope,
         scan_root: &Path,
@@ -1899,8 +1900,9 @@ impl TreeState {
                         if is_directory {
                             let matcher = PrefixMatcher::new([&root]);
                             self.tree
-                                .entries_matching(&matcher)
+                                .entries_stream_matching(&matcher)
                                 .next()
+                                .await
                                 .map(|(_, value)| value)
                                 .transpose()?
                                 .is_none()
@@ -1927,7 +1929,7 @@ impl TreeState {
     /// Rebuilds a bounded, in-memory scan index from the semantic tree. This
     /// replaces the durable per-path table: the index exists only for the
     /// current scan and all inspected paths are read from the scan root.
-    fn rebuild_ephemeral_tracked_paths(
+    async fn rebuild_ephemeral_tracked_paths(
         &mut self,
         scope: &ScanScope,
         explicit_tracking_matcher: &dyn Matcher,
@@ -1945,7 +1947,9 @@ impl TreeState {
         };
         match scope {
             ScanScope::Full => {
-                for (path, result) in self.tree.entries_matching(self.sparse_matcher().as_ref()) {
+                let sparse_matcher = self.sparse_matcher();
+                let mut stream = self.tree.entries_stream_matching(sparse_matcher.as_ref());
+                while let Some((path, result)) = stream.next().await {
                     push_value(path, result?);
                 }
             }
@@ -1967,7 +1971,8 @@ impl TreeState {
                 }
                 let changed_matcher = PrefixMatcher::new(minimal_roots);
                 let matcher = UnionMatcher::new(&changed_matcher, explicit_tracking_matcher);
-                for (path, result) in self.tree.entries_matching(&matcher) {
+                let mut stream = self.tree.entries_stream_matching(&matcher);
+                while let Some((path, result)) = stream.next().await {
                     push_value(path, result?);
                 }
             }
@@ -2733,7 +2738,8 @@ impl TreeState {
                 &scan_root,
                 root_ignores,
                 *force_tracking_matcher,
-            )?
+            )
+            .await?
         } else {
             0
         };
@@ -2780,7 +2786,8 @@ impl TreeState {
             .map(|matcher| matcher as &dyn Matcher)
             .unwrap_or(&EverythingMatcher);
         let matcher = IntersectionMatcher::new(external_sparse_matcher, sparse_scan_matcher);
-        self.rebuild_ephemeral_tracked_paths(&scan_scope, explicit_tracking_matcher)?;
+        self.rebuild_ephemeral_tracked_paths(&scan_scope, explicit_tracking_matcher)
+            .await?;
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             if baseline.is_some() {
@@ -2889,14 +2896,14 @@ impl TreeState {
         let mut tree_builder = MergedTreeBuilder::new(self.tree.clone());
         trace_span!("process tree entries").in_scope(|| {
             for (path, tree_values) in &tree_entries_rx {
-                tree_builder.set_or_remove(path, tree_values);
+                tree_builder.set_or_remove_merge(path, tree_values).unwrap();
             }
         });
         trace_span!("process deleted tree entries").in_scope(|| {
             let deleted_files: HashSet<RepoPathBuf> = HashSet::from_iter(deleted_files_rx);
             is_dirty |= !deleted_files.is_empty();
             for file in &deleted_files {
-                tree_builder.set_or_remove(file.clone(), Merge::absent());
+                tree_builder.set_or_remove(file.clone(), None);
             }
         });
         trace_span!("write tree")
@@ -4674,13 +4681,14 @@ impl TreeState {
             if old_tree.tree_ids().num_sides() == new_tree.tree_ids().num_sides()
                 && old_tree.labels() != new_tree.labels()
             {
-                // TODO: it might be better to use an async stream here and merge it with the
-                // other diff stream, but it could be difficult since the diff stream is not
-                // sorted in the same order as the conflicts iterator.
+                // TODO: it might be better to merge this stream with the other diff stream,
+                // but it could be difficult since the diff stream is not sorted in the same
+                // order as the conflicts stream.
                 new_tree
-                    .conflicts_matching(matcher)
+                    .conflicts_stream_matching(matcher)
                     .map(|(path, value)| value.map(|value| (path, value)))
-                    .try_collect()?
+                    .try_collect()
+                    .await?
             } else {
                 HashMap::new()
             };
@@ -5941,12 +5949,10 @@ pub async fn seed_local_working_copy_initialized_awacs_baseline(
 mod tests {
     use super::*;
     use crate::config::StackedConfig;
-    use crate::matchers::NothingMatcher;
     use crate::signing::Signer;
     use crate::simple_backend::SimpleBackend;
     use crate::tests::TestResult;
     use crate::tests::new_temp_dir;
-    use crate::tree_merge::MergeOptions;
 
     #[test_case::test_case(false, false; "one checkout")]
     #[test_case::test_case(true, false; "repeated checkout")]
@@ -5963,11 +5969,12 @@ mod tests {
             fs::create_dir(path)?;
         }
         fs::write(state_path.join("subvolume_mode"), b"enabling\n")?;
-        let user_settings = UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
+        let user_settings =
+            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
         let store = Store::new(
             Box::new(SimpleBackend::init(&store_path)),
             Signer::new(None, vec![]),
-            MergeOptions::from_settings(&user_settings)?,
+            user_settings.merge_options()?,
         );
         let mut settings = TreeStateSettings::try_from_user_settings(&user_settings)?;
         settings.fsmonitor_settings = FsmonitorSettings::TestAwacs {
@@ -6013,7 +6020,7 @@ mod tests {
         let mut builder = MergedTreeBuilder::new(tree_state.current_tree().clone());
         builder.set_or_remove(
             dependency_path,
-            Merge::normal(TreeValue::File {
+            Some(TreeValue::File {
                 id: dependency_id,
                 executable: false,
                 copy_id: CopyId::placeholder(),

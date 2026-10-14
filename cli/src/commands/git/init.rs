@@ -159,9 +159,7 @@ pub async fn cmd_git_init(
     }
     let cwd = command.cwd();
     let wc_path = cwd.join(&args.destination);
-    let wc_path = file_util::create_or_reuse_dir(&wc_path)
-        .and_then(|_| dunce::canonicalize(wc_path))
-        .map_err(|e| user_error_with_message("Failed to create workspace", e))?;
+    let wc_path = create_workspace_directory(&wc_path)?;
 
     let colocate = if command.settings().get_bool("git.colocate")? {
         !args.no_colocate
@@ -180,6 +178,7 @@ pub async fn cmd_git_init(
         colocate,
         object_hash.into(),
         args.git_repo.as_deref(),
+        InitContext::Command,
     )
     .await?;
 
@@ -193,13 +192,79 @@ pub async fn cmd_git_init(
     Ok(())
 }
 
+fn create_workspace_directory(path: &Path) -> Result<PathBuf, CommandError> {
+    file_util::create_or_reuse_dir(path)
+        .and_then(|_| dunce::canonicalize(path))
+        .map_err(|e| {
+            user_error_with_message(
+                format!("Failed to create workspace at \"{}\"", path.display()),
+                e,
+            )
+        })
+}
+
+/// Initializes a missing sync receiver with ordinary colocated-init semantics.
+/// Snapshotting is left to endpoint preparation so its explicit working-copy
+/// policy also applies when this process is the hidden synchronization helper.
+pub(crate) async fn init_colocated_for_sync(
+    ui: &Ui,
+    command: &CommandHelper,
+    workspace_root: &Path,
+    object_hash: gix::hash::Kind,
+) -> Result<(), CommandError> {
+    let git_path = workspace_root.join(".git");
+    match std::fs::symlink_metadata(&git_path) {
+        Ok(_) => {
+            let git_repo = gix::open(&git_path).map_err(|err| {
+                user_error_with_message("Failed to open destination Git repo", err)
+            })?;
+            if git_repo.object_hash() != object_hash {
+                return Err(user_error(
+                    "Destination Git repository uses a different object hash than the source",
+                ));
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(user_error_with_message(
+                "Failed to inspect destination Git repo",
+                err,
+            ));
+        }
+    }
+    let workspace_root = create_workspace_directory(workspace_root)?;
+    do_init(
+        ui,
+        command,
+        &workspace_root,
+        true,
+        object_hash,
+        None,
+        InitContext::SyncReceiver,
+    )
+    .await?;
+    writeln!(
+        ui.status(),
+        r#"Initialized repo in "{}""#,
+        file_util::relative_path(command.cwd(), &workspace_root).display()
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum InitContext {
+    Command,
+    SyncReceiver,
+}
+
 async fn do_init(
-    ui: &mut Ui,
+    ui: &Ui,
     command: &CommandHelper,
     workspace_root: &Path,
     colocate: bool,
     object_hash: gix::hash::Kind,
     git_repo: Option<&str>,
+    context: InitContext,
 ) -> Result<(), CommandError> {
     #[derive(Clone, Debug)]
     enum GitInitMode {
@@ -238,7 +303,10 @@ async fn do_init(
         GitInitMode::Internal
     };
 
-    let (settings, config_env) = command.settings_for_new_workspace(ui, workspace_root)?;
+    let (settings, config_env) = match context {
+        InitContext::Command => command.settings_for_new_workspace(ui, workspace_root)?,
+        InitContext::SyncReceiver => command.settings_for_new_sync_workspace(ui, workspace_root)?,
+    };
     match &init_mode {
         GitInitMode::Colocate => {
             let (workspace, repo) =
@@ -257,7 +325,9 @@ async fn do_init(
             let mut workspace_command = command.for_workable_repo(ui, workspace, repo)?;
             let git_repo = git::get_git_repo(workspace_command.repo().store())?;
             maybe_add_gitignore(&workspace_command)?;
-            workspace_command.maybe_snapshot(ui).await?;
+            if matches!(context, InitContext::Command) {
+                workspace_command.maybe_snapshot(ui).await?;
+            }
             maybe_set_repository_level_trunk_alias(ui, &git_repo, &config_env)?;
             if !workspace_command.working_copy_shared_with_git() {
                 let mut tx = workspace_command.start_transaction();
@@ -293,7 +363,7 @@ async fn do_init(
 /// This is similar to `WorkspaceCommandHelper::import_git_refs()`, but never
 /// moves the Git HEAD to the working copy parent.
 async fn init_git_refs(
-    ui: &mut Ui,
+    ui: &Ui,
     repo: Arc<ReadonlyRepo>,
     string_args: &[String],
     workspace: &Workspace,

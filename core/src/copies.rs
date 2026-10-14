@@ -24,14 +24,15 @@ use std::task::ready;
 use futures::Stream;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
+use futures::future::Either;
 use futures::future::ready;
 use futures::future::try_join_all;
+use futures::stream::BoxStream;
 use futures::stream::Fuse;
 use futures::stream::FuturesOrdered;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
-use pollster::FutureExt as _;
 
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
@@ -170,61 +171,25 @@ impl CopiesTreeDiffEntryPath {
 }
 
 /// Wraps a `TreeDiffStream`, adding support for copies and renames.
-pub struct CopiesTreeDiffStream<'a> {
+pub fn copies_tree_diff_stream<'a>(
     inner: TreeDiffStream<'a>,
     source_tree: MergedTree,
     target_tree: MergedTree,
     copy_records: &'a CopyRecords,
-}
-
-impl<'a> CopiesTreeDiffStream<'a> {
-    /// Create a new diff stream with copy information.
-    pub fn new(
-        inner: TreeDiffStream<'a>,
-        source_tree: MergedTree,
-        target_tree: MergedTree,
-        copy_records: &'a CopyRecords,
-    ) -> Self {
-        Self {
-            inner,
-            source_tree,
-            target_tree,
-            copy_records,
-        }
-    }
-
-    async fn resolve_copy_source(
-        &self,
-        source: &RepoPath,
-        values: BackendResult<Diff<MergedTreeValue>>,
-    ) -> BackendResult<(CopyOperation, Diff<MergedTreeValue>)> {
-        let target_value = values?.after;
-        let source_value = self.source_tree.path_value(source).await?;
-        // If the source path is deleted in the target tree, it's a rename.
-        let source_value_at_target = self.target_tree.path_value(source).await?;
-        let copy_op = if source_value_at_target.is_absent() || source_value_at_target.is_tree() {
-            CopyOperation::Rename
-        } else {
-            CopyOperation::Copy
-        };
-        Ok((copy_op, Diff::new(source_value, target_value)))
-    }
-}
-
-impl Stream for CopiesTreeDiffStream<'_> {
-    type Item = CopiesTreeDiffEntry;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        while let Some(diff_entry) = ready!(self.inner.as_mut().poll_next(cx)) {
-            let Some(CopyRecord { source, .. }) = self.copy_records.for_target(&diff_entry.path)
-            else {
-                let target_deleted =
-                    matches!(&diff_entry.values, Ok(diff) if diff.after.is_absent());
-                if target_deleted && self.copy_records.has_source(&diff_entry.path) {
-                    // Skip the "delete" entry when there is a rename.
-                    continue;
-                }
-                return Poll::Ready(Some(CopiesTreeDiffEntry {
+) -> BoxStream<'a, CopiesTreeDiffEntry> {
+    let concurrency = source_tree.store().concurrency();
+    inner
+        .filter(move |diff_entry| {
+            let target_deleted = matches!(&diff_entry.values, Ok(diff) if diff.after.is_absent());
+            // Skip the "delete" entry when there is a rename.
+            let skip = target_deleted
+                && copy_records.for_target(&diff_entry.path).is_none()
+                && copy_records.has_source(&diff_entry.path);
+            ready(!skip)
+        })
+        .map(move |diff_entry| {
+            let Some(CopyRecord { source, .. }) = copy_records.for_target(&diff_entry.path) else {
+                return Either::Left(ready(CopiesTreeDiffEntry {
                     path: CopiesTreeDiffEntryPath {
                         source: None,
                         target: diff_entry.path,
@@ -232,26 +197,50 @@ impl Stream for CopiesTreeDiffStream<'_> {
                     values: diff_entry.values,
                 }));
             };
+            let source_tree = source_tree.clone();
+            let target_tree = target_tree.clone();
+            Either::Right(async move {
+                let (copy_op, values) = match resolve_copy_source(
+                    &source_tree,
+                    &target_tree,
+                    source,
+                    diff_entry.values,
+                )
+                .await
+                {
+                    Ok((copy_op, values)) => (copy_op, Ok(values)),
+                    // Fall back to "copy" (= path still exists) if unknown.
+                    Err(err) => (CopyOperation::Copy, Err(err)),
+                };
+                CopiesTreeDiffEntry {
+                    path: CopiesTreeDiffEntryPath {
+                        source: Some((source.to_owned(), copy_op)),
+                        target: diff_entry.path,
+                    },
+                    values,
+                }
+            })
+        })
+        .buffered(concurrency)
+        .boxed()
+}
 
-            let (copy_op, values) = match self
-                .resolve_copy_source(source, diff_entry.values)
-                .block_on()
-            {
-                Ok((copy_op, values)) => (copy_op, Ok(values)),
-                // Fall back to "copy" (= path still exists) if unknown.
-                Err(err) => (CopyOperation::Copy, Err(err)),
-            };
-            return Poll::Ready(Some(CopiesTreeDiffEntry {
-                path: CopiesTreeDiffEntryPath {
-                    source: Some((source.clone(), copy_op)),
-                    target: diff_entry.path,
-                },
-                values,
-            }));
-        }
-
-        Poll::Ready(None)
-    }
+async fn resolve_copy_source(
+    source_tree: &MergedTree,
+    target_tree: &MergedTree,
+    source: &RepoPath,
+    values: BackendResult<Diff<MergedTreeValue>>,
+) -> BackendResult<(CopyOperation, Diff<MergedTreeValue>)> {
+    let target_value = values?.after;
+    let source_value = source_tree.path_value(source).await?;
+    // If the source path is deleted in the target tree, it's a rename.
+    let source_value_at_target = target_tree.path_value(source).await?;
+    let copy_op = if source_value_at_target.is_absent() || source_value_at_target.is_tree() {
+        CopyOperation::Rename
+    } else {
+        CopyOperation::Copy
+    };
+    Ok((copy_op, Diff::new(source_value, target_value)))
 }
 
 /// Maps `CopyId`s to `CopyHistory`s

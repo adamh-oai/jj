@@ -21,8 +21,8 @@ use thiserror::Error;
 
 use crate::backend::Timestamp;
 use crate::index::IndexError;
-use crate::index::IndexStoreError;
 use crate::index::ReadonlyIndex;
+use crate::index_store::IndexStoreError;
 use crate::op_heads_store::OpHeadsStore;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store;
@@ -88,8 +88,29 @@ impl Transaction {
         &self.parent_ops
     }
 
+    /// Records incorporated history without applying another workspace's view.
+    ///
+    /// The caller must merge the relevant indexes and repository fields before
+    /// writing the transaction. Keeping the original baseline first makes it
+    /// possible to restore the receiver's state before an integration.
+    pub fn add_operation_parent(&mut self, operation: Operation) {
+        if !self
+            .parent_ops
+            .iter()
+            .any(|parent| parent.id() == operation.id())
+        {
+            self.parent_ops.push(operation);
+        }
+    }
+
     pub fn set_attribute(&mut self, key: String, value: String) {
         self.op_metadata.attributes.insert(key, value);
+    }
+
+    /// Sets deterministic metadata for an internal reconciliation operation.
+    pub(crate) fn set_metadata(&mut self, metadata: OperationMetadata) {
+        self.end_time = Some(metadata.time.end);
+        self.op_metadata = metadata;
     }
 
     pub fn repo(&self) -> &MutableRepo {

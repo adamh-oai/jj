@@ -17,6 +17,10 @@ revert a specific one which isn't the most recent operation (`jj op revert`). It
 also lets you restore the entire repo to the way it looked at an earlier point
 (`jj op restore`).
 
+To exchange original operations and views with another repository, use
+[`jj sync`](repository-sync.md). Workspaces remain local while shared repository
+history is reconciled.
+
 When referring to operations, you can use `@` to represent the current
 operation.
 

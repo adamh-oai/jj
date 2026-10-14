@@ -1354,6 +1354,15 @@ merge-editor = "meld"  # Or "vscode" or "vscodium" or "kdiff3" or "vimdiff"
 merge-editor = ["meld", "$left", "$base", "$right", "-o", "$output"]
 ```
 
+The following built-in tools are always available:
+
+- `:builtin` launches a TUI tool for 3-way merges (the default).
+- `:editor` opens the conflicted file with conflict markers in your text editor
+  (`ui.editor`). Unlike the other tools, it supports conflicts with any number
+  of sides. Conflict markers left in the file are kept as a partially resolved
+  conflict.
+- `:ours` and `:theirs` pick side #1 or side #2 of the conflict respectively.
+
 The following tools can be used out of the box, as long as they are installed:
 - "kdiff3"
 - "meld"
@@ -1802,6 +1811,14 @@ This is useful when the signing backend requires user interaction or is slow,
 because the signing work is deferred to push time. If `signing.behavior` is set
 to `own` or `force`, commits may already be signed when written, and
 `git.sign-on-push` would have little or nothing left to sign.
+
+The commits are signed in their own transaction which is committed before
+the push starts. If the push fails, the commits stay signed and retrying
+does not have to sign them again. If nothing needs signing, no extra
+transaction is created.
+
+Because signing and pushing are separate operations, `jj undo` of the push
+operation would not undo the commit signatures.
 
 ## Commit Signature Verification
 

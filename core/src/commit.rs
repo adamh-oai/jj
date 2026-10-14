@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![expect(missing_docs)]
+//! A commit loaded from the [`Store`], with convenient accessors.
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
@@ -20,10 +20,12 @@ use std::fmt::Error;
 use std::fmt::Formatter;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::mem;
 use std::sync::Arc;
 
 use futures::future::try_join_all;
 use itertools::Itertools as _;
+use tracing::instrument;
 
 use crate::backend;
 use crate::backend::BackendError;
@@ -33,16 +35,17 @@ use crate::backend::CommitId;
 use crate::backend::Signature;
 use crate::backend::TreeId;
 use crate::conflict_labels::ConflictLabels;
-use crate::index::IndexResult;
+use crate::index::Index;
 use crate::merge::Merge;
 use crate::merged_tree::MergedTree;
-use crate::repo::Repo;
-use crate::rewrite::merge_commit_trees;
-use crate::rewrite::merge_commit_trees_no_resolve;
 use crate::signing::SignResult;
 use crate::signing::Verification;
 use crate::store::Store;
 
+/// A commit object read from the backend, along with its ID and the store it
+/// came from.
+///
+/// Equality, ordering, and hashing are based on the commit ID only.
 #[derive(Clone, serde::Serialize)]
 pub struct Commit {
     #[serde(skip)]
@@ -91,22 +94,27 @@ impl Hash for Commit {
 }
 
 impl Commit {
+    /// Creates a commit object from its backend representation.
     pub fn new(store: Arc<Store>, id: CommitId, data: Arc<backend::Commit>) -> Self {
         Self { store, id, data }
     }
 
+    /// The store this commit was loaded from.
     pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
 
+    /// The commit ID.
     pub fn id(&self) -> &CommitId {
         &self.id
     }
 
+    /// The IDs of the commit's parents.
     pub fn parent_ids(&self) -> &[CommitId] {
         &self.data.parents
     }
 
+    /// Loads the commit's parents from the store.
     pub async fn parents(&self) -> BackendResult<Vec<Self>> {
         try_join_all(
             self.data
@@ -117,6 +125,7 @@ impl Commit {
         .await
     }
 
+    /// The commit's (possibly conflicted) root tree.
     pub fn tree(&self) -> MergedTree {
         MergedTree::new(
             self.store.clone(),
@@ -125,79 +134,80 @@ impl Commit {
         )
     }
 
+    /// The IDs of the terms of the commit's root tree.
     pub fn tree_ids(&self) -> &Merge<TreeId> {
         &self.data.root_tree
     }
 
     /// Return the parent tree, merging the parent trees if there are multiple
     /// parents.
-    pub async fn parent_tree(&self, repo: &dyn Repo) -> BackendResult<MergedTree> {
+    pub async fn parent_tree(&self, index: &dyn Index) -> BackendResult<MergedTree> {
         // Avoid merging parent trees if known to be empty. The index could be
         // queried only when parents.len() > 1, but index query would be cheaper
         // than extracting parent commit from the store.
-        if is_commit_empty_by_index(repo, &self.id).await? == Some(true) {
+        if is_commit_empty_by_index(index, &self.id).await? == Some(true) {
             return Ok(self.tree());
         }
         let parents = self.parents().await?;
-        merge_commit_trees(repo, &parents).await
+        merge_commit_trees(self.store(), index, &parents).await
     }
 
     /// Returns the parent tree, merging the parent trees if there are multiple
     /// parents, without resolving conflicts.
-    pub async fn parent_tree_no_resolve(&self, repo: &dyn Repo) -> BackendResult<MergedTree> {
+    pub async fn parent_tree_no_resolve(&self, index: &dyn Index) -> BackendResult<MergedTree> {
         // Avoid merging parent trees if known to be empty. The index could be
         // queried only when parents.len() > 1, but index query would be cheaper
         // than extracting parent commit from the store.
-        if is_commit_empty_by_index(repo, &self.id).await? == Some(true) {
+        if is_commit_empty_by_index(index, &self.id).await? == Some(true) {
             return Ok(self.tree());
         }
         let parents = self.parents().await?;
-        merge_commit_trees_no_resolve(repo, &parents).await
+        merge_commit_trees_no_resolve(self.store(), index, &parents).await
     }
 
     /// Returns whether commit's content is empty. Commit description is not
     /// taken into consideration.
-    pub async fn is_empty(&self, repo: &dyn Repo) -> BackendResult<bool> {
-        if let Some(empty) = is_commit_empty_by_index(repo, &self.id).await? {
+    pub async fn is_empty(&self, index: &dyn Index) -> BackendResult<bool> {
+        if let Some(empty) = is_commit_empty_by_index(index, &self.id).await? {
             return Ok(empty);
         }
-        is_backend_commit_empty(repo, &self.store, &self.data).await
+        is_backend_commit_empty(index, &self.store, &self.data).await
     }
 
+    /// Returns whether the commit's root tree has conflicts.
     pub fn has_conflict(&self) -> bool {
         !self.tree_ids().is_resolved()
     }
 
+    /// The commit's change ID.
     pub fn change_id(&self) -> &ChangeId {
         &self.data.change_id
     }
 
+    /// The backend representation of the commit.
     pub fn store_commit(&self) -> &Arc<backend::Commit> {
         &self.data
     }
 
+    /// The commit description.
     pub fn description(&self) -> &str {
         &self.data.description
     }
 
+    /// The commit's author.
     pub fn author(&self) -> &Signature {
         &self.data.author
     }
 
+    /// The commit's committer.
     pub fn committer(&self) -> &Signature {
         &self.data.committer
     }
 
-    ///  A commit is hidden if its commit id is not in the change id index.
-    pub async fn is_hidden(&self, repo: &dyn Repo) -> IndexResult<bool> {
-        let maybe_targets = repo.resolve_change_id(self.change_id()).await?;
-        Ok(maybe_targets.is_none_or(|targets| !targets.has_visible(&self.id)))
-    }
-
     /// A commit is discardable if it has no change from its parent, and an
     /// empty description.
-    pub async fn is_discardable(&self, repo: &dyn Repo) -> BackendResult<bool> {
-        Ok(self.description().is_empty() && self.is_empty(repo).await?)
+    pub async fn is_discardable(&self, index: &dyn Index) -> BackendResult<bool> {
+        Ok(self.description().is_empty() && self.is_empty(index).await?)
     }
 
     /// A quick way to just check if a signature is present.
@@ -246,9 +256,11 @@ impl Commit {
     }
 }
 
-// If there is a single commit, returns the detailed conflict label for that
-// commit. If there are multiple commits, joins the short conflict labels of
-// each commit.
+/// A string describing `commits` to be used in conflict markers.
+///
+/// If there is a single commit, returns the detailed conflict label for that
+/// commit. If there are multiple commits, joins the short conflict labels of
+/// each commit.
 pub fn conflict_label_for_commits(commits: &[Commit]) -> String {
     if commits.len() == 1 {
         commits[0].conflict_label()
@@ -257,8 +269,125 @@ pub fn conflict_label_for_commits(commits: &[Commit]) -> String {
     }
 }
 
-pub(crate) async fn is_backend_commit_empty(
-    repo: &dyn Repo,
+/// Merges `commits`, resolving conflicts if possible.
+#[instrument(skip(index))]
+pub async fn merge_commit_trees(
+    store: &Arc<Store>,
+    index: &dyn Index,
+    commits: &[Commit],
+) -> BackendResult<MergedTree> {
+    if let [commit] = commits {
+        return Ok(commit.tree());
+    }
+    merge_commit_trees_no_resolve(store, index, commits)
+        .await?
+        .resolve()
+        .await
+}
+
+/// Merges `commits` without attempting to resolve file conflicts.
+#[instrument(skip(index))]
+pub async fn merge_commit_trees_no_resolve(
+    store: &Arc<Store>,
+    index: &dyn Index,
+    commits: &[Commit],
+) -> BackendResult<MergedTree> {
+    if let [commit] = commits {
+        return Ok(commit.tree());
+    }
+    let commit_ids = commits
+        .iter()
+        .map(|commit| commit.id().clone())
+        .collect_vec();
+    let commit_id_merge = find_recursive_merge_commits(store, index, commit_ids).await?;
+    let tree_merge: Merge<(MergedTree, String)> = commit_id_merge
+        .try_map_async(async |commit_id| {
+            let commit = store.get_commit_async(commit_id).await?;
+            Ok::<_, BackendError>((commit.tree(), commit.conflict_label()))
+        })
+        .await?;
+    Ok(MergedTree::merge_no_resolve(tree_merge))
+}
+
+/// Find the commits to use as input to the recursive merge algorithm.
+pub async fn find_recursive_merge_commits(
+    store: &Arc<Store>,
+    index: &dyn Index,
+    commit_ids: Vec<CommitId>,
+) -> BackendResult<Merge<CommitId>> {
+    #[derive(Debug)]
+    struct WorkItem {
+        commit_ids: Vec<CommitId>,
+        result: Merge<CommitId>,
+        pos: usize,
+    }
+
+    impl WorkItem {
+        fn new(commit_ids: Vec<CommitId>) -> Self {
+            let result = Merge::resolved(commit_ids[0].clone());
+            Self {
+                commit_ids,
+                result,
+                pos: 1,
+            }
+        }
+
+        fn merge_next(&mut self, ancestor: Merge<CommitId>) {
+            let dummy = Merge::resolved(CommitId::new(vec![]));
+            let result = mem::replace(&mut self.result, dummy);
+            let other = Merge::resolved(self.commit_ids[self.pos].clone());
+            self.result = Merge::from_vec(vec![result, ancestor, other]).flatten();
+            self.pos += 1;
+        }
+    }
+
+    let maybe_resolved = |commit_ids: Vec<CommitId>| match commit_ids.len() {
+        0 => Ok(Merge::resolved(store.root_commit_id().clone())),
+        1 => Ok(Merge::resolved(commit_ids.into_iter().next().unwrap())),
+        _ => Err(commit_ids),
+    };
+
+    // Execute recursion without using the call stack:
+    // ```
+    // let mut result = Merge::resolved(commit_ids[0].clone());
+    // for pos in 1..commit_ids.len() {
+    //     let ancestor_ids = index.common_ancestors(&commit_ids[0..pos], &commit_ids[pos..][..1])?;
+    //     let ancestor = find_recursive_merge_commits(store, index, ancestor_ids)?;
+    //     let other = Merge::resolved(commit_ids[pos].clone());
+    //     result = Merge::from_vec(vec![result, ancestor, other]).flatten();
+    // }
+    // ```
+    let mut stack = Vec::new();
+    match maybe_resolved(commit_ids) {
+        Ok(result) => return Ok(result),
+        Err(commit_ids) => stack.push(WorkItem::new(commit_ids)),
+    }
+    loop {
+        let top = stack.last_mut().unwrap();
+        if top.pos < top.commit_ids.len() {
+            let ancestor_ids = index
+                .common_ancestors(&top.commit_ids[0..top.pos], &top.commit_ids[top.pos..][..1])
+                .await
+                // TODO: indexing error shouldn't be a "BackendError"
+                .map_err(|err| BackendError::Other(err.into()))?;
+            match maybe_resolved(ancestor_ids) {
+                Ok(ancestor) => top.merge_next(ancestor),
+                Err(ancestor_ids) => stack.push(WorkItem::new(ancestor_ids)),
+            }
+        } else {
+            let ancestor = stack.pop().unwrap();
+            let Some(top) = stack.last_mut() else {
+                return Ok(ancestor.result);
+            };
+            top.merge_next(ancestor.result);
+        }
+    }
+}
+
+/// Returns whether the backend commit's tree is the same as its parent tree
+/// (the merged parent trees if there are multiple parents).
+pub async fn is_backend_commit_empty(
+    index: &dyn Index,
     store: &Arc<Store>,
     commit: &backend::Commit,
 ) -> BackendResult<bool> {
@@ -266,13 +395,12 @@ pub(crate) async fn is_backend_commit_empty(
         return Ok(commit.root_tree == *store.get_commit_async(parent_id).await?.tree_ids());
     }
     let parents = try_join_all(commit.parents.iter().map(|id| store.get_commit_async(id))).await?;
-    let parent_tree = merge_commit_trees(repo, &parents).await?;
+    let parent_tree = merge_commit_trees(store, index, &parents).await?;
     Ok(commit.root_tree == *parent_tree.tree_ids())
 }
 
-async fn is_commit_empty_by_index(repo: &dyn Repo, id: &CommitId) -> BackendResult<Option<bool>> {
-    let maybe_paths = repo
-        .index()
+async fn is_commit_empty_by_index(index: &dyn Index, id: &CommitId) -> BackendResult<Option<bool>> {
+    let maybe_paths = index
         .changed_paths_in_commit(id)
         .await
         // TODO: index error shouldn't be a "BackendError"
@@ -280,7 +408,9 @@ async fn is_commit_empty_by_index(repo: &dyn Repo, id: &CommitId) -> BackendResu
     Ok(maybe_paths.map(|mut paths| paths.next().is_none()))
 }
 
+/// Extension methods for iterators over [`Commit`]s.
 pub trait CommitIteratorExt<'c, I> {
+    /// Maps the commits to their IDs.
     fn ids(self) -> impl Iterator<Item = &'c CommitId>;
 }
 
@@ -295,7 +425,7 @@ where
 
 /// Wrapper to sort `Commit` by committer timestamp.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct CommitByCommitterTimestamp(pub Commit);
+pub struct CommitByCommitterTimestamp(pub Commit);
 
 impl Ord for CommitByCommitterTimestamp {
     fn cmp(&self, other: &Self) -> Ordering {

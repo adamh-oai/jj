@@ -855,7 +855,7 @@
                         "properties": {
                             "enabled": {
                                 "type": "boolean",
-                                "description": "Whether this alias is enabled",
+                                "description": "Whether this alias is enabled.",
                                 "default": true
                             },
                             "definition": {
@@ -866,19 +866,6 @@
                             },
                             "doc": {
                                 "type": "string"
-                            }
-                        },
-                        "required": [
-                            "definition"
-                        ]
-                    },
-                    {
-                        "type": "object",
-                        "properties": {
-                            "enabled": {
-                                "type": "boolean",
-                                "const": false,
-                                "description": "Disable this alias."
                             }
                         }
                     }
@@ -917,6 +904,29 @@
                     ],
                     "description": "New files with a size in bytes above this threshold are not snapshotted, unless the threshold is 0",
                     "default": "1MiB"
+                }
+            }
+        },
+        "sync": {
+            "type": "object",
+            "description": "Receiver-local resource limits for repository synchronization. Sender configuration is never forwarded.",
+            "properties": {
+                "max-quarantine-bytes": {
+                    "type": ["integer", "string"],
+                    "minimum": 1,
+                    "description": "Maximum staged bytes, including file allocation overhead. Accepts bytes or a size such as 10GiB. Defaults to half the available space after reserving the smaller of 1GiB or ten percent of free space. Increase on the receiver for larger transfers."
+                },
+                "max-records": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1000000,
+                    "description": "Maximum staged object records in one receiving quarantine. Raise on the receiver for larger transfers. Known-ID inventories use a bounded cache and resend omitted IDs."
+                },
+                "max-dependencies": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1000000,
+                    "description": "Maximum pending dependency identities during incoming closure validation, and maximum wire fields in each protobuf metadata record, including nested messages. Raise on the receiver for larger histories or metadata."
                 }
             }
         },

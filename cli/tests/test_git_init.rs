@@ -435,7 +435,7 @@ fn test_git_init_external_non_existent_git_directory() {
     Caused by:
     1: Failed to open git repository
     2: "$TEST_ENV/repo" does not appear to be a git repository
-    3: Missing HEAD at '.git/HEAD'
+    3: Missing HEAD at ".git/HEAD"
     [EOF]
     [exit status: 1]
     "#);
@@ -1206,12 +1206,12 @@ fn test_git_init_bad_wc_path() -> TestResult {
     test_env.add_config("git.colocate = true");
     std::fs::write(test_env.env_root().join("existing-file"), b"")?;
     let output = test_env.run_jj_in(".", ["git", "init", "existing-file"]);
-    insta::assert_snapshot!(output.strip_stderr_last_line(), @"
+    insta::assert_snapshot!(output.normalize_backslash().strip_stderr_last_line(), @r#"
     ------- stderr -------
-    Error: Failed to create workspace
+    Error: Failed to create workspace at "$TEST_ENV/existing-file"
     [EOF]
     [exit status: 1]
-    ");
+    "#);
     Ok(())
 }
 
@@ -1231,7 +1231,7 @@ fn test_git_init_with_invalid_gitlink() {
     Caused by:
     1: Failed to open git repository
     2: "$TEST_ENV/repo/.git" does not appear to be a git repository
-    3: Format should be 'gitdir: <path>', but got, "input"="invalid"
+    3: Format should be 'gitdir: <path>', but got, input="invalid"
     [EOF]
     [exit status: 1]
     "#);
@@ -1243,7 +1243,7 @@ fn test_git_init_with_invalid_gitlink() {
     Caused by:
     1: Failed to open git repository
     2: "$TEST_ENV/repo/.git" does not appear to be a git repository
-    3: Format should be 'gitdir: <path>', but got, "input"="invalid"
+    3: Format should be 'gitdir: <path>', but got, input="invalid"
     [EOF]
     [exit status: 1]
     "#);

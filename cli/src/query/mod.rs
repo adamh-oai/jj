@@ -1513,9 +1513,11 @@ fn native_jj_divergent<'a>(cv: jaq_core::Cv<'a, QueryData>) -> ValXs<'a, QueryVa
 fn native_jj_hidden<'a>(cv: jaq_core::Cv<'a, QueryData>) -> ValXs<'a, QueryValue> {
     with_commit(cv.1, "jj::hidden", |host| {
         cached_semantic(host, "jj::hidden", || {
-            pollster::block_on(host.commit.is_hidden(host.repo.as_ref()))
-                .map(QueryValue::from)
-                .map_err(|error| error.to_string())
+            let targets = pollster::block_on(host.repo.resolve_change_id(host.commit.change_id()))
+                .map_err(|error| error.to_string())?;
+            Ok(targets
+                .is_none_or(|targets| !targets.has_visible(host.commit.id()))
+                .into())
         })
     })
 }
@@ -1551,7 +1553,7 @@ fn native_jj_immutable<'a>(cv: jaq_core::Cv<'a, QueryData>) -> ValXs<'a, QueryVa
 fn native_jj_empty<'a>(cv: jaq_core::Cv<'a, QueryData>) -> ValXs<'a, QueryValue> {
     with_commit(cv.1, "jj::empty", |host| {
         cached_semantic(host, "jj::empty", || {
-            pollster::block_on(host.commit.is_empty(host.repo.as_ref()))
+            pollster::block_on(host.commit.is_empty(host.repo.index()))
                 .map(QueryValue::from)
                 .map_err(|error| error.to_string())
         })
@@ -1629,7 +1631,7 @@ fn native_jj_diff_files<'a>(cv: jaq_core::Cv<'a, QueryData>) -> ValXs<'a, QueryV
     with_commit(cv.1, "jj::diff_files", |host| {
         cached_semantic(host, "jj::diff_files", || {
             pollster::block_on(async {
-                let before = host.commit.parent_tree(host.repo.as_ref()).await?;
+                let before = host.commit.parent_tree(host.repo.index()).await?;
                 let after = host.commit.tree();
                 let mut stream = before.diff_stream(&after, host.matcher.as_ref());
                 let mut entries = Vec::new();
@@ -1662,7 +1664,7 @@ fn native_jj_diff_stats<'a>(cv: jaq_core::Cv<'a, QueryData>) -> ValXs<'a, QueryV
     with_commit(cv.1, "jj::diff_stats", |host| {
         cached_semantic(host, "jj::diff_stats", || {
             pollster::block_on(async {
-                let before = host.commit.parent_tree(host.repo.as_ref()).await?;
+                let before = host.commit.parent_tree(host.repo.index()).await?;
                 let after = host.commit.tree();
                 let copy_records = CopyRecords::default();
                 let tree_diff =

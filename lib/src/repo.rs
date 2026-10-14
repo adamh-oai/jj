@@ -58,11 +58,12 @@ use crate::index::ChangeIdIndex;
 use crate::index::Index;
 use crate::index::IndexError;
 use crate::index::IndexResult;
-use crate::index::IndexStore;
-use crate::index::IndexStoreError;
 use crate::index::MutableIndex;
 use crate::index::ReadonlyIndex;
 use crate::index::ResolvedChangeTargets;
+use crate::index_store::IndexStore;
+use crate::index_store::IndexStoreError;
+use crate::lock::FileLockError;
 use crate::merge::MergeBuilder;
 use crate::merge::SameChange;
 use crate::merge::trivial_merge;
@@ -94,6 +95,7 @@ use crate::refs::diff_named_ref_targets;
 use crate::refs::diff_named_remote_refs;
 use crate::refs::merge_ref_targets;
 use crate::refs::merge_remote_refs;
+use crate::repo_lock::RepoFormatLock;
 use crate::revset;
 use crate::revset::ResolvedRevsetExpression;
 use crate::revset::RevsetEvaluationError;
@@ -116,7 +118,6 @@ use crate::store::Store;
 use crate::submodule_store::SubmoduleStore;
 use crate::transaction::Transaction;
 use crate::transaction::TransactionCommitError;
-use crate::tree_merge::MergeOptions;
 use crate::view::RenameWorkspaceError;
 use crate::view::View;
 use crate::workspace_store::WorkspaceStore;
@@ -181,6 +182,8 @@ impl Debug for ReadonlyRepo {
 #[derive(Error, Debug)]
 pub enum RepoInitError {
     #[error(transparent)]
+    RepositoryLock(#[from] FileLockError),
+    #[error(transparent)]
     Backend(#[from] BackendInitError),
     #[error(transparent)]
     OpHeadsStore(#[from] OpHeadsStoreError),
@@ -232,8 +235,12 @@ impl ReadonlyRepo {
         let backend = backend_initializer(settings, &store_path)?;
         let backend_path = store_path.join("type");
         fs::write(&backend_path, backend.name()).context(&backend_path)?;
-        let merge_options =
-            MergeOptions::from_settings(settings).map_err(|err| BackendInitError(err.into()))?;
+        // No operation-store marker exists yet, so synchronization cannot be
+        // enabled before this initializer has taken shared access.
+        let format_lock = RepoFormatLock::shared(&repo_path)?;
+        let merge_options = settings
+            .merge_options()
+            .map_err(|err| BackendInitError(err.into()))?;
         let store = Store::new(backend, signer, merge_options);
 
         let workspace_store_path = repo_path.join("workspace_store");
@@ -277,6 +284,7 @@ impl ReadonlyRepo {
             .context(&submodule_store_type_path)?;
         let submodule_store = Arc::from(submodule_store);
 
+        let format_lock = (op_store.name() == SimpleOpStore::NAME).then(|| Arc::new(format_lock));
         let loader = RepoLoader {
             settings: settings.clone(),
             store,
@@ -285,6 +293,7 @@ impl ReadonlyRepo {
             op_heads_store,
             index_store,
             submodule_store,
+            _format_lock: format_lock,
         };
 
         let root_operation = loader.root_operation().await;
@@ -464,6 +473,8 @@ pub struct StoreFactories {
 
 #[derive(Debug, Error)]
 pub enum StoreLoadError {
+    #[error(transparent)]
+    RepositoryLock(#[from] FileLockError),
     #[error("Unsupported {store} backend type '{store_type}'")]
     UnsupportedType {
         store: &'static str,
@@ -704,9 +715,18 @@ pub struct RepoLoader {
     op_heads_store: Arc<dyn OpHeadsStore>,
     index_store: Arc<dyn IndexStore>,
     submodule_store: Arc<dyn SubmoduleStore>,
+    // A plain operation-store handle must finish before synchronization changes
+    // the format. Enabled stores already understand the retained history and do
+    // not need to exclude this one-way transition. Drop the guard after stores.
+    _format_lock: Option<Arc<RepoFormatLock>>,
 }
 
 impl RepoLoader {
+    /// Creates a loader from already-opened stores.
+    ///
+    /// The caller coordinates format changes for these custom stores. Load
+    /// filesystem repositories with [`Self::init_from_file_system`] to protect
+    /// their operation-store format for the lifetime of this loader.
     pub fn new(
         settings: UserSettings,
         store: Arc<Store>,
@@ -724,6 +744,7 @@ impl RepoLoader {
             op_heads_store,
             index_store,
             submodule_store,
+            _format_lock: None,
         }
     }
 
@@ -735,8 +756,18 @@ impl RepoLoader {
         repo_path: &Path,
         store_factories: &StoreFactories,
     ) -> Result<Self, StoreLoadError> {
-        let merge_options =
-            MergeOptions::from_settings(settings).map_err(|err| BackendLoadError(err.into()))?;
+        let format_lock = RepoFormatLock::shared(repo_path).map_err(|lock_error| {
+            // Preserve the usual backend diagnostics if its marker cannot be
+            // read. Report actual locking failures separately; neither error
+            // permits loading an unprotected repository.
+            match read_store_type("commit", repo_path.join("store/type")) {
+                Ok(_) => StoreLoadError::RepositoryLock(lock_error),
+                Err(error) => error,
+            }
+        })?;
+        let merge_options = settings
+            .merge_options()
+            .map_err(|err| BackendLoadError(err.into()))?;
         let store = Store::new(
             store_factories.load_backend(settings, &repo_path.join("store"))?,
             signer_from_settings(settings)?,
@@ -748,7 +779,7 @@ impl RepoLoader {
         let root_op_data = RootOperationData {
             root_commit_id: store.root_commit_id().clone(),
         };
-        let op_store = Arc::from(store_factories.load_op_store(
+        let op_store: Arc<dyn OpStore> = Arc::from(store_factories.load_op_store(
             settings,
             &repo_path.join("op_store"),
             root_op_data,
@@ -760,6 +791,7 @@ impl RepoLoader {
         let submodule_store = Arc::from(
             store_factories.load_submodule_store(settings, &repo_path.join("submodule_store"))?,
         );
+        let format_lock = (op_store.name() == SimpleOpStore::NAME).then(|| Arc::new(format_lock));
         Ok(Self {
             settings: settings.clone(),
             store,
@@ -768,6 +800,7 @@ impl RepoLoader {
             op_heads_store,
             index_store,
             submodule_store,
+            _format_lock: format_lock,
         })
     }
 
@@ -1757,7 +1790,7 @@ impl MutableRepo {
             // Call normalized_heads() prior to .view().heads().contains() because
             // the caller expects non-head revisions don't exist in the set.
             self.normalize_heads().await?;
-            if wc_commit.is_discardable(self).await?
+            if wc_commit.is_discardable(self.index()).await?
                 && !is_commit_referenced(&self.view, wc_commit.id())
                 && self.view().heads().contains(wc_commit.id())
             {
@@ -2058,6 +2091,25 @@ impl MutableRepo {
 
     pub fn merge_index(&mut self, other_repo: &ReadonlyRepo) -> IndexResult<()> {
         self.index.merge_in(other_repo.readonly_index())
+    }
+
+    /// Reconciles repository fields while keeping this receiver's local maps.
+    ///
+    /// Mask both the base and incoming side before computing any differences.
+    /// Installing a foreign full view and repairing workspace maps afterward
+    /// would already have applied its workspace rewrites.
+    pub(crate) async fn merge_shared_view(
+        &mut self,
+        base: &op_store::View,
+        other: &op_store::View,
+    ) -> Result<(), RepoLoaderError> {
+        let base = crate::sync::shared::SharedView::from_view(base);
+        let other = crate::sync::shared::SharedView::from_view(other);
+        self.merge_view(
+            &View::new(base.as_view().clone(), true),
+            &View::new(other.as_view().clone(), true),
+        )
+        .await
     }
 
     async fn merge_view(&mut self, base: &View, other: &View) -> Result<(), RepoLoaderError> {

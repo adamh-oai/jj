@@ -15,6 +15,59 @@
 use crate::common::TestEnvironment;
 
 #[test]
+fn test_undo_redo_records_sync_causality_when_view_is_unchanged() {
+    use jj_lib::backend::CommitId;
+    use jj_lib::op_heads_store::OpHeadsStore as _;
+    use jj_lib::op_store::OpStore as _;
+    use jj_lib::op_store::RootOperationData;
+    use jj_lib::ref_name::WorkspaceName;
+    use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
+    use jj_lib::simple_op_store::SimpleOpStore;
+    use jj_lib::sync::state::SyncStateStore;
+    use pollster::FutureExt as _;
+
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    let repo_path = work_dir.root().join(".jj/repo");
+    let op_store = SimpleOpStore::load(
+        &repo_path.join("op_store"),
+        RootOperationData {
+            root_commit_id: CommitId::from_bytes(&[0; 20]),
+        },
+    );
+    let heads = SimpleOpHeadsStore::load(&repo_path.join("op_heads"));
+    let baseline = heads.get_op_heads().block_on().unwrap().pop().unwrap();
+    let mut operation = op_store.read_operation(&baseline).block_on().unwrap();
+    operation.parents = vec![baseline.clone()];
+    operation.metadata.description = "same-view synchronization".to_owned();
+    operation.metadata.workspace_name = Some(WorkspaceName::DEFAULT.to_owned());
+    let integrated = op_store.write_operation(&operation).block_on().unwrap();
+    heads
+        .update_op_heads(&[baseline], &integrated)
+        .block_on()
+        .unwrap();
+    SyncStateStore::init(&repo_path).unwrap();
+    work_dir.write_file(".jj/repo/op_store/type", SimpleOpStore::SYNC_NAME);
+
+    work_dir.run_jj(["undo"]).success();
+    let undo = heads.get_op_heads().block_on().unwrap().pop().unwrap();
+    assert_ne!(undo, integrated);
+    let undone = op_store.read_operation(&undo).block_on().unwrap();
+    assert_eq!(undone.parents, vec![integrated]);
+    assert_eq!(undone.view_id, operation.view_id);
+    assert!(undone.metadata.description.starts_with("undo: "));
+
+    work_dir.run_jj(["redo"]).success();
+    let redo = heads.get_op_heads().block_on().unwrap().pop().unwrap();
+    assert_ne!(redo, undo);
+    let redone = op_store.read_operation(&redo).block_on().unwrap();
+    assert_eq!(redone.parents, vec![undo]);
+    assert_eq!(redone.view_id, operation.view_id);
+    assert!(redone.metadata.description.starts_with("redo: "));
+}
+
+#[test]
 fn test_undo_root_operation() {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "repo"]).success();

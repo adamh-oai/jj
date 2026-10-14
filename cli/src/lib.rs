@@ -36,8 +36,16 @@ mod progress;
 pub mod query;
 pub mod revset_util;
 mod source_symbol;
+#[cfg(feature = "git")]
+pub(crate) mod sync_endpoint;
+#[cfg(all(feature = "git", unix))]
+pub(crate) mod sync_git_transport;
+#[cfg(all(feature = "git", unix))]
+pub(crate) mod sync_process;
+#[cfg(all(feature = "git", unix))]
+pub(crate) mod sync_rsync_transport;
+pub(crate) mod sync_transport;
 pub mod template_builder;
-pub mod template_parser;
 pub mod templater;
 pub mod text_util;
 pub mod time_util;

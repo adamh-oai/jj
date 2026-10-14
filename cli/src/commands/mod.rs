@@ -59,6 +59,8 @@ mod sparse;
 mod split;
 mod squash;
 mod status;
+#[cfg(feature = "git")]
+mod sync;
 mod tag;
 mod undo;
 mod unsign;
@@ -76,6 +78,8 @@ use clap::builder::styling::AnsiColor;
 use clap_complete::engine::SubcommandCandidates;
 use tracing::instrument;
 
+#[cfg(feature = "git")]
+pub(crate) use self::git::init_colocated_for_sync;
 use crate::cli_util::Args;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
@@ -157,6 +161,8 @@ enum Command {
     Split(split::SplitArgs),
     Squash(squash::SquashArgs),
     Status(status::StatusArgs),
+    #[cfg(feature = "git")]
+    Sync(sync::SyncArgs),
     #[command(subcommand)]
     Tag(tag::TagCommand),
     Undo(undo::UndoArgs),
@@ -224,6 +230,8 @@ pub async fn run_command(ui: &mut Ui, command_helper: &CommandHelper) -> Result<
         Command::Split(args) => split::cmd_split(ui, command_helper, args).await,
         Command::Squash(args) => squash::cmd_squash(ui, command_helper, args).await,
         Command::Status(args) => status::cmd_status(ui, command_helper, args).await,
+        #[cfg(feature = "git")]
+        Command::Sync(args) => sync::cmd_sync(ui, command_helper, args).await,
         Command::Tag(args) => tag::cmd_tag(ui, command_helper, args).await,
         Command::Undo(args) => undo::cmd_undo(ui, command_helper, args).await,
         Command::Unsign(args) => unsign::cmd_unsign(ui, command_helper, args).await,

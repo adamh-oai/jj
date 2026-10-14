@@ -94,7 +94,6 @@ maplit = { workspace = true }
 mimalloc = { workspace = true }
 once_cell = { workspace = true }
 pest = { workspace = true }
-pest_derive = { workspace = true }
 pollster = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
@@ -129,6 +128,9 @@ nix = { workspace = true, features = [ "dir", "fs", "signal" ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 btrfs-awacs = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_IO", "Win32_System_Pipes"] }
 
 [dev-dependencies]
 gix-index-cache = { package = "gix-index", git = "https://github.com/adamh-oai/gitoxide", rev = "ae185e5cdccd23f3cabeea83609d978f5a05b95c", features = ["sha1", "sha256"] }

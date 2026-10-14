@@ -3,8 +3,8 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres
-to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and this project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
@@ -16,7 +16,37 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### New features
 
+* `jj git push` with `git.sign-on-push` enabled now signs commits in a
+  separate transaction before the push, so commits stay signed if the push
+  fails and a new push doesn't have to sign them again.
+
+* Diff hunk headers now include symbol context even for unsupported languages.
+
+* `jj resolve` gained a built-in `:editor` merge tool that opens the conflicted
+  file with conflict markers in your text editor. Unlike the other merge tools,
+  it supports conflicts with more than two sides.
+
+* `Commit.contained_in()` now accepts a `Stringify` instead of a `StringLiteral`.
+  This enables dynamic query building during templating.
+
+* Templates now have a top-level `revset(revset: Stringify) -> List<Commit>`
+  function for evaluating revsets during templating.
+
 ### Fixed bugs
+
+* Shell completion now suggests tag names for `jj tag track`, `jj tag untrack`,
+  `jj tag list`, `jj git fetch --tag`, and `jj git push --tag`.
+
+* `jj git fetch` no longer creates additional refs based on non-standard Git
+  `remote.<name>.fetch` configuration.
+
+* Fixed tag deletion with `jj git fetch --tag=NAME`.
+
+* Fixed issue with `config-schema.json` where Taplo (TOML parsing library) would
+  flag any `aliases` defined as a table but without an explicit
+  `.enabled = true` as "valid under more than one of the schemas". This affected
+  downstream tools such as editor extensions showing errors in perfectly valid
+  config files.
 
 ## [0.46.0] - 2026-10-07
 

@@ -175,6 +175,7 @@ fn test_git_clone() {
     let output = clone_dir.run_jj(["git", "fetch"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
+    Fetching from Git remotes: origin
     Nothing changed.
     [EOF]
     ");
@@ -294,7 +295,7 @@ fn test_git_clone_bad_source() {
     let output = root_dir.run_jj(["git", "clone", "", "dest"]);
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
-    Error: local path is empty and does not specify a path to a repository, "input"=""
+    Error: local path is empty and does not specify a path to a repository, input=""
     [EOF]
     [exit status: 2]
     "#);
@@ -303,7 +304,7 @@ fn test_git_clone_bad_source() {
     let output = root_dir.run_jj(["git", "clone", "https://", "dest"]);
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
-    Error: URL can not be parsed as valid URL, "input"="https://"
+    Error: URL can not be parsed as valid URL, input="https://"
     Caused by: Scheme requires host
     [EOF]
     [exit status: 2]
@@ -441,6 +442,7 @@ fn test_git_clone_colocate() -> TestResult {
     let output = clone_dir.run_jj(["git", "fetch"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
+    Fetching from Git remotes: origin
     Nothing changed.
     [EOF]
     ");
@@ -639,6 +641,7 @@ fn test_git_clone_default_bookmarks_and_tags() {
     insta::assert_snapshot!(output, @"
     ------- stderr -------
     Hint: Fetching from the only existing remote: rem3
+    Fetching from Git remotes: rem3
     bookmark: branch1@rem3 [new] untracked
     tag: tag1@rem3 [new] tracked
     [EOF]
@@ -1386,6 +1389,7 @@ fn test_git_clone_branch_or_tag() {
     let output = repo_dir.run_jj(["git", "fetch"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
+    Fetching from Git remotes: origin
     Nothing changed.
     [EOF]
     ");
@@ -1419,6 +1423,7 @@ fn test_git_clone_branch_or_tag() {
     let output = repo_dir.run_jj(["git", "fetch"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
+    Fetching from Git remotes: origin
     Nothing changed.
     [EOF]
     ");
@@ -1471,6 +1476,7 @@ fn test_git_clone_branch_or_tag() {
     let output = repo_dir.run_jj(["git", "fetch"]);
     insta::assert_snapshot!(output, @"
     ------- stderr -------
+    Fetching from Git remotes: origin
     Nothing changed.
     [EOF]
     ");

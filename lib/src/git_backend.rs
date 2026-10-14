@@ -14,6 +14,7 @@
 
 #![expect(missing_docs)]
 
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -26,6 +27,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
 use std::process::ExitStatus;
+use std::process::Stdio;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -98,6 +100,9 @@ use crate::stacked_table::TableStoreError;
 const CHANGE_ID_LENGTH: usize = 16;
 /// Ref namespace used only for preventing GC.
 const NO_GC_REF_NAMESPACE: &str = "refs/jj/keep/";
+// Kept outside NO_GC_REF_NAMESPACE so older jj garbage collectors leave these
+// refs intact. Legacy conflict trees may exist only in the jj metadata table.
+const SYNC_TREE_REF_NAMESPACE: &str = "refs/jj/sync/trees/";
 
 pub const JJ_CONFLICT_README_FILE_NAME: &str = "JJ-CONFLICT-README";
 
@@ -150,12 +155,48 @@ pub enum GitBackendError {
     ReadMetadata(#[source] TableStoreError),
     #[error("Failed to write non-git metadata")]
     WriteMetadata(#[source] TableStoreError),
+    #[error("Invalid Git object record {id}: {reason}")]
+    InvalidObjectRecord {
+        id: gix::ObjectId,
+        reason: &'static str,
+    },
+    #[error("Incompatible jj metadata for Git commit {id}")]
+    ConflictingMetadata { id: CommitId },
 }
 
 impl From<GitBackendError> for BackendError {
     fn from(err: GitBackendError) -> Self {
         Self::Other(err.into())
     }
+}
+
+/// An immutable Git object and the jj metadata needed to interpret a commit.
+///
+/// Object data does not include the loose-object header. Commit extras are the
+/// individual serialized metadata entry, never a mutable metadata table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitObjectRecord {
+    pub id: gix::ObjectId,
+    pub kind: gix::objs::Kind,
+    pub data: Vec<u8>,
+    /// Present for commits, including Git commits without a stored jj entry.
+    pub commit_extras: Option<Vec<u8>>,
+}
+
+/// Metadata for a Git object whose body is transferred separately.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitObjectHeader {
+    pub id: gix::ObjectId,
+    pub kind: gix::objs::Kind,
+    pub size: u64,
+    pub commit_extras: Option<Vec<u8>>,
+}
+
+/// Exact jj interpretation of a commit whose Git body travels in a native pack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommitMetadata {
+    pub id: gix::ObjectId,
+    pub extras: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -191,6 +232,17 @@ pub struct GitBackend {
     cached_extra_metadata: Mutex<Option<Arc<ReadonlyTable>>>,
     git_executable: PathBuf,
     write_change_id_header: bool,
+}
+
+/// Immutable metadata used by a batch of object exports and preflight checks.
+pub(crate) struct GitMetadataSnapshot {
+    heads: Vec<Arc<ReadonlyTable>>,
+}
+
+impl GitMetadataSnapshot {
+    fn get_value(&self, key: &[u8]) -> Option<&[u8]> {
+        self.heads.iter().find_map(|table| table.get_value(key))
+    }
 }
 
 impl GitBackend {
@@ -460,6 +512,17 @@ impl GitBackend {
         Ok(table)
     }
 
+    /// Captures a batch's metadata, releasing the writer lock before returning.
+    pub(crate) fn capture_metadata_snapshot(&self) -> BackendResult<GitMetadataSnapshot> {
+        let (heads, _lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        // Do not merge heads here: a merge could hide a competing identity
+        // from later validation or an importer using a newer snapshot.
+        Ok(GitMetadataSnapshot { heads })
+    }
+
     fn save_extra_metadata_table(
         &self,
         mut_table: MutableTable,
@@ -473,6 +536,597 @@ impl GitBackend {
         // If it's not, cache will be reloaded when entry can't be found.
         *self.cached_extra_metadata.lock().unwrap() = Some(table);
         Ok(())
+    }
+
+    /// Exports one object's exact bytes and its commit metadata, if applicable.
+    ///
+    /// This does not import the commit or create refs. Metadata is read under
+    /// the normal table lock. The caller must separately transfer referenced objects,
+    /// including predecessor commits and legacy conflict trees in the extras.
+    pub fn export_object(&self, id: &gix::oid) -> BackendResult<GitObjectRecord> {
+        self.export_object_with_metadata(id, None)
+    }
+
+    pub(crate) fn export_object_with_metadata(
+        &self,
+        id: &gix::oid,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<GitObjectRecord> {
+        let mut git_repo = self.git_repo();
+        // Replacement refs are a local interpretation, not the immutable object
+        // identified by the requested hash.
+        git_repo.objects.ignore_replacements = true;
+        let object = git_repo
+            .try_find_object(id)
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let Some(object) = object else {
+            // The backend supports this tree without requiring an on-disk
+            // object. Its exact bytes and hash are nevertheless well-defined.
+            if id.as_bytes() == self.empty_tree_id.as_bytes() {
+                return Ok(GitObjectRecord {
+                    id: id.to_owned(),
+                    kind: gix::objs::Kind::Tree,
+                    data: vec![],
+                    commit_extras: None,
+                });
+            }
+            return Err(BackendError::ObjectNotFound {
+                object_type: "Git object".to_owned(),
+                hash: id.to_string(),
+                source: None,
+            });
+        };
+        let commit_extras = if object.kind == gix::objs::Kind::Commit {
+            let commit_id = CommitId::from_bytes(id.as_bytes());
+            let commit = commit_from_git_without_root_parent(&commit_id, &object, false)?;
+            let fresh_table;
+            let extras = match metadata {
+                Some(metadata) => metadata.get_value(id.as_bytes()),
+                None => {
+                    fresh_table = self.read_extra_metadata_table_locked()?.0;
+                    fresh_table.get_value(id.as_bytes())
+                }
+            };
+            Some(match extras {
+                Some(extras) => {
+                    validate_object_extras(id, extras)?;
+                    extras.to_vec()
+                }
+                None => serialize_extras(&commit),
+            })
+        } else {
+            None
+        };
+        Ok(GitObjectRecord {
+            id: id.to_owned(),
+            kind: object.kind,
+            data: object.data.clone(),
+            commit_extras,
+        })
+    }
+
+    /// Exports an object's kind, size, and exact per-commit metadata.
+    ///
+    /// No body-sized buffer is allocated. A commit without stored extras is
+    /// scanned to recover its change ID without retaining its message or signature.
+    pub fn export_object_header(&self, id: &gix::oid) -> BackendResult<GitObjectHeader> {
+        self.export_object_header_with_metadata(id, None)
+    }
+
+    pub(crate) fn export_object_header_with_metadata(
+        &self,
+        id: &gix::oid,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<GitObjectHeader> {
+        let mut git_repo = self.git_repo();
+        git_repo.objects.ignore_replacements = true;
+        if id.as_bytes() == self.empty_tree_id.as_bytes() {
+            return Ok(GitObjectHeader {
+                id: id.to_owned(),
+                kind: gix::objs::Kind::Tree,
+                size: 0,
+                commit_extras: None,
+            });
+        }
+        let object = git_repo
+            .try_find_header(id)
+            .map_err(|err| BackendError::Other(err.into()))?
+            .ok_or_else(|| BackendError::ObjectNotFound {
+                object_type: "Git object".to_owned(),
+                hash: id.to_string(),
+                source: None,
+            })?;
+        let mut header = GitObjectHeader {
+            id: id.to_owned(),
+            kind: object.kind(),
+            size: object.size(),
+            commit_extras: None,
+        };
+        if header.kind == gix::objs::Kind::Commit {
+            let fresh_table;
+            header.commit_extras = match metadata {
+                Some(metadata) => metadata.get_value(id.as_bytes()),
+                None => {
+                    fresh_table = self.read_extra_metadata_table_locked()?.0;
+                    fresh_table.get_value(id.as_bytes())
+                }
+            }
+            .map(<[u8]>::to_vec);
+            if let Some(extras) = &header.commit_extras {
+                validate_object_extras(id, extras)?;
+            } else {
+                let identity = self
+                    .read_object_stream(&header, &mut io::sink())?
+                    .expect("commit header was scanned");
+                header.commit_extras = Some(
+                    crate::protos::git_store::Commit {
+                        change_id: identity.change_id.to_bytes(),
+                        uses_tree_conflict_format: true,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                );
+            }
+        }
+        Ok(header)
+    }
+
+    /// Exports the immutable per-commit entry, independently of its Git body.
+    pub fn export_commit_metadata(&self, id: &gix::oid) -> BackendResult<GitCommitMetadata> {
+        self.export_commit_metadata_with_metadata(id, None)
+    }
+
+    pub(crate) fn export_commit_metadata_with_metadata(
+        &self,
+        id: &gix::oid,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<GitCommitMetadata> {
+        let header = self.export_object_header_with_metadata(id, metadata)?;
+        let extras = header.commit_extras.ok_or_else(|| {
+            BackendError::Other("commit metadata requested for a non-commit object".into())
+        })?;
+        Ok(GitCommitMetadata {
+            id: id.to_owned(),
+            extras,
+        })
+    }
+
+    /// Checks the bounded metadata encoding without requiring its packed body yet.
+    pub fn validate_commit_metadata_encoding(
+        &self,
+        metadata: &GitCommitMetadata,
+    ) -> BackendResult<()> {
+        if metadata.id.kind() != self.git_repo().object_hash() {
+            return Err(BackendError::Other(
+                "commit metadata uses the wrong Git object format".into(),
+            ));
+        }
+        validate_object_extras(&metadata.id, &metadata.extras)?;
+        Ok(())
+    }
+
+    /// Rejects competing identities before a snapshot can authenticate an export.
+    pub(crate) fn validate_commit_metadata_snapshot(
+        &self,
+        metadata: &GitCommitMetadata,
+        snapshot: &GitMetadataSnapshot,
+    ) -> BackendResult<()> {
+        self.validate_commit_metadata_encoding(metadata)?;
+        if snapshot.heads.iter().any(|table| {
+            table
+                .get_value(metadata.id.as_bytes())
+                .is_some_and(|existing| existing != metadata.extras.as_slice())
+        }) {
+            // Normal snapshots have one identical entry and need no body read.
+            // Only competing encodings require checking their effective identity.
+            let header = self.export_object_header_with_metadata(&metadata.id, Some(snapshot))?;
+            let identity = self
+                .read_object_stream(&header, &mut io::sink())?
+                .expect("commit metadata references a commit");
+            for table in &snapshot.heads {
+                if let Some(existing) = table.get_value(metadata.id.as_bytes()) {
+                    identity.validate_existing(&metadata.header(), existing)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Inspects a natively verified packed commit and checks its jj identity.
+    /// The body is streamed once, without hashing or copying it into staging again.
+    pub(crate) fn inspect_packed_commit<T, E>(
+        &self,
+        metadata: &GitCommitMetadata,
+        snapshot: &GitMetadataSnapshot,
+        from: &mut dyn io::Read,
+        inspect: impl FnOnce(&mut dyn io::Read) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<BackendError> + From<io::Error>,
+    {
+        self.validate_commit_metadata_encoding(metadata)?;
+        let mut reader = CommitIdentityReader {
+            from,
+            scanner: CommitIdentityScanner::new(metadata.id),
+        };
+        let result = inspect(&mut reader)?;
+        io::copy(&mut reader, &mut io::sink())?;
+        let identity = reader.scanner.finish()?;
+        let header = metadata.header();
+        for table in &snapshot.heads {
+            if let Some(existing) = table.get_value(metadata.id.as_bytes()) {
+                identity.validate_existing(&header, existing)?;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Installs sidecars in bounded batches under the ordinary metadata lock.
+    /// All competing heads are checked before merging them. Physical packs must
+    /// already be verified; callers protect them until commit/tree refs are pinned.
+    pub fn import_commit_metadata(
+        &self,
+        ids: impl Iterator<Item = gix::ObjectId> + Clone,
+        mut metadata: impl FnMut(&gix::oid) -> BackendResult<Vec<u8>>,
+        mut body: impl FnMut(&gix::oid, &mut dyn io::Write) -> BackendResult<()>,
+    ) -> BackendResult<()> {
+        let (tables, lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        for id in ids.clone() {
+            let incoming = GitCommitMetadata {
+                id,
+                extras: metadata(&id)?,
+            };
+            self.validate_commit_metadata_encoding(&incoming)?;
+            if tables.iter().any(|table| {
+                table
+                    .get_value(id.as_bytes())
+                    .is_some_and(|existing| existing != incoming.extras.as_slice())
+            }) {
+                let mut writer = CommitIdentityWriter(CommitIdentityScanner::new(id));
+                body(&id, &mut writer)?;
+                let identity = writer.0.finish()?;
+                let header = incoming.header();
+                for table in &tables {
+                    if let Some(existing) = table.get_value(id.as_bytes()) {
+                        identity.validate_existing(&header, existing)?;
+                    }
+                }
+            }
+        }
+        let mut table = self
+            .extra_metadata_store
+            .merge_head_tables_locked(tables, &lock)
+            .map_err(GitBackendError::ReadMetadata)?;
+        let mut mutation = table.start_mutation();
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for id in ids {
+            if table.get_value(id.as_bytes()).is_some() {
+                continue;
+            }
+            let extras = metadata(&id)?;
+            validate_object_extras(&id, &extras)?;
+            bytes = bytes.saturating_add(extras.len());
+            mutation.add_entry(id.as_bytes().to_vec(), extras);
+            count += 1;
+            if count >= 512 || bytes >= 64 * 1024 * 1024 {
+                self.save_extra_metadata_table(mutation, &lock)?;
+                table = self.cached_extra_metadata_table()?;
+                mutation = table.start_mutation();
+                bytes = 0;
+                count = 0;
+            }
+        }
+        if count != 0 {
+            self.save_extra_metadata_table(mutation, &lock)?;
+        }
+        Ok(())
+    }
+
+    /// Streams exact Git bytes from loose or packed storage to the writer.
+    ///
+    /// Only fixed-size buffers are used. Local replacement refs are ignored.
+    pub fn export_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        to: &mut dyn io::Write,
+    ) -> BackendResult<()> {
+        validate_stream_header(&self.git_repo(), header)?;
+        self.read_object_stream(header, to)?;
+        Ok(())
+    }
+
+    fn read_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        to: &mut dyn io::Write,
+    ) -> BackendResult<Option<StreamedCommitIdentity>> {
+        if header.id == gix::ObjectId::empty_tree(header.id.kind()) {
+            return scan_object_stream(header, &mut io::empty(), to);
+        }
+        let mut command = Command::new(&self.git_executable);
+        command
+            .current_dir(self.git_repo_path())
+            .args(["--git-dir=.", "--no-replace-objects", "cat-file"])
+            .arg(header.kind.to_string())
+            .arg(header.id.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        crate::subprocess_util::suppress_console_window(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let mut output = child.stdout.take().unwrap();
+        let result = scan_object_stream(header, &mut output, to);
+        drop(output);
+        if result.is_err() {
+            // A failed destination must not leave a blocked producer behind.
+            child.kill().ok();
+        }
+        let status = child
+            .wait()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let identity = result?;
+        if !status.success() {
+            return Err(invalid_stream(
+                header,
+                "Git object streaming command failed",
+            ));
+        }
+        Ok(identity)
+    }
+
+    /// Authenticates a complete body and checks existing commit metadata.
+    ///
+    /// This writes no objects, metadata, or refs. The caller separately validates
+    /// typed dependency closure, including tree entries and commit/tag parents.
+    pub fn validate_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        from: &mut dyn io::Read,
+    ) -> BackendResult<()> {
+        self.validate_object_stream_with_metadata(header, from, None)
+    }
+
+    pub(crate) fn validate_object_stream_with_metadata(
+        &self,
+        header: &GitObjectHeader,
+        from: &mut dyn io::Read,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<()> {
+        validate_stream_header(&self.git_repo(), header)?;
+        let Some(identity) = scan_object_stream(header, from, &mut io::sink())? else {
+            return Ok(());
+        };
+        let (tables, _lock) = match metadata {
+            Some(metadata) => (metadata.heads.clone(), None),
+            None => {
+                let (tables, lock) = self
+                    .extra_metadata_store
+                    .get_head_tables_locked()
+                    .map_err(GitBackendError::ReadMetadata)?;
+                (tables, Some(lock))
+            }
+        };
+        for table in tables {
+            if let Some(existing) = table.get_value(header.id.as_bytes()) {
+                identity.validate_existing(header, existing)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Imports a validated file-backed body without publishing refs or heads.
+    ///
+    /// The body starts at the reader's current position and must end at EOF.
+    /// Hash validation precedes writing; commit metadata is rechecked under the
+    /// ordinary writer lock. The caller protects staged objects from GC and
+    /// validates their complete typed dependency closure before activation.
+    pub fn import_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        from: &mut (impl io::Read + io::Seek),
+    ) -> BackendResult<()> {
+        let git_repo = self.git_repo();
+        validate_stream_header(&git_repo, header)?;
+        let start = from
+            .stream_position()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let identity = scan_object_stream(header, from, &mut io::sink())?;
+        let locked_metadata = if let Some(identity) = identity {
+            let (tables, lock) = self
+                .extra_metadata_store
+                .get_head_tables_locked()
+                .map_err(GitBackendError::ReadMetadata)?;
+            for table in &tables {
+                if let Some(existing) = table.get_value(header.id.as_bytes()) {
+                    identity.validate_existing(header, existing)?;
+                }
+            }
+            let table = self
+                .extra_metadata_store
+                .merge_head_tables_locked(tables, &lock)
+                .map_err(GitBackendError::ReadMetadata)?;
+            Some((table, lock))
+        } else {
+            None
+        };
+        from.seek(io::SeekFrom::Start(start))
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let actual = git_repo
+            .objects
+            .write_stream(header.kind, header.size, from)
+            .map_err(|err| BackendError::WriteObject {
+                object_type: "Git object",
+                source: err.into(),
+            })?;
+        if actual != header.id {
+            return Err(invalid_stream(
+                header,
+                "object changed after stream validation",
+            ));
+        }
+        if let Some((table, lock)) = locked_metadata
+            && table.get_value(header.id.as_bytes()).is_none()
+        {
+            let mut mutation = table.start_mutation();
+            mutation.add_entry(
+                header.id.as_bytes().to_vec(),
+                header.commit_extras.clone().unwrap(),
+            );
+            self.save_extra_metadata_table(mutation, &lock)?;
+        }
+        Ok(())
+    }
+
+    /// Checks an object and its compatibility with existing jj metadata.
+    ///
+    /// This does not write objects, metadata, or refs. It is a preflight check,
+    /// not a reservation: importing repeats the checks under the metadata lock
+    /// to detect a concurrent writer after validation.
+    pub fn validate_object_import(&self, record: &GitObjectRecord) -> BackendResult<()> {
+        self.validate_object_import_with_metadata(record, None)
+    }
+
+    pub(crate) fn validate_object_import_with_metadata(
+        &self,
+        record: &GitObjectRecord,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<()> {
+        let git_repo = self.git_repo();
+        let Some(commit) = validate_object_record(&git_repo, record)? else {
+            return Ok(());
+        };
+        let (tables, _table_lock) = match metadata {
+            Some(metadata) => (metadata.heads.clone(), None),
+            None => {
+                let (tables, lock) = self
+                    .extra_metadata_store
+                    .get_head_tables_locked()
+                    .map_err(GitBackendError::ReadMetadata)?;
+                (tables, Some(lock))
+            }
+        };
+        for table in tables {
+            if let Some(existing_extras) = table.get_value(record.id.as_bytes()) {
+                validate_existing_object_extras(record, &commit, existing_extras)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Imports one immutable object without publishing any commits or refs.
+    ///
+    /// Hashes and metadata are checked before writing. Existing metadata is
+    /// compared under the same table lock used by ordinary commit writers;
+    /// incompatible identities are rejected rather than rewritten. The caller
+    /// is responsible for validating the full object closure before activation
+    /// and protecting staged objects from concurrent garbage collection.
+    pub fn import_object(&self, record: &GitObjectRecord) -> BackendResult<()> {
+        let mut git_repo = self.git_repo();
+        git_repo.objects.ignore_replacements = true;
+        let Some(commit) = validate_object_record(&git_repo, record)? else {
+            git_repo
+                .objects
+                .write_buf_with_known_id(record.kind, &record.data, record.id)
+                .map_err(|err| BackendError::WriteObject {
+                    object_type: "Git object",
+                    source: err.into(),
+                })?;
+            return Ok(());
+        };
+        let extras = record.commit_extras.as_deref().unwrap();
+        let id = CommitId::from_bytes(record.id.as_bytes());
+        let (tables, table_lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        // Compare every head before merging: merging must not hide a competing
+        // metadata identity for the same immutable Git commit.
+        for table in &tables {
+            if let Some(existing_extras) = table.get_value(id.as_bytes()) {
+                validate_existing_object_extras(record, &commit, existing_extras)?;
+            }
+        }
+        let table = self
+            .extra_metadata_store
+            .merge_head_tables_locked(tables, &table_lock)
+            .map_err(GitBackendError::ReadMetadata)?;
+        git_repo
+            .objects
+            .write_buf_with_known_id(record.kind, &record.data, record.id)
+            .map_err(|err| BackendError::WriteObject {
+                object_type: "commit",
+                source: err.into(),
+            })?;
+        if table.get_value(id.as_bytes()).is_none() {
+            let mut mut_table = table.start_mutation();
+            mut_table.add_entry(id.to_bytes(), extras.to_vec());
+            self.save_extra_metadata_table(mut_table, &table_lock)?;
+        }
+        Ok(())
+    }
+
+    /// Protects existing trees and their contents from Git garbage collection.
+    ///
+    /// In particular, legacy conflict trees stored only in commit extras are
+    /// not necessarily reachable from the physical Git commit. Callers must
+    /// install these pins before activating incoming operation history.
+    pub fn pin_sync_trees<'a>(
+        &self,
+        tree_ids: impl IntoIterator<Item = &'a TreeId>,
+    ) -> BackendResult<()> {
+        update_sync_tree_refs(
+            self.git_repo(),
+            tree_ids.into_iter().cloned().collect(),
+            false,
+        )
+    }
+
+    /// Collects legacy tree terms which may be absent from Git commit ancestry.
+    ///
+    /// Modern conflict trees are reachable through their physical Git commit
+    /// tree. Only old metadata entries containing tree overrides need extra
+    /// retention refs. The virtual root has no physical tree to pin.
+    pub fn sync_legacy_tree_roots<'a>(
+        &self,
+        commit_ids: impl IntoIterator<Item = &'a CommitId>,
+    ) -> BackendResult<BTreeSet<TreeId>> {
+        let git_repo = self.git_repo();
+        let (table, _lock) = self.read_extra_metadata_table_locked()?;
+        let mut tree_ids = BTreeSet::new();
+        for id in commit_ids {
+            if id == &self.root_commit_id {
+                continue;
+            }
+            let git_id = validate_git_object_id(&git_repo, id)?;
+            if let Some(extras) = table.get_value(id.as_bytes()) {
+                let proto = validate_object_extras(&git_id, extras)?;
+                if proto.uses_tree_conflict_format {
+                    tree_ids.extend(proto.root_tree.iter().map(|id| TreeId::from_bytes(id)));
+                }
+            }
+        }
+        Ok(tree_ids)
+    }
+
+    /// Replaces the sync tree pins with the complete set of retained tree roots.
+    ///
+    /// The caller must hold the repository's sync/GC lock and include any
+    /// active transfers before removing obsolete pins. Virtual root trees
+    /// without a physical Git object must be excluded.
+    pub fn replace_sync_tree_roots<'a>(
+        &self,
+        tree_ids: impl IntoIterator<Item = &'a TreeId>,
+    ) -> BackendResult<()> {
+        update_sync_tree_refs(
+            self.git_repo(),
+            tree_ids.into_iter().cloned().collect(),
+            true,
+        )
     }
 
     /// Imports the given commits and ancestors from the backing Git repo.
@@ -543,6 +1197,7 @@ impl GitBackend {
                 self.git_repo()
                     .command_context()
                     .map_err(|err| BackendError::Other(Box::new(err)))?,
+                self.git_repo().object_hash(),
                 Default::default(),
             ),
             Vec::new(),
@@ -687,7 +1342,7 @@ fn commit_from_git_without_root_parent(
     git_object: &gix::Object,
     is_shallow: bool,
 ) -> BackendResult<Commit> {
-    let decode_err = |err: gix::Exn<gix::error::Message>| to_read_object_err(err, id);
+    let decode_err = |err: gix::Error| to_read_object_err(err, id);
     let commit = git_object
         .try_to_commit_ref()
         .map_err(|err| to_read_object_err(err, id))?;
@@ -848,6 +1503,470 @@ fn serialize_extras(commit: &Commit) -> Vec<u8> {
     proto.encode_to_vec()
 }
 
+// Returns the commit's interpretation before applying extras, if applicable.
+fn invalid_stream(header: &GitObjectHeader, reason: &'static str) -> BackendError {
+    GitBackendError::InvalidObjectRecord {
+        id: header.id,
+        reason,
+    }
+    .into()
+}
+
+fn validate_stream_header(
+    git_repo: &gix::Repository,
+    header: &GitObjectHeader,
+) -> BackendResult<()> {
+    if header.id.kind() != git_repo.object_hash() {
+        return Err(invalid_stream(
+            header,
+            "object hash format does not match the repository",
+        ));
+    }
+    match (header.kind, header.commit_extras.as_deref()) {
+        (gix::objs::Kind::Commit, Some(extras)) => {
+            validate_object_extras(&header.id, extras)?;
+        }
+        (gix::objs::Kind::Commit, None) => {
+            return Err(invalid_stream(header, "commit metadata is missing"));
+        }
+        (_, Some(_)) => return Err(invalid_stream(header, "only commits can have jj metadata")),
+        (_, None) => {}
+    }
+    Ok(())
+}
+
+fn scan_object_stream(
+    header: &GitObjectHeader,
+    from: &mut dyn io::Read,
+    to: &mut dyn io::Write,
+) -> BackendResult<Option<StreamedCommitIdentity>> {
+    let mut hash = gix::hash::hasher(header.id.kind());
+    hash.update(&gix::objs::encode::loose_header(header.kind, header.size));
+    let mut commit =
+        (header.kind == gix::objs::Kind::Commit).then(|| CommitIdentityScanner::new(header.id));
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let length = from
+            .read(&mut buffer)
+            .map_err(|err| BackendError::Other(err.into()))?;
+        if length == 0 {
+            break;
+        }
+        size = size
+            .checked_add(length as u64)
+            .filter(|size| *size <= header.size)
+            .ok_or_else(|| invalid_stream(header, "object stream exceeds its advertised size"))?;
+        let bytes = &buffer[..length];
+        hash.update(bytes);
+        if let Some(commit) = &mut commit {
+            commit.update(bytes)?;
+        }
+        to.write_all(bytes)
+            .map_err(|err| BackendError::Other(err.into()))?;
+    }
+    if size != header.size {
+        return Err(invalid_stream(header, "object stream is truncated"));
+    }
+    let actual = hash
+        .try_finalize()
+        .map_err(|err| BackendError::Other(err.into()))?;
+    if actual != header.id {
+        return Err(invalid_stream(
+            header,
+            "object contents do not match the advertised hash",
+        ));
+    }
+    commit.map(CommitIdentityScanner::finish).transpose()
+}
+
+/// The only native commit fields that extras can change. All other fields are
+/// already fixed by the Git ID, including arbitrarily large messages/signatures.
+struct StreamedCommitIdentity {
+    change_id: ChangeId,
+    physical_tree: TreeId,
+    has_tree_conflict: bool,
+}
+
+impl GitCommitMetadata {
+    fn header(&self) -> GitObjectHeader {
+        GitObjectHeader {
+            id: self.id,
+            kind: gix::objs::Kind::Commit,
+            size: 0,
+            commit_extras: Some(self.extras.clone()),
+        }
+    }
+}
+
+struct CommitIdentityReader<'a> {
+    from: &'a mut dyn io::Read,
+    scanner: CommitIdentityScanner,
+}
+
+impl io::Read for CommitIdentityReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let length = self.from.read(bytes)?;
+        self.scanner
+            .update(&bytes[..length])
+            .map_err(io::Error::other)?;
+        Ok(length)
+    }
+}
+
+struct CommitIdentityWriter(CommitIdentityScanner);
+
+impl io::Write for CommitIdentityWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes).map_err(io::Error::other)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl StreamedCommitIdentity {
+    fn validate_existing(&self, header: &GitObjectHeader, existing: &[u8]) -> BackendResult<()> {
+        let incoming =
+            validate_object_extras(&header.id, header.commit_extras.as_deref().unwrap())?;
+        let existing = validate_object_extras(&header.id, existing)?;
+        let effective = |proto: crate::protos::git_store::Commit| {
+            let change_id = if proto.change_id.is_empty() {
+                self.change_id.to_bytes()
+            } else {
+                proto.change_id
+            };
+            let tree_terms = if self.has_tree_conflict {
+                None
+            } else if proto.uses_tree_conflict_format && !proto.root_tree.is_empty() {
+                Some(proto.root_tree)
+            } else {
+                Some(vec![self.physical_tree.to_bytes()])
+            };
+            (change_id, tree_terms, proto.predecessors)
+        };
+        if effective(incoming) != effective(existing) {
+            return Err(GitBackendError::ConflictingMetadata {
+                id: CommitId::from_bytes(header.id.as_bytes()),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CommitIdentityHeader {
+    Name,
+    Tree,
+    ChangeId,
+    ConflictTrees,
+    Ignore,
+}
+
+// Retains at most one hash-width token, regardless of line or message size.
+// Even jj:trees can be checked token-by-token without storing all its terms.
+struct CommitIdentityScanner {
+    id: gix::ObjectId,
+    kind: CommitIdentityHeader,
+    previous: CommitIdentityHeader,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    value_too_long: bool,
+    line_has_bytes: bool,
+    in_message: bool,
+    saw_tree: bool,
+    saw_change_id: bool,
+    saw_conflict_trees: bool,
+    conflict_terms: u64,
+    tree_id: Option<TreeId>,
+    change_id: ChangeId,
+}
+
+impl CommitIdentityScanner {
+    fn new(id: gix::ObjectId) -> Self {
+        Self {
+            id,
+            kind: CommitIdentityHeader::Name,
+            previous: CommitIdentityHeader::Ignore,
+            key: Vec::new(),
+            value: Vec::new(),
+            value_too_long: false,
+            line_has_bytes: false,
+            in_message: false,
+            saw_tree: false,
+            saw_change_id: false,
+            saw_conflict_trees: false,
+            conflict_terms: 0,
+            tree_id: None,
+            change_id: synthetic_change_id_from_git_commit_id(&CommitId::from_bytes(id.as_bytes())),
+        }
+    }
+
+    fn invalid(&self, reason: &'static str) -> BackendError {
+        GitBackendError::InvalidObjectRecord {
+            id: self.id,
+            reason,
+        }
+        .into()
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> BackendResult<()> {
+        if self.in_message {
+            return Ok(());
+        }
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let newline = part.last() == Some(&b'\n');
+            let part = if newline {
+                &part[..part.len() - 1]
+            } else {
+                part
+            };
+            self.line_part(part)?;
+            if newline {
+                self.end_line()?;
+                if self.in_message {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn line_part(&mut self, mut bytes: &[u8]) -> BackendResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !self.line_has_bytes && bytes[0] == b' ' {
+            match self.previous {
+                CommitIdentityHeader::Tree | CommitIdentityHeader::ConflictTrees => {
+                    return Err(self.invalid("invalid continuation of commit tree header"));
+                }
+                CommitIdentityHeader::ChangeId => {
+                    self.change_id = synthetic_change_id_from_git_commit_id(&CommitId::from_bytes(
+                        self.id.as_bytes(),
+                    ));
+                }
+                _ => {}
+            }
+            self.kind = CommitIdentityHeader::Ignore;
+        }
+        self.line_has_bytes = true;
+        if self.kind == CommitIdentityHeader::Name {
+            let separator = bytes.iter().position(|byte| *byte == b' ');
+            let prefix = separator.map_or(bytes, |index| &bytes[..index]);
+            if self.key.len() + prefix.len() > CHANGE_ID_COMMIT_HEADER.len() {
+                self.kind = CommitIdentityHeader::Ignore;
+                return Ok(());
+            }
+            self.key.extend_from_slice(prefix);
+            let Some(separator) = separator else {
+                return Ok(());
+            };
+            self.kind = match self.key.as_slice() {
+                b"tree" if !self.saw_tree => {
+                    self.saw_tree = true;
+                    CommitIdentityHeader::Tree
+                }
+                b"change-id" if !self.saw_change_id => {
+                    self.saw_change_id = true;
+                    CommitIdentityHeader::ChangeId
+                }
+                b"jj:trees" if !self.saw_conflict_trees => {
+                    self.saw_conflict_trees = true;
+                    CommitIdentityHeader::ConflictTrees
+                }
+                _ => CommitIdentityHeader::Ignore,
+            };
+            bytes = &bytes[separator + 1..];
+        }
+        if self.kind == CommitIdentityHeader::ConflictTrees {
+            for byte in bytes {
+                if *byte == b' ' {
+                    self.end_tree_term()?;
+                } else if self.value.len() < self.id.as_bytes().len() * 2 {
+                    self.value.push(*byte);
+                } else {
+                    return Err(self.invalid("invalid jj:trees header"));
+                }
+            }
+        } else if matches!(
+            self.kind,
+            CommitIdentityHeader::Tree | CommitIdentityHeader::ChangeId
+        ) {
+            let limit = self.id.as_bytes().len() * 2;
+            let available = limit.saturating_sub(self.value.len());
+            self.value
+                .extend_from_slice(&bytes[..bytes.len().min(available)]);
+            self.value_too_long |= bytes.len() > available;
+        }
+        Ok(())
+    }
+
+    fn end_tree_term(&mut self) -> BackendResult<()> {
+        if self.value.len() != self.id.as_bytes().len() * 2
+            || gix::ObjectId::from_hex(&self.value).is_err()
+        {
+            return Err(self.invalid("invalid jj:trees header"));
+        }
+        self.conflict_terms = self
+            .conflict_terms
+            .checked_add(1)
+            .ok_or_else(|| self.invalid("too many jj:trees terms"))?;
+        self.value.clear();
+        Ok(())
+    }
+
+    fn end_line(&mut self) -> BackendResult<()> {
+        if !self.line_has_bytes {
+            self.in_message = true;
+            return Ok(());
+        }
+        match self.kind {
+            CommitIdentityHeader::Tree => {
+                let id = gix::ObjectId::from_hex(&self.value)
+                    .ok()
+                    .filter(|id| id.kind() == self.id.kind() && !self.value_too_long)
+                    .ok_or_else(|| self.invalid("invalid commit tree header"))?;
+                self.tree_id = Some(TreeId::from_bytes(id.as_bytes()));
+            }
+            CommitIdentityHeader::ChangeId => {
+                if !self.value_too_long
+                    && let Some(id) = ChangeId::try_from_reverse_hex(&self.value)
+                    && id.as_bytes().len() == CHANGE_ID_LENGTH
+                {
+                    self.change_id = id;
+                }
+            }
+            CommitIdentityHeader::ConflictTrees => {
+                self.end_tree_term()?;
+                if self.conflict_terms < 3 || self.conflict_terms.is_multiple_of(2) {
+                    return Err(self.invalid("invalid jj:trees header"));
+                }
+            }
+            CommitIdentityHeader::Name => return Err(self.invalid("invalid commit header")),
+            CommitIdentityHeader::Ignore => {}
+        }
+        self.previous = self.kind;
+        self.kind = CommitIdentityHeader::Name;
+        self.key.clear();
+        self.value.clear();
+        self.value_too_long = false;
+        self.line_has_bytes = false;
+        Ok(())
+    }
+
+    fn finish(self) -> BackendResult<StreamedCommitIdentity> {
+        if !self.in_message {
+            return Err(self.invalid("commit header is not terminated"));
+        }
+        let tree_id = self
+            .tree_id
+            .clone()
+            .ok_or_else(|| self.invalid("commit tree header is missing"))?;
+        Ok(StreamedCommitIdentity {
+            change_id: self.change_id,
+            physical_tree: tree_id,
+            has_tree_conflict: self.saw_conflict_trees,
+        })
+    }
+}
+
+fn validate_object_record(
+    git_repo: &gix::Repository,
+    record: &GitObjectRecord,
+) -> BackendResult<Option<Commit>> {
+    let invalid = |reason| GitBackendError::InvalidObjectRecord {
+        id: record.id,
+        reason,
+    };
+    if record.id.kind() != git_repo.object_hash() {
+        return Err(invalid("object hash format does not match the repository").into());
+    }
+    let actual_id =
+        gix::objs::compute_hash(record.id.kind(), record.kind, &record.data).map_err(|err| {
+            BackendError::WriteObject {
+                object_type: "Git object",
+                source: err.into(),
+            }
+        })?;
+    if actual_id != record.id {
+        return Err(invalid("object contents do not match the advertised hash").into());
+    }
+    gix::objs::ObjectRef::from_bytes(&record.data, record.kind, record.id.kind())
+        .map_err(|err| BackendError::Other(err.into()))?;
+    if record.kind != gix::objs::Kind::Commit {
+        if record.commit_extras.is_some() {
+            return Err(invalid("only commits can have jj metadata").into());
+        }
+        return Ok(None);
+    }
+    let extras = record
+        .commit_extras
+        .as_deref()
+        .ok_or_else(|| invalid("commit metadata is missing"))?;
+    validate_object_extras(&record.id, extras)?;
+    let id = CommitId::from_bytes(record.id.as_bytes());
+    let object = gix::Object {
+        id: record.id,
+        kind: record.kind,
+        data: record.data.clone(),
+        repo: git_repo,
+    };
+    commit_from_git_without_root_parent(&id, &object, false).map(Some)
+}
+
+fn validate_existing_object_extras(
+    record: &GitObjectRecord,
+    commit: &Commit,
+    existing_extras: &[u8],
+) -> BackendResult<()> {
+    validate_object_extras(&record.id, existing_extras)?;
+    let mut incoming_commit = commit.clone();
+    deserialize_extras(
+        &mut incoming_commit,
+        record.commit_extras.as_deref().unwrap(),
+    );
+    let mut existing_commit = commit.clone();
+    deserialize_extras(&mut existing_commit, existing_extras);
+    if existing_commit != incoming_commit {
+        return Err(GitBackendError::ConflictingMetadata {
+            id: CommitId::from_bytes(record.id.as_bytes()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_object_extras(
+    id: &gix::oid,
+    bytes: &[u8],
+) -> BackendResult<crate::protos::git_store::Commit> {
+    let invalid = |reason| GitBackendError::InvalidObjectRecord {
+        id: id.to_owned(),
+        reason,
+    };
+    let proto = crate::protos::git_store::Commit::decode(bytes)
+        .map_err(|_| invalid("invalid commit metadata encoding"))?;
+    if proto
+        .predecessors
+        .iter()
+        .chain(&proto.root_tree)
+        .any(|id_bytes| id_bytes.len() != id.as_bytes().len())
+    {
+        return Err(invalid("invalid object ID length in commit metadata").into());
+    }
+    if proto.uses_tree_conflict_format
+        && !proto.root_tree.is_empty()
+        && proto.root_tree.len() % 2 == 0
+    {
+        return Err(invalid("invalid legacy conflict-tree terms").into());
+    }
+    Ok(proto)
+}
+
 fn deserialize_extras(commit: &mut Commit, bytes: &[u8]) {
     let proto = crate::protos::git_store::Commit::decode(bytes).unwrap();
     if !proto.change_id.is_empty() {
@@ -901,6 +2020,83 @@ fn to_ref_deletion(git_ref: gix::refs::Reference) -> gix::refs::transaction::Ref
     }
 }
 
+fn update_sync_tree_refs(
+    mut git_repo: gix::Repository,
+    tree_ids: HashSet<TreeId>,
+    replace: bool,
+) -> BackendResult<()> {
+    git_repo.objects.ignore_replacements = true;
+    // Validate all roots before changing refs. In particular, don't prune old
+    // pins if the newly captured retained closure is incomplete.
+    let mut updates = Vec::with_capacity(tree_ids.len());
+    for id in &tree_ids {
+        let oid = validate_git_object_id(&git_repo, id)?;
+        // Repository::try_find_object() synthesizes the empty tree, even when
+        // it does not exist in the ODB. A Git retention ref needs a physical
+        // object, so check the raw database before relying on that wrapper.
+        if oid == gix::ObjectId::empty_tree(git_repo.object_hash())
+            && !git_repo.objects.exists(&oid)
+        {
+            git_repo
+                .objects
+                .write_buf_with_known_id(gix::objs::Kind::Tree, &[], oid)
+                .map_err(|err| BackendError::WriteObject {
+                    object_type: "tree",
+                    source: err.into(),
+                })?;
+        }
+        let object = git_repo
+            .try_find_object(oid)
+            .map_err(|err| to_read_object_err(err, id))?;
+        match object {
+            Some(object) if object.kind == gix::objs::Kind::Tree => {}
+            Some(_) => {
+                return Err(GitBackendError::InvalidObjectRecord {
+                    id: oid,
+                    reason: "sync tree root is not a tree",
+                }
+                .into());
+            }
+            None => return Err(not_found_err(id)),
+        }
+        let name = format!("{SYNC_TREE_REF_NAMESPACE}{id}");
+        let new = gix::refs::Target::Object(oid);
+        updates.push(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange {
+                    message: "retained by jj sync".into(),
+                    ..Default::default()
+                },
+                expected: gix::refs::transaction::PreviousValue::ExistingMustMatch(new.clone()),
+                new,
+            },
+            name: name.try_into().unwrap(),
+            deref: false,
+        });
+    }
+    if replace {
+        let references = git_repo
+            .references()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        for git_ref in references
+            .prefixed(SYNC_TREE_REF_NAMESPACE)
+            .map_err(|err| BackendError::Other(err.into()))?
+        {
+            let git_ref = git_ref.map_err(|err| BackendError::Other(err.into()))?;
+            let name = git_ref.name().as_bstr();
+            let maybe_id = gix::ObjectId::from_hex(&name[SYNC_TREE_REF_NAMESPACE.len()..]).ok();
+            if maybe_id.is_some_and(|id| tree_ids.contains(&TreeId::from_bytes(id.as_bytes()))) {
+                continue;
+            }
+            updates.push(to_ref_deletion(git_ref.detach()));
+        }
+    }
+    git_repo
+        .edit_references(updates)
+        .map_err(|err| BackendError::Other(err.into()))?;
+    Ok(())
+}
+
 /// Recreates `refs/jj/keep` refs for the `new_heads`, and removes the other
 /// unreachable and non-head refs.
 fn recreate_no_gc_refs(
@@ -941,7 +2137,12 @@ fn recreate_no_gc_refs(
         // will always have a unique name. Doing that with the current
         // ref-per-head strategy would increase the number of the no-gc refs.
         // https://github.com/jj-vcs/jj/pull/2659#issuecomment-1837057782
-        let loose_ref_path = git_repo.path().join(git_ref.name.to_path());
+        let loose_ref_path = git_repo.path().join(
+            git_ref
+                .name
+                .to_path()
+                .map_err(|err| BackendError::Other(err.into()))?,
+        );
         if let Ok(metadata) = loose_ref_path.metadata() {
             let mtime = metadata.modified().expect("unsupported platform?");
             if mtime > keep_newer {

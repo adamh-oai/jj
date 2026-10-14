@@ -23,6 +23,12 @@ mod markdown_help;
 mod snapshot;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 mod subvolume;
+#[cfg(all(feature = "git", unix))]
+mod sync_git_bridge;
+#[cfg(all(feature = "git", unix))]
+mod sync_rsync_bridge;
+#[cfg(feature = "git")]
+mod sync_server;
 
 use clap::Subcommand;
 use tracing::instrument;
@@ -69,6 +75,15 @@ pub(crate) enum UtilCommand {
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     #[command(subcommand)]
     Subvolume(UtilSubvolumeCommand),
+    #[cfg(feature = "git")]
+    #[command(hide = true)]
+    SyncServer(sync_server::SyncServerArgs),
+    #[cfg(all(feature = "git", unix))]
+    #[command(hide = true)]
+    SyncGitBridge(sync_git_bridge::SyncGitBridgeArgs),
+    #[cfg(all(feature = "git", unix))]
+    #[command(hide = true)]
+    SyncRsyncBridge(sync_rsync_bridge::SyncRsyncBridgeArgs),
 }
 
 #[instrument(skip_all)]
@@ -89,5 +104,11 @@ pub(crate) async fn cmd_util(
         UtilCommand::Snapshot(args) => cmd_util_snapshot(ui, command, args).await,
         #[cfg(all(target_os = "linux", feature = "awacs"))]
         UtilCommand::Subvolume(args) => cmd_util_subvolume(ui, command, args).await,
+        #[cfg(feature = "git")]
+        UtilCommand::SyncServer(args) => sync_server::cmd_sync_server(ui, command, args).await,
+        #[cfg(all(feature = "git", unix))]
+        UtilCommand::SyncGitBridge(args) => sync_git_bridge::cmd_sync_git_bridge(args),
+        #[cfg(all(feature = "git", unix))]
+        UtilCommand::SyncRsyncBridge(args) => sync_rsync_bridge::cmd_sync_rsync_bridge(args),
     }
 }

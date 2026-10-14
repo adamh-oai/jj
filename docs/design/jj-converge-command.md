@@ -54,8 +54,9 @@ these ways:
     chooses the description.
 *   `--json` is not dry-run-only. Without `--dry-run`, it applies a safe
     bottom-most divergence and returns `status: "resolved"`; otherwise it
-    returns machine-readable instructions for the next manual issue or
-    `status: "clean"`. `--dry-run --json` reports the same next issue without
+    returns machine-readable instructions for the next manual issue, a blocked
+    cleanup order, or `status: "clean"` when no issues remain.
+    `--dry-run --json` reports the same next issue or blockage without
     rewriting history. Deferred descendants are intentionally omitted because
     the next invocation replans from current history.
 *   A solution always has exactly one commit-graph parent. Divergent commits
@@ -84,9 +85,10 @@ With no `-r`, the scope is `divergent() | conflicts()`. With `-r`, the scope is
 the matching revisions and their ancestors, intersected with that default issue
 revset. A divergent family is selected if any of its visible versions is in the
 scope; all versions are then considered together. Each invocation selects one
-deterministic bottom-most issue. It either converges a safe divergent change,
-reports every unresolved choice for one divergent change, reports one content
-conflict, or reports that the scope is clean. `/0` and `/1` are not stable
+deterministic issue with no blocking ancestor. It either converges a safe
+divergent change, reports every unresolved choice for one divergent change,
+reports one content conflict, reports a cycle between cleanup issues, or reports
+that the scope is clean because no issues remain. `/0` and `/1` are not stable
 identifiers and are never emitted as machine-facing candidates.
 
 The exact single-divergence form is:
@@ -109,7 +111,14 @@ choices are resolved. Conflict JSON includes `kind: "conflict"`,
 paths, and resolution commands. A successful non-dry-run JSON invocation emits
 `kind: "divergence"`, `status: "resolved"`, the solution commit ID, rebased
 descendant count, and `has_conflicts`.
-Human-readable dry-run output uses compact `READY`, `BLOCKED`, and
+When issues remain but none has a valid cleanup order, ordering JSON includes
+`kind: "ordering"`, `status: "blocked"`,
+`reason: "cyclic_issue_dependencies"`, and a `cycle` array of ancestor and
+descendant witnesses. Each witness includes its issue `kind` (`"divergence"`
+or `"conflict"`), change ID, and exact commit ID. Normal execution exits
+unsuccessfully for this blockage; dry-run successfully returns the diagnostic
+plan. Neither mode rewrites history when reporting a blocked order.
+Human-readable divergence dry-run output uses compact `READY`, `BLOCKED`, and
 `NEEDS_INPUT` status blocks. Description and parent choices
 include copy-pasteable `jj log` commands over the exact candidate commit IDs so
 the user can inspect full descriptions and possible canonical parents.
@@ -570,6 +579,51 @@ conflict resolution can rewrite descendants, remove their conflicts, or change
 their plans. It converges only a change whose author, description, and single
 canonical parent are inferred deterministically. It does not emit deferred
 descendants.
+
+Selection has three distinct outcomes: `Clean` when the issue list is empty,
+`Next(issue)` when an issue has no blocking ancestor, and `Blocked(cycle)` when
+issues remain but none can be selected. Independent eligible issues are still
+processed before reporting a cycle on a later invocation. Failure to select an
+issue must never imply that the scope is clean.
+
+Dependencies are between cleanup issues, not individual commits. A divergent
+family groups all its visible versions, so one version of change A may precede
+change B while another version of B precedes another version of A:
+
+```text
+A0 -> B0
+B1 -> A1
+```
+
+Both A and B must wait for the other under bottom-up cleanup. A similar cycle
+can occur when a content conflict lies between two versions of the same change.
+These are cycles in the dependencies between grouped issues; the commit graph
+itself remains acyclic. The diagnostic reports a deterministic cycle with exact
+commit IDs witnessing each ancestor relationship, for example:
+
+```json
+{
+  "kind": "ordering",
+  "status": "blocked",
+  "reason": "cyclic_issue_dependencies",
+  "cycle": [
+    {
+      "ancestor": {"kind": "divergence", "change_id": "A", "commit_id": "A0"},
+      "descendant": {"kind": "divergence", "change_id": "B", "commit_id": "B0"}
+    },
+    {
+      "ancestor": {"kind": "divergence", "change_id": "B", "commit_id": "B1"},
+      "descendant": {"kind": "divergence", "change_id": "A", "commit_id": "A1"}
+    }
+  ]
+}
+```
+
+The IDs above are illustrative; actual output uses full exact IDs. After
+inspecting the witnesses, the user must choose the intended stack order and
+resolve a divergent family using exact-revision mode with explicit resolution
+options or `--interactive`. A cleanup `-r` alone still includes ancestors and
+can rediscover the same cycle. The command does not pick an order automatically.
 
 `--interactive`, `--onto`, `--author-from`, `--message-from`, and `-m`
 switch to exact-revision mode and require exactly one selected divergent change

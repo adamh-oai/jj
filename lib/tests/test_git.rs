@@ -82,8 +82,10 @@ use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::MutableRepo;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::repo::Repo as _;
+use jj_lib::repo::RepoLoader;
 use jj_lib::settings::UserSettings;
 use jj_lib::signing_factory::signer_from_settings;
+use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::str_util::StringExpression;
 use jj_lib::str_util::StringMatcher;
 use jj_lib::workspace::Workspace;
@@ -174,6 +176,16 @@ fn get_git_backend(repo: &Arc<ReadonlyRepo>) -> &GitBackend {
 
 fn get_git_repo(repo: &Arc<ReadonlyRepo>) -> gix::Repository {
     get_git_backend(repo).git_repo()
+}
+
+fn enable_sync_git_repo(repo: &ReadonlyRepo, repo_path: &Path) -> TestResult<Arc<ReadonlyRepo>> {
+    fs::write(repo_path.join("op_store/type"), SimpleOpStore::SYNC_NAME)?;
+    let loader = RepoLoader::init_from_file_system(
+        repo.settings(),
+        repo_path,
+        &jj_lib::default_backend_factories::default_backend_factories(),
+    )?;
+    Ok(loader.load_at_head().block_on()?)
 }
 
 fn init_external_git_repo(test_repo: &TestRepo, name: &Path) -> TestResult<Arc<ReadonlyRepo>> {
@@ -1344,6 +1356,121 @@ fn test_import_refs_reimport_remote_tags_deleted() -> TestResult {
         repo.view().get_remote_tag(remote_symbol("tag1", "origin")),
         &remote_ref1
     );
+    Ok(())
+}
+
+#[test_case(false, false; "ordinary_absent")]
+#[test_case(false, true; "ordinary_present")]
+#[test_case(true, false; "sync_absent")]
+#[test_case(true, true; "sync_present")]
+fn test_import_refs_sync_observations(sync_enabled: bool, physically_present: bool) -> TestResult {
+    let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let repo = if sync_enabled {
+        enable_sync_git_repo(&test_repo.repo, test_repo.repo_path())?
+    } else {
+        test_repo.repo.clone()
+    };
+    let git_repo = get_git_repo(&repo);
+    let mut options = auto_track_import_options();
+    options.abandon_unreachable_commits = false;
+    let mut tx = repo.start_transaction();
+    let physical = write_random_commit(tx.repo_mut());
+    let synchronized = write_random_commit(tx.repo_mut());
+    let next = write_random_commit(tx.repo_mut());
+    let physical_target = RefTarget::normal(physical.id().clone());
+    let shared_target = RefTarget::normal(synchronized.id().clone());
+    let next_target = RefTarget::normal(next.id().clone());
+    let ref_names = [
+        "refs/heads/local",
+        "refs/remotes/origin/remote",
+        "refs/tags/tag",
+    ];
+    if physically_present {
+        for name in ref_names {
+            git_ref(&git_repo, name, git_id(&physical));
+        }
+    }
+    git::import_refs(tx.repo_mut(), &options).block_on()?;
+
+    // Simulate a sync that changes the shared targets while preserving this
+    // machine's observations of its own physical refs.
+    let synchronized_ref = RemoteRef {
+        target: shared_target.clone(),
+        state: RemoteRefState::Tracked,
+    };
+    for (name, remote) in [("local", "git"), ("remote", "origin")] {
+        tx.repo_mut()
+            .set_remote_bookmark(remote_symbol(name, remote), synchronized_ref.clone());
+        tx.repo_mut()
+            .set_local_bookmark_target(name.as_ref(), shared_target.clone());
+    }
+    tx.repo_mut()
+        .set_remote_tag(remote_symbol("tag", "git"), synchronized_ref);
+    tx.repo_mut()
+        .set_local_tag_target("tag".as_ref(), shared_target.clone());
+    let repo = tx.commit("shared target changes").block_on()?;
+
+    let assert_targets = |repo: &MutableRepo, expected: &RefTarget| {
+        for (name, remote) in [("local", "git"), ("remote", "origin")] {
+            assert_eq!(
+                &repo
+                    .view()
+                    .get_remote_bookmark(remote_symbol(name, remote))
+                    .target,
+                expected,
+            );
+            assert_eq!(repo.view().get_local_bookmark(name.as_ref()), expected);
+        }
+        assert_eq!(
+            &repo
+                .view()
+                .get_remote_tag(remote_symbol("tag", "git"))
+                .target,
+            expected,
+        );
+        assert_eq!(repo.view().get_local_tag("tag".as_ref()), expected);
+    };
+    let mut tx = repo.start_transaction();
+    let stats = git::import_refs(tx.repo_mut(), &options).block_on()?;
+    let expected = if sync_enabled {
+        &shared_target
+    } else if physically_present {
+        &physical_target
+    } else {
+        &ABSENT_REF_TARGET
+    };
+    assert_targets(tx.repo_mut(), expected);
+    if sync_enabled {
+        assert!(stats.changed_remote_bookmarks.is_empty());
+        assert!(stats.changed_remote_tags.is_empty());
+    }
+    for name in ref_names {
+        assert_eq!(
+            tx.repo().view().get_git_ref(name.as_ref()),
+            if physically_present {
+                &physical_target
+            } else {
+                &ABSENT_REF_TARGET
+            },
+        );
+    }
+
+    // A later physical move or creation is imported normally, followed by a
+    // physical deletion. Only unchanged observations receive special handling.
+    for name in ref_names {
+        git_ref(&git_repo, name, git_id(&next));
+    }
+    let stats = git::import_refs(tx.repo_mut(), &options).block_on()?;
+    assert_eq!(stats.changed_remote_bookmarks.len(), 2);
+    assert_eq!(stats.changed_remote_tags.len(), 1);
+    assert_targets(tx.repo_mut(), &next_target);
+    for name in ref_names {
+        delete_git_ref(&git_repo, name);
+    }
+    let stats = git::import_refs(tx.repo_mut(), &options).block_on()?;
+    assert_eq!(stats.changed_remote_bookmarks.len(), 2);
+    assert_eq!(stats.changed_remote_tags.len(), 1);
+    assert_targets(tx.repo_mut(), &RefTarget::absent());
     Ok(())
 }
 
@@ -4673,35 +4800,31 @@ fn test_load_default_fetch_bookmarks_invalid_configuration() -> TestResult {
         RemoteNameBuf(
             "first",
         ),
-        fetch ref-spec under `remote.first` was invalid, "input"="first"
-        |
-        └─ Could not parse refspec, "input"="+refs/heads/bad*pattern*:refs/remotes/heads/bad*pattern*", "key"="remote.<name>.fetch"
-        |
-        └─ refspec patterns may only contain a single '*' character, "input"="refs/heads/bad*pattern*",
+        fetch ref-spec under `remote.first` was invalid, input="first"
+        
+        Caused by:
+            0: Could not parse refspec, input="+refs/heads/bad*pattern*:refs/remotes/heads/bad*pattern*", key="remote.<name>.fetch"
+            1: refspec patterns may only contain a single '*' character, input="refs/heads/bad*pattern*",
     )
     InvalidRemoteConfiguration(
         RemoteNameBuf(
             "second",
         ),
-        fetch ref-spec under `remote.second` was invalid, "input"="second"
-        |
-        └─ Could not parse refspec, "input"="+refs/heads/badpattern?:refs/remotes/heads/badpattern?", "key"="remote.<name>.fetch"
-        |
-        └─ Reference name contains invalid byte: "?"
-        |
-        └─ Reference name contains invalid byte: "?",
+        fetch ref-spec under `remote.second` was invalid, input="second"
+        
+        Caused by:
+            0: Could not parse refspec, input="+refs/heads/badpattern?:refs/remotes/heads/badpattern?", key="remote.<name>.fetch"
+            1: Reference name contains invalid byte: "?",
     )
     InvalidRemoteConfiguration(
         RemoteNameBuf(
             "third",
         ),
-        fetch ref-spec under `remote.third` was invalid, "input"="third"
-        |
-        └─ Could not parse refspec, "input"="+refs/heads/bad[pat]:refs/remotes/heads/bad[pat]", "key"="remote.<name>.fetch"
-        |
-        └─ Reference name contains invalid byte: "["
-        |
-        └─ Reference name contains invalid byte: "[",
+        fetch ref-spec under `remote.third` was invalid, input="third"
+        
+        Caused by:
+            0: Could not parse refspec, input="+refs/heads/bad[pat]:refs/remotes/heads/bad[pat]", key="remote.<name>.fetch"
+            1: Reference name contains invalid byte: "[",
     )
     "#);
     Ok(())
@@ -4751,6 +4874,181 @@ fn test_fetch_multiple_branches() -> TestResult {
 }
 
 #[test]
+fn test_fetch_prune_deleted_refs_with_explicit_patterns() -> TestResult {
+    let test_data = GitRepoData::create();
+    let subprocess_options = GitSubprocessOptions::from_settings(test_data.repo.settings())?;
+    let import_options = default_import_options();
+    let fetch_import = |mut_repo: &mut MutableRepo| -> TestResult {
+        let mut fetcher = GitFetch::new(mut_repo, subprocess_options.clone(), &import_options)?;
+        let ref_expr = GitFetchRefExpression {
+            bookmark: StringExpression::exact("main"),
+            tag: StringExpression::exact("v1"),
+        };
+        fetch_with(&mut fetcher, "origin".as_ref(), ref_expr)?;
+        fetcher.import_refs().block_on()?;
+        Ok(())
+    };
+
+    empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
+    empty_git_commit(&test_data.origin_repo, "refs/tags/v1", &[]);
+    // Keep the remote nonempty after deleting refs
+    empty_git_commit(&test_data.origin_repo, "refs/heads/keep", &[]);
+
+    let mut tx = test_data.repo.start_transaction();
+    fetch_import(tx.repo_mut())?;
+
+    assert!(
+        tx.repo()
+            .get_remote_bookmark(remote_symbol("main", "origin"))
+            .is_present()
+    );
+    assert!(
+        tx.repo()
+            .get_remote_tag(remote_symbol("v1", "origin"))
+            .is_present()
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/remotes/origin/main")?
+            .is_some(),
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/jj/remote-tags/origin/v1")?
+            .is_some()
+    );
+
+    delete_git_ref(&test_data.origin_repo, "refs/heads/main");
+    delete_git_ref(&test_data.origin_repo, "refs/tags/v1");
+    fetch_import(tx.repo_mut())?;
+
+    // Deleted bookmarks and tags should be pruned
+    assert!(
+        tx.repo()
+            .get_remote_bookmark(remote_symbol("main", "origin"))
+            .is_absent()
+    );
+    assert!(
+        tx.repo()
+            .get_remote_tag(remote_symbol("v1", "origin"))
+            .is_absent()
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/remotes/origin/main")?
+            .is_none(),
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/jj/remote-tags/origin/v1")?
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[test_case("foo/bar", "foo"; "nested to parent")]
+#[test_case("foo", "foo/bar"; "parent to nested")]
+fn test_fetch_prune_renamed_bookmark_with_path_conflict(
+    old_name: &str,
+    new_name: &str,
+) -> TestResult {
+    let test_data = GitRepoData::create();
+    let old_ref = format!("refs/heads/{old_name}");
+    let new_ref = format!("refs/heads/{new_name}");
+    let commit = empty_git_commit(&test_data.origin_repo, &old_ref, &[]);
+
+    let mut tx = test_data.repo.start_transaction();
+    fetch_import_all(tx.repo_mut(), "origin".as_ref());
+    assert!(
+        tx.repo()
+            .get_remote_bookmark(remote_symbol(old_name, "origin"))
+            .is_present()
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference(&format!("refs/remotes/origin/{old_name}"))?
+            .is_some()
+    );
+
+    // The old and new ref names conflict in Git's loose ref storage.
+    delete_git_ref(&test_data.origin_repo, &old_ref);
+    git_ref(&test_data.origin_repo, &new_ref, commit);
+
+    fetch_import_all(tx.repo_mut(), "origin".as_ref());
+    assert!(
+        tx.repo()
+            .get_remote_bookmark(remote_symbol(old_name, "origin"))
+            .is_absent()
+    );
+    assert!(
+        tx.repo()
+            .get_remote_bookmark(remote_symbol(new_name, "origin"))
+            .is_present()
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference(&format!("refs/remotes/origin/{new_name}"))?
+            .is_some()
+    );
+
+    Ok(())
+}
+
+#[test_case("foo/bar", "foo"; "nested to parent")]
+#[test_case("foo", "foo/bar"; "parent to nested")]
+fn test_fetch_prune_renamed_tag_with_path_conflict(old_name: &str, new_name: &str) -> TestResult {
+    let test_data = GitRepoData::create();
+    let old_ref = format!("refs/tags/{old_name}");
+    let new_ref = format!("refs/tags/{new_name}");
+    let commit = empty_git_commit(&test_data.origin_repo, &old_ref, &[]);
+
+    let mut tx = test_data.repo.start_transaction();
+    fetch_import_all(tx.repo_mut(), "origin".as_ref());
+    assert!(
+        tx.repo()
+            .get_remote_tag(remote_symbol(old_name, "origin"))
+            .is_present()
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference(&format!("refs/jj/remote-tags/origin/{old_name}"))?
+            .is_some()
+    );
+
+    // The old and new ref names conflict in Git's loose ref storage.
+    delete_git_ref(&test_data.origin_repo, &old_ref);
+    git_ref(&test_data.origin_repo, &new_ref, commit);
+
+    fetch_import_all(tx.repo_mut(), "origin".as_ref());
+    assert!(
+        tx.repo()
+            .get_remote_tag(remote_symbol(old_name, "origin"))
+            .is_absent()
+    );
+    assert!(
+        tx.repo()
+            .get_remote_tag(remote_symbol(new_name, "origin"))
+            .is_present()
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference(&format!("refs/jj/remote-tags/origin/{new_name}"))?
+            .is_some()
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_fetch_local_remote_conflicts() -> TestResult {
     let test_data = GitRepoData::create();
     let subprocess_options = GitSubprocessOptions::from_settings(test_data.repo.settings())?;
@@ -4795,6 +5093,254 @@ fn test_fetch_local_remote_conflicts() -> TestResult {
     assert_eq!(
         repo.view().get_local_tag("tag".as_ref()),
         &conflicted_target3
+    );
+    Ok(())
+}
+
+#[test]
+fn test_fetch_sync_remote_tag_observations() -> TestResult {
+    let mut test_data = GitRepoData::create();
+    let subprocess_options = GitSubprocessOptions::from_settings(test_data.repo.settings())?;
+    let mut options = auto_track_import_options();
+    options.abandon_unreachable_commits = false;
+    let fetch_import = |repo: &mut MutableRepo,
+                        bookmark: StringExpression,
+                        tag: StringExpression|
+     -> TestResult<GitImportStats> {
+        let mut fetcher = GitFetch::new(repo, subprocess_options.clone(), &options)?;
+        fetch_with(
+            &mut fetcher,
+            "origin".as_ref(),
+            GitFetchRefExpression { bookmark, tag },
+        )?;
+        Ok(fetcher.import_refs().block_on()?)
+    };
+    let first = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
+    for name in ["one", "outside"] {
+        git_ref(&test_data.origin_repo, &format!("refs/tags/{name}"), first);
+    }
+    let first_target = RefTarget::normal(jj_id(first));
+    let mut tx = test_data.repo.start_transaction();
+    fetch_import(
+        tx.repo_mut(),
+        StringExpression::all(),
+        StringExpression::all(),
+    )?;
+    // Ordinary repositories have remote tags, but no separate Git observations
+    // for the reserved tag namespace.
+    for name in ["one", "outside"] {
+        assert!(
+            tx.repo()
+                .view()
+                .get_git_ref(format!("refs/jj/remote-tags/origin/{name}").as_ref())
+                .is_absent(),
+        );
+    }
+    let repo = tx.commit("fetch before sync enablement").block_on()?;
+    test_data.repo = enable_sync_git_repo(&repo, &test_data._temp_dir.path().join("jj"))?;
+    let mut tx = test_data.repo.start_transaction();
+    let shared_before = tx
+        .repo()
+        .view()
+        .all_remote_tags()
+        .map(|(symbol, value)| (symbol.to_owned(), value.clone()))
+        .collect_vec();
+    git::record_remote_tag_observations(tx.repo_mut())?;
+    assert_eq!(
+        tx.repo()
+            .view()
+            .all_remote_tags()
+            .map(|(symbol, value)| (symbol.to_owned(), value.clone()))
+            .collect_vec(),
+        shared_before,
+    );
+    for name in ["one", "outside"] {
+        assert_eq!(
+            tx.repo()
+                .view()
+                .get_git_ref(format!("refs/jj/remote-tags/origin/{name}").as_ref()),
+            &first_target,
+        );
+    }
+
+    let shared = write_random_commit(tx.repo_mut());
+    let shared_target = RefTarget::normal(shared.id().clone());
+    let shared_ref = RemoteRef {
+        target: shared_target.clone(),
+        state: RemoteRefState::Tracked,
+    };
+    tx.repo_mut()
+        .set_remote_bookmark(remote_symbol("main", "origin"), shared_ref.clone());
+    tx.repo_mut()
+        .set_local_bookmark_target("main".as_ref(), shared_target.clone());
+    for name in ["one", "outside", "missing"] {
+        tx.repo_mut()
+            .set_remote_tag(remote_symbol(name, "origin"), shared_ref.clone());
+        tx.repo_mut()
+            .set_local_tag_target(name.as_ref(), shared_target.clone());
+    }
+    let repo = tx.commit("synchronized targets").block_on()?;
+    let mut tx = repo.start_transaction();
+
+    // The ordinary automatic import must not prune reserved observations or
+    // replace shared targets using unchanged local Git state.
+    let stats = git::import_refs(tx.repo_mut(), &options).block_on()?;
+    assert!(stats.changed_remote_bookmarks.is_empty());
+    assert!(stats.changed_remote_tags.is_empty());
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/origin/one".as_ref()),
+        &first_target,
+    );
+    let stats = fetch_import(
+        tx.repo_mut(),
+        StringExpression::none(),
+        StringExpression::exact("one"),
+    )?;
+    assert!(stats.changed_remote_tags.is_empty());
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_remote_tag(remote_symbol("one", "origin")),
+        &shared_ref,
+    );
+
+    // Fetch only one of several changed refs. Observations and shared targets
+    // outside that selection must retain their previous values.
+    let next = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[first]);
+    let next_target = RefTarget::normal(jj_id(next));
+    for name in ["one", "outside"] {
+        git_ref(&test_data.origin_repo, &format!("refs/tags/{name}"), next);
+    }
+    let stats = fetch_import(
+        tx.repo_mut(),
+        StringExpression::none(),
+        StringExpression::exact("one"),
+    )?;
+    assert_eq!(stats.changed_remote_tags.len(), 1);
+    assert!(stats.changed_remote_bookmarks.is_empty());
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_remote_tag(remote_symbol("one", "origin"))
+            .target,
+        next_target,
+    );
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_remote_tag(remote_symbol("outside", "origin")),
+        &shared_ref,
+    );
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/origin/outside".as_ref()),
+        &first_target,
+    );
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_remote_bookmark(remote_symbol("main", "origin")),
+        &shared_ref,
+    );
+    delete_git_ref(&test_data.origin_repo, "refs/tags/one");
+    // A glob refspec lets Git prune the physical tag cache. Missing exact tag
+    // refspecs have different pre-existing pruning behavior in GitFetch.
+    let stats = fetch_import(
+        tx.repo_mut(),
+        StringExpression::none(),
+        StringExpression::pattern(jj_lib::str_util::StringPattern::glob("one*")?),
+    )?;
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/jj/remote-tags/origin/one")?
+            .is_none()
+    );
+    assert_eq!(stats.changed_remote_tags.len(), 1);
+    assert!(
+        tx.repo()
+            .view()
+            .get_remote_tag(remote_symbol("one", "origin"))
+            .is_absent()
+    );
+    assert!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/origin/one".as_ref())
+            .is_absent()
+    );
+
+    // A synchronized tag that has never been physically observed must survive
+    // an unchanged absence, then import its later creation and deletion.
+    fetch_import(
+        tx.repo_mut(),
+        StringExpression::none(),
+        StringExpression::all(),
+    )?;
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_remote_tag(remote_symbol("missing", "origin")),
+        &shared_ref,
+    );
+    git_ref(&test_data.origin_repo, "refs/tags/missing", next);
+    fetch_import(
+        tx.repo_mut(),
+        StringExpression::none(),
+        StringExpression::exact("missing"),
+    )?;
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_remote_tag(remote_symbol("missing", "origin"))
+            .target,
+        next_target,
+    );
+    delete_git_ref(&test_data.origin_repo, "refs/tags/missing");
+    fetch_import(
+        tx.repo_mut(),
+        StringExpression::none(),
+        StringExpression::pattern(jj_lib::str_util::StringPattern::glob("missing*")?),
+    )?;
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/jj/remote-tags/origin/missing")?
+            .is_none()
+    );
+    assert!(
+        tx.repo()
+            .view()
+            .get_remote_tag(remote_symbol("missing", "origin"))
+            .is_absent()
+    );
+
+    let stats = fetch_import(
+        tx.repo_mut(),
+        StringExpression::exact("main"),
+        StringExpression::none(),
+    )?;
+    assert_eq!(stats.changed_remote_bookmarks.len(), 1);
+    assert!(stats.changed_remote_tags.is_empty());
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_remote_bookmark(remote_symbol("main", "origin"))
+            .target,
+        next_target,
+    );
+    // Export ignores the receiver-local reserved observations.
+    let stats = git::export_refs(tx.repo_mut())?;
+    assert!(stats.failed_bookmarks.is_empty());
+    assert!(stats.failed_tags.is_empty());
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/origin/outside".as_ref()),
+        &next_target,
     );
     Ok(())
 }
@@ -5042,6 +5588,55 @@ fn test_fetch_export_annotated_tags() -> TestResult {
         test_data.git_repo.find_reference("refs/tags/tag3.4")?.id(),
         git_id(&commit4)
     );
+    Ok(())
+}
+
+#[test]
+fn test_fetch_ignores_configured_refspecs() -> TestResult {
+    let test_data = GitRepoData::create();
+
+    let mut remote = test_data.git_repo.find_remote("origin")?;
+    remote.replace_refspecs(
+        [
+            "+refs/heads/*:refs/unusual/bookmarks/*",
+            "+refs/tags/*:refs/unusual/tags/*",
+        ],
+        gix::remote::Direction::Fetch,
+    )?;
+    let mut config = test_data.git_repo.config_snapshot().clone();
+    remote.save_as_to("origin", &mut config)?;
+    git::save_git_config(&config)?;
+
+    empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
+    empty_git_commit(&test_data.origin_repo, "refs/tags/v1", &[]);
+
+    let mut tx = test_data.repo.start_transaction();
+    fetch_import_all(tx.repo_mut(), "origin".as_ref());
+    assert!(
+        tx.repo()
+            .get_remote_bookmark(remote_symbol("main", "origin"))
+            .is_present()
+    );
+    assert!(
+        tx.repo()
+            .get_remote_tag(remote_symbol("v1", "origin"))
+            .is_present()
+    );
+
+    // Extra refs shouldn't be created by the configured refspecs
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/unusual/bookmarks/main")?
+            .is_none()
+    );
+    assert!(
+        test_data
+            .git_repo
+            .try_find_reference("refs/unusual/tags/v1")?
+            .is_none(),
+    );
+
     Ok(())
 }
 
@@ -6653,7 +7248,7 @@ fn test_shallow_commits_lack_parents() -> TestResult {
         for commit in shallow_commits {
             writeln!(buf, "{commit}").unwrap();
         }
-        fs::write(shallow_file, buf).unwrap();
+        fs::write(shallow_file.unwrap(), buf).unwrap();
         // Reload the repo to invalidate mtime-based in-memory cache
         test_env.load_repo_at_head(&settings, test_repo.repo_path())
     };
@@ -6763,6 +7358,85 @@ fn test_remote_remove_refs() -> TestResult {
             .find_reference("refs/jj/remote-tags/foobar/a")?
             .id(),
         commit_tag_foobar_a,
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sync_remote_tag_observations_follow_remote_management() -> TestResult {
+    let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let repo = enable_sync_git_repo(&test_repo.repo, test_repo.repo_path())?;
+    let git_repo = get_git_repo(&repo);
+    let mut tx = repo.start_transaction();
+    git::add_remote(tx.repo_mut(), "foo".as_ref(), "https://example.com/", None)?;
+    let commit = write_random_commit(tx.repo_mut());
+    let target = RefTarget::normal(commit.id().clone());
+    let remote_ref = RemoteRef {
+        target: target.clone(),
+        state: RemoteRefState::Tracked,
+    };
+    for (remote, name) in [("foo", "x/y"), ("foobar", "a")] {
+        let full_name = format!("refs/jj/remote-tags/{remote}/{name}");
+        git_ref(&git_repo, &full_name, git_id(&commit));
+        tx.repo_mut()
+            .set_git_ref_target(full_name.as_ref(), target.clone());
+        tx.repo_mut()
+            .set_remote_tag(remote_symbol(name, remote), remote_ref.clone());
+    }
+    let repo = tx.commit("add remote observations").block_on()?;
+    let repo = test_repo
+        .env
+        .load_repo_at_head(repo.settings(), test_repo.repo_path());
+    let mut tx = repo.start_transaction();
+    // Observations are never requested exports or implicit tag deletions.
+    let stats = git::export_refs(tx.repo_mut())?;
+    assert!(stats.failed_tags.is_empty());
+    git::rename_remote(tx.repo_mut(), "foo".as_ref(), "bar".as_ref())?;
+    assert!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/foo/x/y".as_ref())
+            .is_absent()
+    );
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/bar/x/y".as_ref()),
+        &target
+    );
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/foobar/a".as_ref()),
+        &target
+    );
+    let repo = tx.commit("rename observed remote").block_on()?;
+    let repo = test_repo
+        .env
+        .load_repo_at_head(repo.settings(), test_repo.repo_path());
+    let mut tx = repo.start_transaction();
+    git::remove_remote(tx.repo_mut(), "bar".as_ref())?;
+    assert!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/bar/x/y".as_ref())
+            .is_absent()
+    );
+    assert_eq!(
+        tx.repo()
+            .view()
+            .get_git_ref("refs/jj/remote-tags/foobar/a".as_ref()),
+        &target
+    );
+    assert!(
+        get_git_repo(&repo)
+            .try_find_reference("refs/jj/remote-tags/bar/x/y")?
+            .is_none()
+    );
+    assert!(
+        get_git_repo(&repo)
+            .try_find_reference("refs/jj/remote-tags/foobar/a")?
+            .is_some()
     );
     Ok(())
 }
@@ -7210,6 +7884,7 @@ fn set_test_index_monitor(index: &gix::index::File, token: &str, dirty: &[bool])
         index.path(),
         gix::lock::acquire::Fail::Immediately,
         None,
+        0,
     )
     .unwrap();
     let previous = std::fs::read(index.path()).unwrap();

@@ -47,6 +47,7 @@ use either::Either;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
 use futures::StreamExt as _;
+use futures::TryStreamExt as _;
 use futures::io::AllowStdIo;
 use itertools::EitherOrBoth;
 use itertools::Itertools as _;
@@ -1476,14 +1477,14 @@ impl TreeState {
         let mut tree_builder = MergedTreeBuilder::new(self.tree.clone());
         trace_span!("process tree entries").in_scope(|| {
             for (path, tree_values) in &tree_entries_rx {
-                tree_builder.set_or_remove(path, tree_values);
+                tree_builder.set_or_remove_merge(path, tree_values).unwrap();
             }
         });
         let deleted_files = trace_span!("process deleted tree entries").in_scope(|| {
             let deleted_files = HashSet::from_iter(deleted_files_rx);
             is_dirty |= !deleted_files.is_empty();
             for file in &deleted_files {
-                tree_builder.set_or_remove(file.clone(), Merge::absent());
+                tree_builder.set_or_remove(file.clone(), None);
             }
             deleted_files
         });
@@ -1507,9 +1508,10 @@ impl TreeState {
         if cfg!(debug_assertions) {
             let native_tree_paths: HashSet<_> = self
                 .tree
-                .entries_matching(sparse_matcher.as_ref())
-                .filter_map(|(path, result)| result.is_ok().then_some(path))
-                .collect();
+                .entries_stream_matching(sparse_matcher.as_ref())
+                .filter_map(async |(path, result)| result.is_ok().then_some(path))
+                .collect()
+                .await;
             let file_states = self.file_states.all();
             let state_paths: HashSet<_> = file_states.paths().map(|path| path.to_owned()).collect();
             assert!(state_paths.is_subset(&native_tree_paths));
@@ -2592,9 +2594,10 @@ impl TreeState {
                 // other diff stream, but it could be difficult since the diff stream is not
                 // sorted in the same order as the conflicts iterator.
                 new_tree
-                    .conflicts_matching(matcher)
+                    .conflicts_stream_matching(matcher)
                     .map(|(path, value)| value.map(|value| (path, value)))
-                    .try_collect()?
+                    .try_collect()
+                    .await?
             } else {
                 HashMap::new()
             };
@@ -3134,7 +3137,6 @@ mod tests {
     use crate::simple_backend::SimpleBackend;
     use crate::tests::TestResult;
     use crate::tests::new_temp_dir;
-    use crate::tree_merge::MergeOptions;
 
     fn repo_path(value: &str) -> &RepoPath {
         RepoPath::from_internal_string(value).unwrap()
@@ -3164,11 +3166,12 @@ mod tests {
         for path in [&store_path, &workspace_root, &state_path] {
             fs::create_dir(path)?;
         }
-        let user_settings = UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
+        let user_settings =
+            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
         let store = Store::new(
             Box::new(SimpleBackend::init(&store_path)),
             Signer::new(None, vec![]),
-            MergeOptions::from_settings(&user_settings)?,
+            user_settings.merge_options()?,
         );
         let mut settings = TreeStateSettings::try_from_user_settings(&user_settings)?;
         settings.fsmonitor_settings = FsmonitorSettings::Test {
@@ -3212,11 +3215,12 @@ mod tests {
         for path in [&store_path, &workspace_root, &state_path] {
             fs::create_dir(path)?;
         }
-        let user_settings = UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
+        let user_settings =
+            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
         let store = Store::new(
             Box::new(SimpleBackend::init(&store_path)),
             Signer::new(None, vec![]),
-            MergeOptions::from_settings(&user_settings)?,
+            user_settings.merge_options()?,
         );
         let mut settings = TreeStateSettings::try_from_user_settings(&user_settings)?;
         let mut tree_state = TreeState::init(

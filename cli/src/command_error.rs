@@ -53,6 +53,8 @@ use jj_lib::revset::RevsetParseErrorKind;
 use jj_lib::revset::RevsetResolutionError;
 use jj_lib::secure_config::SecureConfigError;
 use jj_lib::str_util::StringPatternParseError;
+use jj_lib::template_parser::TemplateParseError;
+use jj_lib::template_parser::TemplateParseErrorKind;
 use jj_lib::trailer::TrailerParseError;
 use jj_lib::transaction::TransactionCommitError;
 use jj_lib::ui_path::UiPathParseError;
@@ -80,8 +82,6 @@ use crate::merge_tools::MergeToolPartialResolutionError;
 use crate::revset_util::BookmarkNameParseError;
 use crate::revset_util::TagNameParseError;
 use crate::revset_util::UserRevsetEvaluationError;
-use crate::template_parser::TemplateParseError;
-use crate::template_parser::TemplateParseErrorKind;
 use crate::ui::Ui;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,6 +345,7 @@ impl From<WorkspaceStoreError> for CommandError {
 impl From<WorkspaceInitError> for CommandError {
     fn from(err: WorkspaceInitError) -> Self {
         match err {
+            WorkspaceInitError::RepositoryLock(err) => user_error(err),
             WorkspaceInitError::DestinationExists(_) => {
                 user_error("The target repo already exists")
             }
@@ -466,9 +467,11 @@ impl From<ConflictResolveError> for CommandError {
             ConflictResolveError::Io(err) => err.into(),
             _ => {
                 let hint = match &err {
-                    ConflictResolveError::ConflictTooComplicated { .. } => {
-                        Some("Edit the conflict markers manually to resolve this.".to_owned())
-                    }
+                    ConflictResolveError::ConflictTooComplicated { .. } => Some(
+                        "Edit the conflict markers to resolve this, e.g. with `jj resolve --tool \
+                         :editor`."
+                            .to_owned(),
+                    ),
                     ConflictResolveError::ExecutableConflict { .. } => {
                         Some("Use `jj file chmod` to update the executable bit.".to_owned())
                     }
@@ -587,7 +590,9 @@ jj currently does not support partial clones. To use jj with this repository, tr
                 GitFetchError::RemoteName(_) => {
                     user_error(err).hinted("Run `jj git remote rename` to give a different name.")
                 }
-                GitFetchError::RejectedUpdates(_) | GitFetchError::Subprocess(_) => user_error(err),
+                GitFetchError::RejectedUpdates(_)
+                | GitFetchError::FailedToPrune(_)
+                | GitFetchError::Subprocess(_) => user_error(err),
             }
         }
     }
@@ -898,12 +903,7 @@ pub(crate) fn revset_parse_error_hint(err: &RevsetParseError) -> Option<String> 
              syntax and how to quote symbols."
                 .into(),
         ),
-        RevsetParseErrorKind::NotPrefixOperator {
-            op: _,
-            similar_op,
-            description,
-        }
-        | RevsetParseErrorKind::NotPostfixOperator {
+        RevsetParseErrorKind::NotPostfixOperator {
             op: _,
             similar_op,
             description,

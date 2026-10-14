@@ -18,11 +18,12 @@ use std::collections::BTreeMap;
 use std::iter::zip;
 
 use futures::future::try_join_all;
+use thiserror::Error;
 
 use crate::backend::BackendResult;
 use crate::backend::MergedTreeValue;
 use crate::backend::TreeId;
-use crate::conflict_labels::ConflictLabels;
+use crate::backend::TreeValue;
 use crate::merge::Merge;
 use crate::merged_tree::MergedTree;
 use crate::repo_path::RepoPathBuf;
@@ -39,6 +40,12 @@ pub struct MergedTreeBuilder {
     overrides: BTreeMap<RepoPathBuf, MergedTreeValue>,
 }
 
+/// Error returned when attempting to set an override with a conflict arity that
+/// does not match the base tree.
+#[derive(Debug, Error)]
+#[error("Conflict arity mismatch")]
+pub struct ConflictArityMismatchError;
+
 impl MergedTreeBuilder {
     /// Create a new builder with the given trees as base.
     pub fn new(base_tree: MergedTree) -> Self {
@@ -48,12 +55,30 @@ impl MergedTreeBuilder {
         }
     }
 
-    /// Set an override compared to  the base tree. The `values` merge must
+    /// Set an override compared to the base tree. Use `None` to remove a
+    /// value from the tree.
+    pub fn set_or_remove(&mut self, path: RepoPathBuf, value: Option<TreeValue>) {
+        self.overrides.insert(path, Merge::resolved(value));
+    }
+
+    /// Set an override compared to the base tree. The `values` merge must
     /// either be resolved (i.e. have 1 side) or have the same number of
-    /// sides as the `base_tree_ids` used to construct this builder. Use
-    /// `Merge::absent()` to remove a value from the tree.
-    pub fn set_or_remove(&mut self, path: RepoPathBuf, values: MergedTreeValue) {
+    /// sides as the base tree used to construct this builder. Conflicted
+    /// values should also be derived from the base tree's conflict. To
+    /// combine paths from a differently conflicted tree, merge the trees
+    /// instead (e.g. using `MergedTree::filtered()` and
+    /// `MergedTree::merge()`). Use `Merge::absent()` to remove a value from
+    /// the tree.
+    pub fn set_or_remove_merge(
+        &mut self,
+        path: RepoPathBuf,
+        values: MergedTreeValue,
+    ) -> Result<(), ConflictArityMismatchError> {
+        if !(values.is_resolved() || values.num_sides() == self.base_tree.tree_ids().num_sides()) {
+            return Err(ConflictArityMismatchError);
+        }
         self.overrides.insert(path, values);
+        Ok(())
     }
 
     /// Create new tree(s) from the base tree(s) and overrides.
@@ -61,15 +86,6 @@ impl MergedTreeBuilder {
         let store = self.base_tree.store().clone();
         let labels = self.base_tree.labels().clone();
         let new_tree_ids = self.write_merged_trees().await?;
-        let labels = if labels.num_sides() == Some(new_tree_ids.num_sides()) {
-            labels
-        } else {
-            // If the number of sides changed, we need to discard the conflict labels,
-            // otherwise `MergedTree::new` would panic.
-            // TODO: we should preserve conflict labels when setting conflicted tree values
-            // originating from a different tree than the base tree.
-            ConflictLabels::unlabeled()
-        };
         let (labels, new_tree_ids) = labels.simplify_with(&new_tree_ids);
         match new_tree_ids.into_resolved() {
             Ok(single_tree_id) => Ok(MergedTree::resolved(store, single_tree_id)),
@@ -82,14 +98,7 @@ impl MergedTreeBuilder {
 
     async fn write_merged_trees(self) -> BackendResult<Merge<TreeId>> {
         let store = self.base_tree.store().clone();
-        let mut base_tree_ids = self.base_tree.into_tree_ids();
-        let num_sides = self
-            .overrides
-            .values()
-            .map(|value| value.num_sides())
-            .max()
-            .unwrap_or(0);
-        base_tree_ids.pad_to(num_sides, store.empty_tree_id());
+        let base_tree_ids = self.base_tree.into_tree_ids();
         // Create a single-tree builder for each base tree
         let mut tree_builders =
             base_tree_ids.into_map(|base_tree_id| TreeBuilder::new(store.clone(), base_tree_id));
@@ -102,8 +111,7 @@ impl MergedTreeBuilder {
                         builder.set_or_remove(path.clone(), value.clone());
                     }
                 }
-                Err(mut values) => {
-                    values.pad_to(num_sides, &None);
+                Err(values) => {
                     // This path was overridden with a conflicted value. Apply each term to
                     // its corresponding builder.
                     for (builder, value) in zip(&mut tree_builders, values) {

@@ -17,10 +17,13 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use jj_lib::repo::Repo as _;
+use jj_lib::simple_op_store::SimpleOpStore;
 
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
+#[cfg(feature = "git")]
+use crate::command_error::user_error_with_message;
 use crate::ui::Ui;
 
 /// Run backend-dependent garbage collection.
@@ -59,6 +62,20 @@ pub async fn cmd_util_gc(
     let workspace_command = command.workspace_helper(ui).await?;
 
     let repo = workspace_command.repo();
+    if SimpleOpStore::is_sync_name(repo.op_store().name()) {
+        #[cfg(feature = "git")]
+        {
+            return collect_synced_repo(repo, workspace_command.repo_path(), keep_newer).await;
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            return Err(user_error(
+                "Synchronization GC requires a Git-enabled jj build",
+            ));
+        }
+    }
+    #[cfg(feature = "test-fakes")]
+    crate::cli_util::pause_for_test("JJ_TEST_SYNC_BEFORE_LEGACY_GC_PAUSE_DIR");
     repo.op_store()
         .gc(slice::from_ref(repo.op_id()), keep_newer)
         .await?;
@@ -66,5 +83,53 @@ pub async fn cmd_util_gc(
     if let Ok(git_backend) = jj_lib::git::get_git_backend(repo.store()) {
         git_backend.gc(repo.index(), keep_newer)?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "git")]
+async fn collect_synced_repo(
+    repo: &jj_lib::repo::ReadonlyRepo,
+    repo_path: &std::path::Path,
+    keep_newer: SystemTime,
+) -> Result<(), CommandError> {
+    use jj_lib::sync::anchor::AnchorStore;
+    use jj_lib::sync::gc::collect_roots;
+    use jj_lib::sync::state::SyncStateStore;
+
+    jj_lib::sync::endpoint::Endpoint::load(repo_path)
+        .retire_inactive_native_transfers()
+        .map_err(|err| {
+            user_error_with_message("Cannot retire interrupted synchronization transfers", err)
+        })?;
+    // Missing state in an enabled repository is corruption, not a new empty
+    // store. Hold the same lock used to establish transfer/import roots until
+    // both collectors have finished; no network work occurs under this lock.
+    let state_store = SyncStateStore::load(repo_path);
+    let state = state_store.lock().map_err(|err| {
+        user_error_with_message("Cannot read synchronization garbage-collection roots", err)
+    })?;
+    let anchors = AnchorStore::load(repo_path);
+    let mut raw_heads = repo.loader().op_heads_store().get_op_heads().await?;
+    raw_heads.push(repo.op_id().clone());
+    let plan = collect_roots(
+        repo.op_store().as_ref(),
+        &anchors,
+        state.state(),
+        &raw_heads,
+    )
+    .await
+    .map_err(|err| {
+        user_error_with_message("Cannot resolve retained synchronization history", err)
+    })?;
+    let retained = plan.build_index(repo).await.map_err(|err| {
+        user_error_with_message("Cannot index retained synchronization history", err)
+    })?;
+    let git_backend = jj_lib::git::get_git_backend(repo.store())?;
+    // Old conflict terms may exist only in jj metadata, without physical Git
+    // commit-tree edges. Refresh their independent Git roots before pruning.
+    git_backend.replace_sync_tree_roots(retained.tree_roots.iter())?;
+    let raw_roots = plan.raw_operations.into_iter().collect::<Vec<_>>();
+    repo.op_store().gc(&raw_roots, keep_newer).await?;
+    git_backend.gc(retained.index.as_index(), keep_newer)?;
     Ok(())
 }

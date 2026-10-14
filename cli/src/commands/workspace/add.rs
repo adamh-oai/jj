@@ -854,6 +854,7 @@ async fn ensure_snapshot_child_git_index(
         &index_path,
         gix::lock::acquire::Fail::Immediately,
         None,
+        0,
     )
     .map_err(|err| user_error(format!("Failed to lock child Git index: {err}")))?;
     match index_path.symlink_metadata() {
@@ -1068,6 +1069,7 @@ fn seed_snapshot_git_index(
         git_repo.index_path(),
         gix::lock::acquire::Fail::Immediately,
         None,
+        0,
     )
     .map_err(|err| user_error(format!("Failed to lock snapshot Git index: {err}")))?;
     // The semantic source tree describes the immutable physical source, while
@@ -1546,6 +1548,7 @@ fn reuse_snapshot_git_index(
             git_repo.index_path(),
             gix::lock::acquire::Fail::Immediately,
             None,
+            0,
         )
         .map_err(|err| user_error(format!("Failed to lock snapshot Git index: {err}")))
     })?;

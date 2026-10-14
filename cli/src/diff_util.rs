@@ -623,7 +623,7 @@ impl<'a> DiffRenderer<'a> {
             .simplify()
         };
         let to_description = Merge::resolved(to_commit.description());
-        let from_tree = rebase_to_dest_parent(self.repo, from_commits, to_commit).await?;
+        let from_tree = rebase_to_dest_parent(self.repo.index(), from_commits, to_commit).await?;
         let to_tree = to_commit.tree();
         let copy_records = CopyRecords::default(); // TODO
         show_diff_bytes(
@@ -653,7 +653,7 @@ impl<'a> DiffRenderer<'a> {
         matcher: &dyn Matcher,
         width: usize,
     ) -> Result<(), DiffRenderError> {
-        let from_tree = commit.parent_tree(self.repo).await?;
+        let from_tree = commit.parent_tree(self.repo.index()).await?;
         let to_tree = commit.tree();
         let mut copy_records = CopyRecords::default();
         for parent_id in commit.parent_ids() {
@@ -705,7 +705,8 @@ pub fn show_diff_bytes<T: AsRef<[u8]> + Eq>(
         .after
         .rsplit(path::is_separator)
         .next()
-        .and_then(SourceLanguage::from_file_name);
+        .and_then(SourceLanguage::from_file_name)
+        .or(Some(SourceLanguage::Generic));
     for format in formats {
         match format {
             // Omit diff from "short" formats. Printing dummy file path wouldn't
@@ -1507,7 +1508,8 @@ pub async fn show_color_words_diff(
         let language = right_path
             .components()
             .next_back()
-            .and_then(|name| SourceLanguage::from_file_name(name.as_internal_str()));
+            .and_then(|name| SourceLanguage::from_file_name(name.as_internal_str()))
+            .or(Some(SourceLanguage::Generic));
         let Diff {
             before: left_value,
             after: right_value,
@@ -1892,7 +1894,8 @@ pub async fn show_git_diff(
         let language = right_path
             .components()
             .next_back()
-            .and_then(|name| SourceLanguage::from_file_name(name.as_internal_str()));
+            .and_then(|name| SourceLanguage::from_file_name(name.as_internal_str()))
+            .or(Some(SourceLanguage::Generic));
         let values = values?;
 
         let left_part = git_diff_part(left_path, values.before, materialize_options).await?;

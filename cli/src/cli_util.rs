@@ -148,6 +148,9 @@ use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::str_util::StringExpression;
 use jj_lib::str_util::StringMatcher;
+use jj_lib::sync::state::LockedSyncState;
+use jj_lib::template_parser::TemplateAliasesMap;
+use jj_lib::template_parser::TemplateDiagnostics;
 use jj_lib::transaction::Transaction;
 use jj_lib::transaction::TransactionCommitError;
 use jj_lib::ui_path::RepoPathUiConverter;
@@ -211,8 +214,6 @@ use crate::revset_util::RevsetExpressionEvaluator;
 use crate::revset_util::parse_union_name_patterns;
 use crate::template_builder;
 use crate::template_builder::TemplateLanguage;
-use crate::template_parser::TemplateAliasesMap;
-use crate::template_parser::TemplateDiagnostics;
 use crate::templater::TemplateRenderer;
 use crate::templater::WrapTemplateProperty;
 use crate::text_util;
@@ -450,10 +451,33 @@ impl CommandHelper {
         ui: &Ui,
         workspace_root: &Path,
     ) -> Result<(UserSettings, ConfigEnv), CommandError> {
+        let repo_path = workspace_root.join(".jj").join("repo");
+        self.settings_for_workspace_paths(ui, workspace_root, &repo_path, None)
+    }
+
+    /// Resolves receiver-local configuration before creating a sync destination.
+    pub(crate) fn settings_for_new_sync_workspace(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+    ) -> Result<(UserSettings, ConfigEnv), CommandError> {
+        let repo_path = workspace_root.join(".jj").join("repo");
+        self.settings_for_workspace_paths(ui, workspace_root, &repo_path, Some("sync"))
+    }
+
+    fn settings_for_workspace_paths(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+        repo_path: &Path,
+        command_name: Option<&str>,
+    ) -> Result<(UserSettings, ConfigEnv), CommandError> {
         let mut config_env = self.data.config_env.clone();
         let mut raw_config = self.data.raw_config.clone();
-        let repo_path = workspace_root.join(".jj").join("repo");
-        config_env.reset_repo_path(&repo_path);
+        if let Some(command_name) = command_name {
+            config_env.set_command_name(command_name.to_owned());
+        }
+        config_env.reset_repo_path(repo_path);
         config_env.reload_repo_config(ui, &mut raw_config)?;
         config_env.reset_workspace_path(workspace_root);
         config_env.reload_workspace_config(ui, &mut raw_config)?;
@@ -551,11 +575,79 @@ impl CommandHelper {
     ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
         let workspace = self.load_workspace()?;
         let env = self.workspace_environment(ui, &workspace)?;
+        self.workspace_helper_from_workspace_with_stats(ui, workspace, env)
+            .await
+    }
+
+    /// Prepares a synchronization endpoint using its own repository and
+    /// workspace settings, and the normal snapshot and stale-copy recovery.
+    ///
+    /// The hidden helper receives its path and working-copy policy in the
+    /// protocol, so its process's initial working directory is not the endpoint
+    /// configuration context. Linked workspaces resolve their shared repository
+    /// through the workspace loader, rather than assuming `.jj/repo` is a
+    /// directory. Conditional command settings use the public `sync` command.
+    pub(crate) async fn workspace_helper_for_sync(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+        ignore_working_copy: bool,
+    ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
+        let workspace = self.load_workspace_for_sync_profile(ui, workspace_root)?;
+        let env = WorkspaceCommandEnvironment::new_with_context(
+            ui,
+            self,
+            &workspace,
+            workspace.workspace_root(),
+            ignore_working_copy,
+        )?;
+        self.workspace_helper_from_workspace_with_stats(ui, workspace, env)
+            .await
+    }
+
+    /// Loads endpoint-specific configuration and stores for read-only protocol
+    /// negotiation. No working-copy snapshot or operation resolution occurs.
+    pub(crate) fn load_workspace_for_sync_profile(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+    ) -> Result<Workspace, CommandError> {
+        let workspace_root = dunce::canonicalize(workspace_root).map_err(|err| {
+            user_error_with_message(
+                format!(
+                    "Failed to access synchronization endpoint {}",
+                    workspace_root.display()
+                ),
+                err,
+            )
+        })?;
+        let loader = self.new_workspace_loader_at(&workspace_root)?;
+        let (settings, _) = self.settings_for_workspace_paths(
+            ui,
+            loader.workspace_root(),
+            loader.repo_path(),
+            Some("sync"),
+        )?;
+        loader
+            .load(
+                &settings,
+                &self.data.store_factories,
+                &self.data.working_copy_factories,
+            )
+            .map_err(|err| map_workspace_load_error(err, None))
+    }
+
+    async fn workspace_helper_from_workspace_with_stats(
+        &self,
+        ui: &Ui,
+        workspace: Workspace,
+        env: WorkspaceCommandEnvironment,
+    ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
         // Acquire the lock to ensure that the loaded repo points to the head
         // operation whose refs should be synchronized with the Git repo. This
         // prevents races with other processes during Git HEAD and refs
         // import/export.
-        let git_import_export_lock = self
+        let git_import_export_lock = env
             .is_working_copy_writable()
             .then(|| env.lock_git_import_export(&workspace))
             .transpose()?;
@@ -577,7 +669,9 @@ impl CommandHelper {
                 unreachable!("snapshot_impl retries internally")
             }
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
-                let auto_update_stale = self.settings().get_bool("snapshot.auto-update-stale")?;
+                let auto_update_stale = workspace_command
+                    .settings()
+                    .get_bool("snapshot.auto-update-stale")?;
                 if !auto_update_stale {
                     return Err(err);
                 }
@@ -656,7 +750,7 @@ impl CommandHelper {
                 .expect("valid syntax");
             env.reload_revset_expressions(ui)?;
         }
-        let may_snapshot_working_copy = self.is_working_copy_writable();
+        let may_snapshot_working_copy = env.is_working_copy_writable();
         WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy)
     }
 
@@ -752,7 +846,7 @@ impl CommandHelper {
             Ok(op) => {
                 // self.for_workable_repo(), but reuse loaded env.
                 let repo = workspace.repo_loader().load_at(&op).await?;
-                let may_snapshot_working_copy = !self.global_args().ignore_working_copy;
+                let may_snapshot_working_copy = !env.ignore_working_copy;
                 let mut workspace_command = WorkspaceCommandHelper::new(
                     ui,
                     workspace,
@@ -837,12 +931,14 @@ impl CommandHelper {
                             &desired_wc_commit,
                         )
                         .await?;
-                        workspace_command.print_updated_working_copy_stats(
-                            ui,
-                            Some(&stale_wc_commit),
-                            &desired_wc_commit,
-                            &stats,
-                        )?;
+                        workspace_command
+                            .print_updated_working_copy_stats(
+                                ui,
+                                Some(&stale_wc_commit),
+                                &desired_wc_commit,
+                                &stats,
+                            )
+                            .await?;
                         writeln!(
                             ui.status(),
                             "Updated working copy to fresh commit {}",
@@ -1107,6 +1203,7 @@ fn load_advance_bookmarks_matcher(
 pub struct WorkspaceCommandEnvironment {
     command: CommandHelper,
     settings: UserSettings,
+    ignore_working_copy: bool,
     fileset_aliases_map: FilesetAliasesMap,
     revset_aliases_map: RevsetAliasesMap,
     template_aliases_map: TemplateAliasesMap,
@@ -1124,13 +1221,29 @@ pub struct WorkspaceCommandEnvironment {
 impl WorkspaceCommandEnvironment {
     #[instrument(skip_all)]
     fn new(ui: &Ui, command: &CommandHelper, workspace: &Workspace) -> Result<Self, CommandError> {
+        Self::new_with_context(
+            ui,
+            command,
+            workspace,
+            command.cwd(),
+            command.global_args().ignore_working_copy,
+        )
+    }
+
+    fn new_with_context(
+        ui: &Ui,
+        command: &CommandHelper,
+        workspace: &Workspace,
+        cwd: &Path,
+        ignore_working_copy: bool,
+    ) -> Result<Self, CommandError> {
         let settings = workspace.settings();
         let fileset_aliases_map = load_fileset_aliases(ui, settings.config())?;
         let revset_aliases_map = load_revset_aliases(ui, settings.config())?;
         let template_aliases_map = load_template_aliases(ui, settings.config())?;
         let default_ignored_remote = default_ignored_remote_name(workspace.repo_loader().store());
         let path_converter = RepoPathUiConverter::Fs {
-            cwd: command.cwd().to_owned(),
+            cwd: cwd.to_owned(),
             base: workspace.workspace_root().to_owned(),
         };
         #[cfg(feature = "git")]
@@ -1144,6 +1257,7 @@ impl WorkspaceCommandEnvironment {
         let mut env = Self {
             command: command.clone(),
             settings: settings.clone(),
+            ignore_working_copy,
             fileset_aliases_map,
             revset_aliases_map,
             template_aliases_map,
@@ -1163,6 +1277,10 @@ impl WorkspaceCommandEnvironment {
 
     pub(crate) fn path_converter(&self) -> &RepoPathUiConverter {
         &self.path_converter
+    }
+
+    fn is_working_copy_writable(&self) -> bool {
+        self.command.is_at_head_operation() && !self.ignore_working_copy
     }
 
     pub(crate) fn cwd(&self) -> &Path {
@@ -1491,6 +1609,14 @@ impl GitImportExportLock {
     }
 }
 
+enum SnapshotValidation<'a> {
+    NotRequired,
+    Required(Option<&'a OperationId>),
+}
+
+type PublishHook<'a> =
+    dyn FnMut(&mut LockedSyncState<'_>, &Operation) -> Result<(), CommandError> + 'a;
+
 /// Provides utilities for writing a command that works on a [`Workspace`]
 /// (which most commands do).
 pub struct WorkspaceCommandHelper {
@@ -1667,10 +1793,10 @@ impl WorkspaceCommandHelper {
         } else {
             tracing::warn!(
                 reason = "working_copy_not_writable",
-                ignore_working_copy = self.env.command.global_args().ignore_working_copy,
+                ignore_working_copy = self.env.ignore_working_copy,
                 "working-copy update rejected"
             );
-            let hint = if self.env.command.global_args().ignore_working_copy {
+            let hint = if self.env.ignore_working_copy {
                 "Don't use --ignore-working-copy."
             } else if self.env.command.global_args().no_integrate_operation {
                 "Don't use --no-integrate-operation."
@@ -1685,7 +1811,7 @@ impl WorkspaceCommandHelper {
     /// the caller chose not to snapshot the source working copy.
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     pub(crate) fn allow_new_snapshot_workspace_initialization(&mut self) {
-        if self.env.command.global_args().ignore_working_copy
+        if self.env.ignore_working_copy
             && self.env.command.is_at_head_operation()
             && self.env.command.should_commit_transaction()
         {
@@ -2370,8 +2496,8 @@ impl WorkspaceCommandHelper {
                 tx,
                 "import git head",
                 git_import_export_lock,
-                true,
-                expected_snapshot_operation.as_ref(),
+                SnapshotValidation::Required(expected_snapshot_operation.as_ref()),
+                None,
             )
             .await
             .map_err(snapshot_command_error)?;
@@ -2419,7 +2545,7 @@ impl WorkspaceCommandHelper {
             tx,
             "import git refs",
             git_import_export_lock,
-            false,
+            SnapshotValidation::NotRequired,
             None,
         )
         .await?;
@@ -3726,7 +3852,7 @@ to the current parents may contain changes from multiple commits.
         Ok(stats)
     }
 
-    fn print_updated_working_copy_stats(
+    async fn print_updated_working_copy_stats(
         &self,
         ui: &Ui,
         maybe_old_commit: Option<&Commit>,
@@ -3752,7 +3878,7 @@ to the current parents may contain changes from multiple commits.
             && let Some(mut formatter) = ui.status_formatter()
             && new_commit.has_conflict()
         {
-            let conflicts = new_commit.tree().conflicts().collect_vec();
+            let conflicts = new_commit.tree().conflicts_stream().collect().await;
             writeln!(
                 formatter.labeled("warning").with_heading("Warning: "),
                 "There are unresolved conflicts at these paths:"
@@ -3773,7 +3899,54 @@ to the current parents may contain changes from multiple commits.
             helper: self,
             tx,
             id_prefix_context,
+            record_empty_operation: false,
         }
+    }
+
+    /// Finalizes a prepared synchronization transaction through the ordinary
+    /// workspace path, recording its exact result before publication.
+    ///
+    /// The callback must durably retain the written operation and its imported
+    /// closure. A callback failure leaves that operation unpublished. A later
+    /// checkout failure can occur after publication; callers must inspect the
+    /// durable operation heads before deciding how to recover.
+    pub(crate) async fn finish_sync_transaction(
+        &mut self,
+        ui: &Ui,
+        mut tx: Transaction,
+        description: impl Into<String>,
+        mut record: impl FnMut(&mut LockedSyncState<'_>, &Operation) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
+        if !self.env.command.should_commit_transaction() {
+            return Err(user_error(
+                "Synchronization requires operation publication; remove --no-integrate-operation",
+            ));
+        }
+        if tx.base_repo().op_id() != self.repo().op_id()
+            || tx.parent_ops().first().map(|op| op.id()) != Some(self.repo().op_id())
+        {
+            return Err(user_error(
+                "The synchronization baseline changed; retry the command",
+            ));
+        }
+        tx.set_workspace_name(self.workspace_name());
+        for (key, value) in command_args_to_transaction_attribute(self.env.command.string_args()) {
+            tx.set_attribute(key, value);
+        }
+        let num_rebased = rebase_mutable_descendants(&self.env, &mut tx).await?;
+        if num_rebased > 0 {
+            writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;
+        }
+        let git_import_export_lock = self.lock_git_import_export()?;
+        self.finish_transaction(
+            ui,
+            tx,
+            description,
+            &git_import_export_lock,
+            SnapshotValidation::NotRequired,
+            Some(&mut record),
+        )
+        .await
     }
 
     async fn finish_transaction(
@@ -3782,10 +3955,17 @@ to the current parents may contain changes from multiple commits.
         mut tx: Transaction,
         description: impl Into<String>,
         git_import_export_lock: &GitImportExportLock,
-        check_snapshot_ready: bool,
-        expected_snapshot_operation: Option<&OperationId>,
+        snapshot_validation: SnapshotValidation<'_>,
+        before_publish: Option<&mut PublishHook<'_>>,
     ) -> Result<(), CommandError> {
+        let (check_snapshot_ready, expected_snapshot_operation) = match snapshot_validation {
+            SnapshotValidation::NotRequired => (false, None),
+            SnapshotValidation::Required(expected_operation) => (true, expected_operation),
+        };
         let old_repo = tx.base_repo().clone();
+        let sync_state_store = before_publish
+            .as_ref()
+            .map(|_| jj_lib::sync::state::SyncStateStore::load(self.repo_path()));
 
         // Importing a deleted Git HEAD releases its first journal lock before
         // entering this transaction. Recheck against the lock actually held
@@ -3969,7 +4149,13 @@ to the current parents may contain changes from multiple commits.
 
         #[cfg(feature = "git")]
         if self.env.working_copy_shared_with_git && should_commit_transaction {
-            if git_checkout_needs_update && let Some(wc_commit) = &maybe_new_wc_commit {
+            if git_checkout_needs_update
+                && (self.may_update_working_copy
+                    || !jj_lib::simple_op_store::SimpleOpStore::is_sync_name(
+                        tx.base_repo().op_store().name(),
+                    ))
+                && let Some(wc_commit) = &maybe_new_wc_commit
+            {
                 let started = Instant::now();
                 let result = try_reset_git_head(
                     ui,
@@ -4002,11 +4188,39 @@ to the current parents may contain changes from multiple commits.
         }
 
         let started = Instant::now();
-        let result = self
-            .env
-            .command
-            .maybe_commit_transaction(tx, description)
-            .await;
+        let result = async {
+            let new_repo = if let Some(before_publish) = before_publish {
+                // Take this lock only after Git and working-copy finalization locks.
+                // Protect the new operation even against GC --expire now between
+                // writing it and persisting the write-ahead publication record.
+                let mut state = sync_state_store.as_ref().unwrap().lock().map_err(|err| {
+                    user_error_with_message("Cannot lock synchronization publication state", err)
+                })?;
+                let unpublished = tx.write(description).await?;
+                before_publish(&mut state, unpublished.operation())?;
+                state.save().map_err(|err| {
+                    user_error_with_message(
+                        "Cannot persist synchronization publication result",
+                        err,
+                    )
+                })?;
+                #[cfg(feature = "test-fakes")]
+                if env::var_os("JJ_TEST_SYNC_FAIL_BEFORE_PUBLISH").is_some() {
+                    return Err(internal_error_with_message(
+                        "Injected failure before synchronization publication",
+                        io::Error::other("JJ_TEST_SYNC_FAIL_BEFORE_PUBLISH"),
+                    ));
+                }
+                unpublished.publish().await?
+            } else {
+                self.env
+                    .command
+                    .maybe_commit_transaction(tx, description)
+                    .await?
+            };
+            Ok::<_, CommandError>(new_repo)
+        }
+        .await;
         tracing::debug!(
             phase = "commit_transaction",
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -4087,7 +4301,8 @@ to the current parents may contain changes from multiple commits.
                 maybe_old_wc_commit.as_ref(),
                 new_commit,
                 &stats,
-            )?;
+            )
+            .await?;
         }
 
         self.report_repo_changes(ui, &old_repo).await?;
@@ -4445,9 +4660,23 @@ pub struct WorkspaceCommandTransaction<'a> {
     tx: Transaction,
     /// Cache of index built against the current MutableRepo state.
     id_prefix_context: OnceCell<IdPrefixContext>,
+    record_empty_operation: bool,
 }
 
 impl WorkspaceCommandTransaction<'_> {
+    /// Records causal progress even if the repository view is unchanged.
+    ///
+    /// Synchronization and its undo/redo can acknowledge new history without
+    /// changing visible commits or references.
+    pub fn record_empty_operation(&mut self) {
+        self.record_empty_operation = true;
+    }
+
+    /// Attaches metadata to the local operation produced by this transaction.
+    pub fn set_attribute(&mut self, key: String, value: String) {
+        self.tx.set_attribute(key, value);
+    }
+
     /// Workspace helper that may use the base repo.
     pub fn base_workspace_helper(&self) -> &WorkspaceCommandHelper {
         self.helper
@@ -4526,8 +4755,13 @@ impl WorkspaceCommandTransaction<'_> {
     }
 
     pub async fn finish(self, ui: &Ui, description: impl Into<String>) -> Result<(), CommandError> {
-        let Self { helper, mut tx, .. } = self;
-        if !tx.repo().has_changes() {
+        let Self {
+            helper,
+            mut tx,
+            record_empty_operation,
+            ..
+        } = self;
+        if !tx.repo().has_changes() && !record_empty_operation {
             writeln!(ui.status(), "Nothing changed.")?;
             return Ok(());
         }
@@ -4539,7 +4773,14 @@ impl WorkspaceCommandTransaction<'_> {
         // Git HEAD export happens atomically with the transaction commit.
         let git_import_export_lock = helper.lock_git_import_export()?;
         helper
-            .finish_transaction(ui, tx, description, &git_import_export_lock, false, None)
+            .finish_transaction(
+                ui,
+                tx,
+                description,
+                &git_import_export_lock,
+                SnapshotValidation::NotRequired,
+                None,
+            )
             .await
     }
 
@@ -4613,6 +4854,7 @@ jj git init",
             err @ (StoreLoadError::ReadError { .. } | StoreLoadError::Backend(_)),
         ) => internal_error_with_message("The repository appears broken or inaccessible", err),
         WorkspaceLoadError::StoreLoadError(StoreLoadError::Signing(err)) => user_error(err),
+        WorkspaceLoadError::StoreLoadError(StoreLoadError::RepositoryLock(err)) => user_error(err),
         WorkspaceLoadError::WorkingCopyState(err) => internal_error(err),
         WorkspaceLoadError::DecodeRepoPath(_) | WorkspaceLoadError::Path(_) => user_error(err),
     }
@@ -6507,16 +6749,31 @@ impl<'a> CliRunner<'a> {
             // TODO: maybe path should be canonicalized by WorkspaceLoader?
             let abs_path = cwd.join(path);
             let abs_path = dunce::canonicalize(&abs_path).unwrap_or(abs_path);
-            // Invalid -R path is an error. No need to proceed.
-            let loader = self
-                .workspace_loader_factory
-                .create(&abs_path)
-                .map_err(|err| map_workspace_load_error(err, Some(path)))?;
-            config_env.reset_repo_path(loader.repo_path());
-            config_env.reload_repo_config(ui, &mut raw_config)?;
-            config_env.reset_workspace_path(loader.workspace_root());
-            config_env.reload_workspace_config(ui, &mut raw_config)?;
-            Ok(loader)
+            match self.workspace_loader_factory.create(&abs_path) {
+                Ok(loader) => {
+                    config_env.reset_repo_path(loader.repo_path());
+                    config_env.reload_repo_config(ui, &mut raw_config)?;
+                    config_env.reset_workspace_path(loader.workspace_root());
+                    config_env.reload_workspace_config(ui, &mut raw_config)?;
+                    Ok(loader)
+                }
+                Err(err @ WorkspaceLoadError::NoWorkspaceHere(_))
+                    if matches.subcommand().is_some_and(|(name, args)| {
+                        name == "sync" && (args.get_flag("receive") || args.get_flag("bidi"))
+                    }) && std::fs::symlink_metadata(abs_path.join(".jj"))
+                        .is_err_and(|err| err.kind() == io::ErrorKind::NotFound) =>
+                {
+                    // Receive can create its missing destination after negotiating
+                    // the source format. Retain the load error for other users,
+                    // while resolving conditional config for this destination.
+                    config_env.reset_repo_path(&abs_path.join(".jj/repo"));
+                    config_env.reload_repo_config(ui, &mut raw_config)?;
+                    config_env.reset_workspace_path(&abs_path);
+                    config_env.reload_workspace_config(ui, &mut raw_config)?;
+                    Err(map_workspace_load_error(err, Some(path)))
+                }
+                Err(err) => return Err(map_workspace_load_error(err, Some(path))),
+            }
         } else {
             maybe_cwd_workspace_loader
         };

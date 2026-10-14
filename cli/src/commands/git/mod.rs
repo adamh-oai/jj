@@ -49,6 +49,7 @@ use self::import::GitImportArgs;
 use self::import::cmd_git_import;
 use self::init::GitInitArgs;
 use self::init::cmd_git_init;
+pub(crate) use self::init::init_colocated_for_sync;
 use self::push::GitPushArgs;
 use self::push::cmd_git_push;
 pub use self::push::is_push_operation;
