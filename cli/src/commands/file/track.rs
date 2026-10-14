@@ -70,7 +70,10 @@ pub(crate) async fn cmd_file_track(
 
     let mut tx = workspace_command.start_transaction().into_inner();
     let (mut locked_ws, _wc_commit) = workspace_command.start_working_copy_mutation().await?;
-    let (_tree, track_stats) = locked_ws.locked_wc().snapshot(&options).await?;
+    let (_tree, track_stats) = locked_ws
+        .locked_wc()
+        .snapshot_for_explicit_tracking(&options)
+        .await?;
     let num_rebased = tx.repo_mut().rebase_descendants().await?;
     if num_rebased > 0 {
         writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;

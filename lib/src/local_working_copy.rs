@@ -107,6 +107,7 @@ use crate::matchers::EverythingMatcher;
 use crate::matchers::FilesMatcher;
 use crate::matchers::IntersectionMatcher;
 use crate::matchers::Matcher;
+use crate::matchers::NothingMatcher;
 use crate::matchers::PrefixMatcher;
 use crate::matchers::UnionMatcher;
 use crate::matchers::Visit;
@@ -1893,7 +1894,11 @@ impl TreeState {
     /// Rebuilds a bounded, in-memory scan index from the semantic tree. This
     /// replaces the durable per-path table: the index exists only for the
     /// current scan and all inspected paths are read from the scan root.
-    fn rebuild_ephemeral_tracked_paths(&mut self, scope: &ScanScope) -> Result<(), SnapshotError> {
+    fn rebuild_ephemeral_tracked_paths(
+        &mut self,
+        scope: &ScanScope,
+        explicit_tracking_matcher: &dyn Matcher,
+    ) -> Result<(), SnapshotError> {
         let mut entries = Vec::new();
         let mut push_value = |path: RepoPathBuf, value: MergedTreeValue| {
             if !value.is_tree() && !value.is_absent() {
@@ -1927,7 +1932,8 @@ impl TreeState {
                         minimal_roots.push(root);
                     }
                 }
-                let matcher = PrefixMatcher::new(minimal_roots);
+                let changed_matcher = PrefixMatcher::new(minimal_roots);
+                let matcher = UnionMatcher::new(&changed_matcher, explicit_tracking_matcher);
                 for (path, result) in self.tree.entries_matching(&matcher) {
                     push_value(path, result?);
                 }
@@ -2501,7 +2507,7 @@ impl TreeState {
         allow_awacs_baseline_rebuild: bool,
     ) -> Result<(bool, SnapshotStats), SnapshotError> {
         let (is_dirty, stats, pending_scan) = self
-            .snapshot_with_pending(options, allow_awacs_baseline_rebuild)
+            .snapshot_with_pending(options, allow_awacs_baseline_rebuild, false)
             .await?;
         // Direct TreeState callers have no working-copy transaction boundary
         // where a lease could be committed, so conservatively abort it.
@@ -2604,6 +2610,7 @@ impl TreeState {
         &mut self,
         options: &SnapshotOptions<'_>,
         allow_awacs_baseline_rebuild: bool,
+        explicit_tracking: bool,
     ) -> Result<(bool, SnapshotStats, Option<PendingScan>), SnapshotError> {
         let SnapshotOptions {
             base_ignores,
@@ -2720,15 +2727,21 @@ impl TreeState {
             });
         }
         let fsmonitor_matcher = scan_scope.matcher();
-
-        let scan_matcher = UnionMatcher::new(fsmonitor_matcher.as_ref(), force_tracking_matcher);
+        let explicit_tracking_matcher: &dyn Matcher = if explicit_tracking {
+            *start_tracking_matcher
+        } else {
+            &NothingMatcher
+        };
+        let requested_matcher =
+            UnionMatcher::new(explicit_tracking_matcher, force_tracking_matcher);
+        let scan_matcher = UnionMatcher::new(fsmonitor_matcher.as_ref(), &requested_matcher);
         let sparse_scan_matcher = IntersectionMatcher::new(sparse_matcher.as_ref(), scan_matcher);
         let external_sparse_matcher: &dyn Matcher = external_sparse_matcher
             .as_ref()
             .map(|matcher| matcher as &dyn Matcher)
             .unwrap_or(&EverythingMatcher);
         let matcher = IntersectionMatcher::new(external_sparse_matcher, sparse_scan_matcher);
-        self.rebuild_ephemeral_tracked_paths(&scan_scope)?;
+        self.rebuild_ephemeral_tracked_paths(&scan_scope, explicit_tracking_matcher)?;
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             if baseline.is_some() {
@@ -2783,13 +2796,31 @@ impl TreeState {
                             };
                             snapshotter.visit_directory(directory_to_visit, scope)
                         }
-                        ScanScope::Changed { exact, prefixes } => snapshotter.visit_changed_paths(
-                            exact,
-                            prefixes,
-                            directed_root_ignores
-                                .expect("changed scan scopes load their root ignore rules"),
-                            scope,
-                        ),
+                        ScanScope::Changed { exact, prefixes } => {
+                            snapshotter.visit_changed_paths(
+                                exact,
+                                prefixes,
+                                directed_root_ignores
+                                    .expect("changed scan scopes load their root ignore rules"),
+                                scope,
+                            )?;
+                            if explicit_tracking {
+                                // The caller deliberately requested these paths, even if
+                                // AWACS reports no changes since its baseline. The matcher
+                                // still limits recursion to the requested fileset and delta.
+                                snapshotter.visit_directory(
+                                    DirectoryToVisit {
+                                        dir: RepoPathBuf::root(),
+                                        disk_dir: scan_root.clone(),
+                                        git_ignore: scan_root_base_ignores,
+                                        ancestor_ignored: false,
+                                        tracked_paths: self.tracked_paths.all(),
+                                    },
+                                    scope,
+                                )?;
+                            }
+                            Ok(())
+                        }
                     });
                 });
                 snapshotter.into_result()
@@ -5320,8 +5351,23 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
         self.abort_pending_scan()?;
         let tree_state = self.wc.tree_state_mut()?;
-        let (is_dirty, stats, pending_scan) =
-            tree_state.snapshot_with_pending(options, false).await?;
+        let (is_dirty, stats, pending_scan) = tree_state
+            .snapshot_with_pending(options, false, false)
+            .await?;
+        self.tree_state_dirty |= is_dirty;
+        self.pending_scan = pending_scan;
+        Ok((tree_state.current_tree().clone(), stats))
+    }
+
+    async fn snapshot_for_explicit_tracking(
+        &mut self,
+        options: &SnapshotOptions,
+    ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
+        self.abort_pending_scan()?;
+        let tree_state = self.wc.tree_state_mut()?;
+        let (is_dirty, stats, pending_scan) = tree_state
+            .snapshot_with_pending(options, false, true)
+            .await?;
         self.tree_state_dirty |= is_dirty;
         self.pending_scan = pending_scan;
         Ok((tree_state.current_tree().clone(), stats))
@@ -5337,8 +5383,9 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
         self.abort_pending_scan()?;
         let tree_state = self.wc.tree_state_mut()?;
-        let (is_dirty, stats, pending_scan) =
-            tree_state.snapshot_with_pending(options, true).await?;
+        let (is_dirty, stats, pending_scan) = tree_state
+            .snapshot_with_pending(options, true, false)
+            .await?;
         self.tree_state_dirty |= is_dirty;
         self.pending_scan = pending_scan;
         Ok((tree_state.current_tree().clone(), stats))
@@ -5879,7 +5926,7 @@ mod tests {
             awacs_compatible_input_fingerprints: vec![],
         };
         let (_, _, completion) = tree_state
-            .snapshot_with_pending(&options, true)
+            .snapshot_with_pending(&options, true, false)
             .block_on()?;
         tree_state.save()?;
         completion.unwrap().finish(ScanOutcome::Committed).unwrap();
@@ -5964,7 +6011,9 @@ mod tests {
         // The synthetic next snapshot omits an unchanged file. A full scan
         // would incorrectly delete it, so this also proves the scan is bounded.
         fs::remove_file(workspace_root.join("untouched"))?;
-        let (_, _, completion) = reloaded.snapshot_with_pending(&options, false).block_on()?;
+        let (_, _, completion) = reloaded
+            .snapshot_with_pending(&options, false, false)
+            .block_on()?;
         let schema_path = RepoPathBuf::from_internal_string("schema.json")?;
         let generated_id = store
             .write_file(&schema_path, &mut "generated schema\n".as_bytes())

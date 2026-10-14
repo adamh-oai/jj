@@ -389,3 +389,56 @@ fn test_track_ignored_directory() {
     [EOF]
     ");
 }
+
+#[cfg(all(target_os = "linux", feature = "awacs", debug_assertions))]
+#[test]
+fn test_file_track_unchanged_awacs_paths() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+    work_dir.write_file("tracked", "tracked\n");
+    work_dir.write_file(".gitignore", "ignored\n");
+    work_dir.run_jj(["commit", "-m", "initial"]).success();
+    test_env.add_config("snapshot.auto-track = 'none()'");
+    work_dir.write_file("excluded", "excluded\n");
+    work_dir.write_file("ignored", "ignored\n");
+    work_dir.write_file("untouched", "untouched\n");
+    std::fs::write(
+        work_dir.root().join(".jj/working_copy/subvolume_mode"),
+        b"enabling\n",
+    )
+    .unwrap();
+    work_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", work_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+
+    // The synthetic backend returns an empty delta after the baseline. These
+    // files can therefore only be found by the explicit tracking request.
+    for args in [
+        &["file", "track", "excluded"][..],
+        &["file", "track", "--include-ignored", "ignored"][..],
+    ] {
+        work_dir
+            .run_jj_with(|cmd| {
+                cmd.env("JJ_TEST_AWACS_SCAN_ROOT", work_dir.root())
+                    .args(args)
+            })
+            .success();
+    }
+    let files = work_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", work_dir.root())
+                .args(["file", "list"])
+        })
+        .success();
+    assert!(files.stdout.raw().lines().any(|path| path == "excluded"));
+    assert!(files.stdout.raw().lines().any(|path| path == "ignored"));
+    assert!(!files.stdout.raw().lines().any(|path| path == "untouched"));
+}

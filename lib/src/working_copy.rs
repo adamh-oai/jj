@@ -120,6 +120,18 @@ pub trait LockedWorkingCopy: Any + Send {
         options: &SnapshotOptions,
     ) -> Result<(MergedTree, SnapshotStats), SnapshotError>;
 
+    /// Snapshot while explicitly visiting paths selected for tracking.
+    ///
+    /// Unlike ordinary snapshots, this may visit unchanged paths selected by
+    /// `start_tracking_matcher` so callers can track files excluded by an
+    /// earlier snapshot.
+    async fn snapshot_for_explicit_tracking(
+        &mut self,
+        options: &SnapshotOptions,
+    ) -> Result<(MergedTree, SnapshotStats), SnapshotError> {
+        self.snapshot(options).await
+    }
+
     /// Check whether an ordinary snapshot can proceed before any related
     /// repository or working-copy mutation is published.
     fn check_snapshot_ready(&mut self, _options: &SnapshotOptions) -> Result<(), SnapshotError> {
