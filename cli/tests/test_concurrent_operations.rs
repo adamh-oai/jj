@@ -709,6 +709,252 @@ fn test_awacs_rechecks_sparse_patterns_before_git_import() -> TestResult {
     debug_assertions
 ))]
 #[test]
+fn test_awacs_rechecks_journal_when_importing_deleted_git_head() -> TestResult {
+    for (delete_during_reread, integrate) in [(false, true), (true, true), (false, false)] {
+        let mut test_env = TestEnvironment::default();
+        test_env
+            .run_jj_in(".", ["git", "init", "--colocate", "main"])
+            .success();
+        let root = test_env.env_root().join("main");
+        test_env.add_env_var("JJ_TEST_AWACS_SCAN_ROOT", &root);
+        test_env.add_env_var("JJ_TEST_AWACS_REAL_FINGERPRINT", "1");
+        let import_pause = test_env.env_root().join("pause-import");
+        std::fs::create_dir(&import_pause)?;
+        if delete_during_reread {
+            test_env.add_env_var("JJ_TEST_IMPORT_HEAD_PAUSE_DIR", &import_pause);
+        }
+        let main = test_env.work_dir("main");
+        main.write_file("subset/file", "old contents\n");
+        main.run_jj(["commit", "-m", "old"]).success();
+        main.write_file("subset/file", "new contents\n");
+        main.run_jj(["commit", "-m", "new"]).success();
+        let old_commit = main
+            .run_jj([
+                "--ignore-working-copy",
+                "log",
+                "--no-graph",
+                "-r",
+                "@--",
+                "-T",
+                "commit_id",
+            ])
+            .success()
+            .stdout
+            .into_raw()
+            .trim()
+            .to_owned();
+        std::fs::write(
+            main.root().join(".jj/working_copy/subvolume_mode"),
+            b"snapshot-backed\n",
+        )?;
+        main.run_jj(["util", "subvolume", "enable", "--rebuild-baseline"])
+            .success();
+
+        let sparse_pause = test_env.env_root().join("pause-sparse");
+        std::fs::create_dir(&sparse_pause)?;
+        let mut sparse = spawn_traced_jj(
+            &test_env,
+            &main,
+            "sparse",
+            &["sparse", "set", "--clear", "--add", "subset"],
+            Some(("JJ_TEST_SPARSE_PRE_MUTATION_PAUSE_DIR", &sparse_pause)),
+        )?;
+        wait_for_child_event(&mut sparse, || sparse_pause.join("ready").exists());
+        let run_git = |args: &[&str]| -> TestResult {
+            let template = test_env.new_jj_cmd();
+            let mut git = std::process::Command::new("git");
+            git.env_clear();
+            for (key, value) in template.get_envs() {
+                if let Some(value) = value {
+                    git.env(key, value);
+                }
+            }
+            let output = git.current_dir(main.root()).args(args).output()?;
+            assert!(
+                output.status.success(),
+                "git command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        run_git(&["checkout", "--detach", "--quiet", &old_commit])?;
+        if !delete_during_reread {
+            run_git(&["symbolic-ref", "HEAD", "refs/heads/missing"])?;
+        }
+
+        let transaction_pause = test_env.env_root().join("pause-import-transaction");
+        std::fs::create_dir(&transaction_pause)?;
+        let args = if integrate {
+            vec!["status"]
+        } else {
+            vec!["--no-integrate-operation", "status"]
+        };
+        let mut scanner = spawn_traced_jj(
+            &test_env,
+            &main,
+            "scanner",
+            &args,
+            Some((
+                "JJ_TEST_IMPORT_HEAD_TRANSACTION_PRE_JOURNAL_PAUSE_DIR",
+                &transaction_pause,
+            )),
+        )?;
+        if delete_during_reread {
+            wait_for_child_event(&mut scanner, || import_pause.join("ready").exists());
+            run_git(&["symbolic-ref", "HEAD", "refs/heads/missing"])?;
+            std::fs::write(import_pause.join("release"), b"release\n")?;
+        }
+        wait_for_child_event(&mut scanner, || transaction_pause.join("ready").exists());
+        std::fs::write(sparse_pause.join("release"), b"release\n")?;
+        sparse.assert_success();
+        let saved_operation = main.current_operation_id();
+        let journal = main.root().join(".jj/working_copy/checkout");
+        let saved_journal = std::fs::read(&journal)?;
+        std::fs::write(transaction_pause.join("release"), b"release\n")?;
+        scanner.assert_failure_containing("working copy changed");
+        assert_eq!(main.current_operation_id(), saved_operation);
+        assert_eq!(std::fs::read(journal)?, saved_journal);
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "test-fakes",
+    feature = "awacs",
+    target_os = "linux",
+    debug_assertions
+))]
+#[test]
+fn test_import_deleted_git_head_accepts_fresh_lagging_journal() -> TestResult {
+    for use_awacs in [false, true] {
+        let mut test_env = TestEnvironment::default();
+        test_env
+            .run_jj_in(".", ["git", "init", "--colocate", "main"])
+            .success();
+        if use_awacs {
+            let root = test_env.env_root().join("main");
+            test_env.add_env_var("JJ_TEST_AWACS_SCAN_ROOT", &root);
+            test_env.add_env_var("JJ_TEST_AWACS_REAL_FINGERPRINT", "1");
+        }
+        let main = test_env.work_dir("main");
+        main.write_file("saved", "contents\n");
+        main.run_jj(["commit", "-m", "base"]).success();
+        if use_awacs {
+            std::fs::write(
+                main.root().join(".jj/working_copy/subvolume_mode"),
+                b"snapshot-backed\n",
+            )?;
+            main.run_jj(["util", "subvolume", "enable", "--rebuild-baseline"])
+                .success();
+        }
+        let journal = main.root().join(".jj/working_copy/checkout");
+        let before_journal = std::fs::read(&journal)?;
+        let before_operation = main.current_operation_id();
+        main.run_jj([
+            "--ignore-working-copy",
+            "bookmark",
+            "set",
+            "other",
+            "-r",
+            "@-",
+        ])
+        .success();
+        assert_ne!(main.current_operation_id(), before_operation);
+        assert_eq!(std::fs::read(&journal)?, before_journal);
+
+        let template = test_env.new_jj_cmd();
+        let mut git = std::process::Command::new("git");
+        git.env_clear();
+        for (key, value) in template.get_envs() {
+            if let Some(value) = value {
+                git.env(key, value);
+            }
+        }
+        let output = git
+            .current_dir(main.root())
+            .args(["symbolic-ref", "HEAD", "refs/heads/missing"])
+            .output()?;
+        assert!(output.status.success());
+        main.run_jj(["status"]).success();
+        assert_eq!(main.read_file("saved"), "contents\n");
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "test-fakes",
+    feature = "awacs",
+    target_os = "linux",
+    debug_assertions
+))]
+#[test]
+fn test_import_deleted_git_head_rejects_changed_subvolume_mode() -> TestResult {
+    for initial_awacs in [false, true] {
+        let mut test_env = TestEnvironment::default();
+        test_env
+            .run_jj_in(".", ["git", "init", "--colocate", "main"])
+            .success();
+        let root = test_env.env_root().join("main");
+        test_env.add_env_var("JJ_TEST_AWACS_SCAN_ROOT", &root);
+        let main = test_env.work_dir("main");
+        main.write_file("saved", "contents\n");
+        main.run_jj(["commit", "-m", "base"]).success();
+        let marker = main.root().join(".jj/working_copy/subvolume_mode");
+        if initial_awacs {
+            std::fs::write(&marker, b"snapshot-backed\n")?;
+            main.run_jj(["util", "subvolume", "enable", "--rebuild-baseline"])
+                .success();
+        }
+        let template = test_env.new_jj_cmd();
+        let mut git = std::process::Command::new("git");
+        git.env_clear();
+        for (key, value) in template.get_envs() {
+            if let Some(value) = value {
+                git.env(key, value);
+            }
+        }
+        let output = git
+            .current_dir(main.root())
+            .args(["symbolic-ref", "HEAD", "refs/heads/missing"])
+            .output()?;
+        assert!(output.status.success());
+
+        let pause = test_env.env_root().join("pause-transaction");
+        std::fs::create_dir(&pause)?;
+        let mut scanner = spawn_traced_jj(
+            &test_env,
+            &main,
+            "scanner",
+            &["status"],
+            Some((
+                "JJ_TEST_IMPORT_HEAD_TRANSACTION_PRE_JOURNAL_PAUSE_DIR",
+                &pause,
+            )),
+        )?;
+        wait_for_child_event(&mut scanner, || pause.join("ready").exists());
+        let saved_operation = main.current_operation_id();
+        let journal = main.root().join(".jj/working_copy/checkout");
+        let saved_journal = std::fs::read(&journal)?;
+        if initial_awacs {
+            std::fs::remove_file(&marker)?;
+        } else {
+            std::fs::write(&marker, b"snapshot-backed\n")?;
+        }
+        std::fs::write(pause.join("release"), b"release\n")?;
+        scanner.assert_failure_containing("subvolume mode changed");
+        assert_eq!(main.current_operation_id(), saved_operation);
+        assert_eq!(std::fs::read(journal)?, saved_journal);
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    feature = "test-fakes",
+    feature = "awacs",
+    target_os = "linux",
+    debug_assertions
+))]
+#[test]
 fn test_awacs_non_colocated_snapshot_rejects_changed_sparse_patterns() -> TestResult {
     let mut test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();

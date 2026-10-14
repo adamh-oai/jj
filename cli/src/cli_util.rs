@@ -2339,6 +2339,18 @@ impl WorkspaceCommandHelper {
         } else {
             // A re-read can observe that HEAD was deleted while waiting.
             // The transaction path below acquires its own working-copy lock.
+            let expected_snapshot_operation = if snapshot_preflight.is_some() {
+                Some(
+                    locked_ws
+                        .as_mut()
+                        .expect("working copy locked for preflight")
+                        .locked_wc()
+                        .old_operation_id()
+                        .clone(),
+                )
+            } else {
+                None
+            };
             drop(locked_ws);
             // Unlikely, but the HEAD ref got deleted by git?
             let num_rebased = tx
@@ -2350,9 +2362,16 @@ impl WorkspaceCommandHelper {
                 writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")
                     .map_err(snapshot_command_error)?;
             }
-            self.finish_transaction(ui, tx, "import git head", git_import_export_lock)
-                .await
-                .map_err(snapshot_command_error)?;
+            self.finish_transaction(
+                ui,
+                tx,
+                "import git head",
+                git_import_export_lock,
+                true,
+                expected_snapshot_operation.as_ref(),
+            )
+            .await
+            .map_err(snapshot_command_error)?;
         }
         Ok(journal_ahead)
     }
@@ -2392,8 +2411,15 @@ impl WorkspaceCommandHelper {
                 "Rebased {num_rebased} descendant commits off of commits rewritten from Git."
             )?;
         }
-        self.finish_transaction(ui, tx, "import git refs", git_import_export_lock)
-            .await?;
+        self.finish_transaction(
+            ui,
+            tx,
+            "import git refs",
+            git_import_export_lock,
+            false,
+            None,
+        )
+        .await?;
         writeln!(
             ui.status(),
             "Done importing changes from the underlying Git repo."
@@ -3748,8 +3774,29 @@ to the current parents may contain changes from multiple commits.
         mut tx: Transaction,
         description: impl Into<String>,
         git_import_export_lock: &GitImportExportLock,
+        check_snapshot_ready: bool,
+        expected_snapshot_operation: Option<&OperationId>,
     ) -> Result<(), CommandError> {
         let old_repo = tx.base_repo().clone();
+
+        // Importing a deleted Git HEAD releases its first journal lock before
+        // entering this transaction. Recheck against the lock actually held
+        // through publication, since sparse state or the baseline may have
+        // changed in that interval.
+        let subvolume_marker = self
+            .workspace_root()
+            .join(".jj/working_copy/subvolume_mode");
+        let snapshot_preflight = if check_snapshot_ready && expected_snapshot_operation.is_some() {
+            let options = self.snapshot_options_with_start_tracking_matcher(&NothingMatcher)?;
+            let sparse_patterns = self
+                .working_copy()
+                .sparse_patterns()
+                .ok()
+                .map(<[_]>::to_vec);
+            Some((options, sparse_patterns))
+        } else {
+            None
+        };
 
         let maybe_old_wc_commit = old_repo
             .view()
@@ -3805,9 +3852,66 @@ to the current parents may contain changes from multiple commits.
         // Hold the working-copy lock across Git mutation, operation
         // publication, and checkout. Persist pending_checkout before the first
         // Git mutation so a failed finalization cannot look clean later.
-        let mut locked_ws = if self.may_update_working_copy {
-            if let Some(new_commit) = &maybe_new_wc_commit {
-                let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+        #[cfg(feature = "test-fakes")]
+        if check_snapshot_ready {
+            pause_for_test("JJ_TEST_IMPORT_HEAD_TRANSACTION_PRE_JOURNAL_PAUSE_DIR");
+        }
+        // Check before loading the journal too: if the marker was removed,
+        // the working-copy loader could otherwise try to decode a compact
+        // journal as the legacy format.
+        if check_snapshot_ready
+            && subvolume_marker.is_file() != expected_snapshot_operation.is_some()
+        {
+            return Err(user_error(
+                "The working-copy subvolume mode changed while preparing the Git HEAD import. \
+                 Retry the command.",
+            ));
+        }
+        let mut locked_ws = if (self.may_update_working_copy && maybe_new_wc_commit.is_some())
+            || check_snapshot_ready
+        {
+            let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+            if check_snapshot_ready
+                && subvolume_marker.is_file() != expected_snapshot_operation.is_some()
+            {
+                return Err(user_error(
+                    "The working-copy subvolume mode changed while preparing the Git HEAD import. \
+                     Retry the command.",
+                ));
+            }
+            if let Some((options, initial_sparse_patterns)) = &snapshot_preflight {
+                let locked_wc = locked_ws.locked_wc();
+                let sparse_changed = if let Some(patterns) = initial_sparse_patterns {
+                    locked_wc.sparse_patterns()? != patterns
+                } else {
+                    false
+                };
+                if expected_snapshot_operation != Some(locked_wc.old_operation_id())
+                    || sparse_changed
+                {
+                    return Err(user_error(
+                        "The working copy changed while preparing the Git HEAD import. Retry the \
+                         command.",
+                    ));
+                }
+                let Some(old_commit) = &maybe_old_wc_commit else {
+                    return Err(user_error(
+                        "The workspace has no working-copy commit for the Git HEAD import.",
+                    ));
+                };
+                if WorkingCopyFreshness::check_stale(locked_wc, old_commit, &old_repo).await?
+                    != WorkingCopyFreshness::Fresh
+                {
+                    return Err(user_error(
+                        "The working copy is not current enough to import Git HEAD. Retry or \
+                         reconcile the workspace first.",
+                    ));
+                }
+                locked_wc.check_snapshot_ready(options)?;
+            }
+            if self.may_update_working_copy
+                && let Some(new_commit) = &maybe_new_wc_commit
+            {
                 if let Some(old_commit) = &maybe_old_wc_commit
                     && old_commit.tree().tree_ids_and_labels()
                         != locked_ws.locked_wc().old_tree().tree_ids_and_labels()
@@ -3836,10 +3940,8 @@ to the current parents may contain changes from multiple commits.
                             )
                         })?;
                 }
-                Some(locked_ws)
-            } else {
-                None
             }
+            Some(locked_ws)
         } else {
             None
         };
@@ -3877,6 +3979,11 @@ to the current parents may contain changes from multiple commits.
             ));
         }
 
+        if !self.may_update_working_copy {
+            // This lock was only needed to validate the import before
+            // publication; an uncommitted transaction must not advance it.
+            drop(locked_ws.take());
+        }
         let maybe_checkout_stats = if let Some(mut locked_ws) = locked_ws.take() {
             if let Some(new_commit) = &maybe_new_wc_commit {
                 // Git and the operation are published, and the journal is
@@ -4377,7 +4484,7 @@ impl WorkspaceCommandTransaction<'_> {
         // Git HEAD export happens atomically with the transaction commit.
         let git_import_export_lock = helper.lock_git_import_export()?;
         helper
-            .finish_transaction(ui, tx, description, &git_import_export_lock)
+            .finish_transaction(ui, tx, description, &git_import_export_lock, false, None)
             .await
     }
 
