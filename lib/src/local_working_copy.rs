@@ -1615,8 +1615,8 @@ impl TreeState {
             if self.has_interrupted_sparse_materialization() {
                 return Err(invalid_working_copy_state(
                     state_path,
-                    "an interrupted sparse update must be reconciled before rebuilding the \
-                     AWACS baseline; preserve the working-copy files and journal",
+                    "an interrupted sparse update must be reconciled before rebuilding the AWACS \
+                     baseline; preserve the working-copy files and journal",
                 ));
             }
             return Err(invalid_working_copy_state(
