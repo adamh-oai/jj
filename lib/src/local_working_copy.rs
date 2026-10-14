@@ -5504,6 +5504,7 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             self.tree_state_dirty
                 || self.old_tree.tree_ids_and_labels() == self.wc.tree()?.tree_ids_and_labels()
         );
+        let mut promotion_error = None;
         if let Some(pending_scan) = self.pending_scan.as_mut() {
             let started = Instant::now();
             let result = pending_scan.prepare_to_commit();
@@ -5515,13 +5516,14 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
             if let Err(err) = result {
                 // The tree produced from the immutable scan is still useful,
                 // but its cursor is no longer safe to persist. Abort the
-                // accepted lease and save the tree without a cursor so the
-                // next snapshot must request Full.
+                // accepted lease and save the tree without a cursor. Report
+                // the failure after saving so the user can rebuild it.
                 tracing::warn!(
                     ?err,
                     "AWACS scan lease failed before tree-state commit; clearing cursor"
                 );
                 self.abort_pending_scan()?;
+                promotion_error = Some(err);
             }
         }
         if self.old_operation_id != operation_id || self.new_workspace_name.is_some() {
@@ -5543,6 +5545,15 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
                 self.abort_pending_scan()?;
                 return Err(err);
             }
+        }
+        if let Some(err) = promotion_error {
+            return Err(WorkingCopyStateError {
+                message: "The working-copy state was saved, but AWACS did not publish a committed \
+                          snapshot baseline. Run `jj util subvolume enable --rebuild-baseline` to \
+                          rebuild it."
+                    .to_owned(),
+                err,
+            });
         }
         if let Some(pending_scan) = self.pending_scan.take() {
             let started = Instant::now();

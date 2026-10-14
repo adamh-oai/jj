@@ -9679,3 +9679,100 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     "#;
     work_dir.run_jj(["log", "-T", template, "-r", "all()"])
 }
+
+#[cfg(all(target_os = "linux", feature = "awacs", debug_assertions))]
+#[test]
+fn test_awacs_lease_promotion_failure_reports_saved_snapshot() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let secondary_dir = test_env.work_dir("secondary");
+    main_dir.run_jj(["workspace", "rename", "main"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "--no-colocate", "../secondary"])
+        .success();
+    main_dir.run_jj(["status"]).success();
+    std::fs::write(
+        main_dir.root().join(".jj/working_copy/subvolume_mode"),
+        b"enabling\n",
+    )?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+
+    // A rebuild snapshots this new file before promotion fails. The saved
+    // operation and the file on disk must both survive the reported error.
+    main_dir.write_file("saved", "local changes\n");
+    let rebuild = main_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+            .env("JJ_TEST_AWACS_FAIL_LEASE_PREPARE", "1")
+            .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+    });
+    assert!(!rebuild.status.success(), "{rebuild}");
+    assert!(
+        rebuild.stderr.raw().contains("--rebuild-baseline"),
+        "{rebuild}"
+    );
+    assert!(
+        rebuild
+            .stderr
+            .raw()
+            .contains("injected AWACS lease prepare failure"),
+        "{rebuild}"
+    );
+    assert_eq!(main_dir.read_file("saved"), "local changes\n");
+    let saved = secondary_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "file",
+            "show",
+            "-r",
+            "main@",
+            "saved",
+        ])
+        .success();
+    assert_eq!(saved.stdout.raw(), "local changes\n");
+    let status = main_dir.run_jj(["util", "subvolume", "status"]).success();
+    assert!(
+        status
+            .stdout
+            .raw()
+            .contains("JJ journal: missing committed baseline"),
+        "{status}"
+    );
+
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+    let snapshot = main_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+            .env("JJ_TEST_AWACS_FAIL_LEASE_PREPARE", "1")
+            .arg("status")
+    });
+    assert!(!snapshot.status.success(), "{snapshot}");
+    assert!(
+        snapshot.stderr.raw().contains("--rebuild-baseline"),
+        "{snapshot}"
+    );
+    let next = main_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+            .arg("status")
+    });
+    assert!(!next.status.success(), "{next}");
+    assert!(next.stderr.raw().contains("--rebuild-baseline"), "{next}");
+    Ok(())
+}
