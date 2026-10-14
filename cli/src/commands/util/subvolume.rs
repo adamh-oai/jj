@@ -268,7 +268,9 @@ async fn cmd_util_subvolume_impl(
             // working copy after that rename can leave its checkout state
             // paired with the old pathname.
             let operation_id = workspace_command.repo().op_id().clone();
-            let (mut locked_workspace, _commit) = workspace_command.unchecked_start_working_copy_mutation().await?;
+            let (mut locked_workspace, _commit) = workspace_command
+                .unchecked_start_working_copy_mutation()
+                .await?;
             if !reset_local_working_copy_fsmonitor(locked_workspace.locked_wc())? {
                 return Err(user_error(
                     "This command requires a standard local-disk working copy",
@@ -330,14 +332,16 @@ async fn rebuild_snapshot_baseline(
     // Match ordinary snapshot lock ordering and keep the journal unchanged
     // while validating its operation and semantic tree.
     let git_import_export_lock = workspace_command.lock_git_import_export()?;
-    let (mut locked_workspace, commit) = workspace_command.unchecked_start_working_copy_mutation().await?;
+    let (mut locked_workspace, commit) = workspace_command
+        .unchecked_start_working_copy_mutation()
+        .await?;
     // The helper was loaded before waiting for these locks. Refuse to reset a
     // journal against an operation that another workspace has already changed.
     let published_operation = command.resolve_operation(ui, repo.loader(), &workspace_name)?;
     if published_operation.id() != repo.op_id() {
         return Err(user_error(
-            "The repository changed while preparing the AWACS baseline rebuild. Retry \
-             `jj util subvolume enable --rebuild-baseline`.",
+            "The repository changed while preparing the AWACS baseline rebuild. Retry `jj util \
+             subvolume enable --rebuild-baseline`.",
         ));
     }
     let locked_wc = locked_workspace.locked_wc();
@@ -396,8 +400,8 @@ async fn rebuild_snapshot_baseline(
         }
     } else if !seed_initial_tree && (!same_tree || freshness != WorkingCopyFreshness::Fresh) {
         return Err(user_error(
-            "Cannot rebuild AWACS baseline: working copy operation or tree is ambiguous. \
-             Preserve the working-copy files and resolve the journal state before retrying.",
+            "Cannot rebuild AWACS baseline: working copy operation or tree is ambiguous. Preserve \
+             the working-copy files and resolve the journal state before retrying.",
         ));
     }
 
@@ -1683,7 +1687,9 @@ async fn reset_local_working_copy_state(
     // The topology/mode switch deliberately changes how the same semantic
     // tree is encoded on disk, so the ordinary old-tree consistency check
     // would compare different state formats and reject the transition.
-    let (mut locked_workspace, _commit) = workspace_command.unchecked_start_working_copy_mutation().await?;
+    let (mut locked_workspace, _commit) = workspace_command
+        .unchecked_start_working_copy_mutation()
+        .await?;
     if !reset_local_working_copy_fsmonitor(locked_workspace.locked_wc())? {
         return Err(user_error(
             "This command requires a standard local-disk working copy",

@@ -1619,8 +1619,8 @@ impl WorkspaceCommandHelper {
             )?;
             if op.id() != expected {
                 return Err(user_error(
-                    "The repository changed while preparing the AWACS baseline rebuild. Retry \
-                     `jj util subvolume enable --rebuild-baseline`.",
+                    "The repository changed while preparing the AWACS baseline rebuild. Retry `jj \
+                     util subvolume enable --rebuild-baseline`.",
                 ));
             }
         }
@@ -2670,15 +2670,19 @@ to the current parents may contain changes from multiple commits.
             let locked_wc = locked_ws.locked_wc();
             if locked_wc.old_operation_id() != expected {
                 return Err(snapshot_command_error(user_error(
-                    "The working copy changed while preparing the AWACS baseline rebuild. \
-                     Retry `jj util subvolume enable --rebuild-baseline`.",
+                    "The working copy changed while preparing the AWACS baseline rebuild. Retry \
+                     `jj util subvolume enable --rebuild-baseline`.",
                 )));
             }
-            let commit_id = repo.view().get_wc_commit_id(&workspace_name).ok_or_else(|| {
-                snapshot_command_error(user_error(
-                    "Cannot rebuild AWACS baseline: the recorded operation has no workspace commit.",
-                ))
-            })?;
+            let commit_id = repo
+                .view()
+                .get_wc_commit_id(&workspace_name)
+                .ok_or_else(|| {
+                    snapshot_command_error(user_error(
+                        "Cannot rebuild AWACS baseline: the recorded operation has no workspace \
+                         commit.",
+                    ))
+                })?;
             let commit = repo
                 .store()
                 .get_commit_async(commit_id)
@@ -2724,8 +2728,8 @@ to the current parents may contain changes from multiple commits.
                 .map_err(snapshot_command_error)?;
             if op.id() != expected {
                 return Err(snapshot_command_error(user_error(
-                    "The repository changed during AWACS baseline rebuilding. Retry \
-                     `jj util subvolume enable --rebuild-baseline`.",
+                    "The repository changed during AWACS baseline rebuilding. Retry `jj util \
+                     subvolume enable --rebuild-baseline`.",
                 )));
             }
         }
@@ -2856,21 +2860,18 @@ to the current parents may contain changes from multiple commits.
             let workspace_revset = shell_quote(&workspace_revset);
             writeln!(
                 ui.warning_default(),
-                "The stale working copy has not been reconciled. Its files remain unchanged.\n\
-                 Review the saved working-copy snapshot with:\n\
-                   jj --at-operation {saved} diff -r {workspace_revset}\n\
-                 Review the newer workspace with:\n\
-                   jj --at-operation {newer} log -r {workspace_revset}\n\
-                 If this workspace cannot load, run these commands from another workspace in \
-                 the same repository. If rebuild fails, retrying it may require manually \
-                 reconciling operations. Ordinary jj commands may reconcile automatically \
-                 when snapshot.auto-update-stale is enabled; use --ignore-working-copy to \
-                 inspect without changing files. Preserve untracked and ignored files before \
-                 reconciling. After deciding how to reconcile changes, run \
-                 `jj workspace update-stale`. That command may move edits out of the working \
-                 copy; changes included in the saved snapshot remain in operation history. \
-                 This rebuild does not refresh the Git fsmonitor baseline while the workspace \
-                 is stale."
+                "The stale working copy has not been reconciled. Its files remain \
+                 unchanged.\nReview the saved working-copy snapshot with:\njj --at-operation \
+                 {saved} diff -r {workspace_revset}\nReview the newer workspace with:\njj \
+                 --at-operation {newer} log -r {workspace_revset}\nIf this workspace cannot load, \
+                 run these commands from another workspace in the same repository. If rebuild \
+                 fails, retrying it may require manually reconciling operations. Ordinary jj \
+                 commands may reconcile automatically when snapshot.auto-update-stale is enabled; \
+                 use --ignore-working-copy to inspect without changing files. Preserve untracked \
+                 and ignored files before reconciling. After deciding how to reconcile changes, \
+                 run `jj workspace update-stale`. That command may move edits out of the working \
+                 copy; changes included in the saved snapshot remain in operation history. This \
+                 rebuild does not refresh the Git fsmonitor baseline while the workspace is stale."
             )
             .map_err(snapshot_command_error)?;
         }
