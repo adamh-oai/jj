@@ -287,6 +287,7 @@ fn seed_test_awacs_baseline(
         retention_token: cursor.to_vec(),
         interpretation_input_fingerprint: input_fingerprint.to_vec(),
     });
+    journal.untracked_scan_complete = true;
     write_compact_working_copy_state(state_path, &journal)
 }
 
@@ -3242,7 +3243,7 @@ fn test_compact_working_copy_state_migrates_legacy_tree_state() -> TestResult {
     tree_state.save()?;
 
     let journal = read_compact_working_copy_state(&state_path)?;
-    assert_eq!(journal.format_version, 3);
+    assert_eq!(journal.format_version, 4);
     assert_eq!(
         journal.tree_ids,
         semantic_tree
@@ -3311,7 +3312,7 @@ fn test_compact_working_copy_state_upgrades_version_two() -> TestResult {
     tree_state.save()?;
 
     let upgraded = read_compact_working_copy_state(&state_path)?;
-    assert_eq!(upgraded.format_version, 3);
+    assert_eq!(upgraded.format_version, 4);
     assert!(upgraded.generation > journal.generation);
     assert_eq!(upgraded.tree_ids, journal.tree_ids);
     assert_eq!(upgraded.sparse_patterns, journal.sparse_patterns);
@@ -3371,6 +3372,157 @@ fn test_compact_working_copy_state_rejects_invalid_pending_scan_paths() -> TestR
             assert_eq!(read_compact_working_copy_state(&state_path)?, invalid);
         }
     }
+    Ok(())
+}
+
+#[test_case(2; "version two")]
+#[test_case(3; "version three")]
+fn test_old_awacs_journal_requires_full_rebuild_for_untracked_paths(version: u32) -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    enable_snapshot_mode(&state_path)?;
+    let settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root: workspace_root.clone(),
+            changed_files: Some(vec![]),
+            cursor: b"next-baseline".to_vec(),
+        },
+        ..TreeStateSettings::try_from_user_settings(repo.settings())?
+    };
+    TreeState::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+    seed_test_awacs_baseline(&state_path, b"old-baseline", [3; 32])?;
+    let mut old = read_compact_working_copy_state(&state_path)?;
+    old.format_version = version;
+    old.untracked_scan_paths.clear();
+    write_compact_working_copy_state(&state_path, &old)?;
+    testutils::write_working_copy_file(&workspace_root, repo_path("omitted"), "contents\n");
+    let mut tree_state = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        &settings,
+    )?;
+    let options = SnapshotOptions {
+        start_tracking_matcher: &jj_lib::matchers::NothingMatcher,
+        awacs_input_fingerprint: Some([3; 32]),
+        ..empty_snapshot_options()
+    };
+    let err = tree_state.snapshot(&options).block_on().unwrap_err();
+    assert!(format!("{err:?}").contains("jj util subvolume enable --rebuild-baseline"));
+    // A metadata-only rewrite upgrades the format but must not mark the
+    // omitted-path record complete until a full scan has actually run.
+    tree_state.save()?;
+    let upgraded = read_compact_working_copy_state(&state_path)?;
+    assert_eq!(upgraded.format_version, 4);
+    assert!(!upgraded.untracked_scan_complete);
+    let mut tree_state =
+        TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
+    let err = tree_state.snapshot(&options).block_on().unwrap_err();
+    assert!(format!("{err:?}").contains("jj util subvolume enable --rebuild-baseline"));
+    let (_, stats) = tree_state
+        .snapshot_for_awacs_baseline(&options)
+        .block_on()?;
+    assert_matches!(
+        stats.untracked_paths.get(repo_path("omitted")),
+        Some(UntrackedReason::FileNotAutoTracked)
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+#[test]
+fn test_initialized_awacs_baseline_inherits_untracked_paths_and_input_fingerprint() -> TestResult {
+    use jj_lib::local_working_copy::UntrackedScanState;
+    use jj_lib::local_working_copy::seed_local_working_copy_initialized_awacs_baseline;
+
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    enable_snapshot_mode(&state_path)?;
+    testutils::write_working_copy_file(&workspace_root, repo_path("inherited"), "contents\n");
+    let wc = LocalWorkingCopy::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        repo.op_id().clone(),
+        WorkspaceName::DEFAULT.to_owned(),
+        repo.settings(),
+    )?;
+    let inherited = UntrackedScanState {
+        paths: vec![repo_path_buf("inherited")],
+        input_fingerprint: vec![3; 32],
+    };
+    let identity = btrfs_awacs::manager::SnapshotIdentity {
+        fs_uuid: [1; 16],
+        subvol_uuid: [2; 16],
+        parent_uuid: None,
+        received_uuid: None,
+        root_id: 1,
+        ctransid: 1,
+        otransid: 1,
+        path: vec![],
+        readonly: true,
+        created_ns: 0,
+    };
+    let mut locked = wc.start_mutation().block_on()?;
+    assert!(
+        seed_local_working_copy_initialized_awacs_baseline(
+            locked.as_mut(),
+            &identity,
+            Some([4; 16]),
+            [9; 32],
+            Some(&inherited),
+        )
+        .block_on()?
+    );
+    locked.finish(repo.op_id().clone()).block_on()?;
+
+    let copied = LocalWorkingCopy::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        repo.settings(),
+    )?
+    .untracked_scan_state()?
+    .unwrap();
+    assert_eq!(copied.paths, inherited.paths);
+    assert_eq!(copied.input_fingerprint, inherited.input_fingerprint);
+
+    let settings = TreeStateSettings {
+        fsmonitor_settings: FsmonitorSettings::TestAwacs {
+            scan_root: workspace_root.clone(),
+            changed_files: Some(vec![]),
+            cursor: b"next-baseline".to_vec(),
+        },
+        ..TreeStateSettings::try_from_user_settings(repo.settings())?
+    };
+    let mut tree_state =
+        TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
+    let mut options = SnapshotOptions {
+        start_tracking_matcher: &jj_lib::matchers::NothingMatcher,
+        awacs_input_fingerprint: Some([9; 32]),
+        ..empty_snapshot_options()
+    };
+    let err = tree_state.snapshot(&options).block_on().unwrap_err();
+    assert!(format!("{err:?}").contains("jj util subvolume enable --rebuild-baseline"));
+    options.awacs_input_fingerprint = Some([3; 32]);
+    let (_, stats) = tree_state.snapshot(&options).block_on()?;
+    assert_matches!(
+        stats.untracked_paths.get(repo_path("inherited")),
+        Some(UntrackedReason::FileNotAutoTracked)
+    );
     Ok(())
 }
 

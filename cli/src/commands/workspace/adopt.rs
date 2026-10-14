@@ -145,7 +145,7 @@ pub async fn cmd_workspace_adopt(
         None
     };
     #[cfg(all(target_os = "linux", feature = "awacs"))]
-    let snapshot_seed_tree = if snapshot {
+    let snapshot_seed = if snapshot {
         if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
             None
         } else {
@@ -178,12 +178,23 @@ pub async fn cmd_workspace_adopt(
                     "Cannot adopt snapshot worktree with unrecorded source filesystem changes",
                 ));
             }
-            Some(
+            let untracked = copied_working_copy
+                .untracked_scan_state()
+                .map_err(|err| user_error(format!("Failed to read copied JJ journal: {err}")))?
+                .ok_or_else(|| {
+                    user_error(
+                        "Cannot adopt snapshot worktree without a complete source AWACS baseline; \
+                         run jj util subvolume enable --rebuild-baseline in the source workspace \
+                         and recreate the worktree",
+                    )
+                })?;
+            Some((
                 copied_working_copy
                     .tree()
                     .map_err(|err| user_error(format!("Failed to read copied JJ tree: {err}")))?
                     .clone(),
-            )
+                untracked,
+            ))
         }
     } else {
         None
@@ -300,10 +311,11 @@ pub async fn cmd_workspace_adopt(
         // created; in that case the final snapshot below reconciles A -> B
         // against the working-copy commit already based on that Git HEAD.
         let synthetic_seed_tree = wc_commit.tree();
+        let snapshot_seed_tree = snapshot_seed.as_ref().map(|(tree, _)| tree);
         adoption_try!(
             seed_snapshot_adopt_tree(
                 &mut workspace_command,
-                snapshot_seed_tree.as_ref().unwrap_or(&synthetic_seed_tree),
+                snapshot_seed_tree.unwrap_or(&synthetic_seed_tree),
             )
             .await
         );
@@ -313,6 +325,7 @@ pub async fn cmd_workspace_adopt(
                     ui,
                     &pending_jj_seed.snapshot_identity,
                     Some(pending_jj_seed.owner_id),
+                    snapshot_seed.as_ref().map(|(_, untracked)| untracked),
                 )
                 .await
         );
@@ -322,16 +335,26 @@ pub async fn cmd_workspace_adopt(
         // bypass new-file limits and ignores during that reconciliation.
         let target_tracking_matcher = adoption_try!(
             snapshot_adopt_tracking_matcher(
-                snapshot_seed_tree.as_ref().unwrap_or(&synthetic_seed_tree),
+                snapshot_seed_tree.unwrap_or(&synthetic_seed_tree),
                 &synthetic_seed_tree,
             )
             .await
         );
-        adoption_try!(
-            workspace_command
-                .maybe_snapshot_with_force_tracking(ui, &target_tracking_matcher)
-                .await
-        );
+        if snapshot_seed.is_none() {
+            // Synthetic snapshot tests have no source journal to inherit, so
+            // establish a complete baseline by scanning their test root.
+            adoption_try!(
+                workspace_command
+                    .snapshot_for_subvolume_enable(ui, &|_| Ok(()), None)
+                    .await
+            );
+        } else {
+            adoption_try!(
+                workspace_command
+                    .maybe_snapshot_with_force_tracking(ui, &target_tracking_matcher)
+                    .await
+            );
+        }
         clear_pending_jj_consumer_seed(&worktree)?;
         writeln!(
             ui.status(),

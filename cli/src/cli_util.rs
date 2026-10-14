@@ -1710,6 +1710,7 @@ impl WorkspaceCommandHelper {
         ui: &Ui,
         snapshot_identity: &btrfs_awacs::manager::SnapshotIdentity,
         baseline_owner_id: Option<[u8; 16]>,
+        inherited_untracked: Option<&jj_lib::local_working_copy::UntrackedScanState>,
     ) -> Result<(), CommandError> {
         let auto_tracking_matcher = self.auto_tracking_matcher(ui)?;
         let options = self.snapshot_options_with_start_tracking_matcher(&auto_tracking_matcher)?;
@@ -1727,6 +1728,7 @@ impl WorkspaceCommandHelper {
             snapshot_identity,
             baseline_owner_id,
             input_fingerprint,
+            inherited_untracked,
         )
         .await
         .map_err(internal_error)?

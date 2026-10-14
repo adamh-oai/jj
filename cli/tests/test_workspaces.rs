@@ -4706,6 +4706,213 @@ fn test_util_subvolume_rebuild_missing_baseline(marker: &str, colocated: bool) -
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]
+fn test_awacs_revisits_untracked_paths_after_baseline_advances() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.add_config(r#"snapshot.auto-track = "none()""#);
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("initial", "initial\n");
+    main_dir.run_jj(["file", "track", "initial"]).success();
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.write_file("keep", "kept untracked\n");
+    main_dir.write_file("track", "track explicitly\n");
+    main_dir.write_file("delete", "delete later\n");
+    std::fs::write(
+        main_dir.root().join(".jj/working_copy/subvolume_mode"),
+        b"enabling\n",
+    )?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+
+    for _ in 0..2 {
+        let output = main_dir
+            .run_jj_with(|cmd| {
+                cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                    .arg("status")
+            })
+            .success();
+        for path in ["keep", "track", "delete"] {
+            assert!(output.stdout.raw().contains(path), "{path}: {output}");
+        }
+    }
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .args(["file", "track", "track"])
+        })
+        .success();
+    std::fs::remove_file(main_dir.root().join("delete"))?;
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
+        })
+        .success();
+    assert!(output.stdout.raw().contains("? keep"), "{output}");
+    assert!(output.stdout.raw().contains("A track"), "{output}");
+    assert!(!output.stdout.raw().contains("delete"), "{output}");
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "--ignore-working-copy",
+                "file",
+                "list",
+            ])
+        })
+        .success();
+    assert!(output.stdout.raw().contains("track"), "{output}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
+fn test_awacs_revisits_oversized_paths_until_they_are_small_enough() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("snapshot.max-new-file-size = 4");
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("initial", "ok\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.write_file("large", "too large\n");
+    std::fs::write(
+        main_dir.root().join(".jj/working_copy/subvolume_mode"),
+        b"enabling\n",
+    )?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+    for _ in 0..2 {
+        let output = main_dir
+            .run_jj_with(|cmd| {
+                cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                    .arg("status")
+            })
+            .success();
+        assert!(output.stdout.raw().contains("? large"), "{output}");
+        assert!(output.stderr.raw().contains("large"), "{output}");
+    }
+    main_dir.write_file("large", "ok\n");
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
+        })
+        .success();
+    assert!(output.stdout.raw().contains("A large"), "{output}");
+    assert!(!output.stdout.raw().contains("? large"), "{output}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
+fn test_awacs_remembers_untracked_paths_through_ignore_changes() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.add_config(r#"snapshot.auto-track = "none()""#);
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("initial", "initial\n");
+    main_dir.run_jj(["file", "track", "initial"]).success();
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir.write_file("keep", "kept untracked\n");
+    main_dir.write_file("ignored-dir/file", "kept in directory\n");
+    main_dir.write_file("replace", "file replaced by directory\n");
+    std::fs::write(
+        main_dir.root().join(".jj/working_copy/subvolume_mode"),
+        b"enabling\n",
+    )?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+
+    main_dir.write_file(".gitignore", "keep\nignored-dir/\n");
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
+        })
+        .success();
+    assert!(!output.stdout.raw().contains("? keep"), "{output}");
+    assert!(!output.stdout.raw().contains("? ignored-dir/"), "{output}");
+    std::fs::remove_file(main_dir.root().join(".gitignore"))?;
+    std::fs::remove_file(main_dir.root().join("replace"))?;
+    main_dir.write_file("replace/child", "new child\n");
+    for _ in 0..2 {
+        let output = main_dir
+            .run_jj_with(|cmd| {
+                cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                    .arg("status")
+            })
+            .success();
+        for path in ["? keep", "? ignored-dir/", "? replace/"] {
+            assert!(output.stdout.raw().contains(path), "{path}: {output}");
+        }
+    }
+
+    // Deletion inside an ignored directory is still removed from the cache.
+    main_dir.write_file(".gitignore", "ignored-dir/\n");
+    std::fs::remove_file(main_dir.root().join("ignored-dir/file"))?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
+        })
+        .success();
+    // The synthetic backend reports no new changes, so recreating the file
+    // here distinguishes a removed candidate from an indefinitely retained one.
+    main_dir.write_file("ignored-dir/file", "recreated\n");
+    std::fs::remove_file(main_dir.root().join(".gitignore"))?;
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
+        })
+        .success();
+    assert!(!output.stdout.raw().contains("? ignored-dir/"), "{output}");
+    std::fs::remove_file(main_dir.root().join("replace/child"))?;
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
+        })
+        .success();
+    main_dir.write_file("replace/new", "not reported by the test backend\n");
+    let output = main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
+        })
+        .success();
+    assert!(!output.stdout.raw().contains("? replace/"), "{output}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
 fn test_util_subvolume_rebuild_interrupted_workspace_add_preserves_conflict() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();

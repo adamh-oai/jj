@@ -85,6 +85,7 @@ struct SnapshotPreparation {
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 struct SnapshotSource {
     path: PathBuf,
+    untracked: jj_lib::local_working_copy::UntrackedScanState,
     _snapshot: btrfs_awacs::btrfs::OpenedSubvolume,
     _working_copy_lock: Box<dyn jj_lib::working_copy::LockedWorkingCopy>,
 }
@@ -435,6 +436,10 @@ async fn cmd_workspace_add_impl(
     // The child now retains its own A. Release the source journal lock before
     // any workspace registration or repository transaction can update it.
     #[cfg(all(target_os = "linux", feature = "awacs"))]
+    let inherited_untracked = snapshot_source
+        .as_ref()
+        .map(|source| source.untracked.clone());
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
     drop(snapshot_source);
     if let Err(mut error) = workspace_setup_result {
         if snapshot
@@ -595,6 +600,7 @@ async fn cmd_workspace_add_impl(
                             ui,
                             snapshot_identity,
                             Some(preparation.awacs_workspace_owner),
+                            inherited_untracked.as_ref(),
                         )
                         .await?;
                 } else {
@@ -760,7 +766,7 @@ async fn prepare_snapshot_source(
 ) -> Result<Option<SnapshotSource>, CommandError> {
     use btrfs_awacs::scan::SnapshotBaseline;
     use btrfs_awacs::status::RootStatus;
-    use jj_lib::local_working_copy::LocalWorkingCopy;
+    use jj_lib::local_working_copy::LockedLocalWorkingCopy;
 
     if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
         return Ok(None);
@@ -776,8 +782,8 @@ async fn prepare_snapshot_source(
             "Source working copy changed before snapshot creation. Try again.",
         ));
     }
-    let local = working_copy
-        .downcast_ref::<LocalWorkingCopy>()
+    let local = locked
+        .downcast_ref::<LockedLocalWorkingCopy>()
         .ok_or_else(|| user_error("Snapshot creation requires a local working-copy journal"))?;
     let journal = local.journal_status()?;
     if journal.phase != "clean-baseline" || journal.baseline_backend.as_deref() != Some("awacs") {
@@ -791,6 +797,12 @@ async fn prepare_snapshot_source(
         )
         .hinted("Run `jj status` in the source workspace, then retry."));
     }
+    let untracked = local.untracked_scan_state()?.ok_or_else(|| {
+        user_error(
+            "Snapshot creation requires a complete source AWACS baseline; run jj util subvolume \
+             enable --rebuild-baseline in the source workspace",
+        )
+    })?;
     let source = journal
         .baseline
         .ok_or_else(|| user_error("Snapshot creation has no committed AWACS source baseline"))?;
@@ -823,6 +835,7 @@ async fn prepare_snapshot_source(
     // source semantic tree was recorded, making an unchanged entry look clean.
     Ok(Some(SnapshotSource {
         path,
+        untracked,
         _snapshot: snapshot,
         _working_copy_lock: locked,
     }))

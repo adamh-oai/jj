@@ -109,6 +109,7 @@ use crate::matchers::IntersectionMatcher;
 use crate::matchers::Matcher;
 use crate::matchers::PrefixMatcher;
 use crate::matchers::UnionMatcher;
+use crate::matchers::Visit;
 use crate::merge::Merge;
 use crate::merge::MergeBuilder;
 use crate::merge::SameChange;
@@ -1096,8 +1097,7 @@ pub struct TreeState {
     sparse_patterns: Vec<RepoPathBuf>,
     symlink_support: bool,
 
-    /// Compact journal state. Per-path file states are never persisted in the
-    /// new format; these fields describe whether an authoritative filesystem
+    /// Compact journal state describing whether an authoritative filesystem
     /// baseline may be reused.
     journal_phase: crate::protos::local_working_copy::WorkingCopyStatePhase,
     journal_generation: u64,
@@ -1110,6 +1110,10 @@ pub struct TreeState {
     // paths in addition to the backend's new delta.
     pending_scan_paths: Vec<RepoPathBuf>,
     pending_scan_prefixes: Vec<RepoPathBuf>,
+    // Known untracked paths need revisiting even when the filesystem delta is
+    // empty. Unlike pending checkout changes, they do not block inheritance.
+    untracked_scan_paths: Vec<RepoPathBuf>,
+    untracked_scan_complete: bool,
     awacs_baseline_owner_id: Vec<u8>,
     transition_id: Vec<u8>,
     no_baseline_reason: String,
@@ -1158,6 +1162,14 @@ pub struct WorkingCopyBaselineStatus {
     pub interpretation_input_fingerprint: Vec<u8>,
 }
 
+/// The omitted paths and interpretation inputs paired with a retained AWACS
+/// baseline. Snapshot workspace creation inherits this with the semantic tree.
+#[derive(Clone, Debug)]
+pub struct UntrackedScanState {
+    pub paths: Vec<RepoPathBuf>,
+    pub input_fingerprint: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum TreeStateError {
     #[error("Reading tree state from {path}")]
@@ -1182,7 +1194,7 @@ pub enum TreeStateError {
 }
 
 const WORKING_COPY_STATE_MAGIC: &[u8] = b"\0JJ-WORKING-COPY-STATE\0v1\n";
-const WORKING_COPY_STATE_FORMAT_VERSION: u32 = 3;
+const WORKING_COPY_STATE_FORMAT_VERSION: u32 = 4;
 const SUBVOLUME_MODE_MARKER: &str = "subvolume_mode";
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 const AWACS_ADOPTION_SEED_MARKER: &str = "awacs-adoption-seed";
@@ -1291,7 +1303,10 @@ fn decode_working_copy_state(
                 source: err,
             }
         })?;
-    if !matches!(proto.format_version, 2 | WORKING_COPY_STATE_FORMAT_VERSION) {
+    if !matches!(
+        proto.format_version,
+        2 | 3 | WORKING_COPY_STATE_FORMAT_VERSION
+    ) {
         return Err(invalid_working_copy_state(
             path,
             format!("unsupported format version {}", proto.format_version),
@@ -1324,6 +1339,16 @@ impl TreeState {
 
     pub fn sparse_patterns(&self) -> &Vec<RepoPathBuf> {
         &self.sparse_patterns
+    }
+
+    fn untracked_scan_state(&self) -> Option<UntrackedScanState> {
+        let baseline = self
+            .scan_baseline()
+            .filter(|_| self.untracked_scan_complete)?;
+        Some(UntrackedScanState {
+            paths: self.untracked_scan_paths.clone(),
+            input_fingerprint: baseline.interpretation_input_fingerprint.clone(),
+        })
     }
 
     /// Returns the last committed A baseline retained by an interrupted
@@ -1477,6 +1502,8 @@ impl TreeState {
         };
         self.pending_scan_paths = exact;
         self.pending_scan_prefixes = prefixes;
+        self.untracked_scan_paths = parse_pending_paths(proto.untracked_scan_paths)?;
+        self.untracked_scan_complete = proto.format_version >= 4 && proto.untracked_scan_complete;
         self.awacs_baseline_owner_id = if proto.awacs_baseline_owner_id.len() == 16 {
             proto.awacs_baseline_owner_id
         } else {
@@ -1651,6 +1678,12 @@ impl TreeState {
                 .iter()
                 .map(|path| path.as_internal_file_string().to_owned())
                 .collect(),
+            untracked_scan_paths: self
+                .untracked_scan_paths
+                .iter()
+                .map(|path| path.as_internal_file_string().to_owned())
+                .collect(),
+            untracked_scan_complete: self.untracked_scan_complete,
         })
     }
 
@@ -1733,6 +1766,7 @@ impl TreeState {
         if proto.phase() != crate::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline
             || !proto.pending_scan_paths.is_empty()
             || !proto.pending_scan_prefixes.is_empty()
+            || !proto.untracked_scan_complete
         {
             return Ok(());
         }
@@ -1956,6 +1990,8 @@ impl TreeState {
             pending_baseline: None,
             pending_scan_paths: Vec::new(),
             pending_scan_prefixes: Vec::new(),
+            untracked_scan_paths: Vec::new(),
+            untracked_scan_complete: false,
             awacs_baseline_owner_id: rand::random::<[u8; 16]>().to_vec(),
             transition_id: Vec::new(),
             no_baseline_reason: "uninitialized".to_owned(),
@@ -2155,6 +2191,8 @@ impl TreeState {
         self.pending_baseline = None;
         self.pending_scan_paths.clear();
         self.pending_scan_prefixes.clear();
+        self.untracked_scan_paths.clear();
+        self.untracked_scan_complete = false;
         self.transition_id.clear();
         self.pending_tree = None;
         self.pending_sparse_patterns = None;
@@ -2483,6 +2521,11 @@ impl TreeState {
                 "the working copy has no committed AWACS baseline",
             ));
         }
+        if !self.untracked_scan_complete {
+            return Err(awacs_baseline_rebuild_error(
+                "the AWACS baseline has no complete record of untracked paths",
+            ));
+        }
         if !self.awacs_baseline_matches_input(
             options.awacs_input_fingerprint,
             &options.awacs_compatible_input_fingerprints,
@@ -2491,6 +2534,69 @@ impl TreeState {
                 "the AWACS baseline no longer matches the working-copy inputs",
             ));
         }
+        Ok(())
+    }
+
+    /// Keep known untracked paths that still exist even when this scan did not
+    /// visit them, such as paths hidden by ignore or sparse rules. The scan's
+    /// immutable root lets us discard deleted candidates without following a
+    /// symlink or another non-directory boundary in an ancestor.
+    async fn update_untracked_scan_paths(
+        &mut self,
+        scan_root: &Path,
+        stats: &SnapshotStats,
+        visited_directories: &HashSet<RepoPathBuf>,
+    ) -> Result<(), SnapshotError> {
+        let mut paths = stats.untracked_paths.keys().cloned().collect::<Vec<_>>();
+        for path in &self.untracked_scan_paths {
+            if stats.untracked_paths.contains_key(path) {
+                continue;
+            }
+            let mut disk_path = scan_root.to_owned();
+            let mut components = path.components().peekable();
+            let mut metadata = None;
+            while let Some(component) = components.next() {
+                disk_path.push(component.as_internal_str());
+                match disk_path.symlink_metadata() {
+                    Ok(found) if components.peek().is_some() && !found.is_dir() => {
+                        metadata = None;
+                        break;
+                    }
+                    Ok(found) => metadata = Some(found),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        metadata = None;
+                        break;
+                    }
+                    // An inaccessible path is not proof that it disappeared.
+                    Err(_) => {
+                        paths.push(path.clone());
+                        metadata = None;
+                        break;
+                    }
+                }
+            }
+            if let Some(metadata) = metadata {
+                if metadata.is_dir() {
+                    // Once a replacement directory was fully visited, its
+                    // skipped children are recorded individually. Avoid
+                    // rescanning the whole directory on every future status.
+                    if !visited_directories.contains(path) {
+                        paths.push(path.clone());
+                    }
+                } else if self.tree.path_value(path).await?.is_absent() {
+                    paths.push(path.clone());
+                }
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        self.untracked_scan_paths = paths;
+        self.untracked_scan_complete = true;
         Ok(())
     }
 
@@ -2513,6 +2619,10 @@ impl TreeState {
 
         if !allow_awacs_baseline_rebuild {
             self.check_snapshot_ready(options)?;
+        } else if is_snapshot_mode(&self.state_path) && !self.untracked_scan_complete {
+            // Earlier journals cannot prove which untracked files were skipped.
+            // Rebuild must traverse the entire selected working copy once.
+            self.set_no_baseline("untracked-path record requires a full baseline scan");
         }
         let sparse_matcher = self.sparse_matcher();
         let external_sparse_matcher = external_sparse_patterns.as_ref().map(PrefixMatcher::new);
@@ -2556,6 +2666,9 @@ impl TreeState {
             .await?;
         scan_scope =
             scan_scope.with_additional_paths(&self.pending_scan_paths, &self.pending_scan_prefixes);
+        // A previously skipped file can have become a directory. Scan it as a
+        // prefix so its newly created children cannot be missed.
+        scan_scope = scan_scope.with_additional_paths(&[], &self.untracked_scan_paths);
         let mut scan_root_base_ignores = base_ignores.clone();
         for relative_path in scan_root_ignores {
             scan_root_base_ignores = scan_root_base_ignores
@@ -2618,6 +2731,14 @@ impl TreeState {
         self.rebuild_ephemeral_tracked_paths(&scan_scope)?;
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
+            if baseline.is_some() {
+                self.update_untracked_scan_paths(
+                    &scan_root,
+                    &SnapshotStats::default(),
+                    &HashSet::new(),
+                )
+                .await?;
+            }
             self.publish_scan_baseline(fsmonitor_cursor, baseline);
             return Ok((is_dirty, SnapshotStats::default(), completion));
         }
@@ -2625,6 +2746,8 @@ impl TreeState {
         let (tree_entries_tx, tree_entries_rx) = channel();
         let (untracked_paths_tx, untracked_paths_rx) = channel();
         let (deleted_files_tx, deleted_files_rx) = channel();
+        let (visited_directories_tx, visited_directories_rx) = channel();
+        let untracked_scan_paths = self.untracked_scan_paths.iter().collect::<HashSet<_>>();
 
         let traversal_result =
             trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
@@ -2641,6 +2764,8 @@ impl TreeState {
                     tree_entries_tx,
                     untracked_paths_tx,
                     deleted_files_tx,
+                    visited_directories_tx,
+                    untracked_scan_paths: &untracked_scan_paths,
                     error: OnceLock::new(),
                     progress: *progress,
                     max_new_file_size: *max_new_file_size,
@@ -2712,9 +2837,15 @@ impl TreeState {
                 Ok(())
             })
             .await?;
-        // Since untracked paths aren't cached in the tree state, we'll need to
-        // rescan the working directory changes to report or track them later.
-        // TODO: store untracked paths and update fsmonitor_cursor?
+        // A retained AWACS baseline may advance past excluded files. Remember
+        // them and any still-existing candidates hidden from this scan.
+        if baseline.is_some() {
+            let visited_directories = visited_directories_rx.into_iter().collect();
+            self.update_untracked_scan_paths(&scan_root, &stats, &visited_directories)
+                .await?;
+        }
+        // Mutable monitor cursors cannot advance past skipped paths without a
+        // durable candidate list, so retain their conservative behavior.
         if stats.untracked_paths.is_empty() || fsmonitor_cursor.is_none() {
             self.publish_scan_baseline(fsmonitor_cursor, baseline);
             Ok((is_dirty, stats, completion))
@@ -3138,6 +3269,8 @@ struct FileSnapshotter<'a> {
     tree_entries_tx: Sender<(RepoPathBuf, MergedTreeValue)>,
     untracked_paths_tx: Sender<(RepoPathBuf, UntrackedReason)>,
     deleted_files_tx: Sender<RepoPathBuf>,
+    visited_directories_tx: Sender<RepoPathBuf>,
+    untracked_scan_paths: &'a HashSet<&'a RepoPathBuf>,
     error: OnceLock<SnapshotError>,
     progress: Option<&'a SnapshotProgress<'a>>,
     max_new_file_size: u64,
@@ -3496,6 +3629,12 @@ impl FileSnapshotter<'_> {
             ancestor_ignored,
             tracked_paths,
         } = directory_to_visit;
+
+        if self.untracked_scan_paths.contains(&dir)
+            && self.matcher.visit(&dir) == Visit::AllRecursively
+        {
+            self.visited_directories_tx.send(dir.clone()).ok();
+        }
 
         if !ancestor_ignored {
             let git_ignore_file_name = RepoPathComponent::new(".gitignore").expect("static string");
@@ -4840,6 +4979,10 @@ impl SnapshotLocalWorkingCopy {
         Ok(self.tree_state()?.journal_status())
     }
 
+    fn untracked_scan_state(&self) -> Result<Option<UntrackedScanState>, WorkingCopyStateError> {
+        Ok(self.tree_state()?.untracked_scan_state())
+    }
+
     #[instrument(skip_all)]
     fn tree_state(&self) -> Result<&TreeState, WorkingCopyStateError> {
         self.tree_state.get_or_try_init(|| {
@@ -5075,6 +5218,16 @@ impl LocalWorkingCopy {
                 pending_mutation: None,
                 has_pending_scan: false,
             }),
+        }
+    }
+
+    /// Returns the complete omitted-path state paired with the AWACS baseline.
+    pub fn untracked_scan_state(
+        &self,
+    ) -> Result<Option<UntrackedScanState>, WorkingCopyStateError> {
+        match &self.inner {
+            LocalWorkingCopyInner::Snapshot(wc) => wc.untracked_scan_state(),
+            LocalWorkingCopyInner::Legacy(_) => Ok(None),
         }
     }
 
@@ -5371,6 +5524,17 @@ impl LockedWorkingCopy for LockedLocalWorkingCopy {
 }
 
 impl LockedLocalWorkingCopy {
+    /// Reads the baseline and omitted paths from the journal under its lock.
+    pub fn journal_status(&self) -> Result<WorkingCopyJournalStatus, WorkingCopyStateError> {
+        self.wc.journal_status()
+    }
+
+    pub fn untracked_scan_state(
+        &self,
+    ) -> Result<Option<UntrackedScanState>, WorkingCopyStateError> {
+        self.wc.untracked_scan_state()
+    }
+
     fn begin_materialization(
         &mut self,
         intended_tree: &MergedTree,
@@ -5593,6 +5757,7 @@ pub async fn seed_local_working_copy_initialized_awacs_baseline(
     snapshot_identity: &btrfs_awacs::manager::SnapshotIdentity,
     baseline_owner_id: Option<[u8; 16]>,
     input_fingerprint: [u8; 32],
+    inherited_untracked: Option<&UntrackedScanState>,
 ) -> Result<bool, SnapshotError> {
     let Some(snapshot) = locked.downcast_mut::<LockedLocalWorkingCopy>() else {
         return Ok(false);
@@ -5616,14 +5781,25 @@ pub async fn seed_local_working_copy_initialized_awacs_baseline(
     // baseline; the next scan replaces it with its integrity-checked cursor.
     let mut continuity_token = b"c:btrfs-awacs:initialized:1:".to_vec();
     continuity_token.extend_from_slice(&snapshot_identity.subvol_uuid);
+    // The inherited tree and omitted-path list were interpreted using the
+    // source inputs. If the child has different inputs, retain that source
+    // fingerprint so its next snapshot requires an explicit full rebuild.
+    let baseline_fingerprint = inherited_untracked.map_or_else(
+        || input_fingerprint.to_vec(),
+        |state| state.input_fingerprint.clone(),
+    );
     let baseline = crate::protos::local_working_copy::AwacsSnapshotBaseline {
         filesystem_uuid: snapshot_identity.fs_uuid.to_vec(),
         subvolume_uuid: snapshot_identity.subvol_uuid.to_vec(),
         continuity_token,
         retention_token: tree_state.awacs_baseline_owner_id.clone(),
-        interpretation_input_fingerprint: input_fingerprint.to_vec(),
+        interpretation_input_fingerprint: baseline_fingerprint,
     };
     tree_state.publish_scan_baseline(None, Some(baseline));
+    if let Some(state) = inherited_untracked {
+        tree_state.untracked_scan_paths = state.paths.clone();
+        tree_state.untracked_scan_complete = true;
+    }
     snapshot.tree_state_dirty = true;
     Ok(true)
 }

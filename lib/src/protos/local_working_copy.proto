@@ -140,6 +140,12 @@ message WorkingCopyState {
   // snapshot unions these paths with its new delta, then clears them.
   repeated string pending_scan_paths = 19;
   repeated string pending_scan_prefixes = 20;
+  // Files omitted from the semantic tree because auto-tracking or size
+  // limits excluded them. Revisit them on later incremental snapshots.
+  repeated string untracked_scan_paths = 21;
+  // Older journals do not record omitted files. This is set only after a
+  // complete baseline scan or inheritance from a complete source journal.
+  bool untracked_scan_complete = 22;
 }
 
 message AwacsSnapshotBaseline {
