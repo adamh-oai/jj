@@ -49,6 +49,7 @@ pub(super) fn set_subvolume_mode(workspace_root: &Path, enabled: bool) -> Result
     if enabled {
         fs::write(&marker, b"snapshot-backed\n")
             .map_err(|err| user_error(format!("Failed to enable subvolume mode: {err}")))?;
+        tracing::info!(state = "snapshot-backed", "updated subvolume mode marker");
     } else if let Err(err) = fs::remove_file(&marker)
         && err.kind() != io::ErrorKind::NotFound
     {
@@ -63,7 +64,9 @@ pub(super) fn set_subvolume_mode(workspace_root: &Path, enabled: bool) -> Result
 pub(super) fn begin_subvolume_mode(workspace_root: &Path) -> Result<(), CommandError> {
     let marker = subvolume_mode_marker(workspace_root);
     fs::write(&marker, SUBVOLUME_MODE_ENABLING)
-        .map_err(|err| user_error(format!("Failed to begin subvolume mode: {err}")))
+        .map_err(|err| user_error(format!("Failed to begin subvolume mode: {err}")))?;
+    tracing::info!(state = "enabling", "updated subvolume mode marker");
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

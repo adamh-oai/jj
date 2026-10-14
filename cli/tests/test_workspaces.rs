@@ -2696,10 +2696,11 @@ exit 1
     );
 
     let tertiary_dir = test_env.work_dir("tertiary");
-    main_dir
+    let output = main_dir
         .run_jj_with(|cmd| {
             cmd.env("PATH", &path)
                 .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .env("JJ_LOG", "info")
                 .args([
                     "--ignore-working-copy",
                     "workspace",
@@ -2709,6 +2710,22 @@ exit 1
                 ])
         })
         .success();
+    let log = output.stderr.raw();
+    for event in [
+        "enabling",
+        "seeding working-copy tree",
+        "committing subvolume mode marker",
+        "snapshot-backed",
+        "initialized snapshot workspace baseline",
+    ] {
+        assert!(log.contains(event), "missing {event} in log: {log}");
+    }
+    assert!(
+        log.lines().any(|line| line.contains("ignore_working_copy")
+            && line.contains("true")
+            && line.contains("initializing snapshot workspace baseline")),
+        "{log}"
+    );
     assert!(tertiary_dir.root().join(".jj").is_dir());
     assert_eq!(
         std::fs::read(tertiary_dir.root().join(".jj/working_copy/subvolume_mode"))?,
@@ -2729,6 +2746,52 @@ exit 1
                 .arg("status")
         })
         .success();
+
+    // The trace identifies a command error and its phase after the enabling
+    // marker is written.
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+            .env("JJ_LOG", "info")
+            .args([
+                "--ignore-working-copy",
+                "--config=snapshot.auto-track='glob:['",
+                "workspace",
+                "add",
+                "--no-colocate",
+                "../failed-baseline",
+            ])
+    });
+    assert!(!output.status.success(), "{output}");
+    let log = output.stderr.raw();
+    assert!(
+        log.lines().any(|line| line.contains("updated subvolume mode marker")
+            && line.contains("enabling")),
+        "{log}"
+    );
+    assert!(
+        log.lines().any(
+            |line| line.contains("snapshot workspace baseline initialization failed")
+                && line.contains("seeding AWACS baseline")
+                && line.contains("error_kind")
+        ),
+        "{log}"
+    );
+    assert!(log.contains("workspace add failed"), "{log}");
+    assert!(
+        !log.lines()
+            .any(|line| line.contains("updated subvolume mode marker")
+                && line.contains("snapshot-backed")),
+        "{log}"
+    );
+    assert_eq!(
+        std::fs::read(
+            test_env
+                .env_root()
+                .join("failed-baseline/.jj/working_copy/subvolume_mode")
+        )?,
+        b"enabling\n"
+    );
 
     for (option, destination, error) in [
         (
@@ -7479,6 +7542,19 @@ fn test_workspaces_update_stale_noop() {
     [EOF]
     [exit status: 1]
     ");
+
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_LOG", "info")
+            .args(["workspace", "update-stale", "--ignore-working-copy"])
+    });
+    let log = output.stderr.raw();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("working_copy_not_writable")
+                && line.contains("ignore_working_copy")
+                && line.contains("true")),
+        "{log}"
+    );
 
     let output = main_dir.run_jj(["op", "log", "-Tdescription"]);
     insta::assert_snapshot!(output, @"

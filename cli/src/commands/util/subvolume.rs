@@ -106,6 +106,18 @@ pub async fn cmd_util_subvolume(
     command: &CommandHelper,
     subcommand: &UtilSubvolumeCommand,
 ) -> Result<(), CommandError> {
+    let result = cmd_util_subvolume_impl(ui, command, subcommand).await;
+    if let Err(err) = &result {
+        tracing::warn!(error_kind = ?err.kind, "subvolume operation failed");
+    }
+    result
+}
+
+async fn cmd_util_subvolume_impl(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    subcommand: &UtilSubvolumeCommand,
+) -> Result<(), CommandError> {
     let recovery_root = command.workspace_loader()?.workspace_root().to_owned();
     // Serialize the entire operation before inspecting or relaxing the mode
     // marker. A rebuild temporarily has no committed baseline, which another
@@ -630,21 +642,26 @@ async fn init_subvolume_at_inner(
     // copy, finishing its reset can reload mode from disk and begin a
     // snapshot-backed materialization. That path needs the external AWACS
     // baseline to exist already.
+    tracing::info!("initializing AWACS root");
     seed_initial_awacs_root(ui, &destination)?;
     begin_subvolume_mode(&destination)?;
+    tracing::info!("resetting local working-copy state");
     reset_local_working_copy_state(&mut destination_command).await?;
     // Finishing the reset replaces the working-copy state directory.
     begin_subvolume_mode(&destination)?;
+    tracing::info!("removing legacy working-copy tree state");
     remove_legacy_tree_state(&destination)?;
     // The helper above was loaded before the marker existed, so it still
     // owns the ordinary local-disk working-copy implementation. Reload after
     // the marker is durable so the initial transaction uses snapshot-backed
     // state and can publish the AWACS baseline.
     drop(destination_command);
+    tracing::info!("reloading snapshot-backed workspace");
     let mut destination_command = command
         .workspace_helper_no_snapshot_at(ui, &destination)
         .await?;
     writeln!(ui.status(), "Seeding snapshot-backed working-copy tree...")?;
+    tracing::info!("seeding snapshot-backed working-copy tree");
     seed_snapshot_working_copy_tree(&mut destination_command).await?;
     writeln!(ui.status(), "awacs: creating initial snapshot baseline...")?;
     establish_initial_snapshot_baseline(ui, &mut destination_command).await?;
@@ -1604,6 +1621,7 @@ async fn establish_initial_snapshot_baseline(
             if let Ok(mut current_phase) = phase.lock() {
                 *current_phase = new_phase;
             }
+            tracing::info!(phase = new_phase, "establishing subvolume baseline");
             writeln!(ui.status(), "JJ subvolume enable: {new_phase}...")?;
             Ok(())
         }
@@ -1613,7 +1631,13 @@ async fn establish_initial_snapshot_baseline(
         let heartbeat = Box::pin(heartbeat_delay(Duration::from_secs(10)));
         match select(snapshot, heartbeat).await {
             Either::Left((result, _heartbeat)) => {
-                result?;
+                result.inspect_err(|err| {
+                    let current_phase = phase
+                        .lock()
+                        .map(|current_phase| *current_phase)
+                        .unwrap_or("running the JJ working-copy transaction");
+                    tracing::warn!(phase = current_phase, error_kind = ?err.kind, "subvolume baseline initialization failed");
+                })?;
                 break;
             }
             Either::Right(((), pending_snapshot)) => {
@@ -1629,19 +1653,32 @@ async fn establish_initial_snapshot_baseline(
             }
         }
     }
-    let local_working_copy = workspace_command
-        .working_copy()
-        .downcast_ref::<LocalWorkingCopy>()
-        .ok_or_else(|| user_error("This command requires a standard local-disk working copy"))?;
-    if local_working_copy
-        .journal_status()?
-        .baseline_backend
-        .is_none()
-    {
-        return Err(user_error(
-            "AWACS did not publish a committed snapshot baseline",
-        ));
-    }
+    tracing::info!(
+        phase = "verifying committed baseline",
+        "establishing subvolume baseline"
+    );
+    let verification = (|| -> Result<(), CommandError> {
+        let local_working_copy = workspace_command
+            .working_copy()
+            .downcast_ref::<LocalWorkingCopy>()
+            .ok_or_else(|| {
+                user_error("This command requires a standard local-disk working copy")
+            })?;
+        if local_working_copy
+            .journal_status()?
+            .baseline_backend
+            .is_none()
+        {
+            return Err(user_error(
+                "AWACS did not publish a committed snapshot baseline",
+            ));
+        }
+        Ok(())
+    })();
+    verification.inspect_err(|err| {
+        tracing::warn!(phase = "verifying committed baseline", error_kind = ?err.kind, "subvolume baseline initialization failed");
+    })?;
+    tracing::info!("verified committed subvolume baseline");
     Ok(())
 }
 

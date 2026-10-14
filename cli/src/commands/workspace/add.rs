@@ -178,6 +178,18 @@ pub async fn cmd_workspace_add(
     command: &CommandHelper,
     args: &WorkspaceAddArgs,
 ) -> Result<(), CommandError> {
+    let result = cmd_workspace_add_impl(ui, command, args).await;
+    if let Err(err) = &result {
+        tracing::warn!(error_kind = ?err.kind, "workspace add failed");
+    }
+    result
+}
+
+async fn cmd_workspace_add_impl(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &WorkspaceAddArgs,
+) -> Result<(), CommandError> {
     // Serialize the complete lifecycle transition, including destination
     // creation/snapshotting, workspace-store registration performed by
     // Workspace::init_workspace_with_existing_repo(), and repo publication.
@@ -497,6 +509,10 @@ pub async fn cmd_workspace_add(
 
     let repo = if let Some(source_commit) = &snapshot_source_commit {
         let baseline_started = Instant::now();
+        tracing::info!(
+            phase = "recording snapshot tree in repository",
+            "initializing snapshot workspace baseline"
+        );
         #[cfg(feature = "git")]
         let _git_import_export_lock = git_worktree_plan
             .as_ref()
@@ -529,6 +545,7 @@ pub async fn cmd_workspace_add(
             ))
             .await?;
         tracing::debug!(elapsed = ?baseline_started.elapsed(), "recorded snapshot tree in repository");
+        tracing::info!(elapsed = ?baseline_started.elapsed(), "recorded snapshot tree in repository");
         repo
     } else {
         repo
@@ -550,33 +567,63 @@ pub async fn cmd_workspace_add(
             // journal state, then pair that journal with the independently cloned
             // AWACS baseline before any checkout mutation asks to advance it.
             drop(new_workspace);
-            let mut workspace_command = command
-                .workspace_helper_no_snapshot_at(ui, &destination_path)
-                .await?;
-            workspace_command.allow_new_snapshot_workspace_initialization();
-            let source_commit = snapshot_source_commit
-                .as_ref()
-                .expect("snapshot workspaces always retain the source commit");
-            seed_snapshot_workspace_tree(&mut workspace_command, source_commit).await?;
-            if let Some(preparation) = snapshot_preparation.as_ref()
-                && let Some(snapshot_identity) = preparation.initialized_awacs_snapshot.as_ref()
-            {
-                workspace_command
-                    .seed_initialized_snapshot_workspace_awacs_baseline(
-                        ui,
-                        snapshot_identity,
-                        Some(preparation.awacs_workspace_owner),
-                    )
+            let started = Instant::now();
+            let mut phase = "loading child workspace";
+            tracing::info!(
+                ignore_working_copy = command.global_args().ignore_working_copy,
+                phase,
+                "initializing snapshot workspace baseline"
+            );
+            let result = async {
+                let mut workspace_command = command
+                    .workspace_helper_no_snapshot_at(ui, &destination_path)
                     .await?;
-            } else {
-                workspace_command
-                    .seed_snapshot_workspace_awacs_baseline(ui)
-                    .await?;
-                establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
+                workspace_command.allow_new_snapshot_workspace_initialization();
+                let source_commit = snapshot_source_commit
+                    .as_ref()
+                    .expect("snapshot workspaces always retain the source commit");
+                phase = "seeding working-copy tree";
+                tracing::info!(phase, "initializing snapshot workspace baseline");
+                seed_snapshot_workspace_tree(&mut workspace_command, source_commit).await?;
+                if let Some(preparation) = snapshot_preparation.as_ref()
+                    && let Some(snapshot_identity) = preparation.initialized_awacs_snapshot.as_ref()
+                {
+                    phase = "publishing initialized AWACS baseline";
+                    tracing::info!(phase, "initializing snapshot workspace baseline");
+                    workspace_command
+                        .seed_initialized_snapshot_workspace_awacs_baseline(
+                            ui,
+                            snapshot_identity,
+                            Some(preparation.awacs_workspace_owner),
+                        )
+                        .await?;
+                } else {
+                    phase = "seeding AWACS baseline";
+                    tracing::info!(phase, "initializing snapshot workspace baseline");
+                    workspace_command
+                        .seed_snapshot_workspace_awacs_baseline(ui)
+                        .await?;
+                    phase = "establishing snapshot workspace baseline";
+                    tracing::info!(phase, "initializing snapshot workspace baseline");
+                    establish_snapshot_workspace_baseline(ui, &mut workspace_command).await?;
+                }
+                phase = "committing subvolume mode marker";
+                tracing::info!(phase, "initializing snapshot workspace baseline");
+                set_subvolume_mode(&destination_path, true)?;
+                Ok::<_, CommandError>(workspace_command)
             }
-            set_subvolume_mode(&destination_path, true)?;
-            tracing::debug!("recorded snapshot tree as workspace baseline");
-            workspace_command
+            .await;
+            match result {
+                Ok(workspace_command) => {
+                    tracing::info!(elapsed = ?started.elapsed(), "initialized snapshot workspace baseline");
+                    tracing::debug!("recorded snapshot tree as workspace baseline");
+                    workspace_command
+                }
+                Err(err) => {
+                    tracing::warn!(phase, error_kind = ?err.kind, elapsed = ?started.elapsed(), "snapshot workspace baseline initialization failed");
+                    return Err(err);
+                }
+            }
         }
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
         unreachable!("snapshot mode was rejected above")

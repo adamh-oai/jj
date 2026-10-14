@@ -1428,6 +1428,11 @@ impl WorkspaceCommandHelper {
         if self.may_update_working_copy {
             Ok(())
         } else {
+            tracing::warn!(
+                reason = "working_copy_not_writable",
+                ignore_working_copy = self.env.command.global_args().ignore_working_copy,
+                "working-copy update rejected"
+            );
             let hint = if self.env.command.global_args().ignore_working_copy {
                 "Don't use --ignore-working-copy."
             } else if self.env.command.global_args().no_integrate_operation {
