@@ -497,6 +497,287 @@ fn test_waiting_for_working_copy_does_not_block_other_worktrees() -> TestResult 
 
 #[cfg(feature = "test-fakes")]
 #[test]
+fn test_git_head_import_rejects_stale_journal_after_another_worktree_rewrites() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env.add_env_var("GIT_OPTIONAL_LOCKS", "0");
+    test_env.add_config("snapshot.auto-update-stale = true\n");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base\n");
+    main.run_jj(["commit", "-m", "blank"]).success();
+    main.write_file("file", "original\n");
+    main.run_jj(["new"]).success();
+    let blank = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@--",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+        .trim()
+        .to_owned();
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    main.write_file("file", "UNSNAPSHOTTED MAIN EDIT\n");
+    secondary.remove_file("file");
+    set_test_git_head(&test_env, &main, &blank)?;
+    let checkout_path = main.root().join(".jj/working_copy/checkout");
+    let tree_state_path = main.root().join(".jj/working_copy/tree_state");
+    let checkout_before = std::fs::read(&checkout_path)?;
+    let tree_state_before = std::fs::read(&tree_state_path)?;
+
+    let lock =
+        jj_lib::lock::FileLock::lock(main.root().join(".jj/working_copy/working_copy.lock"))?;
+    let mut importer = spawn_traced_jj(
+        &test_env,
+        &main,
+        "stale-head-importer",
+        &["--config", "snapshot.auto-track=\"none()\"", "status"],
+        None,
+    )?;
+    wait_for_child_event(&mut importer, || {
+        waiter_log_mentions(&test_env, "stale-head-importer", "working_copy.lock")
+    });
+    // This rewrites main's parent, rebases its commit, and makes the journal
+    // stale while the import is waiting for the journal lock.
+    secondary
+        .run_jj_with(|cmd| {
+            cmd.timeout(std::time::Duration::from_secs(10))
+                .arg("squash")
+        })
+        .success();
+    let listed = secondary
+        .run_jj(["--ignore-working-copy", "file", "list", "-r", "default@"])
+        .success();
+    assert!(!listed.stdout.raw().lines().any(|line| line == "file"));
+    let operation_after_squash = main.current_operation_id();
+    drop(lock);
+    importer.assert_failure_containing("The working copy is stale");
+    let stderr = std::fs::read_to_string(&importer.stderr_path)?;
+    assert!(stderr.contains("Automatic stale recovery is disabled"));
+    assert!(stderr.contains("operation log"));
+    assert_eq!(main.read_file("file"), "UNSNAPSHOTTED MAIN EDIT\n");
+    assert_eq!(std::fs::read(checkout_path)?, checkout_before);
+    assert_eq!(std::fs::read(tree_state_path)?, tree_state_before);
+    assert_eq!(main.current_operation_id(), operation_after_squash);
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_git_head_import_from_updated_journal_does_not_retry_forever() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env.add_env_var("GIT_OPTIONAL_LOCKS", "0");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    for contents in ["first\n", "second\n"] {
+        main.write_file("file", contents);
+        main.run_jj(["commit", "-m", contents.trim()]).success();
+    }
+    main.write_file("file", "third\n");
+    main.run_jj(["describe", "-m", "third"]).success();
+    let old_op = main.current_operation_id();
+    main.run_jj(["new"]).success();
+    let journal_op = main.current_operation_id();
+    let first = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@---",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+        .trim()
+        .to_owned();
+    // Simulate a journal pointing to an operation ahead of the published head.
+    main.remove_file(format!(".jj/repo/op_heads/heads/{journal_op}"));
+    main.write_file(format!(".jj/repo/op_heads/heads/{old_op}"), "");
+    main.write_file("file", "local edit\n");
+    set_test_git_head(&test_env, &main, &first)?;
+    main.run_jj_with(|cmd| {
+        cmd.timeout(std::time::Duration::from_secs(20)).args([
+            "--config",
+            "snapshot.auto-track=\"none()\"",
+            "status",
+        ])
+    })
+    .success();
+    let parent = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@-",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw();
+    assert_eq!(parent.trim(), first);
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "file"])
+            .success()
+            .stdout
+            .raw(),
+        "local edit\n"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+fn set_test_git_head(test_env: &TestEnvironment, work_dir: &TestWorkDir, id: &str) -> TestResult {
+    let template = test_env.new_jj_cmd();
+    let mut git = std::process::Command::new("git");
+    git.env_clear();
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            git.env(key, value);
+        }
+    }
+    let output = git
+        .current_dir(work_dir.root())
+        .args(["update-ref", "--no-deref", "HEAD", id])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "git update-ref failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_git_head_import_stale_journal_without_integrating_fails_safely() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env.add_env_var("GIT_OPTIONAL_LOCKS", "0");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base\n");
+    main.run_jj(["commit", "-m", "blank"]).success();
+    main.write_file("file", "original\n");
+    main.run_jj(["new"]).success();
+    let blank = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@--",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+        .trim()
+        .to_owned();
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    main.write_file("file", "UNSNAPSHOTTED MAIN EDIT\n");
+    secondary.remove_file("file");
+    secondary.run_jj(["squash"]).success();
+    set_test_git_head(&test_env, &main, &blank)?;
+
+    let output = main.run_jj([
+        "--config",
+        "snapshot.auto-track=\"none()\"",
+        "--no-integrate-operation",
+        "status",
+    ]);
+    assert!(
+        !output.status.success(),
+        "stale import unexpectedly succeeded: {output}"
+    );
+    assert!(
+        output.stderr.raw().contains("The working copy is stale"),
+        "{output}"
+    );
+    assert_eq!(main.read_file("file"), "UNSNAPSHOTTED MAIN EDIT\n");
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_git_head_import_does_not_restore_forgotten_workspace() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env.add_env_var("GIT_OPTIONAL_LOCKS", "0");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("file", "first\n");
+    main.run_jj(["commit", "-m", "first"]).success();
+    main.write_file("file", "second\n");
+    main.run_jj(["commit", "-m", "second"]).success();
+    let first = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@--",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+        .trim()
+        .to_owned();
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    secondary
+        .run_jj(["workspace", "forget", "default"])
+        .success();
+    set_test_git_head(&test_env, &main, &first)?;
+    let output = main.run_jj(["status"]);
+    assert!(
+        !output.status.success(),
+        "forgotten workspace was restored: {output}"
+    );
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("doesn't have a working-copy commit"),
+        "{output}"
+    );
+    assert!(
+        !secondary
+            .run_jj(["workspace", "list"])
+            .success()
+            .stdout
+            .raw()
+            .contains("default:")
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
 fn test_git_head_import_waiting_for_working_copy_does_not_block_other_worktrees() -> TestResult {
     check_git_head_import_wait(false)
 }
@@ -972,16 +1253,30 @@ struct TestChild {
 #[cfg(feature = "test-fakes")]
 impl TestChild {
     fn assert_success(&mut self) {
+        let status = self.wait();
+        assert!(
+            status.success(),
+            "child exited with {status}\nstdout:\n{}\nstderr:\n{}",
+            std::fs::read_to_string(&self.stdout_path).unwrap_or_default(),
+            std::fs::read_to_string(&self.stderr_path).unwrap_or_default(),
+        );
+    }
+
+    fn assert_failure_containing(&mut self, expected: &str) {
+        let status = self.wait();
+        let stderr = std::fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        assert!(
+            !status.success() && stderr.contains(expected),
+            "unexpected child result {status}\nstdout:\n{}\nstderr:\n{stderr}",
+            std::fs::read_to_string(&self.stdout_path).unwrap_or_default(),
+        );
+    }
+
+    fn wait(&mut self) -> std::process::ExitStatus {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             if let Some(status) = self.child.try_wait().expect("poll child process") {
-                assert!(
-                    status.success(),
-                    "child exited with {status}\nstdout:\n{}\nstderr:\n{}",
-                    std::fs::read_to_string(&self.stdout_path).unwrap_or_default(),
-                    std::fs::read_to_string(&self.stderr_path).unwrap_or_default(),
-                );
-                return;
+                return status;
             }
             assert!(
                 std::time::Instant::now() < deadline,

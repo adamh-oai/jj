@@ -1397,12 +1397,18 @@ impl WorkspaceCommandHelper {
         let stats = loop {
             let result = async {
                 #[cfg(feature = "git")]
-                if self.env.working_copy_shared_with_git {
-                    self.import_git_head(ui, git_import_export_lock).await?;
-                }
-                // A non-integrated operation may be intentionally unpublished,
-                // so it must not be reloaded from the published operation heads.
-                let can_release_lock = self.env.command.should_commit_transaction();
+                let journal_ahead = if self.env.working_copy_shared_with_git {
+                    self.import_git_head(ui, git_import_export_lock).await?
+                } else {
+                    false
+                };
+                #[cfg(not(feature = "git"))]
+                let journal_ahead = false;
+                // A non-integrated operation or an operation recovered from an
+                // ahead journal can be unpublished. Do not reload it from the
+                // published operation heads during this scan.
+                let can_release_lock =
+                    self.env.command.should_commit_transaction() && !journal_ahead;
                 self.snapshot_working_copy(ui, git_import_export_lock, can_release_lock)
                     .await
             }
@@ -1459,23 +1465,26 @@ impl WorkspaceCommandHelper {
     /// The old working-copy commit will be abandoned if it's discardable. The
     /// working-copy state will be reset to point to the new Git HEAD. The
     /// working-copy contents won't be updated.
+    ///
+    /// Returns true when the working-copy journal was ahead of the published
+    /// repository operation. The following snapshot must keep that operation.
     #[cfg(feature = "git")]
     #[instrument(skip_all)]
     async fn import_git_head(
         &mut self,
         ui: &Ui,
         git_import_export_lock: &GitImportExportLock,
-    ) -> Result<(), SnapshotWorkingCopyError> {
+    ) -> Result<bool, SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
         let workspace_name = self.workspace_name().to_owned();
         let workspace_root = self.workspace_root().to_owned();
-        let repo = self.repo().clone();
+        let mut repo = self.repo().clone();
         let mut tx = self.start_transaction().into_inner();
         jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root)
             .await
             .map_err(snapshot_command_error)?;
         if !tx.repo().has_changes() {
-            return Ok(());
+            return Ok(false);
         }
 
         let can_release_lock =
@@ -1527,13 +1536,64 @@ impl WorkspaceCommandHelper {
                     .await
                     .map_err(snapshot_command_error)?;
                 if !tx.repo().has_changes() {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
             Some(locked_ws)
         } else {
             None
         };
+        let mut journal_ahead = false;
+        if tx
+            .repo()
+            .view()
+            .git_head(&workspace_name)
+            .as_normal()
+            .is_some()
+            && let Some(locked_ws) = &mut locked_ws
+        {
+            // A concurrent operation can rewrite this workspace while we wait
+            // for its journal. Check its old tree before resetting the journal,
+            // or tracked local edits could be mistaken for untracked files.
+            let freshness =
+                handle_stale_working_copy(locked_ws.locked_wc(), repo.clone(), &workspace_name)
+                    .await;
+            let freshness = match freshness {
+                Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
+                    // Automatic stale recovery can leave the saved edits only
+                    // in operation history. Preserve the files on disk and let
+                    // the user decide how to recover them instead.
+                    return Err(SnapshotWorkingCopyError::Command(err.hinted(
+                        "Automatic stale recovery is disabled when Git HEAD has changed. After \
+                         `jj workspace update-stale`, edits may only be saved in the operation \
+                         log; inspect `jj op log` and restore them if needed.",
+                    )));
+                }
+                result => result?,
+            };
+            let Some((journal_repo, _)) = freshness else {
+                return Err(snapshot_command_error(user_error(format!(
+                    "Workspace `{}` doesn't have a working-copy commit",
+                    workspace_name.as_symbol()
+                ))));
+            };
+            if journal_repo.op_id() != repo.op_id() {
+                // An updated journal can point to an unpublished descendant of
+                // the repository operation. Keep it, as snapshot_working_copy
+                // does, and import HEAD from that operation instead of retrying
+                // indefinitely against the same published head.
+                repo = journal_repo;
+                journal_ahead = true;
+                self.user_repo = ReadonlyUserRepo::new(repo.clone());
+                tx = start_repo_transaction(&repo, &workspace_name, self.env.command.string_args());
+                jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root)
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if !tx.repo().has_changes() {
+                    return Ok(journal_ahead);
+                }
+            }
+        }
         let old_git_head = repo.view().git_head(&workspace_name).clone();
         let new_git_head = tx.repo().view().git_head(&workspace_name);
         if let Some(new_git_head_id) = new_git_head.as_normal() {
@@ -1609,7 +1669,7 @@ impl WorkspaceCommandHelper {
                 .await
                 .map_err(snapshot_command_error)?;
         }
-        Ok(())
+        Ok(journal_ahead)
     }
 
     /// Imports branches and tags from the underlying Git repo, abandons old
