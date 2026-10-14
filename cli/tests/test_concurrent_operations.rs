@@ -359,6 +359,529 @@ fn test_git_head_race_condition() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_slow_snapshot_does_not_block_other_worktrees() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base contents\n");
+    main.run_jj(["commit", "-m", "base"]).success();
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    main.write_file("from-main", "main contents\n");
+    secondary.write_file("from-secondary", "secondary contents\n");
+
+    let pause_dir = test_env.env_root().join("pause-snapshot");
+    std::fs::create_dir(&pause_dir)?;
+    let waiter_pause_dir = test_env.env_root().join("pause-waiter");
+    std::fs::create_dir(&waiter_pause_dir)?;
+    let mut scanner = spawn_traced_jj(
+        &test_env,
+        &main,
+        "scanner",
+        &["status"],
+        Some(("JJ_TEST_SNAPSHOT_PAUSE_DIR", &pause_dir)),
+    )?;
+    wait_for_child_event(&mut scanner, || pause_dir.join("ready").exists());
+
+    // The scanner is paused with its working-copy lock held. A second command
+    // in the same worktree must wait, but must not hold the shared Git lock
+    // while it does so.
+    let mut waiter = spawn_traced_jj(
+        &test_env,
+        &main,
+        "waiter",
+        &["status"],
+        Some(("JJ_TEST_SNAPSHOT_PAUSE_DIR", &waiter_pause_dir)),
+    )?;
+    wait_for_child_event(&mut waiter, || {
+        waiter_log_mentions(&test_env, "waiter", "git-worktree-")
+    });
+    let output = secondary.run_jj_with(|cmd| {
+        cmd.timeout(std::time::Duration::from_secs(10))
+            .arg("status")
+    });
+    output.success();
+    assert!(
+        scanner.child.try_wait()?.is_none(),
+        "scanner was not paused"
+    );
+    assert!(waiter.child.try_wait()?.is_none(), "waiter was not blocked");
+    assert_eq!(
+        secondary
+            .run_jj(["--ignore-working-copy", "file", "show", "from-secondary"])
+            .success()
+            .stdout
+            .raw(),
+        "secondary contents\n"
+    );
+
+    std::fs::write(pause_dir.join("release"), b"release\n")?;
+    scanner.assert_success();
+    // Pause the waiter before it can scan, so this assertion proves that the
+    // first scanner itself committed A's edit despite B's concurrent change.
+    wait_for_child_event(&mut waiter, || waiter_pause_dir.join("ready").exists());
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+            .success()
+            .stdout
+            .raw(),
+        "main contents\n"
+    );
+    std::fs::write(waiter_pause_dir.join("release"), b"release\n")?;
+    waiter.assert_success();
+    assert_eq!(
+        secondary
+            .run_jj(["--ignore-working-copy", "file", "show", "from-secondary"])
+            .success()
+            .stdout
+            .raw(),
+        "secondary contents\n"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_waiting_for_working_copy_does_not_block_other_worktrees() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base contents\n");
+    main.run_jj(["commit", "-m", "base"]).success();
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    main.write_file("from-main", "main contents\n");
+    secondary.write_file("from-secondary", "secondary contents\n");
+
+    // Simulate a slow process holding the existing working-copy journal lock.
+    let lock =
+        jj_lib::lock::FileLock::lock(main.root().join(".jj/working_copy/working_copy.lock"))?;
+    let mut waiter = spawn_traced_jj(&test_env, &main, "journal-waiter", &["status"], None)?;
+    wait_for_child_event(&mut waiter, || {
+        waiter_log_mentions(&test_env, "journal-waiter", "working_copy.lock")
+    });
+    let output = secondary.run_jj_with(|cmd| {
+        cmd.timeout(std::time::Duration::from_secs(10))
+            .arg("status")
+    });
+    output.success();
+    assert!(waiter.child.try_wait()?.is_none(), "waiter was not blocked");
+    assert_eq!(
+        secondary
+            .run_jj(["--ignore-working-copy", "file", "show", "from-secondary"])
+            .success()
+            .stdout
+            .raw(),
+        "secondary contents\n"
+    );
+
+    drop(lock);
+    waiter.assert_success();
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+            .success()
+            .stdout
+            .raw(),
+        "main contents\n"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_slow_checkout_does_not_block_other_worktrees() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("checkout-file", "old contents\n");
+    main.run_jj(["commit", "-m", "old"]).success();
+    main.write_file("checkout-file", "new contents\n");
+    main.run_jj(["commit", "-m", "new"]).success();
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    secondary.write_file("from-secondary", "secondary contents\n");
+
+    let pause_dir = test_env.env_root().join("pause-checkout");
+    std::fs::create_dir(&pause_dir)?;
+    let mut checkout = spawn_traced_jj(
+        &test_env,
+        &main,
+        "checkout",
+        &["new", "@--"],
+        Some(("JJ_TEST_CHECKOUT_PAUSE_DIR", &pause_dir)),
+    )?;
+    wait_for_child_event(&mut checkout, || pause_dir.join("ready").exists());
+    assert_eq!(main.read_file("checkout-file"), "new contents\n");
+    let journal_path = main.root().join(".jj/working_copy/working_copy.lock");
+    assert!(
+        jj_lib::lock::FileLock::try_lock(journal_path)?.is_none(),
+        "checkout must exclude older processes that do not take the worktree gate"
+    );
+
+    // A same-worktree command waits on the gate while checkout is paused;
+    // it must not prevent an independent worktree from recording its edit.
+    let mut waiter = spawn_traced_jj(&test_env, &main, "checkout-waiter", &["status"], None)?;
+    wait_for_child_event(&mut waiter, || {
+        waiter_log_mentions(&test_env, "checkout-waiter", "git-worktree-")
+    });
+    secondary
+        .run_jj_with(|cmd| {
+            cmd.timeout(std::time::Duration::from_secs(10))
+                .arg("status")
+        })
+        .success();
+    assert!(
+        checkout.child.try_wait()?.is_none(),
+        "checkout was not paused"
+    );
+    assert!(waiter.child.try_wait()?.is_none(), "waiter was not blocked");
+    assert_eq!(
+        secondary
+            .run_jj(["--ignore-working-copy", "file", "show", "from-secondary"])
+            .success()
+            .stdout
+            .raw(),
+        "secondary contents\n"
+    );
+
+    std::fs::write(pause_dir.join("release"), b"release\n")?;
+    checkout.assert_success();
+    waiter.assert_success();
+    assert_eq!(main.read_file("checkout-file"), "old contents\n");
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "checkout-file"])
+            .success()
+            .stdout
+            .raw(),
+        "old contents\n"
+    );
+    assert_eq!(
+        secondary
+            .run_jj(["--ignore-working-copy", "file", "show", "from-secondary"])
+            .success()
+            .stdout
+            .raw(),
+        "secondary contents\n"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_scan_retries_after_external_git_checkout() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("checkout-file", "old contents\n");
+    main.run_jj(["commit", "-m", "old"]).success();
+    main.write_file("checkout-file", "new contents\n");
+    main.run_jj(["commit", "-m", "new"]).success();
+    let old_commit = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@--",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+        .trim()
+        .to_owned();
+    main.write_file("from-main", "main contents\n");
+
+    let pause_dir = test_env.env_root().join("pause-snapshot");
+    std::fs::create_dir(&pause_dir)?;
+    let mut scanner = spawn_traced_jj(
+        &test_env,
+        &main,
+        "scanner",
+        &["status"],
+        Some(("JJ_TEST_SNAPSHOT_PAUSE_DIR", &pause_dir)),
+    )?;
+    wait_for_child_event(&mut scanner, || pause_dir.join("ready").exists());
+
+    // Git does not honor JJ's lock. Move HEAD and materialize the old tree
+    // while the first JJ scan is paused; the untracked edit must survive.
+    let template = test_env.new_jj_cmd();
+    let mut git = std::process::Command::new("git");
+    git.env_clear();
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            git.env(key, value);
+        }
+    }
+    let output = git
+        .current_dir(main.root())
+        .args(["checkout", "--detach", "--quiet", &old_commit])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(main.read_file("checkout-file"), "old contents\n");
+    assert_eq!(main.read_file("from-main"), "main contents\n");
+
+    std::fs::write(pause_dir.join("release"), b"release\n")?;
+    scanner.assert_success();
+    let parent = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@-",
+            "-T",
+            "commit_id",
+        ])
+        .success();
+    assert_eq!(parent.stdout.raw().trim(), old_commit);
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+            .success()
+            .stdout
+            .raw(),
+        "main contents\n"
+    );
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "checkout-file"])
+            .success()
+            .stdout
+            .raw(),
+        "old contents\n"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_scan_retries_when_older_process_holds_shared_lock() -> TestResult {
+    if let Some(helper_dir) = std::env::var_os("JJ_TEST_OLD_LOCK_HELPER") {
+        // Re-run this test in a separate process to model an older jj which
+        // takes the shared lock before waiting for the working-copy lock.
+        let helper_dir = std::path::PathBuf::from(helper_dir);
+        let shared_path = std::path::PathBuf::from(
+            std::env::var_os("JJ_TEST_OLD_SHARED_LOCK").expect("shared lock path"),
+        );
+        let journal_path = std::path::PathBuf::from(
+            std::env::var_os("JJ_TEST_OLD_JOURNAL_LOCK").expect("journal lock path"),
+        );
+        let _shared = jj_lib::lock::FileLock::lock(shared_path)?;
+        std::fs::write(helper_dir.join("waiting"), b"waiting\n")?;
+        let _journal = jj_lib::lock::FileLock::lock(journal_path)?;
+        std::fs::write(helper_dir.join("acquired"), b"acquired\n")?;
+        return Ok(());
+    }
+
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base contents\n");
+    main.run_jj(["commit", "-m", "base"]).success();
+    main.write_file("from-main", "main contents\n");
+
+    let pause_dir = test_env.env_root().join("pause-snapshot");
+    std::fs::create_dir(&pause_dir)?;
+    let mut scanner = spawn_traced_jj(
+        &test_env,
+        &main,
+        "scanner",
+        &["status"],
+        Some(("JJ_TEST_SNAPSHOT_PAUSE_DIR", &pause_dir)),
+    )?;
+    wait_for_child_event(&mut scanner, || pause_dir.join("ready").exists());
+
+    let helper_dir = test_env.env_root().join("old-lock-helper");
+    std::fs::create_dir(&helper_dir)?;
+    let mut old_holder = spawn_old_lock_holder(&test_env, &main, &helper_dir)?;
+    wait_for_child_event(&mut old_holder, || helper_dir.join("waiting").exists());
+    assert!(!helper_dir.join("acquired").exists());
+
+    // The scanner cannot wait for the shared lock while keeping its journal
+    // lock. It must drop that lock, let the old process finish, and retry.
+    std::fs::write(pause_dir.join("release"), b"release\n")?;
+    old_holder.assert_success();
+    assert!(helper_dir.join("acquired").exists());
+    scanner.assert_success();
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+            .success()
+            .stdout
+            .raw(),
+        "main contents\n"
+    );
+    Ok(())
+}
+
+// Child processes are killed and reaped even when a timeout or assertion
+// fails, so a stalled lock holder cannot hang the rest of the test suite.
+#[cfg(feature = "test-fakes")]
+struct TestChild {
+    child: std::process::Child,
+    stdout_path: std::path::PathBuf,
+    stderr_path: std::path::PathBuf,
+}
+
+#[cfg(feature = "test-fakes")]
+impl TestChild {
+    fn assert_success(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("poll child process") {
+                assert!(
+                    status.success(),
+                    "child exited with {status}\nstdout:\n{}\nstderr:\n{}",
+                    std::fs::read_to_string(&self.stdout_path).unwrap_or_default(),
+                    std::fs::read_to_string(&self.stderr_path).unwrap_or_default(),
+                );
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child timed out\nstdout:\n{}\nstderr:\n{}",
+                std::fs::read_to_string(&self.stdout_path).unwrap_or_default(),
+                std::fs::read_to_string(&self.stderr_path).unwrap_or_default(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(feature = "test-fakes")]
+impl Drop for TestChild {
+    fn drop(&mut self) {
+        drop(self.child.kill());
+        drop(self.child.wait());
+    }
+}
+
+#[cfg(feature = "test-fakes")]
+fn spawn_traced_jj(
+    test_env: &TestEnvironment,
+    work_dir: &TestWorkDir,
+    label: &str,
+    args: &[&str],
+    pause: Option<(&str, &std::path::Path)>,
+) -> std::io::Result<TestChild> {
+    // Use the same isolated configuration and binary as run_jj(), but keep
+    // the child handle so the test can observe and clean up blocked processes.
+    let template = test_env.new_jj_cmd();
+    let stdout_path = test_env.env_root().join(format!("{label}.stdout"));
+    let stderr_path = test_env.env_root().join(format!("{label}.stderr"));
+    let mut command = std::process::Command::new(template.get_program());
+    command.env_clear();
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
+    command
+        .current_dir(work_dir.root())
+        .env("JJ_LOG", "info")
+        .args(args)
+        .stdout(std::fs::File::create(&stdout_path)?)
+        .stderr(std::fs::File::create(&stderr_path)?);
+    if let Some((env_name, pause_dir)) = pause {
+        command.env(env_name, pause_dir);
+    }
+    Ok(TestChild {
+        child: command.spawn()?,
+        stdout_path,
+        stderr_path,
+    })
+}
+
+#[cfg(feature = "test-fakes")]
+fn spawn_old_lock_holder(
+    test_env: &TestEnvironment,
+    work_dir: &TestWorkDir,
+    helper_dir: &std::path::Path,
+) -> std::io::Result<TestChild> {
+    let stdout_path = test_env.env_root().join("old-holder.stdout");
+    let stderr_path = test_env.env_root().join("old-holder.stderr");
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "--exact",
+            "test_concurrent_operations::test_scan_retries_when_older_process_holds_shared_lock",
+        ])
+        .env("JJ_TEST_OLD_LOCK_HELPER", helper_dir)
+        .env(
+            "JJ_TEST_OLD_SHARED_LOCK",
+            work_dir.root().join(".jj/repo/git_import_export.lock"),
+        )
+        .env(
+            "JJ_TEST_OLD_JOURNAL_LOCK",
+            work_dir.root().join(".jj/working_copy/working_copy.lock"),
+        )
+        .stdout(std::fs::File::create(&stdout_path)?)
+        .stderr(std::fs::File::create(&stderr_path)?);
+    Ok(TestChild {
+        child: command.spawn()?,
+        stdout_path,
+        stderr_path,
+    })
+}
+
+#[cfg(feature = "test-fakes")]
+fn waiter_log_mentions(test_env: &TestEnvironment, label: &str, lock_name: &str) -> bool {
+    let path = test_env.env_root().join(format!("{label}.stderr"));
+    std::fs::read_to_string(path).is_ok_and(|log| {
+        log.lines()
+            .any(|line| line.contains("Attempting to lock") && line.contains(lock_name))
+    })
+}
+
+#[cfg(feature = "test-fakes")]
+fn wait_for_child_event(child: &mut TestChild, event: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !event() {
+        assert!(
+            child
+                .child
+                .try_wait()
+                .expect("poll child process")
+                .is_none(),
+            "child exited before reaching barrier\nstdout:\n{}\nstderr:\n{}",
+            std::fs::read_to_string(&child.stdout_path).unwrap_or_default(),
+            std::fs::read_to_string(&child.stderr_path).unwrap_or_default(),
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child did not reach barrier\nstdout:\n{}\nstderr:\n{}",
+            std::fs::read_to_string(&child.stdout_path).unwrap_or_default(),
+            std::fs::read_to_string(&child.stderr_path).unwrap_or_default(),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        child
+            .child
+            .try_wait()
+            .expect("poll child process")
+            .is_none()
+    );
+}
+
 #[must_use]
 fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     work_dir.run_jj(["log", "-T", "description"])
