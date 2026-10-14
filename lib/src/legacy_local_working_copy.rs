@@ -2991,6 +2991,11 @@ pub struct LockedLocalWorkingCopy {
 
 #[async_trait]
 impl LockedWorkingCopy for LockedLocalWorkingCopy {
+    fn replays_skipped_snapshot_paths(&self) -> bool {
+        // A Watchman clock is not advanced past skipped or invalid paths.
+        true
+    }
+
     fn old_operation_id(&self) -> &OperationId {
         &self.old_operation_id
     }

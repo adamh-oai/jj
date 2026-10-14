@@ -5387,6 +5387,12 @@ pub struct LockedLocalWorkingCopy {
 
 #[async_trait]
 impl LockedWorkingCopy for LockedLocalWorkingCopy {
+    fn replays_skipped_snapshot_paths(&self) -> bool {
+        // AWACS journals skipped candidates; mutable monitor cursors are not
+        // advanced past skipped paths.
+        true
+    }
+
     fn old_operation_id(&self) -> &OperationId {
         &self.old_operation_id
     }

@@ -114,6 +114,13 @@ pub trait LockedWorkingCopy: Any + Send {
     /// The tree at the time the lock was taken
     fn old_tree(&self) -> &MergedTree;
 
+    /// Whether skipped paths from a committed snapshot will be considered by
+    /// a later snapshot even if the monitor reports no further changes. This
+    /// lets callers retry after finishing without losing path reports.
+    fn replays_skipped_snapshot_paths(&self) -> bool {
+        false
+    }
+
     /// Snapshot the working copy. Returns the tree and stats.
     async fn snapshot(
         &mut self,

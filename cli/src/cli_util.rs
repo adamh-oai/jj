@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -569,6 +570,9 @@ impl CommandHelper {
         {
             Ok(stats) => (workspace_command, stats),
             Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
+            Err(SnapshotWorkingCopyError::Retry | SnapshotWorkingCopyError::RetryWithWarnings(_)) => {
+                unreachable!("snapshot_impl retries internally")
+            }
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
                 let auto_update_stale = self.settings().get_bool("snapshot.auto-update-stale")?;
                 if !auto_update_stale {
@@ -767,6 +771,7 @@ impl CommandHelper {
                         &NothingMatcher,
                         None,
                         None,
+                        false,
                     )
                     .await
                     .map_err(|err| err.into_command_error())?;
@@ -913,6 +918,7 @@ impl CommandHelper {
                 &NothingMatcher,
                 Some(expected_published_operation),
                 Some(expected_working_copy_operation),
+                false,
             )
             .await
             .map_err(|err| err.into_command_error())?;
@@ -1170,21 +1176,55 @@ impl WorkspaceCommandEnvironment {
         &self.workspace_name
     }
 
+    /// Serialize operations on this Git worktree without blocking unrelated
+    /// worktrees that share the repository.
+    fn lock_git_worktree_gate(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<FileLock>, CommandError> {
+        // Store the gate in the shared repo, outside linked worktrees' own
+        // working-copy metadata. The canonical root distinguishes worktrees
+        // without exposing their paths in the lock name.
+        if self.working_copy_shared_with_git {
+            let root_bytes = workspace.workspace_root().as_os_str().as_encoded_bytes();
+            let root_hash = jj_lib::content_hash::blake2b_hash(root_bytes);
+            let gate_name = format!(
+                "git-worktree-{}.lock",
+                jj_lib::hex_util::encode_hex(&root_hash)
+            );
+            let gate_path = workspace.repo_path().join(gate_name);
+            Ok(Some(FileLock::lock(gate_path).map_err(|err| {
+                user_error_with_message("Failed to take lock for the Git worktree", err)
+            })?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Acquires a lock for Git import/export operations if the workspace is
     /// supposed to be colocated.
     fn lock_git_import_export(
         &self,
         workspace: &Workspace,
     ) -> Result<GitImportExportLock, CommandError> {
-        let lock = if self.working_copy_shared_with_git {
-            let lock_path = workspace.repo_path().join("git_import_export.lock");
-            Some(FileLock::lock(lock_path).map_err(|err| {
+        let path = self
+            .working_copy_shared_with_git
+            .then(|| workspace.repo_path().join("git_import_export.lock"));
+        let gate = self.lock_git_worktree_gate(workspace)?;
+        let lock = if let Some(lock_path) = &path {
+            Some(FileLock::lock(lock_path.clone()).map_err(|err| {
                 user_error_with_message("Failed to take lock for Git import/export", err)
             })?)
         } else {
             None
         };
-        Ok(GitImportExportLock { _lock: lock })
+        Ok(GitImportExportLock {
+            lock: Cell::new(lock),
+            path,
+            _gate: gate,
+            retry_gate: Cell::new(None),
+            retry_gate_held: Cell::new(false),
+        })
     }
 
     /// Parsing context for fileset expressions specified by command arguments.
@@ -1384,7 +1424,68 @@ impl WorkspaceCommandEnvironment {
 /// repositories. For non-colocated repos, this is an empty token (no actual
 /// lock held). The lock is automatically released when this token is dropped.
 pub struct GitImportExportLock {
-    _lock: Option<FileLock>,
+    lock: Cell<Option<FileLock>>,
+    path: Option<PathBuf>,
+    _gate: Option<FileLock>,
+    retry_gate: Cell<Option<FileLock>>,
+    retry_gate_held: Cell<bool>,
+}
+
+impl GitImportExportLock {
+    fn release(&self) {
+        drop(self.lock.take());
+    }
+
+    /// Never wait for the shared lock while holding a working-copy lock. An
+    /// older process may hold the shared lock while waiting for that same
+    /// working copy.
+    fn try_reacquire(&self) -> Result<bool, CommandError> {
+        let Some(path) = &self.path else {
+            return Ok(true);
+        };
+        let lock = FileLock::try_lock(path.clone()).map_err(|err| {
+            user_error_with_message("Failed to take lock for Git import/export", err)
+        })?;
+        let acquired = lock.is_some();
+        self.lock.set(lock);
+        Ok(acquired)
+    }
+
+    fn reacquire(&self) -> Result<(), CommandError> {
+        if let Some(path) = &self.path {
+            let lock = FileLock::lock(path.clone()).map_err(|err| {
+                user_error_with_message("Failed to take lock for Git import/export", err)
+            })?;
+            self.lock.set(Some(lock));
+        }
+        Ok(())
+    }
+
+    /// Serialize only commands that have had to retry a scan. Without this,
+    /// contenders can repeatedly take turns holding the shared lock while
+    /// another worktree is attempting to reacquire it, preventing either
+    /// scan from completing. The working-copy lock must be dropped before
+    /// calling this: an older client may hold Git while waiting for it.
+    fn reacquire_for_retry(&self) -> Result<(), CommandError> {
+        if let Some(path) = &self.path
+            && !self.retry_gate_held.get()
+        {
+            let retry_path = path.with_file_name("git_import_export_retry.lock");
+            let gate = FileLock::lock(retry_path).map_err(|err| {
+                user_error_with_message("Failed to take lock for a Git import/export retry", err)
+            })?;
+            self.retry_gate.set(Some(gate));
+            self.retry_gate_held.set(true);
+        }
+        #[cfg(feature = "test-fakes")]
+        pause_for_test("JJ_TEST_SNAPSHOT_RETRY_PAUSE_DIR");
+        self.reacquire()
+    }
+
+    fn finish_retry(&self) {
+        drop(self.retry_gate.take());
+        self.retry_gate_held.set(false);
+    }
 }
 
 /// Provides utilities for writing a command that works on a [`Workspace`]
@@ -1403,6 +1504,12 @@ pub struct WorkspaceCommandHelper {
 enum SnapshotWorkingCopyError {
     Command(CommandError),
     StaleWorkingCopy(CommandError),
+    /// The shared lock was released and the scan must be restarted from the
+    /// current repository operation and Git HEAD.
+    Retry,
+    /// A scan produced warnings before it needed to be retried. Preserve
+    /// them because a subsequent monitor query may succeed.
+    RetryWithWarnings(Vec<SnapshotWarning>),
 }
 
 impl SnapshotWorkingCopyError {
@@ -1410,6 +1517,9 @@ impl SnapshotWorkingCopyError {
         match self {
             Self::Command(err) => err,
             Self::StaleWorkingCopy(err) => err,
+            Self::Retry | Self::RetryWithWarnings(_) => {
+                unreachable!("snapshot retries are handled by snapshot_impl")
+            }
         }
     }
 }
@@ -1419,6 +1529,20 @@ where
     E: Into<CommandError>,
 {
     SnapshotWorkingCopyError::Command(err.into())
+}
+
+fn merge_snapshot_warnings(target: &mut Vec<SnapshotWarning>, warnings: Vec<SnapshotWarning>) {
+    for warning in warnings {
+        let already_reported = target.iter().any(|existing| match (existing, &warning) {
+            (
+                SnapshotWarning::FileSystemMonitor { message: old },
+                SnapshotWarning::FileSystemMonitor { message: new },
+            ) => old == new,
+        });
+        if !already_reported {
+            target.push(warning);
+        }
+    }
 }
 
 #[cfg(feature = "git")]
@@ -1485,6 +1609,16 @@ fn encode_sparse_state(patterns: Option<Vec<RepoPathBuf>>) -> Vec<u8> {
         result.extend_from_slice(path);
     }
     result
+}
+
+fn saved_snapshot_error<E>(err: E) -> SnapshotWorkingCopyError
+where
+    E: Into<CommandError>,
+{
+    snapshot_command_error(
+        err.into()
+            .hinted("The working-copy snapshot was saved before this error occurred."),
+    )
 }
 
 impl WorkspaceCommandHelper {
@@ -1564,6 +1698,10 @@ impl WorkspaceCommandHelper {
         self.env.lock_git_import_export(&self.workspace)
     }
 
+    pub(crate) fn lock_git_worktree_gate(&self) -> Result<Option<FileLock>, CommandError> {
+        self.env.lock_git_worktree_gate(&self.workspace)
+    }
+
     /// Note that unless you have a good reason not to do so, you should always
     /// call [`print_snapshot_stats`] with the [`SnapshotStats`] returned by
     /// this function to present possible untracked files to the user.
@@ -1575,47 +1713,167 @@ impl WorkspaceCommandHelper {
         force_tracking_matcher: &dyn Matcher,
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
-        // Git HEAD import can update the repository and working-copy journal.
-        // Check the baseline first so an incomplete subvolume transition
-        // cannot publish those changes before the ordinary snapshot fails.
-        if self
-            .workspace_root()
-            .join(".jj/working_copy/subvolume_mode")
-            .is_file()
-        {
-            let options = self
-                .snapshot_options_with_start_tracking_matcher(&NothingMatcher)
+        // A non-integrated operation may be intentionally unpublished, so it
+        // must not be reloaded from the published operation heads.
+        let can_release_lock =
+            self.env.command.should_commit_transaction() && git_import_export_lock.path.is_some();
+        let mut retry_warnings = Vec::new();
+        let stats = loop {
+            // Check the baseline before Git HEAD import, which can update the
+            // repository and journal. Never wait for the journal while holding
+            // the shared lock: another process may be scanning this worktree.
+            let preflight_ready = if self
+                .workspace_root()
+                .join(".jj/working_copy/subvolume_mode")
+                .is_file()
+            {
+                let options = self
+                    .snapshot_options_with_start_tracking_matcher(&NothingMatcher)
+                    .map_err(snapshot_command_error)?;
+                let repo = self.repo().clone();
+                let workspace_name = self.workspace_name().to_owned();
+                let working_copy_type = self.working_copy().name().to_owned();
+                let initial_sparse_patterns = self
+                    .working_copy()
+                    .sparse_patterns()
+                    .ok()
+                    .map(<[_]>::to_vec);
+                if can_release_lock {
+                    git_import_export_lock.release();
+                }
+                #[cfg(feature = "test-fakes")]
+                pause_for_test("JJ_TEST_SNAPSHOT_PREFLIGHT_PAUSE_DIR");
+                let mut locked_ws = self
+                    .workspace
+                    .start_working_copy_mutation()
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if can_release_lock
+                    && !git_import_export_lock
+                        .try_reacquire()
+                        .map_err(snapshot_command_error)?
+                {
+                    // Old binaries can hold the Git lock while waiting for
+                    // this journal. Drop it before waiting for that lock.
+                    drop(locked_ws);
+                    git_import_export_lock
+                        .reacquire_for_retry()
+                        .map_err(snapshot_command_error)?;
+                    false
+                } else {
+                    // HEAD may legitimately differ until the import below.
+                    // Only validate the operation while still holding both
+                    // locks, then perform the baseline preflight.
+                    let is_current = if can_release_lock {
+                        let op = self
+                            .env
+                            .command
+                            .resolve_operation(ui, repo.loader(), &workspace_name)
+                            .map_err(snapshot_command_error)?;
+                        op.id() == repo.op_id()
+                    } else {
+                        true
+                    };
+                    if is_current
+                        && let Some(initial_sparse_patterns) = initial_sparse_patterns
+                        && locked_ws
+                            .locked_wc()
+                            .sparse_patterns()
+                            .map_err(snapshot_command_error)?
+                            != initial_sparse_patterns
+                    {
+                        if !can_release_lock
+                            || locked_ws.locked_wc().old_operation_id() != repo.op_id()
+                        {
+                            return Err(snapshot_command_error(user_error(
+                                "The working-copy sparse patterns changed while preparing the \
+                                 snapshot. Retry the command.",
+                            )));
+                        }
+                        // The fingerprint was calculated from the cached
+                        // patterns. Refresh the working copy before checking
+                        // the baseline or importing Git HEAD, then recompute it.
+                        let operation = locked_ws.locked_wc().old_operation_id().clone();
+                        locked_ws
+                            .finish(operation)
+                            .await
+                            .map_err(snapshot_command_error)?;
+                        if self.workspace_name() != workspace_name
+                            || self.working_copy().name() != working_copy_type
+                        {
+                            return Err(snapshot_command_error(user_error(
+                                "The workspace identity changed while preparing the snapshot",
+                            )));
+                        }
+                        false
+                    } else if is_current {
+                        locked_ws
+                            .locked_wc()
+                            .check_snapshot_ready(&options)
+                            .map_err(snapshot_command_error)?;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+
+            let result = if preflight_ready {
+                async {
+                    #[cfg(feature = "git")]
+                    let journal_ahead = if self.env.working_copy_shared_with_git {
+                        self.import_git_head(ui, git_import_export_lock, true)
+                            .await?
+                    } else {
+                        false
+                    };
+                    #[cfg(not(feature = "git"))]
+                    let journal_ahead = false;
+                    // An ahead journal can refer to an unpublished operation,
+                    // which must not be reloaded from the published heads.
+                    self.snapshot_working_copy(
+                        ui,
+                        git_import_export_lock,
+                        false,
+                        force_tracking_matcher,
+                        None,
+                        None,
+                        can_release_lock && !journal_ahead,
+                    )
+                    .await
+                }
+                .await
+            } else {
+                Err(SnapshotWorkingCopyError::Retry)
+            };
+            let warnings = match result {
+                Ok(mut stats) => {
+                    merge_snapshot_warnings(&mut retry_warnings, stats.warnings);
+                    stats.warnings = retry_warnings;
+                    break stats;
+                }
+                Err(SnapshotWorkingCopyError::RetryWithWarnings(warnings)) => warnings,
+                Err(SnapshotWorkingCopyError::Retry) => Vec::new(),
+                Err(err) => return Err(err),
+            };
+            merge_snapshot_warnings(&mut retry_warnings, warnings);
+            let repo = self.repo().clone();
+            let op = self
+                .env
+                .command
+                .resolve_operation(ui, repo.loader(), self.workspace_name())
                 .map_err(snapshot_command_error)?;
-            let mut locked_ws = self
-                .workspace
-                .start_working_copy_mutation()
+            let repo = repo
+                .loader()
+                .load_at(&op)
                 .await
                 .map_err(snapshot_command_error)?;
-            locked_ws
-                .locked_wc()
-                .check_snapshot_ready(&options)
-                .map_err(snapshot_command_error)?;
-        }
-        #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git {
-            self.import_git_head(ui, git_import_export_lock)
-                .await
-                .map_err(snapshot_command_error)?;
-        }
-        // Because the Git refs (except HEAD) aren't imported yet, the ref
-        // pointing to the new working-copy commit might not be exported.
-        // In that situation, the ref would be conflicted anyway, so export
-        // failure is okay.
-        let stats = self
-            .snapshot_working_copy(
-                ui,
-                git_import_export_lock,
-                false,
-                force_tracking_matcher,
-                None,
-                None,
-            )
-            .await?;
+            self.user_repo = ReadonlyUserRepo::new(repo);
+        };
+
+        git_import_export_lock.finish_retry();
 
         // import_git_refs() can rebase the working-copy commit.
         #[cfg(feature = "git")]
@@ -1699,6 +1957,7 @@ impl WorkspaceCommandHelper {
                 &NothingMatcher,
                 expected_published_operation,
                 None,
+                false,
             )
             .await
             .map_err(|err| err.into_command_error())?;
@@ -1706,7 +1965,25 @@ impl WorkspaceCommandHelper {
         #[cfg(feature = "git")]
         if self.env.working_copy_shared_with_git {
             report_phase("importing the colocated Git HEAD")?;
-            self.import_git_head(ui, &git_import_export_lock).await?;
+            loop {
+                match self
+                    .import_git_head(ui, &git_import_export_lock, false)
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(SnapshotWorkingCopyError::Retry) => {
+                        let repo = self.repo().clone();
+                        let op = self.env.command.resolve_operation(
+                            ui,
+                            repo.loader(),
+                            self.workspace_name(),
+                        )?;
+                        let repo = repo.loader().load_at(&op).await?;
+                        self.user_repo = ReadonlyUserRepo::new(repo);
+                    }
+                    Err(err) => return Err(err.into_command_error()),
+                }
+            }
         }
 
         // import_git_refs() can rebase the working-copy commit. In a large
@@ -1808,53 +2085,246 @@ impl WorkspaceCommandHelper {
     /// The old working-copy commit will be abandoned if it's discardable. The
     /// working-copy state will be reset to point to the new Git HEAD. The
     /// working-copy contents won't be updated.
+    ///
+    /// Returns true when the working-copy journal was ahead of the published
+    /// repository operation. The following snapshot must keep that operation.
     #[cfg(feature = "git")]
     #[instrument(skip_all)]
     async fn import_git_head(
         &mut self,
         ui: &Ui,
         git_import_export_lock: &GitImportExportLock,
-    ) -> Result<(), CommandError> {
+        allow_sparse_retry: bool,
+    ) -> Result<bool, SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
         let workspace_name = self.workspace_name().to_owned();
         let workspace_root = self.workspace_root().to_owned();
-        let mut tx = self.start_transaction();
-        jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root).await?;
+        let mut repo = self.repo().clone();
+        let mut tx = self.start_transaction().into_inner();
+        jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root)
+            .await
+            .map_err(snapshot_command_error)?;
         if !tx.repo().has_changes() {
-            return Ok(());
+            return Ok(false);
         }
 
-        let mut tx = tx.into_inner();
-        let old_git_head = self.repo().view().git_head(&workspace_name).clone();
+        let can_release_lock = allow_sparse_retry
+            && self.env.command.should_commit_transaction()
+            && git_import_export_lock.path.is_some();
+        let snapshot_preflight = if self
+            .workspace_root()
+            .join(".jj/working_copy/subvolume_mode")
+            .is_file()
+        {
+            let options = self
+                .snapshot_options_with_start_tracking_matcher(&NothingMatcher)
+                .map_err(snapshot_command_error)?;
+            let sparse_patterns = self
+                .working_copy()
+                .sparse_patterns()
+                .ok()
+                .map(<[_]>::to_vec);
+            Some((options, sparse_patterns))
+        } else {
+            None
+        };
+        let working_copy_type = self.working_copy().name().to_owned();
+        let mut locked_ws = if tx
+            .repo()
+            .view()
+            .git_head(&workspace_name)
+            .as_normal()
+            .is_some()
+            || snapshot_preflight.is_some()
+        {
+            if can_release_lock {
+                git_import_export_lock.release();
+            }
+            #[cfg(feature = "test-fakes")]
+            pause_for_test("JJ_TEST_IMPORT_HEAD_PRE_JOURNAL_PAUSE_DIR");
+            let locked_ws = self
+                .workspace
+                .start_working_copy_mutation()
+                .await
+                .map_err(snapshot_command_error)?;
+            if can_release_lock {
+                #[cfg(feature = "test-fakes")]
+                pause_for_test("JJ_TEST_IMPORT_HEAD_PAUSE_DIR");
+                if !git_import_export_lock
+                    .try_reacquire()
+                    .map_err(snapshot_command_error)?
+                {
+                    // Older clients can hold the Git lock while waiting for
+                    // this journal. Release it before waiting for them.
+                    drop(locked_ws);
+                    git_import_export_lock
+                        .reacquire_for_retry()
+                        .map_err(snapshot_command_error)?;
+                    return Err(SnapshotWorkingCopyError::Retry);
+                }
+                let op = self
+                    .env
+                    .command
+                    .resolve_operation(ui, repo.loader(), &workspace_name)
+                    .map_err(snapshot_command_error)?;
+                if op.id() != repo.op_id() {
+                    return Err(SnapshotWorkingCopyError::Retry);
+                }
+
+                // Neither the operation nor Git HEAD can be assumed to be
+                // unchanged while waiting for the working-copy lock. Re-read
+                // HEAD with both locks held before resetting the journal.
+                tx = start_repo_transaction(&repo, &workspace_name, self.env.command.string_args());
+                jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root)
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if !tx.repo().has_changes() {
+                    return Ok(false);
+                }
+            }
+            Some(locked_ws)
+        } else {
+            None
+        };
+        let mut journal_ahead = false;
+        if tx
+            .repo()
+            .view()
+            .git_head(&workspace_name)
+            .as_normal()
+            .is_some()
+            && let Some(locked_ws) = &mut locked_ws
+        {
+            // A concurrent operation can rewrite this workspace while we wait
+            // for its journal. Check its old tree before resetting the journal,
+            // or tracked local edits could be mistaken for untracked files.
+            let freshness =
+                handle_stale_working_copy(locked_ws.locked_wc(), repo.clone(), &workspace_name)
+                    .await;
+            let freshness = match freshness {
+                Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
+                    // Automatic stale recovery can leave the saved edits only
+                    // in operation history. Preserve the files on disk and let
+                    // the user decide how to recover them instead.
+                    return Err(SnapshotWorkingCopyError::Command(err.hinted(
+                        "Automatic stale recovery is disabled when Git HEAD has changed. After \
+                         `jj workspace update-stale`, edits may only be saved in the operation \
+                         log; inspect `jj op log` and restore them if needed.",
+                    )));
+                }
+                result => result?,
+            };
+            let Some((journal_repo, _)) = freshness else {
+                return Err(snapshot_command_error(user_error(format!(
+                    "Workspace `{}` doesn't have a working-copy commit",
+                    workspace_name.as_symbol()
+                ))));
+            };
+            if journal_repo.op_id() != repo.op_id() {
+                // An updated journal can point to an unpublished descendant of
+                // the repository operation. Keep it, as snapshot_working_copy
+                // does, and import HEAD from that operation instead of retrying
+                // indefinitely against the same published head.
+                repo = journal_repo;
+                journal_ahead = true;
+                self.user_repo = ReadonlyUserRepo::new(repo.clone());
+                tx = start_repo_transaction(&repo, &workspace_name, self.env.command.string_args());
+                jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root)
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if !tx.repo().has_changes() {
+                    return Ok(journal_ahead);
+                }
+            }
+        }
+        if let Some((options, initial_sparse_patterns)) = &snapshot_preflight {
+            let locked = locked_ws
+                .as_mut()
+                .expect("working copy locked for preflight");
+            if let Some(initial_sparse_patterns) = initial_sparse_patterns
+                && locked
+                    .locked_wc()
+                    .sparse_patterns()
+                    .map_err(snapshot_command_error)?
+                    != initial_sparse_patterns
+            {
+                if !can_release_lock
+                    || !allow_sparse_retry
+                    || journal_ahead
+                    || locked.locked_wc().old_operation_id() != repo.op_id()
+                {
+                    return Err(snapshot_command_error(user_error(
+                        "The working-copy sparse patterns changed while preparing the Git HEAD \
+                         import. Retry the command.",
+                    )));
+                }
+                let operation = locked.locked_wc().old_operation_id().clone();
+                locked_ws
+                    .take()
+                    .unwrap()
+                    .finish(operation)
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if self.workspace_name() != workspace_name
+                    || self.working_copy().name() != working_copy_type
+                {
+                    return Err(snapshot_command_error(user_error(
+                        "The workspace identity changed while preparing the Git HEAD import",
+                    )));
+                }
+                return Err(SnapshotWorkingCopyError::Retry);
+            }
+            locked
+                .locked_wc()
+                .check_snapshot_ready(options)
+                .map_err(snapshot_command_error)?;
+        }
+        let old_git_head = repo.view().git_head(&workspace_name).clone();
         let new_git_head = tx.repo().view().git_head(&workspace_name);
         if let Some(new_git_head_id) = new_git_head.as_normal() {
-            let new_git_head_commit = tx.repo().store().get_commit_async(new_git_head_id).await?;
+            let new_git_head_commit = tx
+                .repo()
+                .store()
+                .get_commit_async(new_git_head_id)
+                .await
+                .map_err(snapshot_command_error)?;
             let wc_commit = tx
                 .repo_mut()
                 .check_out(workspace_name, &new_git_head_commit)
-                .await?;
-            let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+                .await
+                .map_err(snapshot_command_error)?;
+            let mut locked_ws = locked_ws.take().expect("working copy locked for Git HEAD");
             // The working copy was presumably updated by the git command that updated
             // HEAD, so we just need to reset our working copy
             // state to it without updating working copy files.
-            locked_ws.locked_wc().reset(&wc_commit).await?;
-            tx.repo_mut().rebase_descendants().await?;
+            locked_ws
+                .locked_wc()
+                .reset(&wc_commit)
+                .await
+                .map_err(snapshot_command_error)?;
+            tx.repo_mut()
+                .rebase_descendants()
+                .await
+                .map_err(snapshot_command_error)?;
             self.user_repo = ReadonlyUserRepo::new(
                 self.env
                     .command
                     .maybe_commit_transaction(tx, "import git head")
-                    .await?,
+                    .await
+                    .map_err(snapshot_command_error)?,
             );
             if self.env.command.should_commit_transaction() {
                 locked_ws
                     .finish(self.user_repo.repo.op_id().clone())
-                    .await?;
+                    .await
+                    .map_err(snapshot_command_error)?;
             }
             if old_git_head.is_present() {
                 writeln!(
                     ui.status(),
                     "Reset the working copy parent to the new Git HEAD."
-                )?;
+                )
+                .map_err(snapshot_command_error)?;
             } else {
                 // Don't print verbose message on initial checkout.
             }
@@ -1863,18 +2333,28 @@ impl WorkspaceCommandHelper {
                     ui.status(),
                     "Operation left uncommitted because --no-integrate-operation was requested: {}",
                     short_operation_hash(self.repo().op_id())
-                )?;
+                )
+                .map_err(snapshot_command_error)?;
             }
         } else {
+            // A re-read can observe that HEAD was deleted while waiting.
+            // The transaction path below acquires its own working-copy lock.
+            drop(locked_ws);
             // Unlikely, but the HEAD ref got deleted by git?
-            let num_rebased = tx.repo_mut().rebase_descendants().await?;
+            let num_rebased = tx
+                .repo_mut()
+                .rebase_descendants()
+                .await
+                .map_err(snapshot_command_error)?;
             if num_rebased > 0 {
-                writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;
+                writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")
+                    .map_err(snapshot_command_error)?;
             }
             self.finish_transaction(ui, tx, "import git head", git_import_export_lock)
-                .await?;
+                .await
+                .map_err(snapshot_command_error)?;
         }
-        Ok(())
+        Ok(journal_ahead)
     }
 
     /// Imports branches and tags from the underlying Git repo, abandons old
@@ -2698,9 +3178,23 @@ to the current parents may contain changes from multiple commits.
         force_tracking_matcher: &dyn Matcher,
         expected_published_operation: Option<&OperationId>,
         expected_working_copy_operation: Option<&OperationId>,
+        can_release_lock: bool,
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         let workspace_name = self.workspace_name().to_owned();
+        let working_copy_type = self.working_copy().name().to_owned();
         let repo = self.repo().clone();
+        let mut can_release_lock = can_release_lock && git_import_export_lock.path.is_some();
+        // Snapshot options can depend on cached sparse patterns. Check them
+        // against the locked journal before scanning, including after a retry.
+        // Some custom working copies do not support sparse patterns; retain
+        // the shared lock for them instead of requiring this check.
+        let initial_sparse_patterns = match self.working_copy().sparse_patterns() {
+            Ok(patterns) => Some(patterns.to_vec()),
+            Err(_) => {
+                can_release_lock = false;
+                None
+            }
+        };
         let auto_tracking_matcher = self
             .auto_tracking_matcher(ui)
             .map_err(snapshot_command_error)?;
@@ -2723,12 +3217,36 @@ to the current parents may contain changes from multiple commits.
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
         let _ = force_awacs_input_fingerprint;
 
-        // Compare working-copy tree and operation with repo's, and reload as needed.
+        // Do not hold the shared Git lock while waiting for a busy working
+        // copy. Another workspace can synchronize its own Git state meanwhile.
+        if can_release_lock {
+            git_import_export_lock.release();
+        }
+        #[cfg(feature = "test-fakes")]
+        pause_for_test("JJ_TEST_SNAPSHOT_PRE_JOURNAL_PAUSE_DIR");
         let mut locked_ws = self
             .workspace
             .start_working_copy_mutation()
             .await
             .map_err(snapshot_command_error)?;
+        if can_release_lock {
+            if !git_import_export_lock
+                .try_reacquire()
+                .map_err(snapshot_command_error)?
+            {
+                // An older process may hold the Git lock while waiting for
+                // this working copy. Drop it before waiting for the lock.
+                drop(locked_ws);
+                git_import_export_lock
+                    .reacquire_for_retry()
+                    .map_err(snapshot_command_error)?;
+                return Err(SnapshotWorkingCopyError::Retry);
+            }
+            if !snapshot_repo_is_current(ui, &self.env, &repo, &workspace_name).await? {
+                drop(locked_ws);
+                return Err(SnapshotWorkingCopyError::Retry);
+            }
+        }
 
         if let Some(expected) = expected_working_copy_operation {
             let locked_wc = locked_ws.locked_wc();
@@ -2760,6 +3278,8 @@ to the current parents may contain changes from multiple commits.
             }
         }
 
+        // Compare working-copy tree and operation with repo's, and reload as needed.
+        let published_repo = repo.clone();
         let Some((repo, wc_commit)) =
             handle_stale_working_copy(locked_ws.locked_wc(), repo, &workspace_name).await?
         else {
@@ -2768,11 +3288,52 @@ to the current parents may contain changes from multiple commits.
             return Ok(SnapshotStats::default());
         };
 
+        // A journal can point to an operation ahead of the published head.
+        // Preserve that operation's recovery semantics by keeping the shared
+        // lock for this uncommon case.
+        if repo.op_id() != published_repo.op_id() {
+            can_release_lock = false;
+        }
+        if let Some(initial_sparse_patterns) = initial_sparse_patterns
+            && locked_ws
+                .locked_wc()
+                .sparse_patterns()
+                .map_err(snapshot_command_error)?
+                != initial_sparse_patterns
+        {
+            if !can_release_lock {
+                return Err(snapshot_command_error(user_error(
+                    "The working-copy sparse patterns changed while preparing the snapshot. Retry \
+                     the command.",
+                )));
+            }
+            // Install the newly read journal before retrying, so the next
+            // attempt derives its options from the actual sparse patterns.
+            let operation = locked_ws.locked_wc().old_operation_id().clone();
+            locked_ws
+                .finish(operation)
+                .await
+                .map_err(snapshot_command_error)?;
+            if self.workspace_name() != workspace_name
+                || self.working_copy().name() != working_copy_type
+            {
+                return Err(snapshot_command_error(user_error(
+                    "The workspace identity changed while starting the working-copy snapshot",
+                )));
+            }
+            return Err(SnapshotWorkingCopyError::Retry);
+        }
+
         self.user_repo = ReadonlyUserRepo::new(repo.clone());
         let (new_tree, stats) = {
             let mut options = options;
             let progress = crate::progress::snapshot_progress(ui);
             options.progress = progress.as_ref().map(|x| x as _);
+            if can_release_lock {
+                git_import_export_lock.release();
+            }
+            #[cfg(feature = "test-fakes")]
+            pause_snapshot_for_test();
             let locked_wc = locked_ws.locked_wc();
             if force_awacs_input_fingerprint {
                 locked_wc.snapshot_for_awacs_baseline(&options).await
@@ -2781,6 +3342,48 @@ to the current parents may contain changes from multiple commits.
             }
             .map_err(snapshot_command_error)?
         };
+        if can_release_lock {
+            if !git_import_export_lock
+                .try_reacquire()
+                .map_err(snapshot_command_error)?
+            {
+                // Dropping the working copy also aborts any uncommitted scan
+                // session before another process can acquire it.
+                drop(locked_ws);
+                git_import_export_lock
+                    .reacquire_for_retry()
+                    .map_err(snapshot_command_error)?;
+                return Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings));
+            }
+            let scan_repo = snapshot_repo_after_scan(
+                ui,
+                &self.env,
+                &published_repo,
+                &self.user_repo.repo,
+                &workspace_name,
+                &wc_commit,
+                locked_ws.locked_wc(),
+            )
+            .await;
+            let repo = match scan_repo {
+                Ok(Some(repo)) => repo,
+                result => {
+                    // Aborting a scan can perform expensive cleanup too. Do
+                    // not hold the shared lock while dropping its journal.
+                    git_import_export_lock.release();
+                    drop(locked_ws);
+                    git_import_export_lock
+                        .reacquire()
+                        .map_err(snapshot_command_error)?;
+                    return match result {
+                        Ok(None) => Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings)),
+                        Err(err) => Err(err),
+                        Ok(Some(_)) => unreachable!(),
+                    };
+                }
+            };
+            self.user_repo = ReadonlyUserRepo::new(repo);
+        }
         // Some commands publish operations without the shared Git lock.
         // Catch changes during the explicit rebuild's full scan before
         // publishing it, so the user can retry against the new operation.
@@ -2969,10 +3572,122 @@ to the current parents may contain changes from multiple commits.
         }
 
         if self.env.command.should_commit_transaction() {
-            locked_ws
-                .finish(self.user_repo.repo.op_id().clone())
-                .await
-                .map_err(snapshot_command_error)?;
+            // Finishing may commit an immutable scan lease and perform slow
+            // garbage collection. No Git state is needed until the journal
+            // lock has been released. A retry after committing the cursor
+            // must rediscover any skipped paths; custom working copies that
+            // cannot guarantee this retain the shared lock for path reports.
+            // Warnings are carried explicitly across retries.
+            let can_release_finish = can_release_lock
+                && ((stats.untracked_paths.is_empty() && stats.invalid_utf8_paths.is_empty())
+                    || locked_ws.locked_wc().replays_skipped_snapshot_paths());
+            let sparse_patterns = if can_release_finish {
+                Some(
+                    locked_ws
+                        .locked_wc()
+                        .sparse_patterns()
+                        .map_err(snapshot_command_error)?
+                        .to_vec(),
+                )
+            } else {
+                None
+            };
+            if can_release_finish {
+                git_import_export_lock.release();
+            }
+            #[cfg(feature = "test-fakes")]
+            pause_for_test("JJ_TEST_SNAPSHOT_FINISH_PAUSE_DIR");
+            let finish_result = locked_ws.finish(self.user_repo.repo.op_id().clone()).await;
+            if let Some(sparse_patterns) = sparse_patterns {
+                // finish() consumes the journal lock even on failure. Always
+                // drop it before waiting for Git, since older clients can
+                // hold Git while they wait for the journal.
+                if let Err(err) = finish_result {
+                    let mut error: CommandError = err.into();
+                    if let Err(lock_err) = git_import_export_lock.reacquire() {
+                        error.add_hint(format!(
+                            "Failed to reacquire the Git lock: {}",
+                            lock_err.error
+                        ));
+                    }
+                    return Err(snapshot_command_error(error));
+                }
+                #[cfg(feature = "test-fakes")]
+                pause_for_test("JJ_TEST_SNAPSHOT_AFTER_FINISH_PAUSE_DIR");
+
+                // Other commands can modify the journal without changing the
+                // repo operation, even while our worktree gate is held. Read
+                // the whole working copy again under both locks so our cached
+                // state reflects any such change. Acquire Git nonblocking to
+                // avoid deadlocking an older Git-lock-first process.
+                let mut verify_ws = match self.workspace.start_working_copy_mutation().await {
+                    Ok(locked) => locked,
+                    Err(err) => {
+                        let mut error: CommandError = err.into();
+                        if let Err(lock_err) = git_import_export_lock.reacquire() {
+                            error.add_hint(format!(
+                                "Failed to reacquire the Git lock: {}",
+                                lock_err.error
+                            ));
+                        }
+                        return Err(saved_snapshot_error(error));
+                    }
+                };
+                let git_lock_acquired = match git_import_export_lock.try_reacquire() {
+                    Ok(acquired) => acquired,
+                    Err(err) => {
+                        drop(verify_ws);
+                        let mut error: CommandError = err.into();
+                        if let Err(lock_err) = git_import_export_lock.reacquire() {
+                            error.add_hint(format!(
+                                "Failed to reacquire the Git lock: {}",
+                                lock_err.error
+                            ));
+                        }
+                        return Err(saved_snapshot_error(error));
+                    }
+                };
+                if !git_lock_acquired {
+                    drop(verify_ws);
+                    git_import_export_lock
+                        .reacquire_for_retry()
+                        .map_err(saved_snapshot_error)?;
+                    return Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings));
+                }
+                let locked_wc = verify_ws.locked_wc();
+                let journal_operation = locked_wc.old_operation_id().clone();
+                let journal_changed = &journal_operation != self.user_repo.repo.op_id()
+                    || locked_wc.old_tree().tree_ids_and_labels() != new_tree.tree_ids_and_labels()
+                    || locked_wc.sparse_patterns().map_err(saved_snapshot_error)?
+                        != sparse_patterns;
+                let is_current =
+                    snapshot_repo_is_current(ui, &self.env, &self.user_repo.repo, &workspace_name)
+                        .await
+                        .map_err(|err| match err {
+                            SnapshotWorkingCopyError::Command(err) => saved_snapshot_error(err),
+                            err => err,
+                        })?;
+                // Finish the unchanged verification lock at its own operation.
+                // This installs the complete freshly read working-copy state
+                // using the same store as the repo. No scan lease is attached
+                // to this lock, so it does not need scan cleanup.
+                verify_ws
+                    .finish(journal_operation)
+                    .await
+                    .map_err(saved_snapshot_error)?;
+                if self.workspace_name() != workspace_name
+                    || self.working_copy().name() != working_copy_type
+                {
+                    return Err(saved_snapshot_error(user_error(
+                        "The workspace identity changed while saving the working-copy snapshot",
+                    )));
+                }
+                if journal_changed || !is_current {
+                    return Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings));
+                }
+            } else {
+                finish_result.map_err(snapshot_command_error)?;
+            }
         }
         Ok(stats)
     }
@@ -3084,6 +3799,8 @@ to the current parents may contain changes from multiple commits.
         let workspace_name = self.workspace_name().to_owned();
         #[cfg(feature = "git")]
         let workspace_root = self.workspace_root().to_owned();
+        let can_release_checkout_lock =
+            git_import_export_lock.path.is_some() && should_commit_transaction;
 
         // Hold the working-copy lock across Git mutation, operation
         // publication, and checkout. Persist pending_checkout before the first
@@ -3162,18 +3879,36 @@ to the current parents may contain changes from multiple commits.
 
         let maybe_checkout_stats = if let Some(mut locked_ws) = locked_ws.take() {
             if let Some(new_commit) = &maybe_new_wc_commit {
-                let stats = locked_ws
-                    .locked_wc()
-                    .check_out(new_commit)
-                    .await
-                    .map_err(|err| {
-                        internal_error_with_message(
-                            format!("Failed to check out commit {}", new_commit.id().hex()),
-                            err,
-                        )
-                    })?;
-                locked_ws.finish(new_repo.op_id().clone()).await?;
-                Some(stats)
+                // Git and the operation are published, and the journal is
+                // locked until checkout completes. Other worktrees can now
+                // synchronize their own Git state.
+                if can_release_checkout_lock {
+                    git_import_export_lock.release();
+                    #[cfg(feature = "test-fakes")]
+                    pause_for_test("JJ_TEST_CHECKOUT_PAUSE_DIR");
+                }
+                let result = async {
+                    let stats =
+                        locked_ws
+                            .locked_wc()
+                            .check_out(new_commit)
+                            .await
+                            .map_err(|err| {
+                                internal_error_with_message(
+                                    format!("Failed to check out commit {}", new_commit.id().hex()),
+                                    err,
+                                )
+                            })?;
+                    locked_ws.finish(new_repo.op_id().clone()).await?;
+                    Ok::<_, CommandError>(stats)
+                }
+                .await;
+                if can_release_checkout_lock {
+                    // The journal was consumed or dropped, even on error, so
+                    // an older process cannot deadlock while waiting for it.
+                    git_import_export_lock.reacquire()?;
+                }
+                Some(result?)
             } else {
                 None
             }
@@ -3783,6 +4518,115 @@ async fn rebase_mutable_descendants(
         )
         .await?;
     Ok(num_rebased)
+}
+
+/// Check that a scan still belongs to the operation and Git HEAD it started
+/// from. The caller holds both the shared Git lock and the working-copy lock.
+async fn snapshot_repo_is_current(
+    ui: &Ui,
+    env: &WorkspaceCommandEnvironment,
+    repo: &Arc<ReadonlyRepo>,
+    workspace_name: &WorkspaceName,
+) -> Result<bool, SnapshotWorkingCopyError> {
+    let op = env
+        .command
+        .resolve_operation(ui, repo.loader(), workspace_name)
+        .map_err(snapshot_command_error)?;
+    if op.id() != repo.op_id() {
+        return Ok(false);
+    }
+    snapshot_git_head_is_current(env, repo, workspace_name).await
+}
+
+/// Adopt unrelated operation changes made while the scan was running. The
+/// scan is reusable only if this workspace's commit and Git HEAD are still
+/// the ones it was based on.
+async fn snapshot_repo_after_scan(
+    ui: &Ui,
+    env: &WorkspaceCommandEnvironment,
+    published_repo: &Arc<ReadonlyRepo>,
+    scan_repo: &Arc<ReadonlyRepo>,
+    workspace_name: &WorkspaceName,
+    wc_commit: &Commit,
+    locked_wc: &dyn LockedWorkingCopy,
+) -> Result<Option<Arc<ReadonlyRepo>>, SnapshotWorkingCopyError> {
+    let op = env
+        .command
+        .resolve_operation(ui, published_repo.loader(), workspace_name)
+        .map_err(snapshot_command_error)?;
+    let repo = if op.id() == published_repo.op_id() {
+        scan_repo.clone()
+    } else {
+        let repo = published_repo
+            .loader()
+            .load_at(&op)
+            .await
+            .map_err(snapshot_command_error)?;
+        if repo.view().get_wc_commit_id(workspace_name) != Some(wc_commit.id()) {
+            return Ok(None);
+        }
+        // A matching tree and commit ID are insufficient if the journal's
+        // operation is now ahead of, or a sibling of, the published head.
+        // Retry so the usual stale-working-copy handling can resolve it.
+        if WorkingCopyFreshness::check_stale(locked_wc, wc_commit, &repo)
+            .await
+            .map_err(snapshot_command_error)?
+            != WorkingCopyFreshness::Fresh
+        {
+            return Ok(None);
+        }
+        #[cfg(feature = "git")]
+        if repo.view().git_head(workspace_name) != scan_repo.view().git_head(workspace_name) {
+            return Ok(None);
+        }
+        repo
+    };
+    if !snapshot_git_head_is_current(env, &repo, workspace_name).await? {
+        return Ok(None);
+    }
+    Ok(Some(repo))
+}
+
+async fn snapshot_git_head_is_current(
+    env: &WorkspaceCommandEnvironment,
+    repo: &Arc<ReadonlyRepo>,
+    workspace_name: &WorkspaceName,
+) -> Result<bool, SnapshotWorkingCopyError> {
+    #[cfg(feature = "git")]
+    if env.working_copy_shared_with_git {
+        let mut tx = start_repo_transaction(repo, workspace_name, env.command.string_args());
+        jj_lib::git::import_head(tx.repo_mut(), workspace_name, env.workspace_root())
+            .await
+            .map_err(snapshot_command_error)?;
+        if tx.repo().view().git_head(workspace_name) != repo.view().git_head(workspace_name) {
+            return Ok(false);
+        }
+    }
+    #[cfg(not(feature = "git"))]
+    let _ = (env, repo, workspace_name);
+    Ok(true)
+}
+
+#[cfg(feature = "test-fakes")]
+fn pause_snapshot_for_test() {
+    pause_for_test("JJ_TEST_SNAPSHOT_PAUSE_DIR");
+}
+
+#[cfg(feature = "test-fakes")]
+pub(crate) fn pause_for_test(variable: &str) {
+    let Some(dir) = std::env::var_os(variable) else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    std::fs::write(dir.join("ready"), b"ready\n").expect("write test barrier");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !dir.join("release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test barrier timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Check if the working copy is stale and reload the repo if the repo is ahead

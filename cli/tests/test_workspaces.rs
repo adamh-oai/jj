@@ -5227,6 +5227,31 @@ fn test_missing_baseline_does_not_import_external_git_head() -> TestResult {
     );
     assert_eq!(read_working_copy(), working_copy_before);
     assert_eq!(read_operation(), operation_before);
+
+    // Explicit rebuilding establishes the baseline first, then imports the
+    // external Git HEAD using the normal retry-aware import path.
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root()).args([
+                "util",
+                "subvolume",
+                "enable",
+                "--rebuild-baseline",
+            ])
+        })
+        .success();
+    let parent = main_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@-",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ])
+        .success();
+    assert_eq!(parent.stdout.raw().trim(), external_head);
     Ok(())
 }
 

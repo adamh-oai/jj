@@ -65,6 +65,8 @@ async fn update_sparse_patterns_with(
     workspace_command: &mut WorkspaceCommandHelper,
     f: impl FnOnce(&mut Ui, &[RepoPathBuf]) -> Result<Vec<RepoPathBuf>, CommandError>,
 ) -> Result<(), CommandError> {
+    #[cfg(feature = "test-fakes")]
+    crate::cli_util::pause_for_test("JJ_TEST_SPARSE_PRE_MUTATION_PAUSE_DIR");
     let (mut locked_ws, wc_commit) = workspace_command.start_working_copy_mutation().await?;
     let new_patterns = f(ui, locked_ws.locked_wc().sparse_patterns()?)?;
     let stats = locked_ws
