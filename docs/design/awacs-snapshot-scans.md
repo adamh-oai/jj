@@ -26,7 +26,9 @@ those names are not sufficient to prove unchanged semantic paths on a mutable
 live root. The compact-journal implementation therefore conservatively
 full-scans for Watchman and does not persist its clock as a reusable physical
 baseline. Snapshot-backed subvolume mode selects AWACS internally because it
-supplies an immutable scan root plus a complete delta or `Full`.
+supplies an immutable scan root and can prove a complete delta. Ordinary
+commands fail if a full scan would be required; initialization or an explicit
+baseline rebuild may perform one.
 
 That ordering has a race:
 
@@ -52,8 +54,8 @@ but it is not an authoritative no-row incremental baseline.
 * Make every successful AWACS-backed Jujutsu snapshot correspond to one
   read-only Btrfs snapshot and one durable Jujutsu baseline binding.
 * Preserve incremental scans from a retained baseline: given exact snapshot A,
-  AWACS returns a complete A→B delta or `Full`, and Jujutsu reads only the
-  affected paths from B when completeness is proved.
+  AWACS returns a complete A→B delta or reports that a full scan is required,
+  and Jujutsu reads only the affected paths from B when completeness is proved.
 * Keep all Jujutsu state, locks, checkout writes, and colocated Git metadata on
   the live working-copy root.
 * Fail conservatively: an unavailable, expired, pruned, ambiguous, or
@@ -83,7 +85,7 @@ working-copy materialization can also retain a newer physical baseline with
 durable paths that still need semantic scanning. Those paths are part of the
 baseline binding: the next scan must reconcile them even if AWACS reports no
 new changes. The backend must prove that the named snapshot is still available
-or return `Full`.
+or report that a full scan is required.
 
 For one successful snapshot:
 
@@ -91,7 +93,7 @@ For one successful snapshot:
 live root:       W
 baseline:        tree X ↔ retained snapshot A
 AWACS cut:       B
-delta:           complete A→B delta or Full
+delta:           complete A→B delta
 scan root:       read-only snapshot B
 persisted state: tree Y ↔ retained snapshot B
 ~~~
@@ -107,18 +109,18 @@ The following invariants are required:
    the tree, or deliberately invalidating it.
 3. AWACS retains the logical A→B event range while deriving B and returns an
    already-open B descriptor before Jujutsu publishes the clean B binding.
-   AWACS must prove A for every delta or return `Full`.
+   AWACS must prove A for every delta or report that a full scan is required.
 4. A failed or abandoned session does not advance the persisted baseline.
 5. The live root is used only for state and mutation operations while the scan
    session is active.
 6. AWACS must validate the live root's path binding, mount topology,
    filesystem UUID, and subvolume UUID before minting B. Jujutsu must treat a
-   continuity failure as a fresh/full-scan boundary.
+   continuity failure as an error requiring an explicit baseline rebuild.
 7. The scan root must be private and immutable for the lease lifetime. A
    caller-controlled path that can be renamed or mounted over is not a valid
    scan root.
 8. Exact-path and prefix deltas are authoritative complete descriptions for
-   Jujutsu-observable changes; any uncertainty returns `Full`.
+   Jujutsu-observable changes; uncertainty requires a full scan or an error.
 
 This model changes jj status from best effort observation of a changing
 directory to status at snapshot B. Writes after B appear on the next Jujutsu
@@ -157,6 +159,7 @@ BeginScan {
   live_root,
   baseline_owner_id,
   previous_baseline?,
+  allow_full_invalidation,
 }
 
 BeginScanResult {
@@ -188,7 +191,9 @@ scan is in progress.
 ExactPaths and Prefixes contain repository-relative byte strings. In the
 snapshot-baseline design they are authoritative complete delta shapes, not
 advisory scan-narrowing hints. If AWACS cannot prove a complete incremental
-range, it returns Full and Jujutsu scans all sparse paths in snapshot B.
+range, it reports that a full scan is required. An explicitly authorized full
+invalidation can produce `Full`; ordinary snapshot-backed Jujutsu commands
+instead fail and instruct the user to rebuild the baseline.
 Prefixes are a direct-API optimization for directory invalidation; they are
 not a Watchman extension.
 
@@ -244,7 +249,8 @@ hashed encoding of the already-projected conservative path events. SQLite
 stores only the cut sequence, endpoint snapshot IDs, spool pathname, payload
 hash, and event count. For a stale cursor at B and current cut D, replay reads
 and unions the retained C and D spool payloads. A missing file, hash failure,
-sequence gap, or cursor older than the replay floor returns Full.
+sequence gap, or cursor older than the replay floor requires full invalidation
+or an error, according to the caller's policy.
 
 Retention first removes the catalog rows transactionally with the old logical
 cuts, then unlinks the no-longer-referenced spool files after commit. A crash
@@ -267,12 +273,15 @@ The library API must distinguish:
 The embedded coordinator must validate the process root and mount namespace;
 Jujutsu must not supply self-asserted filesystem identity as authority.
 
-Invalid, expired, or pruned previous baselines are not errors: AWACS should
-return a valid target snapshot with delta = Full. Other errors before a scan
-session is accepted fail the AWACS-backed snapshot operation without
-publishing a new baseline. Errors after a session is accepted abort that
-session and fail the AWACS-backed snapshot operation. Jujutsu must never keep
-using an older AWACS baseline after an error.
+An invalid, expired, or pruned previous baseline can result in an
+`InvalidPreviousBaseline` or `FullScanRequired` error. A caller that explicitly
+allows full invalidation may receive a target snapshot with delta = Full when
+establishing a new baseline. Ordinary snapshot-backed Jujutsu commands fail
+and suggest `jj util subvolume enable --rebuild-baseline` instead of performing
+a full scan. Other errors before a scan session is accepted fail the operation
+without publishing a new baseline. Errors after a session is accepted abort
+that session and fail the AWACS-backed snapshot operation. Jujutsu must never
+keep using an older AWACS baseline after an error.
 
 A live full-crawl fallback may be offered as an explicit availability option,
 but it must invalidate the AWACS baseline and emit a warning that
@@ -320,8 +329,8 @@ For none, scan_root is working_copy_path and the matcher is EverythingMatcher.
 For Watchman, scan_root remains working_copy_path and the matcher is
 EverythingMatcher because changed names alone cannot replace the removed
 per-path cache on a mutable root. For AWACS, scan_root is the leased read-only
-snapshot and the matcher comes from AWACS exact paths/prefixes or a full scan
-for Full.
+snapshot and the matcher comes from AWACS exact paths/prefixes. An explicit
+initialization or rebuild may instead scan the full snapshot.
 
 The scanner must not infer the read root from the live working-copy path.
 DirectoryToVisit already carries a disk directory and should be seeded from
@@ -344,9 +353,10 @@ live under the worktree must be read from scan_root. Inputs outside the
 worktree, including global excludes and colocated Git metadata such as
 .git/info/exclude or sparse-checkout configuration, cannot be assumed to be in
 the Btrfs snapshot. Jujutsu should compute a fingerprint of those inputs and
-store it with the baseline journal; a changed or unreadable fingerprint forces
-Full invalidation before the baseline can be reused. This prevents an excluded
-metadata change from making newly visible files appear clean.
+store it with the baseline journal. A changed fingerprint makes the baseline
+unusable; in snapshot-backed mode an ordinary snapshot fails and requires an
+explicit rebuild. Failure to read an input produces an error. These checks
+prevent an excluded metadata change from making newly visible files appear clean.
 
 ### Implementation map
 
@@ -386,18 +396,15 @@ The algorithm is:
    that combined scope to limit reads.
 4. Build Y from semantic tree X plus B reads for changed paths/prefixes; do
    not build or persist file states.
-5. If the scan found untracked paths that require a later rescan, publish
-   `NoBaseline(Y)` so the next command requests a fresh full snapshot scan.
-6. Otherwise retain the candidate baseline and session in
-   LockedLocalWorkingCopy.
-7. Let the command finish any repository operation that does not change the
+5. Retain the candidate baseline and session in LockedLocalWorkingCopy.
+6. Let the command finish any repository operation that does not change the
    disk-derived tree.
-8. In LockedLocalWorkingCopy::finish(), atomically write
+7. In LockedLocalWorkingCopy::finish(), atomically write
    `PendingBaselineCommit`, idempotently promote B, then atomically publish
    `Clean(Y, B, I)` with the successfully reconciled pending paths cleared.
-9. Only after clean publication succeeds, send FinishScan(Committed) to
+8. Only after clean publication succeeds, send FinishScan(Committed) to
    release A and clean up the session.
-10. If any step before clean publication fails, if the command is discarded,
+9. If any step before clean publication fails, if the command is discarded,
     or if a later working-copy mutation makes the tree no longer equal
     snapshot B, send FinishScan(Aborted) and do not publish B as clean.
 
@@ -481,11 +488,12 @@ invariant explicit.
 * Pending scan paths accumulate across materializations and survive interrupted
   materialization recovery; successful semantic scanning clears them.
 * A source with pending scan work cannot seed a snapshot workspace or adoption.
-* Full invalidation scans all sparse paths from the snapshot.
+* Ordinary snapshot-backed scans reject full invalidation; explicit baseline
+  initialization and rebuild may scan all sparse paths from the snapshot.
 * A clean AWACS baseline is published only after successful B promotion and
   journal save.
 * Begin, scan, promotion, and journal-save failures abort the lease or recover
-  to a full-scan requirement.
+  to a state requiring explicit baseline rebuilding.
 * Release failure after a successful save retains B and relies on idempotent
   retry for A cleanup.
 * Backend changes, reset, recover, and colocated Git reset invalidate
@@ -504,7 +512,8 @@ compatibility test:
   Jujutsu scanned B;
 * mutate the live root after BeginScan(B) but before traversal and prove the
   result still equals snapshot B;
-* reclaim or expire the previous baseline and require a fresh snapshot scan;
+* reclaim or expire the previous baseline and require an error followed by an
+  explicit baseline rebuild;
 * expire the active lease mid-scan and require an aborted session plus a
   fail-closed error, or an explicit live-fallback warning when that mode is
   enabled;
@@ -516,9 +525,9 @@ compatibility test:
 ### Performance tests
 
 Measure unchanged status, one-file status, large-directory untracked scans,
-fresh fallback, snapshot lease latency, and retained-snapshot growth. Require
-the one-file path to avoid loading or sorting O(N) per-path state. Compare
-with fsmonitor.backend = none and watchman.
+explicit baseline rebuild, snapshot lease latency, and retained-snapshot
+growth. Require the one-file path to avoid loading or sorting O(N) per-path
+state. Compare with fsmonitor.backend = none and watchman.
 
 ## Alternatives considered
 

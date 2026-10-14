@@ -105,6 +105,13 @@ original path is untouched.
 Running `enable` again upgrades older enabled checkouts whose `.jj` is still a
 plain directory using the same replacement and retention procedure. A linked
 workspace requires the main workspace to have subvolume mode enabled first.
+
+If a snapshot-backed workspace has no usable baseline, commands that snapshot
+the working copy fail with a recovery hint. Run
+`jj util subvolume enable --rebuild-baseline` in that workspace to explicitly
+rebuild its baseline; this may require a full scan. The command reuses the
+existing AWACS root state and rejects stale or ambiguous working-copy state.
+
 Passing `--compress=true` or `--compress=false` sets the corresponding
 Btrfs compression property on the newly created root, `.git`, and `.jj` subvolumes
 and copies file data instead of reflinking it, so existing extents are
@@ -114,7 +121,13 @@ While that mode is enabled, `jj workspace add` creates a Btrfs snapshot of the
 current checkout automatically. This preserves already-materialized files such as
 ignored build outputs while assigning the new workspace its own `.jj` metadata.
 In a Git-colocated repo, the command also creates a new linked Git worktree
-identity without rewriting the copied files. Run `jj util subvolume disable`
+identity without rewriting the copied files. Passing `--ignore-working-copy`
+skips scanning the source to update its working-copy state but still
+initializes the new workspace's baseline. Snapshot-backed workspace creation
+rejects historical operations and `--no-integrate-operation` before creating a
+destination.
+
+Run `jj util subvolume disable`
 to convert `.git` and `.jj` back to ordinary directories before converting the
 repository root. Workspace deletion uses the Btrfs subvolume-destroy ioctl for
 subvolumes, removing nested subvolumes before their parent.

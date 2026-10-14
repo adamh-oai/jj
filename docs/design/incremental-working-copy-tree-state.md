@@ -10,8 +10,10 @@ sparse and ignore inputs used to interpret it. The next status obtains
 snapshot B and a complete A→B delta, inspects only changed paths from B,
 applies those changes to X, and publishes a new `(tree Y, snapshot B)`
 binding. No per-path mtime, size, type, or conflict-marker rows are persisted.
-If retention, lineage, delta completeness, or interpretation-input continuity
-cannot be proved, Jujutsu performs a full scan and establishes a new baseline.
+If a retained baseline is missing or invalid, the delta is incomplete, or
+interpretation inputs change, an ordinary snapshot-backed command fails and
+asks for an explicit baseline rebuild. Initialization or rebuilding may
+perform a full scan to establish a baseline.
 
 ## Objective
 
@@ -39,7 +41,7 @@ The desired steady-state costs are:
 | No change A→B | Bounded journal update; no per-path load |
 | k changed paths | Complete A→B delta plus O(k) reads/hashes from B |
 | Changed directory/prefix | Enumerate only the affected prefix in B and the matching subtree in X |
-| Missing or pruned A, incomplete delta, changed interpretation inputs | Full scan of immutable B, then establish B as the new baseline |
+| Missing or pruned A, incomplete delta, changed interpretation inputs | Fail ordinary snapshot-backed commands; explicitly rebuild the baseline |
 | Checkout, reset, recover, or sparse materialization | Establish a new physical baseline after successful materialization, or invalidate |
 | No authoritative retained-snapshot backend | Conservative full scan |
 
@@ -78,7 +80,7 @@ The O(delta) path requires an authoritative backend that can:
 1. retain the baseline snapshot named by the durable journal;
 2. prove that a new snapshot B descends from that exact A;
 3. return a complete Jujutsu-observable A→B delta, or explicitly return
-   `Full`;
+   that a full scan is required;
 4. keep B available until Jujutsu durably publishes it as the next baseline;
 5. recover idempotently from crashes between backend retention and local
    journal publication.
@@ -144,11 +146,11 @@ The normal transition is:
 ~~~text
 load Clean(X, A, I)
 validate A is retained and I is unchanged
-BeginScan(A) -> leased B + CompleteDelta(A→B) | Full
+BeginScan(A) -> leased B + CompleteDelta(A→B) | full-scan-required
 if CompleteDelta:
   apply only B reads for changed paths/prefixes to X
 else:
-  full-scan B
+  fail and request an explicit baseline rebuild
 produce semantic tree Y
 durably retain/promote B
 atomically publish Clean(Y, B, I)
@@ -158,7 +160,8 @@ release A
 The following invariants are required:
 
 1. A clean journal entry names an immutable snapshot identity plus enough
-   backend proof state to either reopen/prove that snapshot or force `Full`.
+   backend proof state to either reopen/prove that snapshot or require a full
+   scan. Ordinary snapshot-backed commands fail if that proof is unavailable.
    A hard-pinned backend additionally retains that snapshot until the next
    clean binding is durable.
 2. The journal's semantic tree was produced only from that named snapshot and
@@ -166,7 +169,7 @@ The following invariants are required:
 3. A delta is used only when the backend proves complete continuity from the
    exact retained A to B.
 4. Every Jujutsu-observable difference in A→B is either represented in the
-   delta or causes `Full`.
+   delta or requires a full scan.
 5. Jujutsu never publishes B as clean until all reads used to produce Y came
    from B and B is durably retained.
 6. Jujutsu does not release A until the clean B binding is durable.
@@ -262,8 +265,9 @@ workspace.
 ## Authoritative delta contract
 
 `ExactPaths` and `Prefixes` are not advisory hints in this design. They are
-complete delta shapes. If the backend cannot prove completeness, it returns
-`Full`.
+complete delta shapes. If the backend cannot prove completeness, it reports
+that a full scan is required. A caller that permits full invalidation may
+receive `Full`; an ordinary snapshot-backed Jujutsu command fails instead.
 
 The delta must cover every change that can alter Jujutsu's interpretation:
 
@@ -282,8 +286,8 @@ The delta must cover every change that can alter Jujutsu's interpretation:
 An exact-path delta causes Jujutsu to read only those paths from B. A prefix
 delta causes Jujutsu to enumerate the affected prefix in B and enumerate the
 matching semantic subtree in X so additions, deletions, and type transitions
-are handled without a per-path cache. A `Full` result scans all sparse paths
-from B and establishes B as a new baseline.
+are handled without a per-path cache. Explicit initialization or rebuilding
+can scan all sparse paths from B and establish B as a new baseline.
 
 The semantic tree supplies tracked membership and unchanged values. It replaces
 the old file-state vector for deletion detection under changed prefixes.
@@ -296,18 +300,15 @@ For an authoritative retained-snapshot backend:
 2. Verify root identity, backend compatibility, sparse patterns, external
    interpretation fingerprint, and A's durable retention.
 3. Request B and a complete A→B delta.
-4. If the result is `Full`, enumerate the sparse view from B and the
-   matching tracked paths from X, then rebuild Y without per-path rows.
+4. If the result requires a full scan, fail the ordinary snapshot-backed
+   command and ask for an explicit baseline rebuild.
 5. If the result is exact paths or prefixes:
    - start from semantic tree X;
    - use X to identify tracked entries under changed prefixes;
    - read metadata/content only for affected B paths;
    - remove paths absent from B;
    - apply changed values to produce Y.
-6. If the result contains untracked or ignored outcomes that are not
-   represented in Y and must be reported again on a later command, publish
-   `NoBaseline(Y, requires_full_scan)` rather than a reusable clean baseline.
-7. Publish Y↔B with the crash-safe handoff below.
+6. Publish Y↔B with the crash-safe handoff below.
 
 Conflict materialization and executable-bit preservation must not reintroduce
 durable per-path rows:
@@ -372,7 +373,8 @@ Before a mutation that can change physical files or reinterpret them:
 3. Invalidate the reusable baseline before live writes begin.
 4. Materialize against the live root.
 5. On success, either cut and publish a new authoritative baseline or write
-   `NoBaseline(intended_tree)` so the next status full-scans.
+   `NoBaseline(intended_tree)`. An ordinary snapshot-backed status fails if
+   no reusable baseline remains.
 6. On interruption, recover from `PendingMaterialization` before importing
    Git HEAD, snapshotting, or claiming the working copy is clean.
 
@@ -389,21 +391,23 @@ do the same.
 
 ### Fallback
 
-The safe fallback is a full scan, not reuse of an uncertain delta. Full scan is
-required when:
+An uncertain delta must not be reused. An explicit full scan may be needed
+when:
 
 - A is missing, pruned, expired, or cannot be opened;
 - filesystem, subvolume, mount, root, or lineage identity differs;
 - the backend returns `Full` or cannot prove delta completeness;
 - sparse patterns or external interpretation fingerprints changed;
 - an accepted scan lease fails before publication;
-- a pending materialization cannot be reconciled;
-- untracked/ignored output cannot be represented by the semantic tree;
-- the backend is `none`, ordinary Watchman, or otherwise non-authoritative.
+- a pending materialization cannot be reconciled.
 
-When an immutable B is available, full-scan B and establish it as the next
-baseline. When no immutable backend is available, full-scan the live root and
-persist `NoBaseline`.
+In snapshot-backed mode, ordinary snapshots fail when the baseline is unusable
+or a full traversal is required and direct the user to
+`jj util subvolume enable --rebuild-baseline`. Other backend or filesystem
+errors may require a different fix. Initialization or rebuilding may
+full-scan an immutable B and establish it as the next baseline. When the
+backend is `none`, ordinary Watchman, or otherwise non-authoritative,
+full-scan the live root and persist `NoBaseline`.
 
 ### Migration from the legacy protobuf
 
@@ -414,8 +418,8 @@ Migration must not read or copy the O(N) file-state rows:
    Protobuf decoding skips the removed row field instead of allocating it.
 2. Write the new journal as `NoBaseline(X)`, unless the backend can verify
    and durably promote the old cursor's exact snapshot as A.
-3. Force the next authoritative status to full-scan an immutable B and
-   establish a fresh clean baseline.
+3. Establish a fresh clean baseline by an explicit immutable scan; an ordinary
+   snapshot-backed status must fail until a reusable baseline exists.
 4. After the new journal is durable, remove the legacy `tree_state` payload.
 
 ### State cleanup
@@ -464,20 +468,20 @@ must bind snapshot identity to explicit Jujutsu tree IDs.
 
 2. **Add pending materialization recovery first.**
    Implement `PendingMaterialization` around checkout, reset, recover,
-   sparse changes, and colocated Git transitions. Recover or force full scan
-   before HEAD import/snapshot if an interrupted phase is found.
+   sparse changes, and colocated Git transitions. Recover or require an
+   explicit rebuild before HEAD import/snapshot if an interrupted phase is found.
 
 3. **Extend the AWACS retention contract.**
    Add committed-baseline pin/handoff semantics: retain A while deriving A→B,
    lease B during scan, idempotently promote B with a transition ID, publish
-   the local clean binding, then release A. Treat missing lineage or any
-   incomplete delta as `Full`.
+   the local clean binding, then release A. Report missing lineage or any
+   incomplete delta as requiring a full scan.
 
 4. **Refactor snapshotting around semantic tree plus delta.**
    Replace file-state-driven tracked membership, deletion detection, and
    mtime shortcuts with `MergedTree` lookups and B reads limited to exact
    paths or changed prefixes. Preserve full-scan behavior as the oracle and
-   fallback.
+   for explicit initialization or rebuilding.
 
 5. **Remove the remaining FileState-only behavior.**
    Derive conflict materialization for changed paths from the semantic tree and
@@ -486,7 +490,7 @@ must bind snapshot identity to explicit Jujutsu tree IDs.
 
 6. **Migrate without loading rows.**
    Read legacy protobuf metadata only, write `NoBaseline(X)`, and establish a
-   fresh retained baseline on the next full immutable scan.
+   fresh retained baseline through an explicit full immutable scan.
 
 7. **Delete the old implementations.**
    Remove per-path proto messages, `FileStatesMap`, and `TreeStateDelta`.
@@ -522,23 +526,24 @@ must bind snapshot identity to explicit Jujutsu tree IDs.
   hardlinks match a full-scan oracle.
 - Prefix invalidations enumerate only affected B prefixes plus matching X
   subtrees and handle missing directories correctly.
-- Ignore-file changes, global excludes, sparse changes, and colocated Git
-  metadata changes force the required full scan.
+- Changes to interpretation inputs that invalidate a baseline fail ordinary
+  snapshot-backed commands and require an explicit rebuild.
 - Unchanged tracked paths are not read, hashed, decoded from rows, or sorted
   during a complete one-path transition.
-- Untracked/ignored output that cannot be replayed from X prevents reuse of a
-  clean baseline.
+- Untracked/ignored output that must be reported again is handled correctly
+  across incremental snapshots.
 - `none` and ordinary Watchman remain correct via conservative full scan.
 
 ### Retention and crash recovery
 
 - A is retained while B is scanned and until clean B publication is durable.
-- Missing/pruned A, daemon restart, broken lineage, overflow, malformed
-  delta, or unsupported topology returns `Full`.
+- Missing/pruned A, daemon restart, broken lineage, or overflow reports that a
+  full scan is required. Malformed deltas or unsupported topology may fail
+  outright or require full invalidation.
 - Fault injection before pending write, after pending write, before B
   promotion, after B promotion, before clean publication, after clean
   publication, and before A release leaves either usable A, usable B, or an
-  explicit full-scan requirement.
+  explicit baseline-rebuild requirement.
 - Retried transition IDs do not double-release A or lose B.
 - Interrupted checkout/reset/recover/sparse/Git transitions are recovered
   before status can claim cleanliness.
@@ -547,8 +552,8 @@ must bind snapshot identity to explicit Jujutsu tree IDs.
 
 - Legacy protobuf metadata migrates without reading file-state rows; legacy
   SQLite markers fail closed without opening a database.
-- The first post-migration authoritative status full-scans B and establishes a
-  valid clean baseline.
+- A post-migration snapshot-backed status without a valid baseline fails;
+  an explicit baseline rebuild can establish one when the state is suitable.
 - New-format commands never create, open, or mutate SQLite state.
 - Older binaries fail closed instead of treating missing `tree_state` as an
   empty working copy.
@@ -564,7 +569,7 @@ Measure at least:
 - one-file edit, deletion, and rename;
 - changed directory/prefix;
 - 10,000 changed paths;
-- missing-baseline full fallback;
+- missing-baseline failure and explicit rebuild;
 - checkout/reset/recover followed by baseline establishment;
 - startup latency, journal bytes written, retained-snapshot count, and
   end-to-end status latency.
@@ -577,11 +582,11 @@ full filesystem traversal.
 
 - What exact AWACS API represents durable baseline promotion and idempotent
   recovery after a lost response?
-- Can unchanged untracked output be represented compactly, or should any such
-  output continue to force `NoBaseline`?
+- How should unchanged untracked output be reported on subsequent incremental
+  scans without an O(N) path catalog?
 - Which external ignore/config inputs belong in the interpretation fingerprint?
-- After a successful checkout, should Jujutsu cut a new baseline immediately
-  or defer to the next status full scan?
+- After a successful checkout, under which conditions can Jujutsu publish a new
+  baseline immediately or recover its pending materialization?
 - Should a separate recovery tool for intermediate SQLite workspaces be
   provided, or is fail-closed recovery with a compatible JJ sufficient?
 
