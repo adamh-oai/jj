@@ -497,6 +497,234 @@ fn test_waiting_for_working_copy_does_not_block_other_worktrees() -> TestResult 
 
 #[cfg(feature = "test-fakes")]
 #[test]
+fn test_git_head_import_waiting_for_working_copy_does_not_block_other_worktrees() -> TestResult {
+    check_git_head_import_wait(false)
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_git_head_import_retries_after_another_worktree_publishes() -> TestResult {
+    check_git_head_import_wait(true)
+}
+
+#[cfg(feature = "test-fakes")]
+fn check_git_head_import_wait(publish_other: bool) -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    for contents in ["first\n", "second\n", "third\n"] {
+        main.write_file("checkout-file", contents);
+        main.run_jj(["commit", "-m", contents.trim()]).success();
+    }
+    let commit_id = |revision| {
+        main.run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            revision,
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+        .trim()
+        .to_owned()
+    };
+    let first_commit = commit_id("@---");
+    let second_commit = commit_id("@--");
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    secondary.run_jj(["status"]).success();
+    main.write_file("from-main", "main contents\n");
+    if publish_other {
+        secondary.write_file("from-secondary", "secondary contents\n");
+    }
+
+    let operation_id = || {
+        main.run_jj([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--limit=1",
+            "-T",
+            "id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+    };
+    let initial_op = operation_id();
+
+    let checkout = |commit: &str| -> TestResult {
+        let template = test_env.new_jj_cmd();
+        let mut git = std::process::Command::new("git");
+        git.env_clear();
+        for (key, value) in template.get_envs() {
+            if let Some(value) = value {
+                git.env(key, value);
+            }
+        }
+        let output = git
+            .current_dir(main.root())
+            .args(["checkout", "--detach", "--quiet", commit])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    };
+    checkout(&first_commit)?;
+
+    // A sees a changed Git HEAD before trying to take its journal lock.
+    let lock =
+        jj_lib::lock::FileLock::lock(main.root().join(".jj/working_copy/working_copy.lock"))?;
+    let mut importer = spawn_traced_jj(&test_env, &main, "head-importer", &["status"], None)?;
+    wait_for_child_event(&mut importer, || {
+        waiter_log_mentions(&test_env, "head-importer", "working_copy.lock")
+    });
+    secondary
+        .run_jj_with(|cmd| {
+            cmd.timeout(std::time::Duration::from_secs(10))
+                .arg("status")
+        })
+        .success();
+    assert!(
+        importer.child.try_wait()?.is_none(),
+        "importer was not blocked"
+    );
+    assert_eq!(operation_id() != initial_op, publish_other);
+
+    // Change HEAD while A waits. With a separate operation published, A must
+    // reload it. In both cases it must import the latest HEAD, not the earlier
+    // one it saw before waiting.
+    checkout(&second_commit)?;
+    drop(lock);
+    importer.assert_success();
+    assert_eq!(commit_id("@-"), second_commit);
+    assert_eq!(main.read_file("checkout-file"), "second\n");
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+            .success()
+            .stdout
+            .raw(),
+        "main contents\n"
+    );
+    if publish_other {
+        assert_eq!(
+            secondary
+                .run_jj(["--ignore-working-copy", "file", "show", "from-secondary"])
+                .success()
+                .stdout
+                .raw(),
+            "secondary contents\n"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
+fn test_git_head_import_retries_when_older_process_holds_shared_lock() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("checkout-file", "old\n");
+    main.run_jj(["commit", "-m", "old"]).success();
+    main.write_file("checkout-file", "new\n");
+    main.run_jj(["commit", "-m", "new"]).success();
+    let old_commit = main
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@--",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .into_raw()
+        .trim()
+        .to_owned();
+    main.write_file("from-main", "main contents\n");
+    let template = test_env.new_jj_cmd();
+    let mut git = std::process::Command::new("git");
+    git.env_clear();
+    for (key, value) in template.get_envs() {
+        if let Some(value) = value {
+            git.env(key, value);
+        }
+    }
+    let output = git
+        .current_dir(main.root())
+        .args(["checkout", "--detach", "--quiet", &old_commit])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "git checkout failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let pause_dir = test_env.env_root().join("pause-import-head");
+    std::fs::create_dir(&pause_dir)?;
+    let mut importer = spawn_traced_jj(
+        &test_env,
+        &main,
+        "head-importer",
+        &["status"],
+        Some(("JJ_TEST_IMPORT_HEAD_PAUSE_DIR", &pause_dir)),
+    )?;
+    wait_for_child_event(&mut importer, || pause_dir.join("ready").exists());
+    let helper_dir = test_env.env_root().join("old-lock-helper");
+    std::fs::create_dir(&helper_dir)?;
+    let mut old_holder = spawn_old_lock_holder(&test_env, &main, &helper_dir)?;
+    wait_for_child_event(&mut old_holder, || helper_dir.join("waiting").exists());
+    assert!(!helper_dir.join("acquired").exists());
+
+    // The older process holds the shared lock while waiting for A's journal.
+    // A must release the journal before waiting for the shared lock and retry.
+    std::fs::write(pause_dir.join("release"), b"release\n")?;
+    old_holder.assert_success();
+    assert!(helper_dir.join("acquired").exists());
+    importer.assert_success();
+    assert_eq!(
+        main.run_jj([
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            "@-",
+            "-T",
+            "commit_id",
+        ])
+        .success()
+        .stdout
+        .raw()
+        .trim(),
+        old_commit
+    );
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+            .success()
+            .stdout
+            .raw(),
+        "main contents\n"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-fakes")]
+#[test]
 fn test_slow_checkout_does_not_block_other_worktrees() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env

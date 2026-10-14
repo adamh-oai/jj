@@ -1395,19 +1395,19 @@ impl WorkspaceCommandHelper {
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
         let stats = loop {
-            #[cfg(feature = "git")]
-            if self.env.working_copy_shared_with_git {
-                self.import_git_head(ui, git_import_export_lock)
+            let result = async {
+                #[cfg(feature = "git")]
+                if self.env.working_copy_shared_with_git {
+                    self.import_git_head(ui, git_import_export_lock).await?;
+                }
+                // A non-integrated operation may be intentionally unpublished,
+                // so it must not be reloaded from the published operation heads.
+                let can_release_lock = self.env.command.should_commit_transaction();
+                self.snapshot_working_copy(ui, git_import_export_lock, can_release_lock)
                     .await
-                    .map_err(snapshot_command_error)?;
             }
-            // A non-integrated operation may be intentionally unpublished,
-            // so it must not be reloaded from the published operation heads.
-            let can_release_lock = self.env.command.should_commit_transaction();
-            match self
-                .snapshot_working_copy(ui, git_import_export_lock, can_release_lock)
-                .await
-            {
+            .await;
+            match result {
                 Ok(stats) => break stats,
                 Err(SnapshotWorkingCopyError::Retry) => {
                     let repo = self.repo().clone();
@@ -1465,47 +1465,121 @@ impl WorkspaceCommandHelper {
         &mut self,
         ui: &Ui,
         git_import_export_lock: &GitImportExportLock,
-    ) -> Result<(), CommandError> {
+    ) -> Result<(), SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
         let workspace_name = self.workspace_name().to_owned();
         let workspace_root = self.workspace_root().to_owned();
-        let mut tx = self.start_transaction();
-        jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root).await?;
+        let repo = self.repo().clone();
+        let mut tx = self.start_transaction().into_inner();
+        jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root)
+            .await
+            .map_err(snapshot_command_error)?;
         if !tx.repo().has_changes() {
             return Ok(());
         }
 
-        let mut tx = tx.into_inner();
-        let old_git_head = self.repo().view().git_head(&workspace_name).clone();
+        let can_release_lock =
+            self.env.command.should_commit_transaction() && git_import_export_lock.path.is_some();
+        let mut locked_ws = if tx
+            .repo()
+            .view()
+            .git_head(&workspace_name)
+            .as_normal()
+            .is_some()
+        {
+            if can_release_lock {
+                git_import_export_lock.release();
+            }
+            let locked_ws = self
+                .workspace
+                .start_working_copy_mutation()
+                .await
+                .map_err(snapshot_command_error)?;
+            if can_release_lock {
+                #[cfg(feature = "test-fakes")]
+                pause_for_test("JJ_TEST_IMPORT_HEAD_PAUSE_DIR");
+                if !git_import_export_lock
+                    .try_reacquire()
+                    .map_err(snapshot_command_error)?
+                {
+                    // Older clients can hold the Git lock while waiting for
+                    // this journal. Release it before waiting for them.
+                    drop(locked_ws);
+                    git_import_export_lock
+                        .reacquire()
+                        .map_err(snapshot_command_error)?;
+                    return Err(SnapshotWorkingCopyError::Retry);
+                }
+                let op = self
+                    .env
+                    .command
+                    .resolve_operation(ui, repo.loader(), &workspace_name)
+                    .map_err(snapshot_command_error)?;
+                if op.id() != repo.op_id() {
+                    return Err(SnapshotWorkingCopyError::Retry);
+                }
+
+                // Neither the operation nor Git HEAD can be assumed to be
+                // unchanged while waiting for the working-copy lock. Re-read
+                // HEAD with both locks held before resetting the journal.
+                tx = start_repo_transaction(&repo, &workspace_name, self.env.command.string_args());
+                jj_lib::git::import_head(tx.repo_mut(), &workspace_name, &workspace_root)
+                    .await
+                    .map_err(snapshot_command_error)?;
+                if !tx.repo().has_changes() {
+                    return Ok(());
+                }
+            }
+            Some(locked_ws)
+        } else {
+            None
+        };
+        let old_git_head = repo.view().git_head(&workspace_name).clone();
         let new_git_head = tx.repo().view().git_head(&workspace_name);
         if let Some(new_git_head_id) = new_git_head.as_normal() {
-            let new_git_head_commit = tx.repo().store().get_commit_async(new_git_head_id).await?;
+            let new_git_head_commit = tx
+                .repo()
+                .store()
+                .get_commit_async(new_git_head_id)
+                .await
+                .map_err(snapshot_command_error)?;
             let wc_commit = tx
                 .repo_mut()
                 .check_out(workspace_name, &new_git_head_commit)
-                .await?;
-            let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+                .await
+                .map_err(snapshot_command_error)?;
+            let mut locked_ws = locked_ws.take().expect("working copy locked for Git HEAD");
             // The working copy was presumably updated by the git command that updated
             // HEAD, so we just need to reset our working copy
             // state to it without updating working copy files.
-            locked_ws.locked_wc().reset(&wc_commit).await?;
-            tx.repo_mut().rebase_descendants().await?;
+            locked_ws
+                .locked_wc()
+                .reset(&wc_commit)
+                .await
+                .map_err(snapshot_command_error)?;
+            tx.repo_mut()
+                .rebase_descendants()
+                .await
+                .map_err(snapshot_command_error)?;
             self.user_repo = ReadonlyUserRepo::new(
                 self.env
                     .command
                     .maybe_commit_transaction(tx, "import git head")
-                    .await?,
+                    .await
+                    .map_err(snapshot_command_error)?,
             );
             if self.env.command.should_commit_transaction() {
                 locked_ws
                     .finish(self.user_repo.repo.op_id().clone())
-                    .await?;
+                    .await
+                    .map_err(snapshot_command_error)?;
             }
             if old_git_head.is_present() {
                 writeln!(
                     ui.status(),
                     "Reset the working copy parent to the new Git HEAD."
-                )?;
+                )
+                .map_err(snapshot_command_error)?;
             } else {
                 // Don't print verbose message on initial checkout.
             }
@@ -1514,16 +1588,26 @@ impl WorkspaceCommandHelper {
                     ui.status(),
                     "Operation left uncommitted because --no-integrate-operation was requested: {}",
                     short_operation_hash(self.repo().op_id())
-                )?;
+                )
+                .map_err(snapshot_command_error)?;
             }
         } else {
+            // A re-read can observe that HEAD was deleted while waiting.
+            // The transaction path below acquires its own working-copy lock.
+            drop(locked_ws);
             // Unlikely, but the HEAD ref got deleted by git?
-            let num_rebased = tx.repo_mut().rebase_descendants().await?;
+            let num_rebased = tx
+                .repo_mut()
+                .rebase_descendants()
+                .await
+                .map_err(snapshot_command_error)?;
             if num_rebased > 0 {
-                writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;
+                writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")
+                    .map_err(snapshot_command_error)?;
             }
             self.finish_transaction(ui, tx, "import git head", git_import_export_lock)
-                .await?;
+                .await
+                .map_err(snapshot_command_error)?;
         }
         Ok(())
     }
