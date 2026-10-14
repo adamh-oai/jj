@@ -174,6 +174,14 @@ pub struct WorkingCopyState {
     pub pending_scan_paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(string, repeated, tag = "20")]
     pub pending_scan_prefixes: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Files omitted from the semantic tree because auto-tracking or size
+    /// limits excluded them. Revisit them on later incremental snapshots.
+    #[prost(string, repeated, tag = "21")]
+    pub untracked_scan_paths: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Older journals do not record omitted files. This is set only after a
+    /// complete baseline scan or inheritance from a complete source journal.
+    #[prost(bool, tag = "22")]
+    pub untracked_scan_complete: bool,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AwacsSnapshotBaseline {
