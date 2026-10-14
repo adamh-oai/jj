@@ -4875,6 +4875,17 @@ impl WorkingCopy for SnapshotLocalWorkingCopy {
             compact_journal,
             self.tree_state_settings.clone(),
         )?;
+        // A command can snapshot successfully and later acquire this lock to
+        // publish a transaction, after another process interrupted a sparse
+        // update. Reject the freshly loaded journal before that transaction
+        // can overwrite the pending intent or advance its operation ID.
+        wc.tree_state()?
+            .check_interrupted_sparse_materialization()
+            .map_err(|err| WorkingCopyStateError {
+                message: "Cannot mutate a working copy with an interrupted sparse update"
+                    .to_owned(),
+                err: Box::new(err),
+            })?;
         let old_operation_id = wc.operation_id().clone();
         let old_tree = wc.tree()?.clone();
         Ok(Box::new(LockedLocalWorkingCopy {

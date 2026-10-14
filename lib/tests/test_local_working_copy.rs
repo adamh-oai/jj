@@ -3937,6 +3937,87 @@ fn test_subvolume_mode_recovers_pending_materialization_incrementally(marker: &s
 }
 
 #[test]
+fn test_working_copy_mutation_reloads_interrupted_sparse_intent() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    enable_snapshot_mode(&state_path)?;
+    LocalWorkingCopy::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        repo.op_id().clone(),
+        WorkspaceName::DEFAULT.to_owned(),
+        repo.settings(),
+    )?;
+
+    let tree = create_tree(
+        repo,
+        &[
+            (repo_path("keep/file"), "keep\n"),
+            (repo_path("removed/file"), "tracked\n"),
+        ],
+    );
+    let mut journal = read_compact_working_copy_state(&state_path)?;
+    journal.tree_ids = tree.tree_ids().iter().map(|id| id.to_bytes()).collect();
+    journal.conflict_labels = tree.labels().as_slice().to_owned();
+    journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
+    journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
+        filesystem_uuid: vec![1; 16],
+        subvolume_uuid: vec![2; 16],
+        continuity_token: b"baseline".to_vec(),
+        interpretation_input_fingerprint: vec![3; 32],
+        ..Default::default()
+    });
+    let journal_path = state_path.join("checkout");
+    let encode = |journal: &jj_lib::protos::local_working_copy::WorkingCopyState| {
+        let mut bytes = b"\0JJ-WORKING-COPY-STATE\0v1\n".to_vec();
+        bytes.extend_from_slice(&journal.encode_to_vec());
+        bytes
+    };
+    std::fs::write(&journal_path, encode(&journal))?;
+    std::fs::write(state_path.join("subvolume_mode"), b"snapshot-backed\n")?;
+    std::fs::create_dir(workspace_root.join("keep"))?;
+    std::fs::write(workspace_root.join("keep/file"), b"unsnapshotted edit\n")?;
+
+    // One command has loaded a clean working copy and completed its first
+    // lock acquisition. Another process then interrupts a sparse contraction
+    // before the first command obtains a new lock for its transaction.
+    let wc = LocalWorkingCopy::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        repo.settings(),
+    )?;
+    drop(wc.start_mutation().block_on()?);
+    journal.phase =
+        jj_lib::protos::local_working_copy::WorkingCopyStatePhase::PendingMaterialization as i32;
+    journal.pending_tree_ids = journal.tree_ids.clone();
+    journal.pending_baseline = journal.baseline.take();
+    journal.pending_sparse_patterns = vec!["keep".to_owned()];
+    journal.mutation_kind = "sparse-patterns".to_owned();
+    let pending_journal = encode(&journal);
+    std::fs::write(&journal_path, &pending_journal)?;
+
+    let error = match wc.start_mutation().block_on() {
+        Ok(_) => panic!("mutation must refuse the newly interrupted sparse update"),
+        Err(err) => err,
+    };
+    assert!(error.to_string().contains("interrupted sparse update"));
+    assert_eq!(std::fs::read(&journal_path)?, pending_journal);
+    assert_eq!(wc.operation_id(), repo.op_id());
+    assert_eq!(
+        std::fs::read(workspace_root.join("keep/file"))?,
+        b"unsnapshotted edit\n"
+    );
+    assert!(!workspace_root.join("removed/file").exists());
+    Ok(())
+}
+
+#[test]
 fn test_legacy_checkout_missing_tree_state_reinitializes_legacy_state() -> TestResult {
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;

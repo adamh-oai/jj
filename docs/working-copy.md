@@ -125,6 +125,12 @@ run `jj util subvolume enable --rebuild-baseline` in that workspace before
 the next ordinary snapshot. The rebuild discovers files in newly included
 paths and may require a full scan.
 
+If a sparse update was interrupted, a rebuild cannot tell which tracked files
+were intentionally removed from the sparse checkout and which were deleted by
+the user. Jujutsu refuses to snapshot or rebuild this state. Preserve the
+working-copy files and journal for manual reconciliation before retrying; no
+automatic recovery command is currently available for this case.
+
 Passing `--compress=true` or `--compress=false` sets the corresponding
 Btrfs compression property on the newly created root, `.git`, and `.jj` subvolumes
 and copies file data instead of reflinking it, so existing extents are

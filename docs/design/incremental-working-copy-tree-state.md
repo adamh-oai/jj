@@ -470,6 +470,8 @@ must bind snapshot identity to explicit Jujutsu tree IDs.
    Implement `PendingMaterialization` around checkout, reset, recover,
    sparse changes, and colocated Git transitions. Recover or require an
    explicit rebuild before HEAD import/snapshot if an interrupted phase is found.
+   An interrupted sparse change instead requires manual reconciliation because
+   partial materialization cannot be distinguished from user deletions.
 
 3. **Extend the AWACS retention contract.**
    Add committed-baseline pin/handoff semantics: retain A while deriving A→B,
@@ -545,8 +547,9 @@ must bind snapshot identity to explicit Jujutsu tree IDs.
   publication, and before A release leaves either usable A, usable B, or an
   explicit baseline-rebuild requirement.
 - Retried transition IDs do not double-release A or lose B.
-- Interrupted checkout/reset/recover/sparse/Git transitions are recovered
-  before status can claim cleanliness.
+- Interrupted checkout/reset/recover/Git transitions are recovered before
+  status can claim cleanliness. Interrupted sparse transitions fail before
+  snapshot or mutation and retain the files and journal for reconciliation.
 
 ### Migration and downgrade
 
