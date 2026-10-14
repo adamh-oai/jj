@@ -2038,7 +2038,10 @@ to the current parents may contain changes from multiple commits.
         }
         #[cfg(all(target_os = "linux", feature = "awacs"))]
         let (awacs_input_fingerprint, awacs_compatible_input_fingerprints) =
-            if cfg!(debug_assertions) && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+            if cfg!(debug_assertions)
+                && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some()
+                && std::env::var_os("JJ_TEST_AWACS_REAL_FINGERPRINT").is_none()
+            {
                 (Some([0; 32]), vec![])
             } else {
                 let fingerprints = self

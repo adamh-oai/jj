@@ -42,7 +42,7 @@ use jj_lib::git::GitSubprocessOptions;
 #[cfg(feature = "git")]
 use jj_lib::git::create_worktree;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-use jj_lib::local_working_copy::seed_local_working_copy_tree;
+use jj_lib::local_working_copy::seed_local_working_copy_tree_with_sparse_patterns;
 use jj_lib::lock::FileLock;
 #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
 use jj_lib::matchers::Matcher;
@@ -86,6 +86,7 @@ struct SnapshotPreparation {
 struct SnapshotSource {
     path: PathBuf,
     untracked: jj_lib::local_working_copy::UntrackedScanState,
+    sparse_patterns: Vec<jj_lib::repo_path::RepoPathBuf>,
     _snapshot: btrfs_awacs::btrfs::OpenedSubvolume,
     _working_copy_lock: Box<dyn jj_lib::working_copy::LockedWorkingCopy>,
 }
@@ -201,6 +202,17 @@ async fn cmd_workspace_add_impl(
     let lifecycle_lock = lifecycle_store.lock_lifecycle()?;
     let old_workspace_command = command.workspace_helper(ui).await?;
     let mut snapshot = is_subvolume_mode_enabled(old_workspace_command.workspace_root());
+    #[cfg_attr(not(all(target_os = "linux", feature = "awacs")), allow(unused_mut))]
+    let mut snapshot_source_sparse_patterns = if snapshot {
+        Some(
+            old_workspace_command
+                .working_copy()
+                .sparse_patterns()?
+                .to_vec(),
+        )
+    } else {
+        None
+    };
     // Initializing a snapshot workspace must publish and update its new
     // working copy. Reject incompatible global modes before creating any
     // destination or registering the workspace.
@@ -344,6 +356,9 @@ async fn cmd_workspace_add_impl(
             {
                 snapshot_source =
                     prepare_snapshot_source(&old_workspace_command, &source_commit).await?;
+                if let Some(source) = &snapshot_source {
+                    snapshot_source_sparse_patterns = Some(source.sparse_patterns.clone());
+                }
             }
             #[cfg(all(target_os = "linux", feature = "awacs"))]
             let physical_source = snapshot_source
@@ -589,7 +604,14 @@ async fn cmd_workspace_add_impl(
                     .expect("snapshot workspaces always retain the source commit");
                 phase = "seeding working-copy tree";
                 tracing::info!(phase, "initializing snapshot workspace baseline");
-                seed_snapshot_workspace_tree(&mut workspace_command, source_commit).await?;
+                seed_snapshot_workspace_tree(
+                    &mut workspace_command,
+                    source_commit,
+                    snapshot_source_sparse_patterns
+                        .as_deref()
+                        .expect("snapshot source has sparse patterns"),
+                )
+                .await?;
                 if let Some(preparation) = snapshot_preparation.as_ref()
                     && let Some(snapshot_identity) = preparation.initialized_awacs_snapshot.as_ref()
                 {
@@ -641,13 +663,18 @@ async fn cmd_workspace_add_impl(
     maybe_add_gitignore(&new_workspace_command)?;
 
     let sparsity = match args.sparse_patterns {
+        SparseInheritance::Full if snapshot => Some(vec![jj_lib::repo_path::RepoPathBuf::root()]),
         SparseInheritance::Full => None,
         SparseInheritance::Empty => Some(vec![]),
         SparseInheritance::Copy => {
-            let sparse_patterns = old_workspace_command
-                .working_copy()
-                .sparse_patterns()?
-                .to_vec();
+            let sparse_patterns = if let Some(patterns) = &snapshot_source_sparse_patterns {
+                patterns.clone()
+            } else {
+                old_workspace_command
+                    .working_copy()
+                    .sparse_patterns()?
+                    .to_vec()
+            };
             Some(sparse_patterns)
         }
     };
@@ -751,7 +778,9 @@ async fn cmd_workspace_add_impl(
                 .expect("snapshot workspaces always retain the source commit"),
             &new_wc_commit,
             snapshot_identity,
-            old_workspace_command.working_copy().sparse_patterns()?,
+            snapshot_source_sparse_patterns
+                .as_deref()
+                .expect("snapshot source has sparse patterns"),
             snapshot_git_index.as_mut(),
         )?;
     }
@@ -836,6 +865,7 @@ async fn prepare_snapshot_source(
     Ok(Some(SnapshotSource {
         path,
         untracked,
+        sparse_patterns: locked.sparse_patterns()?.to_vec(),
         _snapshot: snapshot,
         _working_copy_lock: locked,
     }))
@@ -1416,14 +1446,19 @@ fn invalidate_snapshot_git_conversions_in_index(
 async fn seed_snapshot_workspace_tree(
     workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
     source_commit: &jj_lib::commit::Commit,
+    source_sparse_patterns: &[jj_lib::repo_path::RepoPathBuf],
 ) -> Result<(), CommandError> {
     let operation_id = workspace_command.repo().op_id().clone();
     let (mut locked_workspace, _commit) = workspace_command
         .unchecked_start_working_copy_mutation()
         .await?;
-    if !seed_local_working_copy_tree(locked_workspace.locked_wc(), &source_commit.tree())
-        .await
-        .map_err(|err| internal_error_with_message("Failed to seed snapshot workspace tree", err))?
+    if !seed_local_working_copy_tree_with_sparse_patterns(
+        locked_workspace.locked_wc(),
+        &source_commit.tree(),
+        Some(source_sparse_patterns),
+    )
+    .await
+    .map_err(|err| internal_error_with_message("Failed to seed snapshot workspace tree", err))?
     {
         return Err(internal_error_with_message(
             "Failed to seed snapshot workspace tree",

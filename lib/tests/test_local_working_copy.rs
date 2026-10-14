@@ -3527,6 +3527,93 @@ fn test_initialized_awacs_baseline_inherits_untracked_paths_and_input_fingerprin
 }
 
 #[test]
+fn test_seeded_snapshot_tree_preserves_source_sparse_patterns() -> TestResult {
+    use jj_lib::local_working_copy::seed_local_working_copy_tree_with_sparse_patterns;
+
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    enable_snapshot_mode(&state_path)?;
+    testutils::write_working_copy_file(&workspace_root, repo_path("kept"), "kept\n");
+    let tree = create_tree(
+        repo,
+        &[
+            (repo_path("kept"), "kept\n"),
+            (repo_path("expanded"), "expanded\n"),
+        ],
+    );
+    let wc = LocalWorkingCopy::init(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path.clone(),
+        repo.op_id().clone(),
+        WorkspaceName::DEFAULT.to_owned(),
+        repo.settings(),
+    )?;
+    let mut locked = wc.start_mutation().block_on()?;
+    assert!(
+        seed_local_working_copy_tree_with_sparse_patterns(
+            locked.as_mut(),
+            &tree,
+            Some(&[repo_path_buf("kept")]),
+        )
+        .block_on()?
+    );
+    locked.finish(repo.op_id().clone()).block_on()?;
+    assert!(!workspace_root.join("expanded").exists());
+
+    let settings = TreeStateSettings::try_from_user_settings(repo.settings())?;
+    let mut child = TreeState::load(
+        repo.store().clone(),
+        workspace_root.clone(),
+        state_path,
+        &settings,
+    )?;
+    assert_eq!(child.sparse_patterns(), &vec![repo_path_buf("kept")]);
+    child.set_sparse_patterns(vec![RepoPathBuf::root()])?;
+    assert_eq!(
+        std::fs::read_to_string(workspace_root.join("expanded"))?,
+        "expanded\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_locked_snapshot_source_reads_current_sparse_patterns() -> TestResult {
+    let test_repo = TestRepo::init();
+    let repo = &test_repo.repo;
+    let workspace_root = test_repo.env.root().join("workspace");
+    let state_path = test_repo.env.root().join("state");
+    std::fs::create_dir(&workspace_root)?;
+    std::fs::create_dir(&state_path)?;
+    enable_snapshot_mode(&state_path)?;
+    let wc = LocalWorkingCopy::init(
+        repo.store().clone(),
+        workspace_root,
+        state_path.clone(),
+        repo.op_id().clone(),
+        WorkspaceName::DEFAULT.to_owned(),
+        repo.settings(),
+    )?;
+    assert_eq!(wc.sparse_patterns()?, vec![RepoPathBuf::root()]);
+
+    // Simulate a concurrent update after the workspace helper was loaded.
+    let mut journal = read_compact_working_copy_state(&state_path)?;
+    journal.sparse_patterns.as_mut().unwrap().prefixes = vec!["kept".to_owned()];
+    let mut bytes = b"\0JJ-WORKING-COPY-STATE\0v1\n".to_vec();
+    bytes.extend_from_slice(&journal.encode_to_vec());
+    std::fs::write(state_path.join("checkout"), bytes)?;
+
+    assert_eq!(wc.sparse_patterns()?, vec![RepoPathBuf::root()]);
+    let locked = wc.start_mutation().block_on()?;
+    assert_eq!(locked.sparse_patterns()?, &[repo_path_buf("kept")]);
+    Ok(())
+}
+
+#[test]
 fn test_snapshot_mode_compact_state_tracks_semantic_tree_without_legacy_rows() -> TestResult {
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;

@@ -2819,6 +2819,153 @@ exit 1
 }
 
 #[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
+fn test_awacs_workspace_add_expands_sparse_source() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.add_config(r#"working-copy.eol-conversion = "none""#);
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    let child_dir = test_env.work_dir("child");
+    main_dir.write_file("kept", "kept\n");
+    main_dir.write_file("expanded", "expanded\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["sparse", "set", "--clear", "--add=kept"])
+        .success();
+    assert!(!main_dir.root().join("expanded").exists());
+    // This file is physically present, but the source's sparse selection
+    // excludes it from the baseline and its remembered untracked paths.
+    main_dir.write_file("outside", "outside\n");
+    main_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    exit 0
+fi
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "snapshot" ]; then
+    /bin/cp -a "$3" "$4"
+    exit $?
+fi
+exit 1
+"#,
+    );
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+                .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+        })
+        .success();
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+                .args(["workspace", "add", "--sparse-patterns=full", "../child"])
+        })
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(child_dir.root().join("expanded"))?,
+        "expanded\n"
+    );
+    // The changed sparse selection needs a full rebuild to discover any
+    // previously unseen untracked files in the newly included paths.
+    let status = child_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root())
+            .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+            .arg("status")
+    });
+    assert!(!status.status.success(), "{status}");
+    assert!(
+        status
+            .stderr
+            .raw()
+            .contains("jj util subvolume enable --rebuild-baseline"),
+        "{status}"
+    );
+    child_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root())
+                .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+                .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+        })
+        .success();
+    let status = child_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root())
+                .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+                .arg("status")
+        })
+        .success();
+    assert!(!status.stdout.raw().contains("D expanded"), "{status}");
+    assert!(status.stdout.raw().contains("A outside"), "{status}");
+    let changed_eol = child_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root())
+            .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+            .args(["--config=working-copy.eol-conversion='input'", "status"])
+    });
+    assert!(!changed_eol.status.success(), "{changed_eol}");
+    assert!(
+        changed_eol
+            .stderr
+            .raw()
+            .contains("jj util subvolume enable --rebuild-baseline"),
+        "{changed_eol}"
+    );
+
+    child_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root())
+                .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+                .args(["sparse", "set", "--clear", "--add=kept"])
+        })
+        .success();
+    assert!(!child_dir.root().join("expanded").exists());
+    let status = child_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root())
+            .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+            .arg("status")
+    });
+    assert!(!status.status.success(), "{status}");
+    assert!(
+        status
+            .stderr
+            .raw()
+            .contains("jj util subvolume enable --rebuild-baseline"),
+        "{status}"
+    );
+    child_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root())
+                .env("JJ_TEST_AWACS_REAL_FINGERPRINT", "1")
+                .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+        })
+        .success();
+    let files = child_dir
+        .run_jj(["--ignore-working-copy", "file", "list"])
+        .success();
+    assert!(
+        files.stdout.raw().lines().any(|line| line == "expanded"),
+        "{files}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 #[test]
 fn test_workspaces_add_plain_workspace_when_subvolume_mode_is_disabled() -> TestResult {
     let test_env = TestEnvironment::default();

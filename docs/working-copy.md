@@ -118,6 +118,13 @@ workspace before running `jj workspace update-stale`. Preserve untracked and
 ignored files separately, since they may not be included in the snapshot. A
 stale rebuild does not refresh the Git fsmonitor baseline.
 
+Changing sparse patterns in a snapshot-backed workspace also changes the
+inputs to its baseline. After changing patterns, including when creating a
+workspace with a different `--sparse-patterns` selection from its source,
+run `jj util subvolume enable --rebuild-baseline` in that workspace before
+the next ordinary snapshot. The rebuild discovers files in newly included
+paths and may require a full scan.
+
 Passing `--compress=true` or `--compress=false` sets the corresponding
 Btrfs compression property on the newly created root, `.git`, and `.jj` subvolumes
 and copies file data instead of reflinking it, so existing extents are

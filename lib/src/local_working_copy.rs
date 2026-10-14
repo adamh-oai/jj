@@ -5697,10 +5697,24 @@ pub async fn seed_local_working_copy_tree(
     locked: &mut dyn LockedWorkingCopy,
     tree: &MergedTree,
 ) -> Result<bool, ResetError> {
+    seed_local_working_copy_tree_with_sparse_patterns(locked, tree, None).await
+}
+
+/// Seeds a copied tree and, when supplied, the sparse patterns describing the
+/// copied filesystem. This records existing materialization without changing it.
+pub async fn seed_local_working_copy_tree_with_sparse_patterns(
+    locked: &mut dyn LockedWorkingCopy,
+    tree: &MergedTree,
+    sparse_patterns: Option<&[RepoPathBuf]>,
+) -> Result<bool, ResetError> {
     let Some(snapshot) = locked.downcast_mut::<LockedLocalWorkingCopy>() else {
         return Ok(false);
     };
-    snapshot.wc.tree_state_mut()?.reset(tree).await?;
+    let tree_state = snapshot.wc.tree_state_mut()?;
+    if let Some(sparse_patterns) = sparse_patterns {
+        tree_state.sparse_patterns = sparse_patterns.to_vec();
+    }
+    tree_state.reset(tree).await?;
     // reset() deliberately rewrites the physical tracked-path baseline
     // without changing the semantic commit. Mark that state transition so
     // finish() does not mistake it for an unchecked semantic tree rewrite.
