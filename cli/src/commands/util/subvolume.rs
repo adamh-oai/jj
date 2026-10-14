@@ -326,9 +326,7 @@ async fn rebuild_snapshot_baseline(
     // Match ordinary snapshot lock ordering and keep the journal unchanged
     // while validating its operation and semantic tree.
     let git_import_export_lock = workspace_command.lock_git_import_export()?;
-    let (mut locked_workspace, commit) = workspace_command
-        .unchecked_start_working_copy_mutation()
-        .await?;
+    let (mut locked_workspace, commit) = workspace_command.unchecked_start_working_copy_mutation().await?;
     let locked_wc = locked_workspace.locked_wc();
     let freshness = WorkingCopyFreshness::check_stale(locked_wc, &commit, &repo).await?;
     let same_tree =
@@ -337,8 +335,12 @@ async fn rebuild_snapshot_baseline(
         .loader()
         .load_operation(locked_wc.old_operation_id())
         .await?;
+    // An interrupted workspace-add may have published only the empty
+    // placeholder, before recording the source snapshot's tree. In that case
+    // the journal and repo agree, but neither describes the inherited files.
     let is_initial_placeholder = marker_was_enabling
-        && (!same_tree || freshness != WorkingCopyFreshness::Fresh)
+        && locked_wc.old_tree().tree_ids_and_labels()
+            == repo.store().empty_merged_tree().tree_ids_and_labels()
         && old_operation.metadata().description
             == format!("add workspace '{}'", workspace_name.as_symbol());
     let seed_initial_tree = if is_initial_placeholder {
@@ -353,6 +355,14 @@ async fn rebuild_snapshot_baseline(
     } else {
         false
     };
+    if is_initial_placeholder && !seed_initial_tree {
+        return Err(user_error(
+            "Cannot rebuild AWACS baseline: interrupted workspace initialization did not record \
+             the inherited source tree. The files remain on disk, but tracked files and conflicts \
+             cannot be reconstructed safely. Recover or recreate this workspace from its source \
+             before retrying.",
+        ));
+    }
     if !seed_initial_tree && (!same_tree || freshness != WorkingCopyFreshness::Fresh) {
         return Err(user_error(
             "Cannot rebuild AWACS baseline: working copy is stale or its recorded tree does not \
@@ -879,7 +889,9 @@ async fn seed_snapshot_working_copy_tree(
     workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
 ) -> Result<(), CommandError> {
     let operation_id = workspace_command.repo().op_id().clone();
-    let (mut locked_workspace, commit) = workspace_command.unchecked_start_working_copy_mutation().await?;
+    let (mut locked_workspace, commit) = workspace_command
+        .unchecked_start_working_copy_mutation()
+        .await?;
     if !seed_local_working_copy_tree(locked_workspace.locked_wc(), &commit.tree())
         .await
         .map_err(internal_error)?

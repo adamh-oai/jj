@@ -4797,12 +4797,7 @@ exit 1
     let add_operation = operation_id("add workspace 'child'");
     let baseline_operation = operation_id("record snapshot baseline in workspace child");
     main_dir
-        .run_jj([
-            "--ignore-working-copy",
-            "op",
-            "restore",
-            &baseline_operation,
-        ])
+        .run_jj(["--ignore-working-copy", "op", "restore", &add_operation])
         .success();
 
     // Restore the initial, empty legacy journal that workspace initialization
@@ -4837,6 +4832,60 @@ exit 1
         "oversized-tracked",
         "unsnapshotted oversized edit exceeding the limit\n",
     );
+
+    // The add operation's empty tree matches the empty journal, but the
+    // physical snapshot contains inherited tracked files and conflict data.
+    // Until the source tree is recorded, a rebuild must not assume those
+    // files are untracked and silently reclassify them.
+    let checkout_before = std::fs::read(child_dir.root().join(".jj/working_copy/checkout"))?;
+    let tree_state_before = std::fs::read(child_dir.root().join(".jj/working_copy/tree_state"))?;
+    let operation_before = main_dir.current_operation_id();
+    let conflicted_before = child_dir.read_file("conflicted");
+    let ignored_before = child_dir.read_file("ignored-tracked");
+    let oversized_before = child_dir.read_file("oversized-tracked");
+    let output = child_dir.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root()).args([
+            "--config=snapshot.max-new-file-size=32",
+            "util",
+            "subvolume",
+            "enable",
+            "--rebuild-baseline",
+        ])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("did not record the inherited source tree"),
+        "{output}"
+    );
+    assert_eq!(main_dir.current_operation_id(), operation_before);
+    assert_eq!(
+        std::fs::read(child_dir.root().join(".jj/working_copy/checkout"))?,
+        checkout_before
+    );
+    assert_eq!(
+        std::fs::read(child_dir.root().join(".jj/working_copy/tree_state"))?,
+        tree_state_before
+    );
+    assert_eq!(
+        std::fs::read(child_dir.root().join(".jj/working_copy/subvolume_mode"))?,
+        b"enabling\n"
+    );
+    assert_eq!(child_dir.read_file("conflicted"), conflicted_before);
+    assert_eq!(child_dir.read_file("ignored-tracked"), ignored_before);
+    assert_eq!(child_dir.read_file("oversized-tracked"), oversized_before);
+
+    // Once the source commit was recorded, rebuilding can safely recover it.
+    main_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "op",
+            "restore",
+            &baseline_operation,
+        ])
+        .success();
     child_dir
         .run_jj_with(|cmd| {
             cmd.env("JJ_TEST_AWACS_SCAN_ROOT", child_dir.root()).args([
