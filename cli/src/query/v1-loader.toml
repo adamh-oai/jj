@@ -1,0 +1,11 @@
+# Non-normative implementation metadata for the v1 loader.
+native = [
+  "length/0", "keys_unsorted/0", "has/1", "contains/1", "indices/1", "tojson/0", "fromjson/0",
+  "explode/0", "ascii_downcase/0", "ascii_upcase/0", "reverse/0", "sort/0",
+  "sort_by/1", "group_by/1", "min_by_or_empty/1", "max_by_or_empty/1",
+  "startswith/1", "endswith/1", "ltrimstr/1", "rtrimstr/1",
+  "__jj_encode_base64/0", "__jj_encode_uri/0", "__jj_format_csv/0", "__jj_format_tsv/0",
+]
+
+library = "v1.jq"
+host_module = "jj.jq"

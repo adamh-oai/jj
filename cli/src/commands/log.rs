@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::cmp::min;
+use std::io::Write as _;
 
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
@@ -39,11 +40,15 @@ use crate::cli_util::LogContentFormat;
 use crate::cli_util::RevisionArg;
 use crate::cli_util::format_template;
 use crate::command_error::CommandError;
+use crate::command_error::user_error;
 use crate::complete;
 use crate::diff_util::DiffFormatArgs;
+use crate::diff_util::DiffStatOptions;
 use crate::formatter::FormatterExt as _;
 use crate::graphlog::GraphStyle;
 use crate::graphlog::get_graphlog;
+use crate::query::QueryProgram;
+use crate::query::QueryValue;
 use crate::templater::TemplateRenderer;
 use crate::ui::Ui;
 
@@ -124,6 +129,20 @@ pub(crate) struct LogArgs {
     #[arg(long, conflicts_with_all = ["DiffFormatArgs", "no_graph", "patch", "reversed", "template"])]
     count: bool,
 
+    /// Evaluate a jq-compatible structured query for each revision
+    #[arg(long, value_name = "FILTER")]
+    #[arg(conflicts_with_all = ["DiffFormatArgs", "count", "patch", "template"])]
+    jq: Option<String>,
+
+    /// Select the structured query language and schema version
+    #[arg(long, value_name = "VERSION", requires = "jq")]
+    #[arg(value_parser = ["v1"])]
+    query_version: Option<String>,
+
+    /// Supply one array of revisions to the structured query
+    #[arg(long, requires = "jq")]
+    slurp: bool,
+
     #[command(flatten)]
     diff_format: DiffFormatArgs,
 }
@@ -179,6 +198,96 @@ pub(crate) async fn cmd_log(
         return Ok(());
     }
 
+    let mut unmatched_explicit_paths = fileset_expression.explicit_paths().collect_vec();
+    let mut update_unmatched_explicit_paths = async |commit: &Commit| -> Result<(), CommandError> {
+        if unmatched_explicit_paths.is_empty() {
+            return Ok(());
+        }
+        let tree = &commit.tree();
+        unmatched_explicit_paths = stream::iter(unmatched_explicit_paths.iter().copied())
+            .filter_map(|path| async move {
+                tree.path_value(path)
+                    .await
+                    .map(|value| value.is_absent().then_some(path))
+                    .transpose()
+            })
+            .try_collect()
+            .await?;
+        Ok(())
+    };
+
+    if let Some(source) = &args.jq {
+        debug_assert_eq!(args.query_version.as_deref().unwrap_or("v1"), "v1");
+        let program = QueryProgram::compile(source).map_err(user_error)?;
+        let repo = workspace_command.repo().clone();
+        let store = repo.store();
+        let user_email: std::sync::Arc<str> = settings.get_string("user.email")?.into();
+        let workspace_name = workspace_command.workspace_name().to_owned();
+        let immutable_expression = workspace_command
+            .attach_revset_evaluator(workspace_command.env().immutable_expression())
+            .resolve()?;
+        let diff_stat_options = std::sync::Arc::new(DiffStatOptions::from_settings(settings)?);
+        let conflict_marker_style = workspace_command.env().conflict_marker_style();
+        let query_matcher: std::sync::Arc<dyn jj_lib::matchers::Matcher> =
+            fileset_expression.to_matcher().into();
+        let forward_stream = revset.stream().take(args.limit.unwrap_or(usize::MAX));
+        let id_stream: LocalBoxStream<Result<CommitId, RevsetEvaluationError>> = if args.reversed {
+            let entries: Vec<_> = forward_stream.try_collect().await?;
+            stream::iter(entries.into_iter().rev().map(Ok)).boxed_local()
+        } else {
+            forward_stream.boxed_local()
+        };
+        let mut commit_stream = id_stream.commits(store);
+        let mut stdout = ui.stdout();
+
+        if args.slurp {
+            let mut inputs = Vec::new();
+            while let Some(commit) = commit_stream.try_next().await? {
+                update_unmatched_explicit_paths(&commit).await?;
+                inputs.push(QueryValue::commit(
+                    repo.clone(),
+                    commit,
+                    user_email.clone(),
+                    workspace_name.clone(),
+                    immutable_expression.clone(),
+                    query_matcher.clone(),
+                    diff_stat_options.clone(),
+                    conflict_marker_style,
+                ));
+            }
+            write_query_results(&mut stdout, program.run(inputs.into_iter().collect()))?;
+        } else {
+            while let Some(commit) = commit_stream.try_next().await? {
+                update_unmatched_explicit_paths(&commit).await?;
+                write_query_results(
+                    &mut stdout,
+                    program.run(QueryValue::commit(
+                        repo.clone(),
+                        commit,
+                        user_email.clone(),
+                        workspace_name.clone(),
+                        immutable_expression.clone(),
+                        query_matcher.clone(),
+                        diff_stat_options.clone(),
+                        conflict_marker_style,
+                    )),
+                )?;
+            }
+        }
+
+        if !unmatched_explicit_paths.is_empty() {
+            let ui_paths = unmatched_explicit_paths
+                .iter()
+                .map(|&path| workspace_command.format_file_path(path))
+                .join(", ");
+            writeln!(
+                ui.warning_default(),
+                "No matching entries for paths: {ui_paths}"
+            )?;
+        }
+        return Ok(());
+    }
+
     let repo = workspace_command.repo();
     let matcher = fileset_expression.to_matcher();
 
@@ -217,24 +326,6 @@ pub(crate) async fn cmd_log(
             .parse_template(ui, &language, &settings.get_string("templates.log_node")?)?
             .labeled(["log", "commit", "node"]);
     }
-
-    let mut unmatched_explicit_paths = fileset_expression.explicit_paths().collect_vec();
-    let mut update_unmatched_explicit_paths = async |commit: &Commit| -> Result<(), CommandError> {
-        if unmatched_explicit_paths.is_empty() {
-            return Ok(());
-        }
-        let tree = &commit.tree();
-        unmatched_explicit_paths = stream::iter(unmatched_explicit_paths.iter().copied())
-            .filter_map(|path| async move {
-                tree.path_value(path)
-                    .await
-                    .map(|value| value.is_absent().then_some(path))
-                    .transpose()
-            })
-            .try_collect()
-            .await?;
-        Ok(())
-    };
 
     {
         ui.request_pager();
@@ -410,5 +501,18 @@ pub(crate) async fn cmd_log(
         }
     }
 
+    Ok(())
+}
+
+fn write_query_results(
+    output: &mut impl std::io::Write,
+    results: impl Iterator<Item = Result<QueryValue, String>>,
+) -> Result<(), CommandError> {
+    for result in results {
+        let value = result.map_err(user_error)?;
+        let record = value.to_json_record().map_err(user_error)?;
+        output.write_all(&record)?;
+        output.write_all(b"\n")?;
+    }
     Ok(())
 }

@@ -18,8 +18,8 @@ use std::collections::HashSet;
 use std::slice;
 use std::sync::Arc;
 
-use futures::StreamExt as _;
 use futures::executor::block_on_stream;
+use futures::StreamExt as _;
 use itertools::Itertools as _;
 use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
@@ -29,14 +29,14 @@ use jj_lib::backend::TreeId;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
 use jj_lib::conflict_labels::ConflictLabels;
-use jj_lib::converge::CommitsByChangeId;
-use jj_lib::converge::ConvergedAttribute;
-use jj_lib::converge::TreeIdsAndLabels;
-use jj_lib::converge::TruncatedEvolutionGraph;
 use jj_lib::converge::apply_solution;
 use jj_lib::converge::converge_change;
 use jj_lib::converge::find_divergent_changes;
 use jj_lib::converge::remove_descendants;
+use jj_lib::converge::CommitsByChangeId;
+use jj_lib::converge::ConvergedAttribute;
+use jj_lib::converge::TreeIdsAndLabels;
+use jj_lib::converge::TruncatedEvolutionGraph;
 use jj_lib::evolution::walk_predecessors;
 use jj_lib::merge::Merge;
 use jj_lib::merge::MergeBuilder;
@@ -48,9 +48,6 @@ use jj_lib::revset::RevsetExpression;
 use jj_lib::store::Store;
 use jj_lib::transaction::Transaction;
 use pollster::FutureExt as _;
-use testutils::CommitBuilderExt as _;
-use testutils::TestRepo;
-use testutils::TestResult;
 use testutils::commit_transactions;
 use testutils::create_random_tree;
 use testutils::create_tree_with;
@@ -59,6 +56,9 @@ use testutils::repo_path;
 use testutils::repo_path_buf;
 use testutils::write_random_commit;
 use testutils::write_random_commit_with_parents;
+use testutils::CommitBuilderExt as _;
+use testutils::TestRepo;
+use testutils::TestResult;
 
 fn make_change_id(repo: &TestRepo, byte: u8) -> ChangeId {
     ChangeId::new(vec![byte; repo.repo.store().change_id_length()])
@@ -371,24 +371,20 @@ fn test_build_truncated_evolution_graph() -> TestResult {
             .collect::<Vec<_>>(),
         &[commit2.id(), commit3.id()]
     );
-    assert!(
-        truncated_evolution_graph
-            .flow_graph
-            .graph
-            .adjacent_nodes(commit2.id())
-            .unwrap()
-            .collect::<Vec<_>>()
-            .is_empty(),
-    );
-    assert!(
-        truncated_evolution_graph
-            .flow_graph
-            .graph
-            .adjacent_nodes(commit3.id())
-            .unwrap()
-            .collect::<Vec<_>>()
-            .is_empty(),
-    );
+    assert!(truncated_evolution_graph
+        .flow_graph
+        .graph
+        .adjacent_nodes(commit2.id())
+        .unwrap()
+        .collect::<Vec<_>>()
+        .is_empty(),);
+    assert!(truncated_evolution_graph
+        .flow_graph
+        .graph
+        .adjacent_nodes(commit3.id())
+        .unwrap()
+        .collect::<Vec<_>>()
+        .is_empty(),);
 
     Ok(())
 }
@@ -626,6 +622,71 @@ fn test_automatic_converge_description_and_parent() -> TestResult {
     assert_eq!(
         converge_result.tree,
         Some(TreeIdsAndLabels::new(commit1.tree()))
+    );
+    Ok(())
+}
+
+// Evolution (predecessors are below their successors):
+//
+// C2("bar", new_parent)   C3("bar", old_parent)
+//                        /
+//                C1("foo", old_parent)
+//
+// Commit graph:
+//
+// C2  C3
+// |   |
+// new_parent
+// |
+// old_parent
+//
+// Expected result: Solution("bar", new_parent).
+#[test]
+fn test_automatic_converge_prefers_descendant_parent() -> TestResult {
+    let test_repo = TestRepo::init();
+
+    let new_parent_tree = create_random_tree(&test_repo.repo);
+    let mut tx = test_repo.repo.start_transaction();
+    let old_parent = write_random_commit(tx.repo_mut());
+    let new_parent = tx
+        .repo_mut()
+        .new_commit(vec![old_parent.id().clone()], new_parent_tree)
+        .write_unwrap();
+    let repo0 = tx.commit("test").block_on()?;
+
+    let mut tx = repo0.start_transaction();
+    let commit1 = tx
+        .repo_mut()
+        .new_commit(vec![old_parent.id().clone()], create_random_tree(&repo0))
+        .set_description("foo".to_string())
+        .write_unwrap();
+    let repo1 = tx.commit("test").block_on()?;
+
+    let mut tx2 = repo1.start_transaction();
+    let commit2 = tx2
+        .repo_mut()
+        .rewrite_commit(&commit1)
+        .set_description("bar")
+        .set_parents(vec![new_parent.id().clone()])
+        .write_unwrap();
+    tx2.repo_mut().rebase_descendants().block_on()?;
+    let mut tx3 = repo1.start_transaction();
+    let commit3 = tx3
+        .repo_mut()
+        .rewrite_commit(&commit1)
+        .set_description("bar")
+        .write_unwrap();
+    tx3.repo_mut().rebase_descendants().block_on()?;
+    let repo2 = commit_transactions(vec![tx2, tx3]);
+
+    let divergent_commits = vec![commit2, commit3];
+    let truncated_evolution_graph =
+        TruncatedEvolutionGraph::new(repo2, divergent_commits).block_on()?;
+    let converge_result =
+        converge_change(&truncated_evolution_graph, None, None, None, None).block_on()?;
+    assert_eq!(
+        converge_result.parents,
+        ConvergedAttribute::Solved(vec![new_parent.id().clone()])
     );
     Ok(())
 }

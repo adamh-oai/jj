@@ -14,12 +14,21 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::sync_channel;
+use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
 use crossterm::terminal::Clear;
 use crossterm::terminal::ClearType;
+use jj_lib::lock::FileLockWaitNotice;
+use jj_lib::lock::FileLockWaitReporter;
 use jj_lib::repo_path::RepoPath;
 
 use crate::text_util;
@@ -29,6 +38,8 @@ use crate::ui::Ui;
 
 pub const UPDATE_HZ: u32 = 30;
 pub const INITIAL_DELAY: Duration = Duration::from_millis(250);
+const LOCK_WAIT_INITIAL_DELAY: Duration = Duration::from_secs(3);
+const LOCK_WAIT_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct ProgressWriter<'a> {
     prefix: &'a str,
@@ -97,6 +108,146 @@ impl<'a> ProgressWriter<'a> {
     }
 }
 
+pub(crate) fn install_file_lock_wait_reporter(ui: &Ui) {
+    let reporter = ui.progress_output().map(|output| {
+        Arc::new(InteractiveFileLockWaitReporter {
+            output: Arc::new(Mutex::new(output)),
+        }) as Arc<dyn FileLockWaitReporter>
+    });
+    jj_lib::lock::set_file_lock_wait_reporter(reporter);
+}
+
+struct InteractiveFileLockWaitReporter {
+    output: Arc<Mutex<ProgressOutput<io::Stderr>>>,
+}
+
+impl FileLockWaitReporter for InteractiveFileLockWaitReporter {
+    fn start_wait(
+        &self,
+        path: &Path,
+        read_owner: Box<dyn Fn() -> Option<String> + Send>,
+    ) -> Box<dyn FileLockWaitNotice> {
+        let (stop_tx, stop_rx) = sync_channel(1);
+        let output = self.output.clone();
+        let path = path.to_owned();
+        let thread = thread::spawn(move || {
+            display_file_lock_wait_notice(output, path, read_owner, stop_rx);
+        });
+        Box::new(InteractiveFileLockWaitNotice {
+            stop_tx: Some(stop_tx),
+            thread: Some(thread),
+        })
+    }
+}
+
+struct InteractiveFileLockWaitNotice {
+    stop_tx: Option<SyncSender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl FileLockWaitNotice for InteractiveFileLockWaitNotice {}
+
+impl Drop for InteractiveFileLockWaitNotice {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            drop(thread.join());
+        }
+    }
+}
+
+fn display_file_lock_wait_notice(
+    output: Arc<Mutex<ProgressOutput<io::Stderr>>>,
+    path: std::path::PathBuf,
+    read_owner: Box<dyn Fn() -> Option<String> + Send>,
+    stop_rx: Receiver<()>,
+) {
+    let started = Instant::now();
+    match stop_rx.recv_timeout(LOCK_WAIT_INITIAL_DELAY) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+        Err(RecvTimeoutError::Timeout) => {}
+    }
+
+    loop {
+        let Ok(mut progress_output) = output.lock() else {
+            return;
+        };
+        if write_file_lock_wait_notice(
+            &mut progress_output,
+            &path,
+            read_owner.as_ref(),
+            started.elapsed(),
+        )
+        .is_err()
+        {
+            return;
+        }
+        drop(progress_output);
+
+        match stop_rx.recv_timeout(LOCK_WAIT_UPDATE_INTERVAL) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                if let Ok(mut progress_output) = output.lock() {
+                    clear_file_lock_wait_notice(&mut progress_output).ok();
+                }
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn write_file_lock_wait_notice<W: io::Write>(
+    output: &mut ProgressOutput<W>,
+    path: &Path,
+    read_owner: &dyn Fn() -> Option<String>,
+    elapsed: Duration,
+) -> io::Result<()> {
+    // The holder can acquire the lock before its metadata has been written.
+    // Refresh it for every display instead of retaining an initial unknown.
+    let holder = read_owner().unwrap_or_else(|| "<unknown>".to_owned());
+    let line_width = output.term_width().map(usize::from).unwrap_or(80);
+    let elapsed = format!("{:.1}s", elapsed.as_secs_f32());
+    let prefix = "Waiting for lock";
+    let infix = " (held by ";
+    let suffix = format!("; {elapsed})");
+    let fixed_width = prefix.len() + infix.len() + suffix.len();
+    let text = if fixed_width > line_width / 2 {
+        // On a narrow terminal, give the holder more space than the labels.
+        let suffix = format!(" ({elapsed})");
+        let (holder, _) =
+            text_util::elide_end(&holder, "...", line_width.saturating_sub(suffix.len()));
+        format!("{holder}{suffix}")
+    } else {
+        // Keep the PID and command prefix visible. Trim the lock path first,
+        // then trim the end of an oversized command rather than its beginning.
+        let (holder, holder_width) =
+            text_util::elide_end(&holder, "...", line_width.saturating_sub(fixed_width));
+        let path_width = line_width.saturating_sub(fixed_width + holder_width + 1);
+        let path = path.to_string_lossy();
+        let (path, path_width) = text_util::elide_start(&path, "...", path_width);
+        if path_width == 0 {
+            format!("{prefix}{infix}{holder}{suffix}")
+        } else {
+            format!("{prefix} {path}{infix}{holder}{suffix}")
+        }
+    };
+    let (display_text, _) = text_util::elide_end(&text, "...", line_width);
+    write!(
+        output,
+        "\r{}{}",
+        Clear(ClearType::CurrentLine),
+        display_text
+    )?;
+    output.flush()
+}
+
+fn clear_file_lock_wait_notice<W: io::Write>(output: &mut ProgressOutput<W>) -> io::Result<()> {
+    write!(output, "\r{}", Clear(ClearType::CurrentLine))?;
+    output.flush()
+}
+
 pub fn snapshot_progress(ui: &Ui) -> Option<impl Fn(&RepoPath) + use<>> {
     let writer = Mutex::new(ProgressWriter::new(ui, "Snapshotting")?);
 
@@ -112,4 +263,82 @@ pub fn snapshot_progress(ui: &Ui) -> Option<impl Fn(&RepoPath) + use<>> {
                 .ok();
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_lock_wait_notice_includes_lock_holder_and_timer() {
+        let mut buffer = Vec::new();
+        {
+            let mut output = ProgressOutput::for_test(&mut buffer, 200);
+            write_file_lock_wait_notice(
+                &mut output,
+                Path::new("/tmp/working_copy.lock"),
+                &|| Some("pid=42 argv=jj status".to_owned()),
+                Duration::from_millis(3400),
+            )
+            .unwrap();
+        }
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains(
+            "Waiting for lock /tmp/working_copy.lock (held by pid=42 argv=jj status; 3.4s)"
+        ));
+    }
+
+    #[test]
+    fn file_lock_wait_notice_refreshes_late_owner_metadata() {
+        let holder = Mutex::new(None);
+        let read_owner = || holder.lock().unwrap().clone();
+        let mut buffer = Vec::new();
+        {
+            let mut output = ProgressOutput::for_test(&mut buffer, 200);
+            write_file_lock_wait_notice(
+                &mut output,
+                Path::new("/tmp/working_copy.lock"),
+                &read_owner,
+                Duration::from_secs(3),
+            )
+            .unwrap();
+            *holder.lock().unwrap() = Some("pid=42 argv=jj status".to_owned());
+            write_file_lock_wait_notice(
+                &mut output,
+                Path::new("/tmp/working_copy.lock"),
+                &read_owner,
+                Duration::from_secs(4),
+            )
+            .unwrap();
+        }
+        let output = String::from_utf8(buffer).unwrap();
+        let displays = output.split('\r').collect::<Vec<_>>();
+        assert!(displays[1].contains("held by <unknown>; 3.0s"));
+        assert!(displays[2].contains("held by pid=42 argv=jj status; 4.0s"));
+    }
+
+    #[test]
+    fn file_lock_wait_notice_preserves_pid_and_command_on_narrow_terminal() {
+        let holder = format!("pid=42 argv=jj rebase --destination {}", "x".repeat(200));
+        for line_width in [40, 80] {
+            let mut buffer = Vec::new();
+            {
+                let mut output = ProgressOutput::for_test(&mut buffer, line_width);
+                write_file_lock_wait_notice(
+                    &mut output,
+                    Path::new("/long/workspace/path/.jj/working_copy/working_copy.lock"),
+                    &|| Some(holder.clone()),
+                    Duration::from_millis(3400),
+                )
+                .unwrap();
+            }
+            let output = String::from_utf8(buffer).unwrap();
+            assert!(output.contains("pid=42 argv=jj rebase"), "{output}");
+            assert!(output.contains("..."), "{output}");
+            assert!(output.contains("3.4s"), "{output}");
+            let clear_line = format!("\r{}", Clear(ClearType::CurrentLine));
+            let text = output.strip_prefix(&clear_line).unwrap();
+            assert!(text.len() <= usize::from(line_width), "{text}");
+        }
+    }
 }

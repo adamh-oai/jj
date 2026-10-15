@@ -29,6 +29,7 @@ ansi-to-tui = "8.0.1"
 anstream = "1.0.0"
 assert_cmd = "2.2.2"
 async-trait = "0.1.89"
+base64 = "0.22.1"
 blake2 = "0.11.0"
 btrfs-awacs = { path = "btrfs-awacs" }
 bstr = { version = "1.12.1", features = ["serde"] }
@@ -77,6 +78,9 @@ indoc = "2.0.7"
 insta = { version = "1.47.2", features = ["filters"] }
 interim = { version = "0.2.1", features = ["chrono_0_4"] }
 itertools = "0.15.0"
+jaq-core = "=3.1.0"
+jaq-json = "=2.0.1"
+jaq-std = { version = "=3.0.1", default-features = false }
 jsonschema = { version = "0.58.2", default-features = false }
 libc = { version = "0.2.186" }
 maplit = "1.0.2"
@@ -139,8 +143,10 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
     "ansi",
     "env-filter",
     "fmt",
+    "json",
 ] }
 unicode-width = "0.2.2"
+urlencoding = "2.1.3"
 watchman_client = "0.9.0"
 whoami = "2.1.2"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }

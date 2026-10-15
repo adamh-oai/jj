@@ -1,13 +1,17 @@
-# jj converge (aka resolve-divergence) Command Design
+# jj converge Command Design
 
 Authors: [David Rieber](mailto:drieber@google.com),
 [Martin von Zweigbergk](mailto:martinvonz@google.com)
 
-**Summary:** This document is a proposal for a new `jj converge` command to help
-users resolve (or reduce) divergence. The command will use heuristics -- and
-sometimes will prompt the user for input -- to rewrite the N visible commits for
-a given change with a single new commit, without introducing new divergence in
-the process. `jj resolve-divergence` will be an alias for `jj converge`.
+**Summary:** This document is a proposal for a new `jj converge` command to
+clean divergence and content conflicts bottom-up. For divergence, the command
+uses heuristics to rewrite the N visible commits for a given change with a
+single new commit, without introducing new divergence in the process. For a
+content conflict, it reports the exact next manual resolution step instead of
+editing files itself. By default the command is non-interactive: it either
+converges one safe bottom-most divergence or reports the next choice/conflict
+that needs human input. `--interactive` (`-i`) opts into prompts and an editor
+for exact, human-driven divergence resolution.
 
 ## Objective
 
@@ -21,13 +25,115 @@ scenarios with the help of this command. Solving divergence means rewriting the
 commit graph to end up with a single visible commit for the given change id. For
 the purposes of this design doc we call this commit the *"solution"*.
 
-The command should produce informative messages to summarize any changes made,
-and will prompt for user input in some situations. The user may of course not
-like the solution. `jj undo` can be used in that case.
+The command should produce informative messages to summarize any changes made
+or the next manual conflict step. It must not read stdin or open an editor
+unless `--interactive` is passed. The user may of course not like the solution.
+`jj undo` can be used in that case.
+
+## Differences from the existing RFC
+
+This design intentionally changes the original interactive-first proposal in
+these ways:
+
+*   Normal `jj converge` never prompts or opens an editor. Its default cleanup
+    revset is `divergent() | conflicts()`. It considers only the bottom-most
+    outstanding issue, automatically converges safe divergence, and stops with
+    exact instructions for an ambiguous divergence or content conflict. The
+    caller reruns the command after each result, so descendants are not planned
+    or reported before their ancestors are clean.
+*   Unlike the original one-change-per-invocation proposal, normal
+    non-interactive `-r <revset>` names stack tips: cleanup is limited to
+    `(divergent() | conflicts()) & ancestors(<revset>)`. Thus `-r @` cleans the
+    current stack. Interactive mode and explicit resolution flags preserve
+    exact-revision targeting and require one divergent change ID.
+*   `--interactive` (`-i`) preserves the original prompt/editor flow as an
+    explicit human-only mode. Explicit resolution flags always take precedence.
+*   Each promptable attribute has a deterministic override: `--onto` chooses
+    the single canonical parent, `--author-from` copies the full author
+    signature from an exact divergent commit, and `--message-from` or `-m`
+    chooses the description.
+*   `--json` is not dry-run-only. Without `--dry-run`, it applies a safe
+    bottom-most divergence and returns `status: "resolved"`; otherwise it
+    returns machine-readable instructions for the next manual issue or
+    `status: "clean"`. `--dry-run --json` reports the same next issue without
+    rewriting history. Deferred descendants are intentionally omitted because
+    the next invocation replans from current history.
+*   A solution always has exactly one commit-graph parent. Divergent commits
+    become evolution predecessors, never multiple commit-graph parents. If no
+    safe linear parent is obvious, the caller must provide `--onto` or stop.
+*   Content conflicts are never merged inside `jj converge`. A bottom-most
+    conflict produces `status: "needs_manual_resolution"` with its exact
+    commit ID, paths, and the `jj new` / `jj resolve --list` /
+    `jj squash --use-destination-message` workflow. A convergence that creates
+    conflicts returns `has_conflicts: true`; the next invocation reports that
+    conflict before any divergent descendant.
 
 [divergent change]: ../glossary.md#divergent-change
 [visible commits]: ../glossary.md#visible-commits
 [Handling divergent commits]: ../guides/divergence.md
+
+## Command-line contract
+
+The cleanup form is:
+
+```sh
+jj converge [-r <stack-tip-revset>] [--dry-run] [--json]
+```
+
+With no `-r`, the scope is `divergent() | conflicts()`. With `-r`, the scope is
+the matching revisions and their ancestors, intersected with that default issue
+revset. A divergent family is selected if any of its visible versions is in the
+scope; all versions are then considered together. Each invocation selects one
+deterministic bottom-most issue. It either converges a safe divergent change,
+reports every unresolved choice for one divergent change, reports one content
+conflict, or reports that the scope is clean. `/0` and `/1` are not stable
+identifiers and are never emitted as machine-facing candidates.
+
+The exact single-divergence form is:
+
+```sh
+jj converge -r 'change_id(<change-id>)' \
+  [--onto <parent>] \
+  [--author-from <divergent-commit>] \
+  [--message-from <divergent-commit> | -m <message>]
+```
+
+Explicit resolution flags imply exact-revision mode and require one divergent
+change ID. They are the escape hatch after cleanup JSON reports
+`status: "needs_input"`. Dry-run never performs a convergence transaction.
+Divergence JSON includes the change ID, exact divergent commit IDs, `ready`,
+`status`, unresolved choices with their `resolve_with` flags and candidates,
+hard `blocked` reasons, `would_rebase_descendants`, and `may_conflict` once all
+choices are resolved. Conflict JSON includes `kind: "conflict"`,
+`status: "needs_manual_resolution"`, the exact commit and change IDs, conflicted
+paths, and resolution commands. A successful non-dry-run JSON invocation emits
+`kind: "divergence"`, `status: "resolved"`, the solution commit ID, rebased
+descendant count, and `has_conflicts`.
+Human-readable dry-run output uses compact `READY`, `BLOCKED`, and
+`NEEDS_INPUT` status blocks. Description and parent choices
+include copy-pasteable `jj log` commands over the exact candidate commit IDs so
+the user can inspect full descriptions and possible canonical parents.
+Callers may supply only some overrides, rerun dry-run, inspect the remaining
+choices, and apply once the plan is ready. Each invocation recomputes the plan
+from current repository state; no partial convergence state is persisted.
+
+The human-driven form is:
+
+```sh
+jj converge -i -r 'change_id(<change-id>)'
+```
+
+In interactive mode, unresolved authors and parents use prompts and unresolved
+descriptions use an editor. Explicit flags still win and suppress interaction
+for their attributes. `--interactive` and `--dry-run` are mutually exclusive.
+Interactive mode requires the revset to resolve to one divergent change ID.
+
+Some conditions are safety failures, not promptable choices: no divergent
+change, immutable commits that would be rewritten, root-commit convergence, or
+an invalid `--onto` that is hidden, has the divergent change ID, or descends
+from a divergent commit. Normal mode reports these as errors. Dry-run includes
+rewrite-immutability failures in `blocked`; invalid explicit arguments still
+fail immediately.
 
 ## Divergent changes
 
@@ -171,9 +277,12 @@ SameChange::Accept` (later on in this design doc we will tweak the merge
 algorithm a bit).
 
 The description is merged as a String value. If the description does not
-trivially resolve, the user's merge tool will be invoked, with conflict markers.
-If author does not trivially resolve, the user will be presented with the
-options to choose from. Once that's all done we have our solution commit *B*.
+trivially resolve, normal mode reports `--message-from <commit-id>` and
+`-m <message>` as the ways to resolve it. With `--interactive`, the user's
+merge tool is invoked with conflict markers. If author does not trivially
+resolve, normal mode reports exact `--author-from <commit-id>` candidates;
+interactive mode presents those options to the user. Once all choices are
+resolved we have our solution commit *B*.
 All descendants of *B/0* and *B/1* are rebased onto *B*. The command records the
 operation in the operation log with a new View where *B* is a visible commit
 with *{B/0, B/1}* as predecessors. *B/0* and *B/1* become hidden commits.
@@ -255,7 +364,7 @@ parents = P⁻ + (B/0⁻ - P⁻) + (B/1⁻ - P⁻)
 
 That expression resolves trivially to *{A}* when using SameChange::Accept.
 
-#### Example 4: divergent commits with different parents, must prompt user to choose parents
+#### Example 4: divergent commits with different parents, must choose one parent
 
 If instead *P* is a child of some other commit *X*, the story is a bit
 different:
@@ -280,8 +389,10 @@ In this case parents will be
 {X} + ({A} - {X}) + ({C} - {X}) = {A} + ({C} - {X})
 ```
 
-Since this does not trivially resolve, the command prompts the user to select
-the desired parents for the solution: either *{A}* or *{C}*.
+Since this does not trivially resolve, normal mode exits without rewriting and
+reports *A* and *C* as exact `--onto` candidates. With `--interactive`, the
+command prompts the user to select the desired parent for the solution: either
+*A* or *C*.
 
 Assume the user chooses *{C}*. The command then rebases (in memory) *B/0*, *B/1*
 and *P* onto the chosen parents:
@@ -415,10 +526,11 @@ Q /     ( foo.txt contents: "v1" )
 P       ( foo.txt contents: "v1" )
 ```
 
-In this case *try_resolve_deduplicating_same_diffs* produces none. jj converge
-cannot automatically resolve this merge so the user has to merge the
-description: the command invokes the user's merge-tool with base "v1" and sides
-"v2"/"v3".
+In this case *try_resolve_deduplicating_same_diffs* produces none. `jj converge`
+cannot automatically resolve this merge. Normal mode reports the exact commits
+that can be selected with `--message-from`, or the caller can pass a merged
+description with `-m`. With `--interactive`, the command invokes the user's
+merge tool with base "v1" and sides "v2"/"v3".
 
 ### Edge cases when choosing the parents of the solution
 
@@ -440,25 +552,29 @@ On the other hand,
     the same change-id,
 
 then we would introduce new divergence or cycles in the commit graph if we based
-on the solution on such candidate parents. In these edge cases the command will
-simply discard the candidate parents and will instead ask the user to choose
-which parents to use (or quit without making any changes). Care must be
-taken when picking the options to present to the user for choosing parents:
-essentially the user will choose between the parents of *B/0*, the parents of
-*B/1*, and so on, but we will skip any *B/i* if any of the parents of *B/i*
-descends from any *B/j*. Since the commit graph is a DAG, at least one option is
-viable.
+the solution on such candidate parents. In these edge cases the command discards
+unsafe candidates. Normal mode reports the remaining exact `--onto` candidates,
+or errors with no valid candidates if none remain. Interactive mode instead asks
+the user to choose a parent (or quit without making any changes). Care must be
+taken when picking the options to report or present: essentially the user chooses
+between the parents of *B/0*, the parents of *B/1*, and so on, but we skip any
+*B/i* if any of its parents descends from any *B/j*. Since the commit graph is a
+DAG, at least one option is viable.
 
-## Multiple divergent change-ids
+## Bottom-up cleanup
 
-If there are multiple divergent change-ids, the command could prompt the user to
-choose one, or apply heuristics to choose one programmatically. In the first
-version it is OK to prompt the user.
+Normal non-interactive mode may discover many divergent changes and conflicted
+commits in the selected scope. It chooses only one bottom-most issue and
+re-finds the next issue on the next invocation because convergence or manual
+conflict resolution can rewrite descendants, remove their conflicts, or change
+their plans. It converges only a change whose author, description, and single
+canonical parent are inferred deterministically. It does not emit deferred
+descendants.
 
-If the command successfully resolves divergence in the first divergent
-change-id, it could continue to process the next divergent change-id, and so on.
-To avoid complexity the first implementation will only deal with one divergent
-change per invocation.
+`--interactive`, `--onto`, `--author-from`, `--message-from`, and `-m`
+switch to exact-revision mode and require exactly one selected divergent change
+ID. These choices describe one specific change and cannot safely be applied
+across a cleanup scope.
 
 ### Rebasing descendants and persisting
 

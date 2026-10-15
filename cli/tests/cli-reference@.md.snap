@@ -165,7 +165,7 @@ To get started, see the tutorial at [`jj help -k tutorial`][tutorial].
 * `bookmark` — Manage bookmarks [default alias: b]
 * `commit` — Update the description and create a new change on top [default alias: ci]
 * `config` — Manage config options
-* `converge` — Converge divergent changes
+* `converge` — Clean divergent changes and content conflicts from a stack
 * `describe` — Update the change description or other metadata [default alias: desc]
 * `diff` — Compare file contents between two revisions
 * `diffedit` — Touch up the content changes in a revision with a diff editor
@@ -963,30 +963,37 @@ Update a config file to unset the given option
 
 ## `jj converge`
 
-Converge divergent changes
+Clean divergent changes and content conflicts from a stack
 
-Attempts to resolve divergence by replacing two or more visible revisions for a given change with a single revision. `jj converge` evaluates the revset(s) given by the `--revisions` arg (or the `revsets.converge` setting if none are specified) and groups the resulting revisions by change ID. Change IDs with more than one revision are divergent.
-
-If there is no divergence it returns successfully. If there is more than one divergent change it prompts the user to choose one. The command then applies heuristics to try to automatically come up with a good solution (i.e. a new revision) that replaces the divergent revisions. If the heuristics are inconclusive `jj converge` falls back to prompting the user. Use `--no-interactive` to print a warning instead of prompting the user.
-
-The user may be prompted for any of the following: to merge revision descriptions, to choose parents for the solution, and/or (very rarely) to choose a revision author.
-
-When a solution is found, the new revision replaces the divergent revisions of the specific change ID (but only those matching the revsets; if there are other visible revisions for the same change ID outside the revset, those will remain and you will still have divergence, though it will be reduced). Descendants of the divergent revisions are rebased onto the solution, and local bookmarks pointing to any divergent revision are updated to point to the solution.
-
-Note that there may be file conflicts in the solution whether or not there were conflicts to begin with.
-
-The modifications made by `jj converge` can be reviewed by `jj op show -p`. You can inspect the change evolution with `jj evolog`. If not satisfied with the result you can run `jj undo`.
+The divergent revisions become evolution predecessors of the new revision. They do not become commit-graph parents. The solution always has exactly one commit-graph parent; use --onto to choose that parent when it cannot be inferred automatically. By default, the command never prompts or opens an editor; use --interactive to opt into that behavior. With --json, the command processes the next bottom-most issue: safe divergence is converged automatically, while conflicts and ambiguous divergence are reported with machine-readable instructions.
 
 **Usage:** `jj converge [OPTIONS]`
 
 ###### **Options:**
 
-* `-r`, `--revision <REVSETS>` — The search space to look for divergent revisions
+* `-r`, `--revision <REVSETS>` — Stack tips whose ancestors should be cleaned
 
-   If no revisions are specified, this defaults to the `revsets.converge` setting.
-* `--no-interactive` — Do not prompt the user for help resolving divergence
+   In normal non-interactive mode, issues are selected from `(divergent() | conflicts()) & ancestors(<revset>)`. If omitted, all divergent revisions and conflicted revisions are considered. Interactive mode and explicit resolution options keep the exact-revision behavior and require exactly one divergent change ID.
+* `-o`, `--onto <REVSET>` — Canonical parent for the solution revision
 
-   If the command cannot solve divergence automatically it will print a warning and exit without making any changes (divergence will still be present).
+   This accepts exactly one revision. It is useful when divergent versions were rebased onto different parents and no unique linear parent can be inferred.
+* `--author-from <REVSET>` — Revision whose author should be used for the solution revision
+
+   This must select exactly one of the divergent revisions. The full author signature, including its timestamp, is copied from that revision.
+* `-m`, `--message <MESSAGE>` — Description for the solution revision
+
+   If the divergent descriptions cannot be merged automatically and this option is omitted, normal mode reports the unresolved choice. With --interactive, an editor opens with the competing descriptions.
+* `--message-from <REVSET>` — Revision whose description should be used for the solution revision
+
+   This must select exactly one of the divergent revisions.
+* `-i`, `--interactive` — Prompt for unresolved author, description, or parent choices
+
+   Without this option, unresolved choices are reported without changing history. Explicit options such as --onto, --author-from, --message-from, and --message take precedence over interactive choices.
+* `--no-interactive` — Do not prompt for unresolved choices (the default)
+* `--dry-run` — Report the convergence plan without changing history
+* `--json` — Emit a machine-readable cleanup result as JSON
+
+   Without --dry-run, safe bottom-most divergence is converged automatically. Ambiguous divergence and content conflicts are reported without changing history.
 
 
 
@@ -2250,6 +2257,12 @@ The working-copy commit is indicated by a `@` symbol in the graph. [Immutable re
    [templates]: https://docs.jj-vcs.dev/latest/templates/
 * `-p`, `--patch` — Show patch
 * `--count` — Print the number of commits instead of showing them
+* `--jq <FILTER>` — Evaluate a jq-compatible structured query for each revision
+* `--query-version <VERSION>` — Select the structured query language and schema version
+
+  Possible values: `v1`
+
+* `--slurp` — Supply one array of revisions to the structured query
 * `-s`, `--summary` — For each path, show only whether it was modified, added, or deleted
 * `--stat` — Show a histogram of the changes
 * `--types` — For each path, show only its type before and after
