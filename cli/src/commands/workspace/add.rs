@@ -309,6 +309,7 @@ async fn cmd_workspace_add_impl(
             #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
             if let Some(plan) = &git_worktree_plan
                 && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_none()
+                && snapshot_git_handoff_environment_is_safe()
                 && crate::git_util::git_uses_awacs_fsmonitor(
                     &plan.git_executable,
                     old_workspace_command.workspace_root(),
@@ -324,9 +325,9 @@ async fn cmd_workspace_add_impl(
                         .join("git_import_export.lock"),
                 )
                 .map_err(|err| user_error(format!("Failed to lock source Git index: {err}")))?;
-                let source_git = gix::open(old_workspace_command.workspace_root())
-                    .map_err(|err| user_error(format!("Failed to open source Git index: {err}")))?;
-                if source_git.index_path().is_file()
+                if let Some(source_git) =
+                    snapshot_git_handoff_worktree(old_workspace_command.workspace_root())?
+                    && let Some(index_file) = open_snapshot_git_index(&source_git.index_path())?
                     && let Some(config) = snapshot_git_index_config(
                         &plan.git_executable,
                         old_workspace_command.workspace_root(),
@@ -336,6 +337,7 @@ async fn cmd_workspace_add_impl(
                     let handoff = GitIndexHandoff::capture(
                         old_workspace_command.workspace_root(),
                         &source_git.index_path(),
+                        index_file,
                         source_git.object_hash().len_in_bytes(),
                     )
                     .map_err(|err| {
@@ -423,7 +425,9 @@ async fn cmd_workspace_add_impl(
                 .as_mut()
                 .expect("snapshot workspaces always retain their preparation");
             #[cfg(feature = "git")]
-            let retain_git_consumer = if let Some(plan) = &git_worktree_plan {
+            let retain_git_consumer = if let Some(plan) = &git_worktree_plan
+                && snapshot_git_handoff_environment_is_safe()
+            {
                 crate::git_util::git_uses_awacs_fsmonitor(&plan.git_executable, &destination_path)?
             } else {
                 false
@@ -784,7 +788,83 @@ async fn cmd_workspace_add_impl(
             snapshot_git_index.as_mut(),
         )?;
     }
+    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+    if snapshot && git_worktree_plan.is_some() {
+        ensure_snapshot_child_git_index(&new_workspace_command, &new_wc_commit).await?;
+    }
     drop(lifecycle_lock);
+    Ok(())
+}
+
+// Handoff may be unsafe when the caller has selected another Git index. The
+// new worktree still needs its own index: a missing index makes Git report
+// all tracked files as staged deletions. Construct a cold one from the final
+// tree without consulting or changing the caller's repository environment.
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+async fn ensure_snapshot_child_git_index(
+    workspace_command: &crate::cli_util::WorkspaceCommandHelper,
+    final_commit: &jj_lib::commit::Commit,
+) -> Result<(), CommandError> {
+    use jj_lib::matchers::PrefixMatcher;
+    use jj_lib::repo_path::RepoPath;
+
+    let root = workspace_command.workspace_root();
+    let git_repo = gix::open_opts(root, gix::open::Options::isolated())
+        .map_err(|err| user_error(format!("Failed to open child Git worktree: {err}")))?;
+    let expected_root = fs::canonicalize(root)
+        .map_err(|err| user_error(format!("Failed to inspect child Git worktree: {err}")))?;
+    if !git_repo
+        .workdir()
+        .and_then(|workdir| fs::canonicalize(workdir).ok())
+        .is_some_and(|workdir| workdir == expected_root)
+    {
+        return Err(user_error(
+            "Child Git worktree does not match its workspace",
+        ));
+    }
+    // Do not use index_path(), which can be redirected by Git configuration.
+    let index_path = git_repo.path().join("index");
+    let mut lock = gix::lock::File::acquire_to_update_resource(
+        &index_path,
+        gix::lock::acquire::Fail::Immediately,
+        None,
+    )
+    .map_err(|err| user_error(format!("Failed to lock child Git index: {err}")))?;
+    match index_path.symlink_metadata() {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(user_error(format!(
+                "Failed to inspect child Git index: {err}"
+            )));
+        }
+    }
+    let mut index = jj_lib::git::build_working_copy_index(
+        workspace_command.repo().as_ref(),
+        &git_repo,
+        final_commit,
+    )
+    .await
+    .map_err(|err| user_error(format!("Failed to initialize child Git index: {err}")))?;
+    let materialized = PrefixMatcher::new(workspace_command.working_copy().sparse_patterns()?);
+    for (entry, path) in index.entries_mut_with_paths() {
+        let materialized_path = std::str::from_utf8(path)
+            .ok()
+            .and_then(|path| RepoPath::from_internal_string(path).ok())
+            .is_some_and(|path| materialized.matches(path));
+        if !materialized_path {
+            entry.flags.insert(
+                gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
+            );
+        }
+    }
+    // The entries have no stat or fsmonitor claims, so the first status must
+    // check the materialized files and create this worktree's own cursor.
+    index
+        .write_to(&mut lock, gix::index::write::Options::default())
+        .map_err(|err| user_error(format!("Failed to write child Git index: {err}")))?;
+    lock.commit()
+        .map_err(|err| user_error(format!("Failed to publish child Git index: {err}")))?;
     Ok(())
 }
 
@@ -927,8 +1007,9 @@ fn seed_snapshot_git_index(
         return Ok(());
     };
     let root = workspace_command.workspace_root();
-    let git_repo = gix::open(root)
-        .map_err(|err| user_error(format!("Failed to open snapshot Git worktree: {err}")))?;
+    let Some(git_repo) = snapshot_git_handoff_worktree(root)? else {
+        return Ok(());
+    };
     let lock_path = workspace_command.repo_path().join("git_import_export.lock");
     let _git_lock = FileLock::lock(lock_path.clone()).map_err(|err| {
         user_error(format!(
@@ -968,13 +1049,19 @@ fn seed_snapshot_git_index(
         }
     };
     let source_index = index_from_tree(tree_id)?;
-    let index = match git_repo.open_index() {
-        Ok(index) => index,
-        Err(err) if err.is_not_found()
-            && git_repo
-                .index_path()
-                .symlink_metadata()
-                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+    let (index, previous_index) = match open_snapshot_git_index(&git_repo.index_path())? {
+        Some(file) => {
+            let Some((index, bytes)) =
+                read_snapshot_git_index(file, &git_repo.index_path(), git_repo.object_hash())?
+            else {
+                return Ok(());
+            };
+            (index, Some(bytes))
+        }
+        None if git_repo
+            .index_path()
+            .symlink_metadata()
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
         {
             // If the requested revision already matches the source, JJ can
             // skip Git checkout entirely. The no-checkout worktree then has
@@ -983,7 +1070,7 @@ fn seed_snapshot_git_index(
             let Some(tree_id) = final_tree.tree_ids().as_resolved() else {
                 return Ok(());
             };
-            if tree_id == workspace_command.repo().store().empty_tree_id() {
+            let index = if tree_id == workspace_command.repo().store().empty_tree_id() {
                 index_from_tree(tree_id)?
             } else {
                 jj_lib::git_index_cache::index_from_tree(
@@ -991,13 +1078,10 @@ fn seed_snapshot_git_index(
                     &gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()),
                 )
                 .map_err(|err| user_error(format!("Failed to seed snapshot Git index: {err}")))?
-            }
+            };
+            (index, None)
         }
-        Err(err) => {
-            return Err(user_error(format!(
-                "Failed to read snapshot Git index: {err}"
-            )));
-        }
+        None => return Ok(()),
     };
 
     let mut client = DirectScanClient::for_root(root)
@@ -1078,8 +1162,14 @@ fn seed_snapshot_git_index(
         // the final checkout's attributes before publishing any clean bits.
         invalidate_snapshot_git_conversions_in_index(&git_repo, &index, &mut dirty)?;
         let mut index_lock = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
-        jj_lib::git_index_cache::write_with_monitor(&index, &token, &dirty, &mut index_lock)
-            .map_err(|err| user_error(format!("Failed to write snapshot Git index: {err}")))?;
+        jj_lib::git_index_cache::write_with_monitor(
+            &index,
+            &token,
+            &dirty,
+            previous_index.as_deref(),
+            &mut index_lock,
+        )
+        .map_err(|err| user_error(format!("Failed to write snapshot Git index: {err}")))?;
         let index_lock = index_lock
             .into_inner()
             .map_err(|err| user_error(format!("Failed to flush snapshot Git index: {err}")))?;
@@ -1100,6 +1190,140 @@ fn seed_snapshot_git_index(
         drop(lease.finish(ScanOutcome::Aborted));
     }
     result
+}
+
+/// Repository-local Git environment variables identify the caller's worktree,
+/// not necessarily the newly created one. Do not use them to transfer a cache
+/// between worktrees. Leaving the optimization unused is safe: Git will build
+/// its own index and fsmonitor cursor on demand.
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+fn snapshot_git_handoff_environment_is_safe() -> bool {
+    const REPOSITORY_ENVIRONMENT: &[&str] = &[
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CONFIG",
+    ];
+    !REPOSITORY_ENVIRONMENT
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+fn snapshot_git_handoff_worktree(root: &Path) -> Result<Option<gix::Repository>, CommandError> {
+    if !snapshot_git_handoff_environment_is_safe() {
+        return Ok(None);
+    }
+    let repo = gix::open(root)
+        .map_err(|err| user_error(format!("Failed to open snapshot Git worktree: {err}")))?;
+    if !snapshot_git_index_in_expected_worktree(root, &repo) {
+        tracing::debug!("Git index does not belong to snapshot worktree; skipping handoff");
+        return Ok(None);
+    }
+    Ok(Some(repo))
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+fn snapshot_git_index_in_expected_worktree(root: &Path, repo: &gix::Repository) -> bool {
+    // A configured gitoxide.core.indexFile can redirect the index even with no
+    // environment override. Git's per-worktree index is always under git_dir.
+    if repo.index_path() != repo.path().join("index") {
+        return false;
+    }
+    match fs::symlink_metadata(repo.index_path()) {
+        Ok(metadata) if !metadata.is_file() => return false,
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return false,
+        _ => {}
+    }
+    let Ok(root) = fs::canonicalize(root) else {
+        return false;
+    };
+    repo.workdir()
+        .and_then(|workdir| fs::canonicalize(workdir).ok())
+        .is_some_and(|workdir| workdir == root)
+}
+
+// Open the source without following a link even if it was replaced after
+// the ownership check. A missing or linked index just skips the optimization.
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+fn open_snapshot_git_index(path: &Path) -> Result<Option<fs::File>, CommandError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) if file.metadata().is_ok_and(|metadata| metadata.is_file()) => Ok(Some(file)),
+        Ok(_) => Ok(None),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::NotFound
+                || err.raw_os_error() == Some(libc::ELOOP) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(user_error(format!(
+            "Failed to open source Git index: {err}"
+        ))),
+    }
+}
+
+// Parse the exact file we opened, rather than reopening its pathname after a
+// concurrent replacement. Split indexes are not used for this optimization.
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+fn read_snapshot_git_index(
+    mut file: fs::File,
+    path: &Path,
+    object_hash: gix::hash::Kind,
+) -> Result<Option<(gix::index::File, Vec<u8>)>, CommandError> {
+    use std::io::Read as _;
+
+    let metadata = file
+        .metadata()
+        .map_err(|err| user_error(format!("Failed to inspect snapshot Git index: {err}")))?;
+    let timestamp = metadata.modified().map_err(|err| {
+        user_error(format!(
+            "Failed to inspect snapshot Git index timestamp: {err}"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| user_error(format!("Failed to read snapshot Git index: {err}")))?;
+    let hash_len = object_hash.len_in_bytes();
+    let Some(trailer_offset) = bytes
+        .len()
+        .checked_sub(hash_len)
+        .filter(|offset| *offset >= 12)
+    else {
+        return Err(user_error("Snapshot Git index is truncated"));
+    };
+    let trailer = &bytes[trailer_offset..];
+    if trailer.iter().any(|byte| *byte != 0)
+        && btrfs_awacs::status::git_index_checksum(&bytes[..trailer_offset], hash_len)
+            .map_err(user_error)?
+            != trailer
+    {
+        return Err(user_error("Snapshot Git index checksum does not match"));
+    }
+    let (state, _) = gix::index::State::from_bytes(
+        &bytes,
+        timestamp.into(),
+        object_hash,
+        gix::index::decode::Options::default(),
+    )
+    .map_err(|err| user_error(format!("Failed to parse snapshot Git index: {err}")))?;
+    if state.link().is_some() {
+        return Ok(None);
+    }
+    Ok(Some((gix::index::File::from_state(state, path), bytes)))
 }
 
 /// Compare Git's effective configuration, including conditional includes. A
@@ -1192,18 +1416,17 @@ fn reuse_snapshot_git_index(
         .handoff
         .copy_index(&index_path)
         .map_err(user_error)?;
-    let index = match gix::index::File::at(
-        index_path.clone(),
-        git_repo.object_hash(),
-        false,
-        gix::index::decode::Options::default(),
-    ) {
-        Ok(index) => index,
+    let Some(index_file) = open_snapshot_git_index(&index_path)? else {
+        return Ok(false);
+    };
+    let index = match read_snapshot_git_index(index_file, &index_path, git_repo.object_hash()) {
+        Ok(Some((index, _))) => index,
+        Ok(None) => return Ok(false),
         Err(err) => {
             // A split index needs adjacent sharedindex files that this capture
             // deliberately does not inherit. Unsupported or damaged indexes
             // also lose only this optimization, as with a missing TREE proof.
-            tracing::debug!(%err, "captured Git index is ineligible for reuse");
+            tracing::debug!(?err, "captured Git index is ineligible for reuse");
             return Ok(false);
         }
     };
@@ -1654,6 +1877,144 @@ fn prune_git_worktree_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+    fn snapshot_git_handoff_does_not_use_another_worktrees_environment() {
+        const CHILD: &str = "JJ_TEST_HANDOFF_ENVIRONMENT_CHILD";
+        const ROOT: &str = "JJ_TEST_HANDOFF_ROOT";
+        const SENTINEL: &str = "JJ_TEST_HANDOFF_SENTINEL";
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+            let sentinel = PathBuf::from(std::env::var_os(SENTINEL).unwrap());
+            assert!(!snapshot_git_handoff_environment_is_safe());
+            assert!(snapshot_git_handoff_worktree(&root).unwrap().is_none());
+            if std::env::var_os("GIT_INDEX_FILE").is_some() {
+                // This proves that an unchecked gix open would choose the
+                // other worktree's index, not just that the guard exists.
+                assert_eq!(gix::open(&root).unwrap().index_path(), sentinel);
+            }
+            assert_eq!(fs::read(sentinel).unwrap(), b"another worktree's index");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        gix::ThreadSafeRepository::init_opts(
+            &root,
+            gix::create::Kind::WithWorktree,
+            gix::create::Options::default(),
+            gix::open::Options::isolated(),
+        )
+        .unwrap();
+        let sentinel = temp.path().join("other-index");
+        fs::write(&sentinel, b"another worktree's index").unwrap();
+        let test_name = std::thread::current().name().unwrap().to_owned();
+        for variable in [
+            "GIT_INDEX_FILE",
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test_name, "--nocapture"])
+                .env(CHILD, "1")
+                .env(ROOT, &root)
+                .env(SENTINEL, &sentinel)
+                .env(variable, &sentinel)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{variable}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "the child must run the index isolation test: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(fs::read(&sentinel).unwrap(), b"another worktree's index");
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+    fn snapshot_git_handoff_skips_a_symlink_index() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let repo = gix::ThreadSafeRepository::init_opts(
+            &root,
+            gix::create::Kind::WithWorktree,
+            gix::create::Options::default(),
+            gix::open::Options::isolated(),
+        )
+        .unwrap()
+        .to_thread_local();
+        let sentinel = temp.path().join("other-index");
+        fs::write(&sentinel, b"another worktree's index").unwrap();
+        let index_path = root.join(".git/index");
+        symlink(&sentinel, &index_path).unwrap();
+        assert!(!snapshot_git_index_in_expected_worktree(&root, &repo));
+        assert!(open_snapshot_git_index(&index_path).unwrap().is_none());
+        assert_eq!(fs::read(sentinel).unwrap(), b"another worktree's index");
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+    fn snapshot_git_handoff_reads_the_opened_index_after_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let index_path = temp.path().join("index");
+        let mut index = gix::index::File::from_state(
+            gix::index::State::new(gix::hash::Kind::Sha1),
+            &index_path,
+        );
+        index.write(gix::index::write::Options::default()).unwrap();
+        let file = open_snapshot_git_index(&index_path).unwrap().unwrap();
+        fs::rename(&index_path, temp.path().join("old-index")).unwrap();
+        let sentinel = temp.path().join("other-index");
+        fs::write(&sentinel, b"another worktree's index").unwrap();
+        symlink(&sentinel, &index_path).unwrap();
+        let (read_index, _) = read_snapshot_git_index(file, &index_path, gix::hash::Kind::Sha1)
+            .unwrap()
+            .unwrap();
+        assert!(read_index.entries().is_empty());
+        assert_eq!(fs::read(sentinel).unwrap(), b"another worktree's index");
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+    fn snapshot_git_handoff_rejects_a_configured_alternate_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        gix::ThreadSafeRepository::init_opts(
+            &root,
+            gix::create::Kind::WithWorktree,
+            gix::create::Options::default(),
+            gix::open::Options::isolated(),
+        )
+        .unwrap();
+        let sentinel = temp.path().join("other-index");
+        fs::write(&sentinel, b"another worktree's index").unwrap();
+        let config = format!("gitoxide.core.indexFile={}", sentinel.display());
+        let repo = gix::open::Options::default()
+            .config_overrides([config])
+            .open(&root)
+            .unwrap()
+            .to_thread_local();
+        assert_eq!(repo.index_path(), sentinel);
+        assert!(!snapshot_git_index_in_expected_worktree(&root, &repo));
+        assert_eq!(fs::read(sentinel).unwrap(), b"another worktree's index");
+    }
 
     #[test]
     #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]

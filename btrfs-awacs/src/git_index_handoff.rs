@@ -76,9 +76,12 @@ pub struct GitIndexHandoff {
 }
 
 impl GitIndexHandoff {
-    pub fn capture(source: &Path, index_path: &Path, hash_len: usize) -> Result<Self, String> {
-        let source_index =
-            File::open(index_path).map_err(|error| format!("open source Git index: {error}"))?;
+    pub fn capture(
+        source: &Path,
+        index_path: &Path,
+        source_index: File,
+        hash_len: usize,
+    ) -> Result<Self, String> {
         // Capture the file before reading its cursor. An anonymous reflink
         // survives both atomic index replacement and later in-place writes,
         // without leaving a temporary file in the source checkout.

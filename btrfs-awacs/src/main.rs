@@ -1629,7 +1629,9 @@ fn run_git_worktree_add_inner(options: &GitWorktreeAdd<'_>) -> Result<(), String
     let source_index = git_path(options.git, &source, "index")?;
     let hash_len = git_object_hash_len(options.git, &source)?;
     let mut handoff = timed_git_phase("capture_source_index_and_cut", || {
-        GitIndexHandoff::capture(&source, &source_index, hash_len)
+        let index =
+            File::open(&source_index).map_err(|error| format!("open source Git index: {error}"))?;
+        GitIndexHandoff::capture(&source, &source_index, index, hash_len)
     })?;
     let target = String::from_utf8(git_capture(
         options.git,

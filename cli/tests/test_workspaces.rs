@@ -410,6 +410,13 @@ fn test_git_snapshot_worktree_from_collected_fsmonitor_baseline() -> TestResult 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 #[test]
 #[ignore = "requires patched Git, JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
+fn test_workspace_add_with_external_git_index_first_status() -> TestResult {
+    git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::ColocatedJjExternalIndex)
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+#[test]
+#[ignore = "requires patched Git, JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_workspace_add_reuses_git_index_from_collected_fsmonitor_baseline() -> TestResult {
     git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::ColocatedJjReuse)
 }
@@ -454,6 +461,7 @@ fn test_git_snapshot_worktree_without_source_fsmonitor_cursor() -> TestResult {
 enum GitSnapshotHandoffScenario {
     CollectedCursor,
     ColocatedJjReuse,
+    ColocatedJjExternalIndex,
     ColocatedJjStagedIndex,
     ColocatedJjEmptySparse,
     ColocatedJjFilter,
@@ -520,7 +528,7 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_OPTIONAL_LOCKS")
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .env_remove("GIT_AWACS_BYPASS")
             .env_remove("BTRFS_AWACS_STATE_DIR")
             .env_remove("BTRFS_AWACS_STATE_ROOT")
@@ -555,10 +563,12 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
     let colocated_jj = matches!(
         scenario,
         GitSnapshotHandoffScenario::ColocatedJjReuse
+            | GitSnapshotHandoffScenario::ColocatedJjExternalIndex
             | GitSnapshotHandoffScenario::ColocatedJjStagedIndex
             | GitSnapshotHandoffScenario::ColocatedJjEmptySparse
             | GitSnapshotHandoffScenario::ColocatedJjFilter
     );
+    let external_index = scenario == GitSnapshotHandoffScenario::ColocatedJjExternalIndex;
     let empty_sparse = scenario == GitSnapshotHandoffScenario::ColocatedJjEmptySparse;
     let custom_filter = scenario == GitSnapshotHandoffScenario::ColocatedJjFilter;
     // Git-only scenarios intentionally have no JJ consumer, which would pin
@@ -773,16 +783,32 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
     let creation_trace = runtime.join("creation.jsonl");
     let replacement_index = b"source index atomically replaced during creation\n";
     let race_marker = runtime.join("race-ran");
+    let mut external_contents = None;
     let creation = if colocated_jj {
         let mut cmd = jj_command(&root);
         cmd.env("GIT_TRACE2_EVENT", &creation_trace).args([
             "workspace",
             "add",
+            "--colocate",
             "--name",
             "reused-index",
         ]);
         if empty_sparse {
             cmd.arg("--sparse-patterns=empty");
+        }
+        if external_index {
+            let external = runtime.join("other-worktree-index");
+            std::fs::copy(&index_path, &external)?;
+            let blob = run(git_command(&root).args(["rev-parse", "HEAD:one"]))?.stdout;
+            run(git_command(&root)
+                .env("GIT_INDEX_FILE", &external)
+                .args(["update-index", "--add", "--cacheinfo"])
+                .arg(format!(
+                    "100644,{},external-sentinel",
+                    String::from_utf8(blob)?.trim()
+                )))?;
+            external_contents = Some(std::fs::read(&external)?);
+            cmd.env("GIT_INDEX_FILE", external);
         }
         cmd.arg(&child).output()?
     } else if race {
@@ -855,6 +881,43 @@ fi
         creation.status,
         String::from_utf8_lossy(&creation.stderr)
     );
+    if external_index {
+        let external = runtime.join("other-worktree-index");
+        assert_eq!(
+            std::fs::read(&external)?,
+            external_contents.unwrap(),
+            "workspace creation must not mutate the selected other-worktree index"
+        );
+        let status = run(git_command(&child)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["status", "--porcelain=v1"]))?;
+        assert!(
+            status.stdout.is_empty(),
+            "first child Git status: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        // An explicit index write is needed when optional locks are disabled.
+        run(git_command(&child).env("GIT_OPTIONAL_LOCKS", "0").args([
+            "update-index",
+            "--refresh",
+            "--force-write-index",
+        ]))?;
+        let index_path = gix::open(&child)?.git_dir().join("index");
+        let GitFsmonitorStatus::Baseline(child_baseline) =
+            inspect_git_index(&index_path)?.fsmonitor
+        else {
+            panic!("the child's first Git status must establish an AWACS cursor");
+        };
+        assert_ne!(child_baseline.retention_token, baseline.retention_token);
+        assert!(
+            RootStatus::open(&child)?
+                .inspect_baseline(&child_baseline)
+                .issues
+                .is_empty()
+        );
+        cleanup.cleanup()?;
+        return Ok(());
+    }
     // Read the child index before either frontend can repair or warm it. A
     // correct cold reconstruction can pass the GC/status checks below, but
     // it must not pass the separate warm-index inheritance requirement.

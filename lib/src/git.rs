@@ -2199,6 +2199,66 @@ async fn reset_index(
     wc_commit: &Commit,
     index_lock: gix::lock::File,
 ) -> Result<(), GitResetHeadError> {
+    let mut index = build_working_copy_index(repo, git_repo, wc_commit).await?;
+
+    // Match entries in the new index with entries in the old index, and copy stat
+    // information if the entry didn't change.
+    let old_index = git_repo.try_index().map_err(GitResetHeadError::from_git)?;
+    let sparse_patterns = old_index
+        .as_ref()
+        .map(|old| git_sparse_patterns_from_index(git_repo, old))
+        .transpose()?
+        .flatten();
+    if let Some(old_index) = old_index {
+        index
+            .entries_mut_with_paths()
+            .merge_join_by(old_index.entries(), |(entry, path), old_entry| {
+                gix::index::Entry::cmp_filepaths(path, old_entry.path(&old_index))
+                    .then_with(|| entry.stage().cmp(&old_entry.stage()))
+            })
+            .filter_map(|merged| merged.both())
+            .map(|((entry, _), old_entry)| (entry, old_entry))
+            .filter(|(entry, old_entry)| entry.id == old_entry.id && entry.mode == old_entry.mode)
+            .for_each(|(entry, old_entry)| entry.stat = old_entry.stat);
+    }
+
+    if let Some(sparse_patterns) = sparse_patterns {
+        for (entry, path) in index.entries_mut_with_paths() {
+            let path = path.to_str().map_err(GitResetHeadError::from_git)?;
+            let path = RepoPath::from_internal_string(path).map_err(GitResetHeadError::from_git)?;
+            if sparse_patterns
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+            {
+                entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+            } else {
+                // SKIP_WORKTREE is stored in the on-disk extended flags word.
+                entry.flags.insert(
+                    gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
+                );
+            }
+        }
+    }
+    debug_assert!(index.verify_entries().is_ok());
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
+    git_index_cache::write_preserving_cache(&index, &mut writer)
+        .map_err(GitResetHeadError::from_git)?;
+    let index_lock = writer
+        .into_inner()
+        .map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
+    index_lock.commit().map_err(GitResetHeadError::from_git)?;
+    Ok(())
+}
+
+/// Build a cold Git index for a working-copy commit, without reading an existing index.
+///
+/// The merged parent supplies index entries and conflict stages, while additions
+/// in the working copy are represented as intent-to-add entries.
+pub async fn build_working_copy_index(
+    repo: &dyn Repo,
+    git_repo: &gix::Repository,
+    wc_commit: &Commit,
+) -> Result<gix::index::File, GitResetHeadError> {
     let parent_tree = wc_commit.parent_tree(repo).await?;
     // Use the merged parent tree as the Git index, allowing `git diff` to show the
     // same changes as `jj diff`. If the merged parent tree has conflicts, then the
@@ -2228,50 +2288,7 @@ async fn reset_index(
     let wc_tree = wc_commit.tree();
     update_intent_to_add_impl(git_repo, &mut index, &parent_tree, &wc_tree).await?;
 
-    // Match entries in the new index with entries in the old index, and copy stat
-    // information if the entry didn't change.
-    let old_index = git_repo.try_index().map_err(GitResetHeadError::from_git)?;
-    let sparse_patterns = old_index
-        .as_ref()
-        .map(|old| git_sparse_patterns_from_index(git_repo, old))
-        .transpose()?
-        .flatten();
-    if let Some(old_index) = old_index {
-        index
-            .entries_mut_with_paths()
-            .merge_join_by(old_index.entries(), |(entry, path), old_entry| {
-                gix::index::Entry::cmp_filepaths(path, old_entry.path(&old_index))
-                    .then_with(|| entry.stage().cmp(&old_entry.stage()))
-            })
-            .filter_map(|merged| merged.both())
-            .map(|((entry, _), old_entry)| (entry, old_entry))
-            .filter(|(entry, old_entry)| entry.id == old_entry.id && entry.mode == old_entry.mode)
-            .for_each(|(entry, old_entry)| entry.stat = old_entry.stat);
-    }
-
-    if let Some(sparse_patterns) = sparse_patterns {
-        for (entry, path) in index.entries_mut_with_paths() {
-            let path = path.to_str().map_err(GitResetHeadError::from_git)?;
-            let path = RepoPath::from_internal_string(path).map_err(GitResetHeadError::from_git)?;
-            if sparse_patterns.iter().any(|prefix| path.starts_with(prefix)) {
-                entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
-            } else {
-                // SKIP_WORKTREE is stored in the on-disk extended flags word.
-                entry.flags.insert(
-                    gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
-                );
-            }
-        }
-    }
-    debug_assert!(index.verify_entries().is_ok());
-    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
-    git_index_cache::write_preserving_cache(&index, &mut writer)
-        .map_err(GitResetHeadError::from_git)?;
-    let index_lock = writer
-        .into_inner()
-        .map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
-    index_lock.commit().map_err(GitResetHeadError::from_git)?;
-    Ok(())
+    Ok(index)
 }
 
 fn build_index_from_merged_tree(

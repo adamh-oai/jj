@@ -2245,6 +2245,7 @@ fn test_git_colocated_preserves_fsmonitor_cursor() -> TestResult {
         &index,
         "awacs-git-v2:cli-cursor",
         &clean_entries,
+        Some(&std::fs::read(index.path())?),
         &mut lock,
     )
     .expect("test monitor state should be writable");

@@ -3958,6 +3958,28 @@ fn test_reset_head_with_index_merge_conflict() -> TestResult {
         )
         .write_unwrap();
 
+    // A new worktree can need a cold index before it has any index file.
+    // It must retain the same conflict stages without consulting an old one.
+    let git_repo = gix::open(workspace_root).unwrap();
+    let cold = git::build_working_copy_index(mut_repo, &git_repo, &wc_commit).block_on()?;
+    let stages = cold
+        .entries()
+        .iter()
+        .filter(|entry| {
+            let path: &[u8] = entry.path(&cold).as_ref();
+            path == b"some/dir/normal-file"
+        })
+        .map(|entry| entry.stage())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stages,
+        [
+            gix::index::entry::Stage::Base,
+            gix::index::entry::Stage::Ours,
+            gix::index::entry::Stage::Theirs,
+        ]
+    );
+
     // Reset head to working copy commit with merge conflict
     reset_head(mut_repo, &test_workspace.workspace, &wc_commit)?;
 
@@ -7190,7 +7212,9 @@ fn set_test_index_monitor(index: &gix::index::File, token: &str, dirty: &[bool])
         None,
     )
     .unwrap();
-    jj_lib::git_index_cache::write_with_monitor(index, token, dirty, &mut lock).unwrap();
+    let previous = std::fs::read(index.path()).unwrap();
+    jj_lib::git_index_cache::write_with_monitor(index, token, dirty, Some(&previous), &mut lock)
+        .unwrap();
     lock.commit().unwrap();
 }
 

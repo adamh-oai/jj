@@ -161,10 +161,13 @@ pub fn write_preserving_cache(
 ///
 /// This is for a caller that has already proved which entries are clean at the
 /// specified baseline. The caller must hold the index lock through publication.
+/// If supplied, `previous_index` must be bytes read under that lock from the
+/// same worktree's index; its untracked-cache extension will be retained.
 pub fn write_with_monitor(
     index: &gix::index::File,
     token: &str,
     dirty: &[bool],
+    previous_index: Option<&[u8]>,
     mut out: impl Write,
 ) -> Result<(), ErrorBox> {
     if dirty.len() != index.entries().len() {
@@ -175,7 +178,13 @@ pub fn write_with_monitor(
         .into());
     }
     let mut rebuilt = cache_index(index)?;
-    if let Some(previous) = read_cache_index(index.path(), cache_hash(index.object_hash())?)? {
+    if let Some(previous_index) = previous_index {
+        let (previous, _) = gix_index_cache::State::from_bytes(
+            previous_index,
+            SystemTime::UNIX_EPOCH.into(),
+            cache_hash(index.object_hash())?,
+            gix_index_cache::decode::Options::default(),
+        )?;
         rebuilt.inherit_untracked_from(&previous);
     }
     let monitor =
@@ -230,6 +239,7 @@ mod tests {
             &original,
             "test-cursor",
             &[false, true, false, true],
+            None,
             &mut bytes,
         )
         .unwrap();
@@ -301,7 +311,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index");
         let index = make_index(&path, gix::hash::Kind::Sha1, &[("a", 1)]);
-        assert!(write_with_monitor(&index, "token", &[], Vec::new()).is_err());
+        assert!(write_with_monitor(&index, "token", &[], None, Vec::new()).is_err());
         std::fs::write(&path, b"DIRC").unwrap();
         assert!(write_preserving_cache(&index, Vec::new()).is_err());
     }
