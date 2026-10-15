@@ -39,8 +39,7 @@ use jj_lib::repo::Repo as _;
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 use jj_lib::working_copy::WorkingCopy as _;
 use jj_lib::workspace::Workspace;
-use jj_lib::simple_workspace_store::SimpleWorkspaceStore;
-use jj_lib::workspace_store::WorkspaceStore as _;
+use jj_lib::workspace_store::WorkspaceStore;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -204,8 +203,8 @@ pub async fn cmd_workspace_adopt(
     // entry before its first working-copy snapshot can run. Keep that whole
     // transition serialized so a failed snapshot can roll back the same name
     // without racing another workspace lifecycle command.
-    let lifecycle_store = SimpleWorkspaceStore::load(main_workspace.repo_path())?;
-    let _lifecycle_lock = lifecycle_store.lock_lifecycle()?;
+    let _lifecycle_lock = super::lock_workspace_lifecycle(main_workspace.repo_path())?;
+    let workspace_store = main_workspace.repo_loader().workspace_store().clone();
     let op = command.resolve_operation(
         ui,
         main_workspace.repo_loader(),
@@ -244,7 +243,7 @@ pub async fn cmd_workspace_adopt(
                     if let Err(rollback_error) = rollback_failed_adoption(
                         command,
                         &main_workspace,
-                        &lifecycle_store,
+                        workspace_store.as_ref(),
                         &worktree.root,
                         &workspace_name,
                     )
@@ -381,7 +380,7 @@ pub async fn cmd_workspace_adopt(
 async fn rollback_failed_adoption(
     command: &CommandHelper,
     main_workspace: &Workspace,
-    lifecycle_store: &SimpleWorkspaceStore,
+    workspace_store: &dyn WorkspaceStore,
     worktree_root: &Path,
     workspace_name: &WorkspaceNameBuf,
 ) -> Result<(), CommandError> {
@@ -402,7 +401,7 @@ async fn rollback_failed_adoption(
             unpublished.leave_unpublished();
         }
     }
-    lifecycle_store.forget(&[workspace_name.as_ref()])?;
+    workspace_store.forget(&[workspace_name.as_ref()])?;
     let jj_dir = worktree_root.join(".jj");
     match remove_directory_tree(&jj_dir) {
         Ok(()) => {}

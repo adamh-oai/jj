@@ -22,7 +22,10 @@ mod rename;
 mod root;
 mod update_stale;
 
+use std::path::Path;
+
 use clap::Subcommand;
+use jj_lib::lock::FileLock;
 use tracing::instrument;
 
 pub(crate) use self::add::SparseInheritance;
@@ -46,6 +49,7 @@ use self::update_stale::WorkspaceUpdateStaleArgs;
 use self::update_stale::cmd_workspace_update_stale;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;
+use crate::command_error::internal_error;
 use crate::ui::Ui;
 
 /// Commands for working with workspaces
@@ -89,4 +93,8 @@ pub(crate) async fn cmd_workspace(
         WorkspaceCommand::Root(args) => cmd_workspace_root(ui, command, args).await,
         WorkspaceCommand::UpdateStale(args) => cmd_workspace_update_stale(ui, command, args).await,
     }
+}
+
+fn lock_workspace_lifecycle(repo_path: &Path) -> Result<FileLock, CommandError> {
+    FileLock::lock(repo_path.join("workspace_store/lifecycle.lock")).map_err(internal_error)
 }

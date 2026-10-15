@@ -51,7 +51,6 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
-use jj_lib::simple_workspace_store::SimpleWorkspaceStore;
 use jj_lib::workspace::Workspace;
 use tracing::instrument;
 
@@ -196,11 +195,10 @@ async fn cmd_workspace_add_impl(
     // Serialize the complete lifecycle transition, including destination
     // creation/snapshotting, workspace-store registration performed by
     // Workspace::init_workspace_with_existing_repo(), and repo publication.
-    let lifecycle_store = {
+    let lifecycle_lock = {
         let workspace_command = command.workspace_helper_no_snapshot(ui).await?;
-        SimpleWorkspaceStore::load(workspace_command.repo_path())?
+        super::lock_workspace_lifecycle(workspace_command.repo_path())?
     };
-    let lifecycle_lock = lifecycle_store.lock_lifecycle()?;
     let old_workspace_command = command.workspace_helper(ui).await?;
     let mut snapshot = is_subvolume_mode_enabled(old_workspace_command.workspace_root());
     #[cfg_attr(not(all(target_os = "linux", feature = "awacs")), allow(unused_mut))]
@@ -970,11 +968,9 @@ fn seed_snapshot_git_index(
         }
     };
     let source_index = index_from_tree(tree_id)?;
-    let mut index = match git_repo.open_index() {
+    let index = match git_repo.open_index() {
         Ok(index) => index,
-        Err(gix::worktree::open_index::Error::IndexFile(gix::index::file::init::Error::Io(
-            err,
-        ))) if err.kind() == std::io::ErrorKind::NotFound
+        Err(err) if err.is_not_found()
             && git_repo
                 .index_path()
                 .symlink_metadata()
@@ -987,7 +983,15 @@ fn seed_snapshot_git_index(
             let Some(tree_id) = final_tree.tree_ids().as_resolved() else {
                 return Ok(());
             };
-            index_from_tree(tree_id)?
+            if tree_id == workspace_command.repo().store().empty_tree_id() {
+                index_from_tree(tree_id)?
+            } else {
+                jj_lib::git_index_cache::index_from_tree(
+                    &git_repo,
+                    &gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()),
+                )
+                .map_err(|err| user_error(format!("Failed to seed snapshot Git index: {err}")))?
+            }
         }
         Err(err) => {
             return Err(user_error(format!(
@@ -1035,7 +1039,7 @@ fn seed_snapshot_git_index(
         let changed = snapshot_git_invalidation_matcher(&lease.invalidation);
         let materialized = PrefixMatcher::new(source_sparse_patterns);
         let mut source_entries = source_index.entries().iter().peekable();
-        let dirty = index
+        let mut dirty = index
             .entries()
             .iter()
             .map(|entry| {
@@ -1070,15 +1074,11 @@ fn seed_snapshot_git_index(
         let token = encode_git_fsmonitor_token(&lease.next_baseline).map_err(|err| {
             user_error(format!("Failed to encode AWACS Git index baseline: {err}"))
         })?;
-        let monitor = gix::index::extension::FsMonitor::from_token(token, &dirty)
-            .ok_or_else(|| user_error("Cannot represent snapshot Git index validity bitmap"))?;
-        index.set_fs_monitor(monitor);
         // Git compares cleaned contents rather than JJ's raw blobs. Inspect
         // the final checkout's attributes before publishing any clean bits.
-        invalidate_snapshot_git_conversions_in_index(&git_repo, &mut index)?;
+        invalidate_snapshot_git_conversions_in_index(&git_repo, &index, &mut dirty)?;
         let mut index_lock = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
-        index
-            .write_to(&mut index_lock, gix::index::write::Options::default())
+        jj_lib::git_index_cache::write_with_monitor(&index, &token, &dirty, &mut index_lock)
             .map_err(|err| user_error(format!("Failed to write snapshot Git index: {err}")))?;
         let index_lock = index_lock
             .into_inner()
@@ -1366,27 +1366,19 @@ fn snapshot_git_entry_is_dirty(
 #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
 fn invalidate_snapshot_git_conversions_in_index(
     git_repo: &gix::Repository,
-    index: &mut gix::index::State,
+    index: &gix::index::State,
+    dirty: &mut [bool],
 ) -> Result<bool, CommandError> {
     use gix::attrs::StateRef;
-    use gix::index::entry::Flags;
     use gix::index::entry::Mode;
     use gix::worktree::stack::state::attributes::Source;
 
-    let Some(monitor) = index.fs_monitor() else {
-        return Ok(false);
-    };
-    let mut dirty = vec![false; index.entries().len()];
-    let mut changed = monitor
-        .for_each_dirty_entry(|position| {
-            *dirty.get_mut(position)? = true;
-            Some(())
-        })
-        .is_none();
-    if changed {
-        // A malformed bitmap cannot authorize any clean entries.
-        dirty.fill(true);
+    if dirty.len() != index.entries().len() {
+        return Err(user_error(
+            "Snapshot Git index validity bitmap length mismatch",
+        ));
     }
+    let mut changed = false;
     // "input" and invalid values both require conservative handling. Only
     // absent or explicitly false autocrlf allows raw content to prove validity.
     let autocrlf = !matches!(
@@ -1404,7 +1396,7 @@ fn invalidate_snapshot_git_conversions_in_index(
         "text",
         "working-tree-encoding",
     ]);
-    for (entry, dirty) in index.entries().iter().zip(&mut dirty) {
+    for (entry, dirty) in index.entries().iter().zip(dirty.iter_mut()) {
         if *dirty || !matches!(entry.mode, Mode::FILE | Mode::FILE_EXECUTABLE) {
             continue;
         }
@@ -1429,17 +1421,6 @@ fn invalidate_snapshot_git_conversions_in_index(
             *dirty = true;
             changed = true;
         }
-    }
-    if changed {
-        // Preserve the existing cursor and every prior dirty bit; this guard
-        // only revokes validity and must never establish a newer baseline.
-        index.edit_preserving_fs_monitor(|index| {
-            for (entry, dirty) in index.entries_mut().iter_mut().zip(dirty) {
-                if dirty {
-                    entry.flags.remove(Flags::FSMONITOR_VALID);
-                }
-            }
-        });
     }
     Ok(changed)
 }
@@ -1757,7 +1738,6 @@ mod tests {
     fn conversion_test_index(
         repo: &gix::Repository,
         entries: &[(&str, gix::index::entry::Mode)],
-        dirty: &[bool],
     ) -> gix::index::State {
         let mut index = gix::index::State::new(repo.object_hash());
         for (path, mode) in entries {
@@ -1770,15 +1750,12 @@ mod tests {
             );
         }
         index.sort_entries();
-        index.set_fs_monitor(
-            gix::index::extension::FsMonitor::from_token("unchanged-cursor", dirty).unwrap(),
-        );
         index
     }
 
     #[test]
     #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
-    fn snapshot_git_conversion_guard_uses_final_attributes_and_preserves_monitor() {
+    fn snapshot_git_conversion_guard_uses_final_attributes_and_preserves_dirty_entries() {
         use gix::index::entry::Mode;
 
         let temp = tempfile::tempdir().unwrap();
@@ -1790,7 +1767,7 @@ mod tests {
         )
         .unwrap()
         .to_thread_local();
-        let mut index = conversion_test_index(
+        let index = conversion_test_index(
             &repo,
             &[
                 ("binary", Mode::FILE),
@@ -1800,15 +1777,15 @@ mod tests {
                 ("plain", Mode::FILE),
                 ("prior", Mode::FILE),
             ],
-            &[false, false, false, false, false, true],
         );
+        let mut dirty = [false, false, false, false, false, true];
         fs::create_dir(temp.path().join("dir")).unwrap();
         fs::write(
             temp.path().join(".gitattributes"),
             "* binary linguist-generated\n",
         )
         .unwrap();
-        assert!(!invalidate_snapshot_git_conversions_in_index(&repo, &mut index).unwrap());
+        assert!(!invalidate_snapshot_git_conversions_in_index(&repo, &index, &mut dirty).unwrap());
 
         // These are the attributes after checkout, which need not match the
         // source attributes used when the index was seeded. No tracked file is
@@ -1823,18 +1800,9 @@ mod tests {
             "file working-tree-encoding=UTF-16\n",
         )
         .unwrap();
-        assert!(invalidate_snapshot_git_conversions_in_index(&repo, &mut index).unwrap());
-        let monitor = index.fs_monitor().unwrap();
-        assert_eq!(monitor.token().unwrap(), "unchanged-cursor");
-        let mut dirty_positions = Vec::new();
-        monitor
-            .for_each_dirty_entry(|position| {
-                dirty_positions.push(position);
-                Some(())
-            })
-            .unwrap();
-        assert_eq!(dirty_positions, [1, 2, 5]);
-        assert!(!invalidate_snapshot_git_conversions_in_index(&repo, &mut index).unwrap());
+        assert!(invalidate_snapshot_git_conversions_in_index(&repo, &index, &mut dirty).unwrap());
+        assert_eq!(dirty, [false, true, true, false, false, true]);
+        assert!(!invalidate_snapshot_git_conversions_in_index(&repo, &index, &mut dirty).unwrap());
     }
 
     #[test]
@@ -1865,12 +1833,14 @@ mod tests {
             ("[attr]converted filter=test\n* converted\n", true),
         ] {
             fs::write(temp.path().join(".gitattributes"), attributes).unwrap();
-            let mut index = conversion_test_index(&repo, &[("file", Mode::FILE)], &[false]);
+            let index = conversion_test_index(&repo, &[("file", Mode::FILE)]);
+            let mut dirty = [false];
             assert_eq!(
-                invalidate_snapshot_git_conversions_in_index(&repo, &mut index).unwrap(),
+                invalidate_snapshot_git_conversions_in_index(&repo, &index, &mut dirty).unwrap(),
                 conversion,
                 "{attributes:?}",
             );
+            assert_eq!(dirty, [conversion], "{attributes:?}");
         }
         fs::remove_file(temp.path().join(".gitattributes")).unwrap();
         for (autocrlf, conversion) in [
@@ -1884,24 +1854,15 @@ mod tests {
                 gix::open::Options::isolated().cli_overrides([format!("core.autocrlf={autocrlf}")]),
             )
             .unwrap();
-            let mut index = conversion_test_index(
-                &repo,
-                &[("file", Mode::FILE), ("link", Mode::SYMLINK)],
-                &[false, false],
-            );
+            let index =
+                conversion_test_index(&repo, &[("file", Mode::FILE), ("link", Mode::SYMLINK)]);
+            let mut dirty = [false, false];
             assert_eq!(
-                invalidate_snapshot_git_conversions_in_index(&repo, &mut index).unwrap(),
+                invalidate_snapshot_git_conversions_in_index(&repo, &index, &mut dirty).unwrap(),
                 conversion,
                 "core.autocrlf={autocrlf}",
             );
-            index
-                .fs_monitor()
-                .unwrap()
-                .for_each_dirty_entry(|position| {
-                    assert_eq!(position, 0, "symlinks bypass conversion");
-                    Some(())
-                })
-                .unwrap();
+            assert_eq!(dirty, [conversion, false], "symlinks bypass conversion");
         }
     }
 

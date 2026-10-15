@@ -6936,7 +6936,7 @@ exit 1
         output
             .stderr
             .raw()
-            .contains("Cannot remove the current workspace")
+            .contains("its directory contains the shared Jujutsu repository")
     );
 }
 
@@ -7008,6 +7008,7 @@ exit 1
     assert!(output.stdout.raw().contains("secondary"), "{output}");
 }
 
+#[cfg(unix)]
 #[test]
 fn test_workspace_remove_rejects_dirty_target() {
     let test_env = TestEnvironment::default();
@@ -7023,7 +7024,25 @@ fn test_workspace_remove_rejects_dirty_target() {
     secondary_dir.write_file("file", "dirty\n");
     let operation_id = main_dir.current_operation_id();
 
-    let output = main_dir.run_jj(["workspace", "remove", "secondary"]);
+    // Unlike ordinary workspaces, protected Btrfs targets are never removed
+    // while dirty. The fake classifies only this target as a subvolume.
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    case "$3" in */secondary) echo 5; exit 0 ;; esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    case "$3" in */secondary) exit 0 ;; esac
+fi
+exit 1
+"#,
+    );
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env("JJ_TEST_BTRFS_CLI", "1")
+            .args(["workspace", "remove", "secondary"])
+    });
     assert!(!output.status.success(), "{output}");
     assert!(
         output.stderr.raw().contains("uncommitted changes"),
@@ -8993,7 +9012,7 @@ fn test_workspaces_remove_refuses_main_workspace() {
     let output = main_dir.run_jj(["workspace", "remove", "default"]);
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
-    Error: Cannot remove workspace 'default' because it contains the repository
+    Error: Cannot remove workspace default: its directory contains the shared Jujutsu repository
     [EOF]
     [exit status: 1]
     "#);
@@ -9021,8 +9040,7 @@ fn test_workspaces_remove_refuses_foreign_repository() {
     let output = main_dir.run_jj(["workspace", "remove", "secondary"]);
     insta::assert_snapshot!(output, @r#"
     ------- stderr -------
-    Error: Cannot remove workspace 'secondary' because it belongs to another repository
-    Hint: Use `jj workspace forget` to stop tracking a workspace without deleting files.
+    Error: Cannot remove workspace secondary: its registered path identifies a different workspace
     [EOF]
     [exit status: 1]
     "#);
@@ -9916,4 +9934,271 @@ fn test_awacs_lease_promotion_failure_reports_saved_snapshot() -> TestResult {
     assert!(!next.status.success(), "{next}");
     assert!(next.stderr.raw().contains("--rebuild-baseline"), "{next}");
     Ok(())
+}
+#[cfg(unix)]
+#[test]
+fn test_workspace_remove_mixed_mode_preflights_all_targets() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("tracked", "clean\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    main_dir
+        .run_jj(["workspace", "add", "../ordinary"])
+        .success();
+    main_dir
+        .run_jj(["workspace", "add", "../protected"])
+        .success();
+    let ordinary = test_env.work_dir("ordinary");
+    let protected = test_env.work_dir("protected");
+    ordinary.write_file("new", "must not be snapshotted during failed preflight\n");
+    protected.write_file("tracked", "dirty\n");
+    let op = main_dir.current_operation_id();
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    case "$3" in */protected) echo 5; exit 0 ;; esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    case "$3" in */protected) exit 0 ;; esac
+fi
+exit 1
+"#,
+    );
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path).env("JJ_TEST_BTRFS_CLI", "1").args([
+            "workspace",
+            "remove",
+            "ordinary",
+            "protected",
+        ])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("uncommitted changes"),
+        "{output}"
+    );
+    assert_eq!(main_dir.current_operation_id(), op);
+    assert!(ordinary.root().join("new").is_file());
+    assert_eq!(
+        std::fs::read_to_string(protected.root().join("tracked")).unwrap(),
+        "dirty\n"
+    );
+    let list = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(list.stdout.raw().contains("ordinary:"), "{list}");
+    assert!(list.stdout.raw().contains("protected:"), "{list}");
+}
+
+#[test]
+fn test_workspace_force_remove_preflights_every_target() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let op = main_dir.current_operation_id();
+    let output = main_dir.run_jj(["workspace", "remove", "--force", "secondary", "default"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Cannot remove the current workspace"),
+        "{output}"
+    );
+    assert!(test_env.env_root().join("secondary").is_dir());
+    assert_eq!(main_dir.current_operation_id(), op);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspace_remove_mixed_mode_snapshots_ordinary_target() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir
+        .run_jj(["workspace", "add", "../ordinary"])
+        .success();
+    main_dir
+        .run_jj(["workspace", "add", "../protected"])
+        .success();
+    let ordinary = test_env.work_dir("ordinary");
+    ordinary.write_file("unsnapshotted", "preserve me\n");
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    case "$3" in */protected) echo 5; exit 0 ;; esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    case "$3" in */protected) exit 0 ;; esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    case "$3" in */.jj-removing-*) rm -rf "$3"; exit 0 ;; esac
+fi
+exit 1
+"#,
+    );
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path).env("JJ_TEST_BTRFS_CLI", "1").args([
+                "workspace",
+                "remove",
+                "ordinary",
+                "protected",
+            ])
+        })
+        .success();
+    assert!(!ordinary.root().exists());
+    assert!(!test_env.env_root().join("protected").exists());
+    let output = main_dir
+        .run_jj(["log", "-r", r#"files("unsnapshotted")"#, "--summary"])
+        .success();
+    assert!(output.stdout.raw().contains("A unsnapshotted"), "{output}");
+}
+
+#[test]
+fn test_workspace_remove_rejects_current_snapshot_mode() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir
+        .run_jj(["workspace", "add", "../secondary"])
+        .success();
+    let secondary = test_env.work_dir("secondary");
+    secondary.write_file(".jj/working_copy/subvolume_mode", "enabling\n");
+    let output = main_dir.run_jj(["-R", "../secondary", "workspace", "remove", "secondary"]);
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Cannot remove the current workspace"),
+        "{output}"
+    );
+    assert!(secondary.root().exists());
+}
+
+#[test]
+fn test_workspace_remove_busy_subvolume_target_preflights_batch() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir
+        .run_jj(["workspace", "add", "../ordinary"])
+        .success();
+    main_dir
+        .run_jj(["workspace", "add", "../protected"])
+        .success();
+    let op = main_dir.current_operation_id();
+    let lock_path = test_env.env_root().join(".protected.jj-subvolume.lock");
+    let _lock = jj_lib::lock::FileLock::lock(lock_path).unwrap();
+    for force in [false, true] {
+        let mut args = vec!["workspace", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.extend(["ordinary", "protected"]);
+        let output = main_dir.run_jj(args);
+        assert!(!output.status.success(), "{output}");
+        assert!(
+            output
+                .stderr
+                .raw()
+                .contains("a subvolume operation is in progress"),
+            "{output}"
+        );
+        assert!(test_env.env_root().join("ordinary").is_dir());
+        assert!(test_env.env_root().join("protected").is_dir());
+        assert_eq!(main_dir.current_operation_id(), op);
+    }
+}
+
+#[test]
+fn test_workspace_force_remove_with_missing_parent() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    std::fs::create_dir(test_env.env_root().join("stale-parent")).unwrap();
+    main_dir
+        .run_jj(["workspace", "add", "../stale-parent/target"])
+        .success();
+    std::fs::remove_dir_all(test_env.env_root().join("stale-parent")).unwrap();
+    main_dir
+        .run_jj(["workspace", "remove", "--force", "target"])
+        .success();
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(!output.stdout.raw().contains("target:"), "{output}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_workspace_remove_holds_lifecycle_and_subvolume_locks_during_deletion() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir
+        .run_jj(["workspace", "add", "../protected"])
+        .success();
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    case "$3" in */protected) echo 5; exit 0 ;; esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    case "$3" in */protected) exit 0 ;; esac
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "delete" ]; then
+    command -v flock >/dev/null || exit 1
+    if flock -n "$LIFECYCLE_LOCK" true || flock -n "$SUBVOLUME_LOCK" true; then
+        echo "removal lock was not held" >&2
+        exit 1
+    fi
+    touch "$LOCKS_CHECKED"
+    rm -rf "$3"
+    exit 0
+fi
+exit 1
+"#,
+    );
+    let lifecycle_lock = main_dir
+        .root()
+        .join(".jj/repo/workspace_store/lifecycle.lock");
+    let subvolume_lock = test_env.env_root().join(".protected.jj-subvolume.lock");
+    let locks_checked = test_env.env_root().join("locks-checked");
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_BTRFS_CLI", "1")
+                .env("LIFECYCLE_LOCK", &lifecycle_lock)
+                .env("SUBVOLUME_LOCK", &subvolume_lock)
+                .env("LOCKS_CHECKED", &locks_checked)
+                .args(["workspace", "remove", "protected"])
+        })
+        .success();
+    assert!(locks_checked.exists());
+    assert!(!test_env.env_root().join("protected").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_workspace_remove_does_not_need_btrfs_program_for_ordinary_target() {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "main"]).success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.run_jj(["workspace", "add", "../target"]).success();
+    let path = install_fake_btrfs(&test_env, r#"#!/bin/sh
+touch "$BTRFS_INVOKED"
+exit 1
+"#);
+    let sentinel = test_env.env_root().join("btrfs-invoked");
+    main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path).env("BTRFS_INVOKED", &sentinel)
+            .args(["workspace", "remove", "target"])
+    }).success();
+    assert!(!sentinel.exists());
+    assert!(!test_env.env_root().join("target").exists());
 }

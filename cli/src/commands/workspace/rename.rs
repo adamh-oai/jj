@@ -37,11 +37,10 @@ pub async fn cmd_workspace_rename(
         return Err(user_error("New workspace name cannot be empty"));
     }
 
-    let lifecycle_store = {
+    let lifecycle_lock = {
         let workspace_command = command.workspace_helper_no_snapshot(ui).await?;
-        SimpleWorkspaceStore::load(workspace_command.repo_path())?
+        super::lock_workspace_lifecycle(workspace_command.repo_path())?
     };
-    let lifecycle_lock = lifecycle_store.lock_lifecycle()?;
     let mut workspace_command = command.workspace_helper(ui).await?;
 
     let old_name = workspace_command.working_copy().workspace_name().to_owned();

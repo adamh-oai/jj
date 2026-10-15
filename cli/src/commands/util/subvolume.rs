@@ -76,6 +76,7 @@ use crate::commands::btrfs::is_subvolume_mode_committed;
 use crate::commands::btrfs::is_subvolume_mode_enabled;
 use crate::commands::btrfs::recursive_btrfs_snapshot;
 use crate::commands::btrfs::set_subvolume_mode;
+use crate::commands::btrfs::subvolume_operation_lock_path;
 use crate::ui::Ui;
 
 /// Manage the Btrfs subvolume layout of the current repository.
@@ -301,19 +302,6 @@ async fn cmd_util_subvolume_impl(
     };
     writeln!(ui.status(), "Btrfs subvolume mode {mode}.")?;
     Ok(())
-}
-
-fn subvolume_operation_lock_path(workspace_root: &Path) -> Result<PathBuf, CommandError> {
-    let parent = workspace_root
-        .parent()
-        .ok_or_else(|| user_error("Repository root has no parent directory"))?;
-    let name = workspace_root
-        .file_name()
-        .ok_or_else(|| user_error("Repository root has no final component"))?;
-    let mut lock_name = std::ffi::OsString::from(".");
-    lock_name.push(name);
-    lock_name.push(".jj-subvolume.lock");
-    Ok(parent.join(lock_name))
 }
 
 async fn rebuild_snapshot_baseline(

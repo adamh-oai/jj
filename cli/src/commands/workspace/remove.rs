@@ -33,17 +33,18 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap_complete::ArgValueCandidates;
+use itertools::Itertools as _;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::file_util::FileIdentity;
 use jj_lib::file_util::IoResultExt as _;
 #[cfg(feature = "git")]
+use jj_lib::git::GitSubprocessOptions;
 use jj_lib::lock::FileLock;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::ref_name::WorkspaceNameBuf;
 use jj_lib::repo::Repo as _;
-use jj_lib::simple_workspace_store::SimpleWorkspaceStore;
-use jj_lib::workspace_store::WorkspaceStore as _;
+use jj_lib::workspace_store::WorkspaceStore;
 #[cfg(all(unix, not(all(target_os = "linux", feature = "awacs"))))]
 use nix::dir::Dir;
 #[cfg(all(unix, not(all(target_os = "linux", feature = "awacs"))))]
@@ -71,26 +72,39 @@ use tracing::instrument;
 use crate::cli_util::CommandHelper;
 use crate::cli_util::WorkspaceCommandHelper;
 use crate::command_error::CommandError;
+use crate::command_error::print_error_sources;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::commands::btrfs::btrfs_user_subvol_rm_allowed;
 use crate::commands::btrfs::delete_btrfs_subvolume;
-use crate::commands::btrfs::is_btrfs_subvolume;
+use crate::commands::btrfs::is_btrfs_subvolume_for_removal;
+use crate::commands::btrfs::is_subvolume_mode_enabled;
+use crate::commands::btrfs::subvolume_operation_lock_path;
 use crate::complete;
+#[cfg(feature = "git")]
+use crate::git_util::unlink_git_worktree;
 use crate::ui::Ui;
 
-/// Remove a workspace and its directory from disk
+const USE_WORKSPACE_FORGET_HINT: &str =
+    "Use `jj workspace forget` to stop tracking a workspace without deleting files.";
+
+/// Remove workspaces and their working-copy files from disk
 ///
-/// The current workspace cannot be removed. Use `jj workspace forget` if you
-/// only want to stop tracking a workspace without deleting its files.
+/// Ordinary working copies are snapshotted before removal. Snapshot-backed
+/// and Btrfs-subvolume workspaces must have no unsnapshotted changes, and may
+/// not be the current workspace. The main workspace cannot be removed.
 #[derive(clap::Args, Clone, Debug)]
 pub struct WorkspaceRemoveArgs {
     /// Skip validity and dirty checks; delete the recorded path if it exists
     #[arg(long)]
     force: bool,
 
-    /// Name of the workspace to remove
-    #[arg(value_name = "WORKSPACE", add = ArgValueCandidates::new(complete::workspaces))]
+    /// Names of the workspaces to remove
+    #[arg(required = true, add = ArgValueCandidates::new(complete::workspaces))]
+    workspaces: Vec<WorkspaceNameBuf>,
+}
+
+struct SingleWorkspaceRemoveArgs {
     workspace: WorkspaceNameBuf,
 }
 
@@ -100,38 +114,236 @@ pub async fn cmd_workspace_remove(
     command: &CommandHelper,
     args: &WorkspaceRemoveArgs,
 ) -> Result<(), CommandError> {
-    if args.force {
-        return cmd_workspace_remove_force(ui, command, args).await;
+    let initial = command.workspace_helper_no_snapshot(ui).await?;
+    if !args.force {
+        initial
+            .check_working_copy_writable()
+            .map_err(|err| err.hinted(USE_WORKSPACE_FORGET_HINT))?;
     }
+    let _lifecycle_lock = super::lock_workspace_lifecycle(initial.repo_path())?;
+    let workspace_command = command.workspace_helper_no_snapshot(ui).await?;
+    let workspace_store = workspace_command.repo().loader().workspace_store().clone();
 
-    // Reject an unsafe target before snapshotting the invoking workspace. A
-    // failed attempt to remove the primary workspace must not create an
-    // operation while proving that its shared repo is still needed.
-    let lifecycle_store = {
-        let workspace_command = command.workspace_helper_no_snapshot(ui).await?;
-        let workspace_store = SimpleWorkspaceStore::load(workspace_command.repo_path())?;
-        preflight_workspace_removal(
+    let mut ordinary = Vec::new();
+    let mut guarded = Vec::new();
+    let mut seen: Vec<WorkspaceNameBuf> = Vec::new();
+    let mut _subvolume_locks = Vec::new();
+    let mut subvolume_lock_paths = Vec::new();
+    for name in &args.workspaces {
+        if seen.contains(name) {
+            continue;
+        }
+        seen.push(name.clone());
+        if args.force {
+            if name.as_str() == workspace_command.workspace_name().as_str() {
+                return Err(user_error(
+                    "Cannot remove the current workspace; run this command from another workspace",
+                ));
+            }
+            let is_tracked = workspace_command
+                .repo()
+                .view()
+                .get_wc_commit_id(name)
+                .is_some();
+            let stored_path = workspace_store.get_workspace_path(name)?;
+            if !is_tracked && stored_path.is_none() {
+                return Err(user_error(format!(
+                    "No such workspace: {}",
+                    name.as_symbol()
+                )));
+            }
+            if let Some(stored_path) = stored_path {
+                let path =
+                    normalize_absolute_path(&workspace_command.repo_path().join(stored_path));
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| user_error("Workspace path has no parent"))?;
+                match dunce::canonicalize(parent) {
+                    Ok(parent) => {
+                        let name_part = path
+                            .file_name()
+                            .ok_or_else(|| user_error("Workspace path has no final component"))?;
+                        lock_subvolume_operation(
+                            name,
+                            &parent.join(name_part),
+                            &mut subvolume_lock_paths,
+                            &mut _subvolume_locks,
+                        )?;
+                    }
+                    // No process can hold the sibling lock when the parent is
+                    // absent, and force must still clear stale registrations.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err).context(parent).map_err(Into::into),
+                }
+            }
+            guarded.push(name.clone());
+            continue;
+        }
+        if workspace_command
+            .repo()
+            .view()
+            .get_wc_commit_id(name)
+            .is_none()
+        {
+            writeln!(
+                ui.warning_default(),
+                "No such workspace: {}",
+                name.as_symbol()
+            )?;
+            continue;
+        }
+        let target_before_lock = preflight_workspace_removal(
             command,
             &workspace_command,
-            &workspace_store,
-            args.workspace.as_ref(),
+            workspace_store.as_ref(),
+            name.as_ref(),
+            true,
         )?;
-        workspace_store
-    };
+        // Mode transitions replace the checkout directory under a separate
+        // lock. Hold that lock for every target, including ordinary ones, so
+        // one cannot turn into a snapshot workspace after classification.
+        // `try_lock` avoids a lock-order cycle with an in-progress transition.
+        lock_subvolume_operation(
+            name,
+            &target_before_lock.path,
+            &mut subvolume_lock_paths,
+            &mut _subvolume_locks,
+        )?;
+        let target = preflight_workspace_removal(
+            command,
+            &workspace_command,
+            workspace_store.as_ref(),
+            name.as_ref(),
+            true,
+        )?;
+        if target.path != target_before_lock.path || target.identity != target_before_lock.identity
+        {
+            return Err(unsafe_removal_error(
+                name,
+                "its filesystem identity changed during validation",
+            ));
+        }
+        let requires_guard = is_subvolume_mode_enabled(&target.path)
+            || is_btrfs_subvolume_for_removal(&target.path)?;
+        // An ordinary checkout can still have AWACS data in its linked Git
+        // administrative directory. Route it through the guarded cleanup too.
+        #[cfg(feature = "git")]
+        let requires_guard = {
+            let has_awacs_git_state = linked_git_worktree_cleanup(&workspace_command, &target)?
+                .is_some_and(|cleanup| cleanup.awacs_identity.is_some());
+            requires_guard || has_awacs_git_state
+        };
+        if requires_guard {
+            if name.as_str() == workspace_command.workspace_name().as_str() {
+                return Err(user_error(
+                    "Cannot remove the current workspace; run this command from another workspace",
+                ));
+            }
+            // Test all guarded workspaces before deleting any target. Each is
+            // checked again just before deletion to catch later changes.
+            reject_dirty_removal_target(ui, command, &workspace_command, name.as_ref(), &target)
+                .await?;
+            guarded.push(name.clone());
+        } else {
+            ordinary.push(name.clone());
+        }
+    }
+    drop(workspace_command);
+    drop(initial);
 
-    // Preserve normal command behavior for a safe removal: snapshot the
-    // invoking workspace while holding the repository-wide lifecycle lock,
-    // then repeat the preflight, delete the target, forget it, and publish the
-    // repo transaction before releasing that lock. This keeps a concurrent
-    // add/rename/forget from changing the registered survivor topology between
-    // the safety proof and the destructive effect.
-    let lifecycle_lock = lifecycle_store.lock_lifecycle()?;
+    if ordinary.is_empty() && guarded.is_empty() {
+        writeln!(ui.status(), "Nothing changed.")?;
+        return Ok(());
+    }
+
+    // Remove guarded targets first, as an ordinary target may be the current
+    // workspace and would then leave no workspace from which to run the rest.
+    for name in guarded {
+        let single = SingleWorkspaceRemoveArgs { workspace: name };
+        if args.force {
+            cmd_workspace_remove_force(ui, command, &single, workspace_store.as_ref()).await?;
+        } else {
+            cmd_workspace_remove_guarded(ui, command, &single, workspace_store.as_ref()).await?;
+        }
+    }
+    if !ordinary.is_empty() {
+        // Preflight again under the same lifecycle lock after the guarded
+        // removals, including a fresh check that each target still uses the
+        // ordinary path. Never route a changed target into upstream deletion.
+        let check = command.workspace_helper_no_snapshot(ui).await?;
+        for name in &ordinary {
+            let target = preflight_workspace_removal(
+                command,
+                &check,
+                workspace_store.as_ref(),
+                name.as_ref(),
+                true,
+            )?;
+            let requires_guard = is_subvolume_mode_enabled(&target.path)
+                || is_btrfs_subvolume_for_removal(&target.path)?;
+            #[cfg(feature = "git")]
+            let requires_guard = {
+                let has_awacs_git_state = linked_git_worktree_cleanup(&check, &target)?
+                    .is_some_and(|cleanup| cleanup.awacs_identity.is_some());
+                requires_guard || has_awacs_git_state
+            };
+            if requires_guard {
+                return Err(unsafe_removal_error(
+                    name,
+                    "its deletion mode changed during removal",
+                ));
+            }
+        }
+        drop(check);
+        cmd_workspace_remove_ordinary(
+            ui,
+            command,
+            &WorkspaceRemoveArgs {
+                force: false,
+                workspaces: ordinary,
+            },
+            workspace_store.as_ref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn lock_subvolume_operation(
+    name: &WorkspaceName,
+    workspace_path: &Path,
+    locked_paths: &mut Vec<PathBuf>,
+    locks: &mut Vec<FileLock>,
+) -> Result<(), CommandError> {
+    let lock_path = subvolume_operation_lock_path(workspace_path)?;
+    if !locked_paths.contains(&lock_path) {
+        let lock = FileLock::try_lock(lock_path.clone())
+            .map_err(|err| {
+                user_error(format!(
+                    "Failed to lock subvolume operation at {}: {err}",
+                    lock_path.display()
+                ))
+            })?
+            .ok_or_else(|| unsafe_removal_error(name, "a subvolume operation is in progress"))?;
+        locked_paths.push(lock_path);
+        locks.push(lock);
+    }
+    Ok(())
+}
+
+async fn cmd_workspace_remove_guarded(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &SingleWorkspaceRemoveArgs,
+    workspace_store: &dyn WorkspaceStore,
+) -> Result<(), CommandError> {
     let mut workspace_command = command.workspace_helper(ui).await?;
     let target = preflight_workspace_removal(
         command,
         &workspace_command,
-        &lifecycle_store,
+        workspace_store,
         args.workspace.as_ref(),
+        false,
     )?;
     reject_dirty_removal_target(
         ui,
@@ -144,11 +356,11 @@ pub async fn cmd_workspace_remove(
 
     revalidate_removal_target(
         &workspace_command,
-        &lifecycle_store,
+        workspace_store,
         args.workspace.as_ref(),
         &target,
     )?;
-    let verified_btrfs_subvolume = is_btrfs_subvolume(&target.path).unwrap_or(false);
+    let verified_btrfs_subvolume = is_btrfs_subvolume_for_removal(&target.path)?;
     #[cfg(feature = "git")]
     let git_cleanup = linked_git_worktree_cleanup(&workspace_command, &target)?;
 
@@ -203,13 +415,12 @@ pub async fn cmd_workspace_remove(
     let git_cleanup_error = git_cleanup
         .as_ref()
         .and_then(|cleanup| cleanup_linked_git_worktree(cleanup).err());
-    lifecycle_store.forget(&[args.workspace.as_ref()])?;
+    workspace_store.forget(&[args.workspace.as_ref()])?;
     tx.finish(
         ui,
         format!("remove workspace {}", args.workspace.as_symbol()),
     )
     .await?;
-    drop(lifecycle_lock);
     #[cfg(feature = "git")]
     if let Some(err) = git_cleanup_error {
         writeln!(
@@ -229,13 +440,11 @@ pub async fn cmd_workspace_remove(
 async fn cmd_workspace_remove_force(
     ui: &mut Ui,
     command: &CommandHelper,
-    args: &WorkspaceRemoveArgs,
+    args: &SingleWorkspaceRemoveArgs,
+    workspace_store: &dyn WorkspaceStore,
 ) -> Result<(), CommandError> {
     // Force removal is also the recovery path for stale registrations, so do
     // not snapshot the invoking working copy or try to load the target.
-    let initial_workspace = command.workspace_helper_no_snapshot(ui).await?;
-    let workspace_store = SimpleWorkspaceStore::load(initial_workspace.repo_path())?;
-    let lifecycle_lock = workspace_store.lock_lifecycle()?;
     let mut workspace_command = command.workspace_helper_no_snapshot(ui).await?;
 
     if args.workspace.as_str() == workspace_command.workspace_name().as_str() {
@@ -281,7 +490,6 @@ async fn cmd_workspace_remove_force(
         )
         .await?;
     }
-    drop(lifecycle_lock);
 
     match (registered_path, removed_path) {
         (Some(path), true) => writeln!(ui.status(), "Removed workspace at \"{}\"", path.display())?,
@@ -336,8 +544,9 @@ fn force_delete_registered_path(
         path: path.to_owned(),
         identity,
     };
+    let verified_btrfs_subvolume = is_btrfs_subvolume_for_removal(path)?;
     let claimed = claim_removal_target(workspace_name, &target)?;
-    let deletion_result = if is_btrfs_subvolume(&claimed.path).unwrap_or(false) {
+    let deletion_result = if verified_btrfs_subvolume {
         delete_btrfs_subvolume(&claimed.path)
             .and_then(|deleted| {
                 if deleted {
@@ -358,7 +567,7 @@ fn force_delete_registered_path(
     if let Err(mut err) = deletion_result {
         if let Err(restore_err) = restore_claimed_target(&target, &claimed) {
             err.add_hint(format!(
-                "The force-removal target remains at {} because restoring its original name +                 failed: {restore_err:?}",
+                "The force-removal target remains at {} because restoring its original name failed: {restore_err:?}",
                 claimed.path.display()
             ));
         }
@@ -367,9 +576,10 @@ fn force_delete_registered_path(
     Ok(true)
 }
 
-/// Snapshots the target in memory with filesystem monitoring disabled, then
-/// discards the lock instead of publishing a working-copy operation. Removal
-/// must not silently destroy files that are absent from the recorded commit.
+/// Snapshots the target in memory, then discards the lock instead of
+/// publishing a working-copy operation. Ordinary filesystem monitoring is
+/// disabled, while snapshot-backed workspaces still use their AWACS baseline.
+/// Removal must not silently destroy files absent from the recorded commit.
 async fn reject_dirty_removal_target(
     ui: &Ui,
     command: &CommandHelper,
@@ -758,7 +968,8 @@ fn linked_git_worktree_cleanup(
     };
     Ok(Some(GitWorktreeCleanup {
         git_repo_path: git_backend.git_repo_path().to_owned(),
-        git_executable: git_backend.git_executable_path().to_owned(),
+        git_executable: jj_lib::git::GitSettings::from_settings(workspace_command.settings())?
+            .executable_path,
         lock_root: workspace_command.repo_path().to_owned(),
         worktree_path: target.path.clone(),
         common_dir,
@@ -952,10 +1163,11 @@ fn retire_git_worktree_awacs(cleanup: &GitWorktreeCleanup) -> Result<(), Command
 fn preflight_workspace_removal(
     command: &CommandHelper,
     workspace_command: &WorkspaceCommandHelper,
-    workspace_store: &SimpleWorkspaceStore,
+    workspace_store: &dyn WorkspaceStore,
     workspace_name: &WorkspaceName,
+    allow_current: bool,
 ) -> Result<RemovalTarget, CommandError> {
-    if workspace_name.as_str() == workspace_command.workspace_name().as_str() {
+    if !allow_current && workspace_name.as_str() == workspace_command.workspace_name().as_str() {
         return Err(user_error(
             "Cannot remove the current workspace; run this command from another workspace",
         ));
@@ -1030,7 +1242,7 @@ fn preflight_workspace_removal(
 
 fn resolve_surviving_workspace(
     workspace_command: &WorkspaceCommandHelper,
-    workspace_store: &SimpleWorkspaceStore,
+    workspace_store: &dyn WorkspaceStore,
     workspace_name: &WorkspaceName,
 ) -> Result<Option<RemovalTarget>, CommandError> {
     if workspace_name.as_str() == workspace_command.workspace_name().as_str() {
@@ -1067,7 +1279,7 @@ fn resolve_surviving_workspace(
 
 fn resolve_registered_survivor_path(
     workspace_command: &WorkspaceCommandHelper,
-    workspace_store: &SimpleWorkspaceStore,
+    workspace_store: &dyn WorkspaceStore,
     workspace_name: &WorkspaceName,
 ) -> Result<RemovalTarget, CommandError> {
     let stored_path = workspace_store
@@ -1118,7 +1330,7 @@ fn resolve_loaded_workspace(
 fn resolve_registered_workspace(
     command: &CommandHelper,
     workspace_command: &WorkspaceCommandHelper,
-    workspace_store: &SimpleWorkspaceStore,
+    workspace_store: &dyn WorkspaceStore,
     workspace_name: &WorkspaceName,
 ) -> Result<RemovalTarget, CommandError> {
     let stored_path = workspace_store
@@ -1185,7 +1397,7 @@ fn resolve_registered_workspace(
 
 fn revalidate_removal_target(
     workspace_command: &WorkspaceCommandHelper,
-    workspace_store: &SimpleWorkspaceStore,
+    workspace_store: &dyn WorkspaceStore,
     workspace_name: &WorkspaceName,
     target: &RemovalTarget,
 ) -> Result<(), CommandError> {
@@ -1286,4 +1498,146 @@ fn unsafe_removal_error(
         "Cannot remove workspace {}: {reason}",
         workspace_name.as_symbol()
     ))
+}
+
+#[instrument(skip_all)]
+async fn cmd_workspace_remove_ordinary(
+    ui: &mut Ui,
+    command: &CommandHelper,
+    args: &WorkspaceRemoveArgs,
+    workspace_store: &dyn WorkspaceStore,
+) -> Result<(), CommandError> {
+    let mut workspace_command = command.workspace_helper(ui).await?;
+    workspace_command
+        .check_working_copy_writable()
+        .map_err(|err| err.hinted(USE_WORKSPACE_FORGET_HINT))?;
+
+    let wss = args.workspaces.clone();
+
+    let mut remove_ws = Vec::new();
+    for ws in &wss {
+        if workspace_command
+            .repo()
+            .view()
+            .get_wc_commit_id(ws)
+            .is_none()
+        {
+            writeln!(
+                ui.warning_default(),
+                "No such workspace: {}",
+                ws.as_symbol()
+            )?;
+        } else {
+            remove_ws.push(ws);
+        }
+    }
+    if remove_ws.is_empty() {
+        writeln!(ui.status(), "Nothing changed.")?;
+        return Ok(());
+    }
+
+    let repo_path = workspace_command.repo_path();
+
+    let mut workspaces_to_remove = Vec::new();
+    for ws in &remove_ws {
+        let ws_path = workspace_store.get_workspace_path(ws)?.ok_or_else(|| {
+            user_error(format!(
+                "Cannot remove unreachable workspace '{}'",
+                ws.as_symbol()
+            ))
+            .hinted(USE_WORKSPACE_FORGET_HINT)
+        })?;
+        let ws_path = dunce::canonicalize(repo_path.join(ws_path)).map_err(|err| {
+            user_error_with_message(
+                format!("Cannot access workspace '{}' directory", ws.as_symbol()),
+                err,
+            )
+            .hinted(USE_WORKSPACE_FORGET_HINT)
+        })?;
+        // The repository itself lives under the main workspace (in `.jj/repo`),
+        // so removing that directory would destroy the repository. Don't
+        // suggest `jj workspace forget` here: forgetting the main workspace
+        // isn't a useful thing to do either.
+        if repo_path.starts_with(&ws_path) {
+            return Err(user_error(format!(
+                "Cannot remove workspace '{}' because it contains the repository",
+                ws.as_symbol()
+            )));
+        }
+        // The recorded path may since have been replaced by a workspace of an
+        // unrelated repository, which we must not remove.
+        let ws_workspace = command.load_workspace_at(&ws_path, workspace_command.settings())?;
+        if ws_workspace.repo_path() != repo_path {
+            return Err(user_error(format!(
+                "Cannot remove workspace '{}' because it belongs to another repository",
+                ws.as_symbol()
+            ))
+            .hinted(USE_WORKSPACE_FORGET_HINT));
+        }
+        workspaces_to_remove.push((ws_path, ws_workspace));
+    }
+
+    // Snapshot each workspace before its directory goes away, so that tracked
+    // working-copy changes that were never committed survive as a commit.
+    // Untracked and ignored files are not part of the snapshot and are lost
+    // along with the directory.
+    let mut op_id = workspace_command.repo().op_id().clone();
+    let mut paths_to_remove = Vec::new();
+    for (abs_path, ws_workspace) in workspaces_to_remove {
+        let op = ws_workspace.repo_loader().load_operation(&op_id).await?;
+        let ws_repo = ws_workspace.repo_loader().load_at(&op).await?;
+        let mut ws_helper = command.for_workable_repo(ui, ws_workspace, ws_repo)?;
+        ws_helper.maybe_snapshot(ui).await?;
+        // Continue from the operation the snapshot created, so that the next
+        // snapshot and the removal itself build on it.
+        op_id = ws_helper.repo().op_id().clone();
+        paths_to_remove.push(abs_path);
+    }
+
+    let workspace = command.load_workspace()?;
+    let op = workspace.repo_loader().load_operation(&op_id).await?;
+    let repo = workspace.repo_loader().load_at(&op).await?;
+    workspace_command = command.for_workable_repo(ui, workspace, repo)?;
+
+    let mut tx = workspace_command.start_transaction();
+    for ws in &remove_ws {
+        tx.repo_mut().remove_workspace(ws).await?;
+    }
+    let names = remove_ws.iter().map(|ws| ws.as_symbol()).join(", ");
+    let description = if remove_ws.len() == 1 {
+        format!("remove workspace {names}")
+    } else {
+        format!("remove workspaces {names}")
+    };
+    tx.finish(ui, description).await?;
+
+    workspace_store.forget(&remove_ws.iter().map(|ws| ws.as_ref()).collect_vec())?;
+
+    #[cfg(feature = "git")]
+    {
+        let subprocess_options = GitSubprocessOptions::from_settings(workspace_command.settings())?;
+        let store = workspace_command.repo().store();
+        for path in &paths_to_remove {
+            unlink_git_worktree(ui, store, subprocess_options.clone(), path)?;
+        }
+    }
+
+    for path in &paths_to_remove {
+        if let Err(err) = std::fs::remove_dir_all(path) {
+            writeln!(
+                ui.warning_default(),
+                r#"Failed to remove workspace directory "{}"."#,
+                path.display()
+            )?;
+            print_error_sources(ui, Some(&err))?;
+        } else {
+            writeln!(
+                ui.status(),
+                r#"Removed workspace directory "{}"."#,
+                path.display()
+            )?;
+        }
+    }
+
+    Ok(())
 }

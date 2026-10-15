@@ -78,6 +78,21 @@ pub(super) fn btrfs_command() -> Command {
     Command::new("btrfs")
 }
 
+pub(super) fn subvolume_operation_lock_path(
+    workspace_root: &Path,
+) -> Result<PathBuf, CommandError> {
+    let parent = workspace_root
+        .parent()
+        .ok_or_else(|| user_error("Repository root has no parent directory"))?;
+    let name = workspace_root
+        .file_name()
+        .ok_or_else(|| user_error("Repository root has no final component"))?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".jj-subvolume.lock");
+    Ok(parent.join(lock_name))
+}
+
 /// Snapshots the source and all descendant subvolumes into a writable root.
 pub(super) fn recursive_btrfs_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
     #[cfg(all(target_os = "linux", feature = "awacs"))]
@@ -163,6 +178,47 @@ pub(super) fn is_btrfs_subvolume(path: &Path) -> Result<bool, CommandError> {
         .output()
         .map_err(|err| user_error(format!("Failed to inspect Btrfs subvolume: {err}")))?;
     Ok(output.status.success())
+}
+
+/// Identifies a removal target without depending on `btrfs` being installed or
+/// requiring metadata-search privileges. Failed inspection on Linux is an
+/// error, not evidence that deleting the directory tree is safe.
+pub(super) fn is_btrfs_subvolume_for_removal(path: &Path) -> Result<bool, CommandError> {
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(feature = "test-fakes")]
+        if std::env::var_os("JJ_TEST_BTRFS_CLI").is_some_and(|value| value == "1")
+            || std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some()
+        {
+            return is_btrfs_subvolume(path);
+        }
+        use std::os::fd::AsRawFd as _;
+
+        let metadata = fs::metadata(path)
+            .map_err(|err| user_error(format!("Failed to inspect removal target: {err}")))?;
+        if metadata.ino() != 256 {
+            return Ok(false);
+        }
+        let directory = fs::File::open(path)
+            .map_err(|err| user_error(format!("Failed to open removal target: {err}")))?;
+        let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: the open descriptor stays live and the output is only read
+        // after fstatfs has successfully initialized it.
+        if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+            return Err(user_error(format!(
+                "Failed to inspect removal target filesystem: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let filesystem = unsafe { filesystem.assume_init() };
+        Ok(filesystem.f_type as u32 == 0x9123_683e)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Btrfs detection remains best-effort on platforms without a native
+        // Btrfs filesystem interface.
+        Ok(is_btrfs_subvolume(path).unwrap_or(false))
+    }
 }
 
 pub(super) fn btrfs_user_subvol_rm_allowed(path: &Path) -> io::Result<Option<bool>> {
