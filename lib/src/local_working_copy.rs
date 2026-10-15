@@ -1305,7 +1305,12 @@ impl TreeState {
             max_new_file_size,
         } = options;
 
-        let sparse_matcher = self.sparse_matcher();
+        let jj_sparse_matcher = self.sparse_matcher();
+        let git_sparse_matcher = external_sparse_patterns.as_ref().map(PrefixMatcher::new);
+        let git_matcher: &dyn Matcher = git_sparse_matcher
+            .as_ref()
+            .map_or(&EverythingMatcher, |matcher| matcher);
+        let sparse_matcher = IntersectionMatcher::new(jj_sparse_matcher.as_ref(), git_matcher);
 
         let mut is_dirty = false;
         let FsmonitorMatcher {
@@ -1320,14 +1325,10 @@ impl TreeState {
             Some(fsmonitor_matcher) => fsmonitor_matcher.as_ref(),
         };
 
-        let external_sparse_matcher = external_sparse_patterns.as_ref().map(PrefixMatcher::new);
-        let scan_matcher = UnionMatcher::new(fsmonitor_matcher, force_tracking_matcher);
-        let sparse_scan_matcher = IntersectionMatcher::new(sparse_matcher.as_ref(), scan_matcher);
-        let external_sparse_matcher: &dyn Matcher = external_sparse_matcher
-            .as_ref()
-            .map(|matcher| matcher as &dyn Matcher)
-            .unwrap_or(&EverythingMatcher);
-        let matcher = IntersectionMatcher::new(external_sparse_matcher, sparse_scan_matcher);
+        let matcher = IntersectionMatcher::new(
+            &sparse_matcher,
+            UnionMatcher::new(fsmonitor_matcher, force_tracking_matcher),
+        );
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             if should_update_watchman_clock {
@@ -1348,7 +1349,7 @@ impl TreeState {
                 tree_state: self,
                 current_tree: &self.tree,
                 matcher: &matcher,
-                sparse_matcher: sparse_matcher.as_ref(),
+                sparse_matcher: &sparse_matcher,
                 start_tracking_matcher,
                 force_tracking_matcher,
                 // Move tx sides so they'll be dropped at the end of the scope.
@@ -1414,12 +1415,12 @@ impl TreeState {
         if cfg!(debug_assertions) {
             let tree_paths: HashSet<_> = self
                 .tree
-                .entries_matching(sparse_matcher.as_ref())
+                .entries_matching(jj_sparse_matcher.as_ref())
                 .filter_map(|(path, result)| result.is_ok().then_some(path))
                 .collect();
             let file_states = self.file_states.all();
             let state_paths: HashSet<_> = file_states.paths().map(|path| path.to_owned()).collect();
-            assert!(state_paths.is_subset(&tree_paths));
+            assert_eq!(state_paths, tree_paths);
         }
         // Since untracked paths aren't cached in the tree state, we'll need to
         // rescan the working directory changes to report or track them later.

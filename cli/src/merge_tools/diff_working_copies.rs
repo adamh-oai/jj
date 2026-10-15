@@ -298,8 +298,8 @@ diff editing in mind and be a little inaccurate.
         let mut output_tree_state = diff_wc.output.unwrap_or(diff_wc.right);
         output_tree_state
             .snapshot(&SnapshotOptions {
-                base_ignores,
                 external_sparse_patterns: None,
+                base_ignores,
                 progress: None,
                 start_tracking_matcher: &EverythingMatcher,
                 force_tracking_matcher: &NothingMatcher,

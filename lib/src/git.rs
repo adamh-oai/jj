@@ -49,6 +49,7 @@ use crate::file_util::IoResultExt as _;
 use crate::file_util::PathError;
 use crate::file_util::is_empty_dir;
 use crate::git_backend::GitBackend;
+use crate::git_index_cache;
 use crate::git_subprocess::GitFetchStatus;
 pub use crate::git_subprocess::GitProgress;
 pub use crate::git_subprocess::GitSidebandLineTerminator;
@@ -1996,29 +1997,6 @@ impl GitResetHeadError {
     }
 }
 
-fn open_git_repo_with_dir(
-    settings: &UserSettings,
-    git_dir: &Path,
-) -> Result<gix::Repository, GitResetHeadError> {
-    // Match options used by the backend when opening a repository.
-    let opts = gix::open::Options::default()
-        // The git_dir path should point the repository, not the working directory.
-        .open_path_as_is(true)
-        // Gitoxide recommends this when correctness is preferred
-        .strict_config(true)
-        .config_overrides([
-            // Committer has to be configured to record reflog. Author isn't
-            // needed, but let's copy the same values.
-            format!("author.name={}", settings.user_name()),
-            format!("author.email={}", settings.user_email()),
-            format!("committer.name={}", settings.user_name()),
-            format!("committer.email={}", settings.user_email()),
-        ]);
-    gix::ThreadSafeRepository::open_opts(git_dir, opts)
-        .map(|repo| repo.to_thread_local())
-        .map_err(|err| GitResetHeadError::Git(Box::new(err)))
-}
-
 fn git_sparse_patterns_from_index(
     git_repo: &gix::Repository,
     index: &gix::index::File,
@@ -2026,7 +2004,6 @@ fn git_sparse_patterns_from_index(
     if git_repo.config_snapshot().boolean("core.sparseCheckout") != Some(true) {
         return Ok(None);
     }
-
     let mut included_paths = Vec::new();
     let mut excluded_ancestors = HashSet::new();
     for entry in index.entries() {
@@ -2045,10 +2022,6 @@ fn git_sparse_patterns_from_index(
             included_paths.push(path);
         }
     }
-
-    // A directory is safe to use as a native jj sparse prefix only when no
-    // Git-skipped entry lives beneath it. This keeps included directories open
-    // to new files without turning an excluded sibling into a jj deletion.
     let mut patterns = BTreeSet::new();
     for path in included_paths {
         let pattern = path
@@ -2058,103 +2031,50 @@ fn git_sparse_patterns_from_index(
             .unwrap_or(path.as_ref());
         patterns.insert(pattern.to_owned());
     }
-
     Ok(Some(patterns.into_iter().collect()))
 }
 
-/// Returns native jj sparse prefixes matching a colocated Git worktree index.
-///
-/// A Git sparse index can represent an excluded directory as one skipped tree
-/// entry. Deriving prefixes from index entries supports both that compressed
-/// representation and full indexes carrying per-file skip-worktree flags.
+/// Return the snapshot prefixes implied by the colocated Git index, if sparse.
+pub fn sparse_patterns_in_workdir(
+    repo: &dyn Repo,
+    workspace_root: &Path,
+) -> Result<Option<Vec<RepoPathBuf>>, GitResetHeadError> {
+    let backend = get_git_backend(repo.store())?;
+    let git_repo = backend
+        .open_git_repo_at_workdir(workspace_root)
+        .map_err(GitResetHeadError::from_git)?;
+    sparse_patterns_in_repo(&git_repo)
+}
+
+/// Return snapshot prefixes using a previously discovered worktree Git directory.
 pub fn sparse_patterns_in_git_dir(
-    settings: &UserSettings,
+    repo: &dyn Repo,
     git_dir: &Path,
 ) -> Result<Option<Vec<RepoPathBuf>>, GitResetHeadError> {
-    let git_repo = open_git_repo_with_dir(settings, git_dir)?;
+    sparse_patterns_in_repo(&open_git_repo_with_dir(repo, git_dir)?)
+}
+
+fn open_git_repo_with_dir(
+    repo: &dyn Repo,
+    git_dir: &Path,
+) -> Result<gix::Repository, GitResetHeadError> {
+    let backend = get_git_backend(repo.store())?;
+    let opts = backend.git_repo().open_options().clone().open_path_as_is(true);
+    gix::ThreadSafeRepository::open_opts(git_dir, opts)
+        .map(|repo| repo.to_thread_local())
+        .map_err(GitResetHeadError::from_git)
+}
+
+fn sparse_patterns_in_repo(
+    git_repo: &gix::Repository,
+) -> Result<Option<Vec<RepoPathBuf>>, GitResetHeadError> {
     if git_repo.config_snapshot().boolean("core.sparseCheckout") != Some(true) {
         return Ok(None);
     }
     let Some(index) = git_repo.try_index().map_err(GitResetHeadError::from_git)? else {
         return Ok(Some(vec![RepoPathBuf::root()]));
     };
-    git_sparse_patterns_from_index(&git_repo, &index)
-}
-
-async fn reset_head_impl(
-    mut_repo: &mut MutableRepo,
-    workspace_name: &WorkspaceName,
-    wc_commit: &Commit,
-    git_repo: gix::Repository,
-    should_update_git_head: bool,
-) -> Result<(), GitResetHeadError> {
-    // Reserve the index before changing HEAD. Keep the lock until the index
-    // is committed so a failed permission/concurrency preflight cannot leave
-    // HEAD partially updated.
-    let index_lock = gix::lock::File::acquire_to_update_resource(
-        git_repo.index_path(),
-        gix::lock::acquire::Fail::Immediately,
-        None,
-    )
-    .map_err(GitResetHeadError::from_git)?;
-    let first_parent_id = &wc_commit.parent_ids()[0];
-    let new_head_target = if first_parent_id != mut_repo.store().root_commit_id() {
-        RefTarget::normal(first_parent_id.clone())
-    } else {
-        RefTarget::absent()
-    };
-
-    let old_head_target = if should_update_git_head {
-        mut_repo.git_head(workspace_name).clone()
-    } else {
-        RefTarget::absent()
-    };
-    let repo_head_target = git_repo
-        .head_id()
-        .ok()
-        .map(|oid| RefTarget::normal(CommitId::from_bytes(oid.as_bytes())))
-        .unwrap_or_else(RefTarget::absent);
-    let expected_ref = match old_head_target.as_normal() {
-        Some(id) => {
-            // We have to check the actual HEAD state because we don't record a
-            // symbolic ref as such.
-            let actual_head = git_repo.head().map_err(GitResetHeadError::from_git)?;
-            if actual_head.is_detached() {
-                let id = owned_oid_from_commit_id(id);
-                gix::refs::transaction::PreviousValue::MustExistAndMatch(id.into())
-            } else {
-                // Just overwrite symbolic ref, which is unusual. Alternatively,
-                // maybe we can test the target ref by issuing noop edit.
-                gix::refs::transaction::PreviousValue::MustExist
-            }
-        }
-        None => gix::refs::transaction::PreviousValue::Any,
-    };
-    // When updating the view, the workspace's cached JJ target is the expected state.
-    // If the desired target is unchanged, leave an externally moved HEAD
-    // alone so a no-op export cannot overwrite it. A caller that opts out of
-    // updating the view compares the actual worktree HEAD instead.
-    let should_reset_head = if should_update_git_head {
-        old_head_target != new_head_target
-    } else {
-        repo_head_target != new_head_target
-    };
-    if should_reset_head {
-        let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
-        update_git_head(&git_repo, expected_ref, new_oid)
-            .map_err(GitResetHeadError::UpdateHeadRef)?;
-        if should_update_git_head {
-            mut_repo.set_git_head_target(workspace_name, new_head_target);
-        }
-    }
-
-    // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
-    // up.
-    if git_repo.state().is_some() {
-        clear_operation_state(&git_repo)?;
-    }
-
-    reset_index(mut_repo, &git_repo, wc_commit, index_lock).await
+    git_sparse_patterns_from_index(git_repo, &index)
 }
 
 /// Sets Git HEAD to the parent of the given working-copy commit and resets
@@ -2170,30 +2090,74 @@ pub async fn reset_head(
         .open_git_repo_at_workdir(workspace_root)
         .map_err(GitResetHeadError::from_git)?;
 
-    reset_head_impl(mut_repo, workspace_name, wc_commit, git_repo, true).await
+    reset_head_with_repo(mut_repo, workspace_name, wc_commit, git_repo).await
 }
 
-/// Resets HEAD and index using the Git worktree located at `git_dir`.
-///
-/// If `should_update_git_head` is true, the repo view's cached HEAD for
-/// `workspace` will be updated. Otherwise, only the actual worktree HEAD and
-/// index are updated, leaving the repo view unchanged.
+/// Reset Git HEAD and index using a previously discovered worktree Git directory.
 pub async fn reset_head_in_git_dir(
     mut_repo: &mut MutableRepo,
-    workspace: &WorkspaceName,
+    workspace_name: &WorkspaceName,
     wc_commit: &Commit,
     git_dir: &Path,
-    should_update_git_head: bool,
 ) -> Result<(), GitResetHeadError> {
-    let git_repo = open_git_repo_with_dir(mut_repo.base_repo().settings(), git_dir)?;
-    reset_head_impl(
-        mut_repo,
-        workspace,
-        wc_commit,
-        git_repo,
-        should_update_git_head,
+    let git_repo = open_git_repo_with_dir(mut_repo, git_dir)?;
+    reset_head_with_repo(mut_repo, workspace_name, wc_commit, git_repo).await
+}
+
+async fn reset_head_with_repo(
+    mut_repo: &mut MutableRepo,
+    workspace_name: &WorkspaceName,
+    wc_commit: &Commit,
+    git_repo: gix::Repository,
+) -> Result<(), GitResetHeadError> {
+
+    // Reserve the index before moving HEAD so lock failure cannot leave the
+    // worktree with a new HEAD and the previous index.
+    let index_lock = gix::lock::File::acquire_to_update_resource(
+        git_repo.index_path(),
+        gix::lock::acquire::Fail::Immediately,
+        None,
     )
-    .await
+    .map_err(GitResetHeadError::from_git)?;
+    let first_parent_id = &wc_commit.parent_ids()[0];
+    let new_head_target = if first_parent_id != mut_repo.store().root_commit_id() {
+        RefTarget::normal(first_parent_id.clone())
+    } else {
+        RefTarget::absent()
+    };
+
+    // If the first parent of the working copy has changed, reset the Git HEAD.
+    let old_head_target = mut_repo.git_head(workspace_name);
+    if *old_head_target != new_head_target {
+        let expected_ref = if let Some(id) = old_head_target.as_normal() {
+            // We have to check the actual HEAD state because we don't record a
+            // symbolic ref as such.
+            let actual_head = git_repo.head().map_err(GitResetHeadError::from_git)?;
+            if actual_head.is_detached() {
+                let id = owned_oid_from_commit_id(id);
+                gix::refs::transaction::PreviousValue::MustExistAndMatch(id.into())
+            } else {
+                // Just overwrite symbolic ref, which is unusual. Alternatively,
+                // maybe we can test the target ref by issuing noop edit.
+                gix::refs::transaction::PreviousValue::MustExist
+            }
+        } else {
+            // Just overwrite if unborn (or conflict), which is also unusual.
+            gix::refs::transaction::PreviousValue::MustExist
+        };
+        let new_oid = new_head_target.as_normal().map(owned_oid_from_commit_id);
+        update_git_head(&git_repo, expected_ref, new_oid)
+            .map_err(GitResetHeadError::UpdateHeadRef)?;
+        mut_repo.set_git_head_target(workspace_name, new_head_target);
+    }
+
+    // If there is an ongoing operation (merge, rebase, etc.), we need to clean it
+    // up.
+    if git_repo.state().is_some() {
+        clear_operation_state(&git_repo)?;
+    }
+
+    reset_index(mut_repo, &git_repo, wc_commit, index_lock).await
 }
 
 // TODO: Polish and upstream this to `gix`.
@@ -2251,9 +2215,11 @@ async fn reset_index(
         } else {
             // If the parent tree is resolved, we can use gix's `index_from_tree` method.
             // This is more efficient than iterating over the tree and adding each entry.
-            git_repo
-                .index_from_tree(&gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()))
-                .map_err(GitResetHeadError::from_git)?
+            git_index_cache::index_from_tree(
+                git_repo,
+                &gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()),
+            )
+            .map_err(GitResetHeadError::from_git)?
         }
     } else {
         build_index_from_merged_tree(git_repo, &parent_tree)?
@@ -2263,16 +2229,14 @@ async fn reset_index(
     update_intent_to_add_impl(git_repo, &mut index, &parent_tree, &wc_tree).await?;
 
     // Match entries in the new index with entries in the old index, and copy stat
-    // information if the entry didn't change. Preserve Git's sparse profile
-    // separately: rebuilding from the JJ tree expands a sparse-directory entry
-    // into files, so pairwise entry copying alone cannot retain skip-worktree.
+    // information if the entry didn't change.
     let old_index = git_repo.try_index().map_err(GitResetHeadError::from_git)?;
     let sparse_patterns = old_index
         .as_ref()
-        .map(|index| git_sparse_patterns_from_index(git_repo, index))
+        .map(|old| git_sparse_patterns_from_index(git_repo, old))
         .transpose()?
         .flatten();
-    if let Some(old_index) = old_index.as_ref() {
+    if let Some(old_index) = old_index {
         index
             .entries_mut_with_paths()
             .merge_join_by(old_index.entries(), |(entry, path), old_entry| {
@@ -2283,33 +2247,27 @@ async fn reset_index(
             .map(|((entry, _), old_entry)| (entry, old_entry))
             .filter(|(entry, old_entry)| entry.id == old_entry.id && entry.mode == old_entry.mode)
             .for_each(|(entry, old_entry)| entry.stat = old_entry.stat);
-        index.inherit_fs_monitor_from(old_index);
-        index.inherit_untracked_from(old_index);
     }
+
     if let Some(sparse_patterns) = sparse_patterns {
         for (entry, path) in index.entries_mut_with_paths() {
             let path = path.to_str().map_err(GitResetHeadError::from_git)?;
             let path = RepoPath::from_internal_string(path).map_err(GitResetHeadError::from_git)?;
-            if sparse_patterns
-                .iter()
-                .any(|prefix| path.starts_with(prefix))
-            {
+            if sparse_patterns.iter().any(|prefix| path.starts_with(prefix)) {
                 entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
             } else {
-                entry.flags.insert(gix::index::entry::Flags::SKIP_WORKTREE);
+                // SKIP_WORKTREE is stored in the on-disk extended flags word.
+                entry.flags.insert(
+                    gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
+                );
             }
         }
     }
-
     debug_assert!(index.verify_entries().is_ok());
-
-    // gix serializes each entry with many small writes. Buffer them so large
-    // indexes don't issue millions of write syscalls and fsnotify events.
-    let mut index_lock = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
-    index
-        .write_to(&mut index_lock, gix::index::write::Options::default())
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
+    git_index_cache::write_preserving_cache(&index, &mut writer)
         .map_err(GitResetHeadError::from_git)?;
-    let index_lock = index_lock
+    let index_lock = writer
         .into_inner()
         .map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
     index_lock.commit().map_err(GitResetHeadError::from_git)?;
@@ -2442,22 +2400,44 @@ pub async fn update_intent_to_add(
     old_tree: &MergedTree,
     new_tree: &MergedTree,
 ) -> Result<(), GitResetHeadError> {
-    let git_backend = get_git_backend(repo.store())?;
-    let git_repo = git_backend
+    let backend = get_git_backend(repo.store())?;
+    let git_repo = backend
         .open_git_repo_at_workdir(workspace_root)
         .map_err(GitResetHeadError::from_git)?;
     let mut index = git_repo
         .index_or_empty()
         .map_err(GitResetHeadError::from_git)?;
-    let mut_index = Arc::make_mut(&mut index);
-    if !update_intent_to_add_impl(&git_repo, mut_index, old_tree, new_tree).await? {
+    let preliminary_index = Arc::make_mut(&mut index);
+    if !update_intent_to_add_impl(&git_repo, preliminary_index, old_tree, new_tree).await? {
         return Ok(());
     }
-    debug_assert!(mut_index.verify_entries().is_ok());
-    mut_index
-        .write(gix::index::write::Options::default())
+    // The preliminary check avoids an index lock for a no-op. Once the lock is
+    // held, reopen and recalculate against the current index to avoid losing
+    // changes made by another Git process between the two reads.
+    let index_lock = gix::lock::File::acquire_to_update_resource(
+        git_repo.index_path(),
+        gix::lock::acquire::Fail::Immediately,
+        None,
+    )
+    .map_err(GitResetHeadError::from_git)?;
+    let git_repo = backend
+        .open_git_repo_at_workdir(workspace_root)
         .map_err(GitResetHeadError::from_git)?;
-
+    let mut index = git_repo
+        .index_or_empty()
+        .map_err(GitResetHeadError::from_git)?;
+    let index = Arc::make_mut(&mut index);
+    if !update_intent_to_add_impl(&git_repo, index, old_tree, new_tree).await? {
+        return Ok(());
+    }
+    debug_assert!(index.verify_entries().is_ok());
+    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
+    git_index_cache::write_preserving_cache(index, &mut writer)
+        .map_err(GitResetHeadError::from_git)?;
+    let index_lock = writer
+        .into_inner()
+        .map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
+    index_lock.commit().map_err(GitResetHeadError::from_git)?;
     Ok(())
 }
 
@@ -2505,29 +2485,32 @@ async fn update_intent_to_add_impl(
                     .contains(gix::index::entry::Flags::INTENT_TO_ADD)
             })
     });
-
     if added_paths.is_empty() && removed_paths.is_empty() {
         return Ok(false);
     }
 
-    let empty_blob = if !added_paths.is_empty() {
-        // We need to write the empty blob, otherwise `jj util gc` will report an error.
-        Some(
-            git_repo
-                .write_blob(b"")
-                .map_err(GitResetHeadError::from_git)?
-                .detach(),
-        )
-    } else {
-        None
-    };
+    // Only directories containing changed entries need a cache-tree rebuild.
+    // Unaffected subtrees can still be used by Git after this index update.
+    if let Some(tree) = index.tree_mut() {
+        for (path, _) in &added_paths {
+            invalidate_cache_tree_path(tree, path.as_bstr());
+        }
+        for path in &removed_paths {
+            invalidate_cache_tree_path(tree, path.as_bstr());
+        }
+    }
 
-    index.edit_preserving_fs_monitor(|index| {
+    if !added_paths.is_empty() {
+        // We need to write the empty blob, otherwise `jj util gc` will report an error.
+        let empty_blob = git_repo
+            .write_blob(b"")
+            .map_err(GitResetHeadError::from_git)?
+            .detach();
         for (path, executable) in added_paths {
             // We have checked that the index doesn't have this entry
             index.dangerously_push_entry(
                 gix::index::entry::Stat::default(),
-                empty_blob.expect("an empty blob is created before adding intent-to-add entries"),
+                empty_blob,
                 gix::index::entry::Flags::INTENT_TO_ADD | gix::index::entry::Flags::EXTENDED,
                 if executable {
                     gix::index::entry::Mode::FILE_EXECUTABLE
@@ -2537,22 +2520,38 @@ async fn update_intent_to_add_impl(
                 path.as_ref(),
             );
         }
-        if !removed_paths.is_empty() {
-            index.remove_entries(|_size, path, entry| {
-                entry
-                    .flags
-                    .contains(gix::index::entry::Flags::INTENT_TO_ADD)
-                    && removed_paths.contains(path)
-            });
-        }
+    }
+    if !removed_paths.is_empty() {
+        index.remove_entries(|_size, path, entry| {
+            entry
+                .flags
+                .contains(gix::index::entry::Flags::INTENT_TO_ADD)
+                && removed_paths.contains(path)
+        });
+    }
 
-        index.sort_entries();
-    });
+    index.sort_entries();
 
-    // The pinned gix implementation invalidates cache-tree paths when entries
-    // are added or removed, preserving reusable subtrees without writing stale
-    // entry counts back to the index.
     Ok(true)
+}
+
+fn invalidate_cache_tree_path(tree: &mut gix::index::extension::Tree, path: &BStr) {
+    tree.num_entries = None;
+    let (component, remainder) = match path.split_once_str("/") {
+        Some((component, remainder)) => (component, Some(remainder)),
+        None => (path.as_ref(), None),
+    };
+    if let Ok(position) = tree
+        .children
+        .binary_search_by(|child| child.name.as_slice().cmp(component))
+    {
+        if let Some(remainder) = remainder {
+            invalidate_cache_tree_path(&mut tree.children[position], remainder.as_bstr());
+        } else {
+            // A file can replace a former cached directory.
+            tree.children.remove(position);
+        }
+    }
 }
 
 #[derive(Debug, Error)]

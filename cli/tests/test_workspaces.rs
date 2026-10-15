@@ -2714,136 +2714,6 @@ fn get_log_output(work_dir: &TestWorkDir) -> CommandOutput {
     work_dir.run_jj(["log", "-T", template, "-r", "all()"])
 }
 
-#[test]
-fn test_workspaces_add_colocated_git_worktree() {
-    let test_env = TestEnvironment::default();
-    test_env
-        .run_jj_in(".", ["git", "init", "--colocate", "main"])
-        .success();
-    let main_dir = test_env.work_dir("main");
-    let secondary_dir = test_env.work_dir("secondary");
-
-    main_dir.write_file("file", "contents");
-    main_dir.run_jj(["commit", "-m", "initial"]).success();
-
-    main_dir.create_dir("../secondary");
-    let output = main_dir.run_jj(["workspace", "add", "--colocate", "../secondary"]);
-    insta::assert_snapshot!(output.normalize_backslash(), @r#"
-    ------- stderr -------
-    Created Git worktree for the new workspace.
-    Created workspace in "../secondary"
-    Working copy  (@) now at: pmmvwywv 058f604d (empty) (no description set)
-    Parent commit (@-)      : qpvuntsm 7b22a8cb initial
-    Added 1 files, modified 0 files, removed 0 files
-    [EOF]
-    "#);
-    assert!(secondary_dir.root().join(".git").exists());
-
-    let worktree_output = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(main_dir.root())
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
-    assert!(
-        stdout.contains(secondary_dir.root().to_str().unwrap()),
-        "worktree list should mention secondary workspace: {stdout}"
-    );
-
-    let status_output = std::process::Command::new("git")
-        .args(["status", "--short"])
-        .current_dir(secondary_dir.root())
-        .output()
-        .unwrap();
-    let git_status = String::from_utf8_lossy(&status_output.stdout);
-    assert!(
-        git_status.is_empty() || git_status.trim() == "?? .jj/",
-        "git status should be clean in the new worktree; got {git_status:?}"
-    );
-}
-
-#[test]
-fn test_workspaces_adopt_existing_colocated_git_worktree() -> TestResult {
-    let test_env = TestEnvironment::default();
-    test_env
-        .run_jj_in(".", ["git", "init", "--colocate", "main"])
-        .success();
-    let main_dir = test_env.work_dir("main");
-    let worktree_dir = test_env.work_dir("worktree");
-
-    main_dir.write_file("file", "contents");
-    main_dir.run_jj(["commit", "-m", "initial"]).success();
-    let add_output = std::process::Command::new("git")
-        .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
-        .current_dir(main_dir.root())
-        .output()?;
-    assert!(
-        add_output.status.success(),
-        "git worktree add failed: {}",
-        String::from_utf8_lossy(&add_output.stderr)
-    );
-    worktree_dir.write_file("file", "changed in worktree\n");
-    worktree_dir.write_file("untracked", "new\n");
-
-    let output = worktree_dir
-        .run_jj(["workspace", "adopt", "--name", "adopted"])
-        .success();
-    assert!(
-        output
-            .stderr
-            .raw()
-            .contains("Adopted Git worktree as workspace 'adopted'")
-    );
-
-    let output = worktree_dir.run_jj(["status"]).success();
-    assert!(output.stdout.raw().contains("M file"));
-    assert!(output.stdout.raw().contains("A untracked"));
-
-    let worktree_output = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(main_dir.root())
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
-    assert!(
-        stdout.contains(worktree_dir.root().to_str().unwrap()),
-        "worktree list should mention adopted workspace: {stdout}"
-    );
-
-    let status_output = std::process::Command::new("git")
-        .args(["status", "--short"])
-        .current_dir(worktree_dir.root())
-        .output()
-        .unwrap();
-    assert!(
-        status_output.status.success(),
-        "git status failed: {}",
-        String::from_utf8_lossy(&status_output.stderr)
-    );
-
-    let output = main_dir.run_jj(["workspace", "list"]).success();
-    assert!(output.stdout.raw().contains("adopted:"));
-
-    Ok(())
-}
-
-#[test]
-fn test_workspaces_adopt_rejects_main_git_worktree() {
-    let test_env = TestEnvironment::default();
-    test_env
-        .run_jj_in(".", ["git", "init", "--colocate", "main"])
-        .success();
-    let main_dir = test_env.work_dir("main");
-
-    let output = main_dir.run_jj(["workspace", "adopt"]);
-    insta::assert_snapshot!(output, @"
-    ------- stderr -------
-    Error: Cannot adopt the main Git worktree; run this from a linked Git worktree
-    [EOF]
-    [exit status: 1]
-    ");
-}
-
 #[test_case(false, false; "main worktree with full git index")]
 #[test_case(false, true; "main worktree with sparse git index")]
 #[test_case(true, false; "linked worktree with full git index")]
@@ -2887,6 +2757,19 @@ fn test_workspaces_colocated_git_worktree_preserves_git_sparse_checkout(
         initial_git_status.stdout.is_empty(),
         "the linked Git worktree must start clean: {}",
         String::from_utf8_lossy(&initial_git_status.stdout)
+    );
+
+    // With optional locks disabled, `git status` cannot refresh the index.
+    // Refresh it explicitly before Git removes sparse-excluded files.
+    let refresh = std::process::Command::new("git")
+        .args(["update-index", "--refresh"])
+        .current_dir(sparse_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        refresh.status.success(),
+        "git update-index --refresh failed: {}",
+        String::from_utf8_lossy(&refresh.stderr)
     );
 
     let index_mode = if sparse_index {
@@ -3009,4 +2892,86 @@ fn test_workspaces_colocated_git_worktree_preserves_git_sparse_checkout(
             "a linked-worktree sparse profile must not change the main worktree"
         );
     }
+}
+
+#[test]
+fn test_workspaces_adopt_existing_colocated_git_worktree() -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let worktree_dir = test_env.work_dir("worktree");
+
+    main_dir.write_file("file", "contents");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let add_output = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(
+        add_output.status.success(),
+        "git worktree add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+    worktree_dir.write_file("file", "changed in worktree\n");
+    worktree_dir.write_file("untracked", "new\n");
+
+    let output = worktree_dir
+        .run_jj(["workspace", "adopt", "--name", "adopted"])
+        .success();
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Adopted Git worktree as workspace 'adopted'")
+    );
+
+    let output = worktree_dir.run_jj(["status"]).success();
+    assert!(output.stdout.raw().contains("M file"));
+    assert!(output.stdout.raw().contains("A untracked"));
+
+    let worktree_output = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(main_dir.root())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&worktree_output.stdout);
+    assert!(
+        stdout.contains(worktree_dir.root().to_str().unwrap()),
+        "worktree list should mention adopted workspace: {stdout}"
+    );
+
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(worktree_dir.root())
+        .output()
+        .unwrap();
+    assert!(
+        status_output.status.success(),
+        "git status failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+
+    let output = main_dir.run_jj(["workspace", "list"]).success();
+    assert!(output.stdout.raw().contains("adopted:"));
+
+    Ok(())
+}
+
+#[test]
+fn test_workspaces_adopt_rejects_main_git_worktree() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+
+    let output = main_dir.run_jj(["workspace", "adopt"]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Error: Cannot adopt the main Git worktree; run this from a linked Git worktree
+    [EOF]
+    [exit status: 1]
+    ");
 }

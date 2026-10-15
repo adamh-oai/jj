@@ -151,6 +151,7 @@ pub(crate) async fn cmd_file_edit(
 
     tree_state
         .snapshot(&SnapshotOptions {
+            external_sparse_patterns: None,
             base_ignores: GitIgnoreFile::empty(),
             progress: None,
             start_tracking_matcher: &EverythingMatcher,

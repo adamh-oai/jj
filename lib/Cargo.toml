@@ -35,6 +35,11 @@ digest = { workspace = true }
 dunce = { workspace = true }
 either = { workspace = true }
 futures = { workspace = true }
+filetime = { version = "0.2.29", optional = true }
+gix-index-cache = { package = "gix-index", git = "https://github.com/adamh-oai/gitoxide", rev = "ae185e5cdccd23f3cabeea83609d978f5a05b95c", optional = true, features = ["sha1", "sha256"] }
+gix-hash-cache = { package = "gix-hash", git = "https://github.com/adamh-oai/gitoxide", rev = "ae185e5cdccd23f3cabeea83609d978f5a05b95c", optional = true, features = ["sha1", "sha256"] }
+gix-object-cache = { package = "gix-object", git = "https://github.com/adamh-oai/gitoxide", rev = "ae185e5cdccd23f3cabeea83609d978f5a05b95c", optional = true }
+gix-validate-cache = { package = "gix-validate", git = "https://github.com/adamh-oai/gitoxide", rev = "ae185e5cdccd23f3cabeea83609d978f5a05b95c", optional = true }
 gix = { workspace = true, optional = true }
 gix-ignore = { workspace = true }
 globset = { workspace = true }
@@ -87,7 +92,7 @@ nix = { workspace = true, features = [ "fs" ] }
 
 [features]
 default = ["git"]
-git = ["dep:gix"]
+git = ["dep:gix", "dep:filetime", "dep:gix-index-cache", "dep:gix-hash-cache", "dep:gix-object-cache", "dep:gix-validate-cache"]
 watchman = ["dep:watchman_client", "dep:tokio"]
 testing = ["git"]
 
