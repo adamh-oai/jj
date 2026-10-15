@@ -62,6 +62,36 @@ mod tests {
     }
 
     #[test]
+    fn lock_contender_does_not_truncate_held_lock() {
+        let temp_dir = new_temp_dir();
+        let lock_path = temp_dir.path().join("test.lock");
+        let _held_lock = FileLock::lock(lock_path.clone()).unwrap();
+        fs::write(&lock_path, b"preserve contents").unwrap();
+        assert!(FileLock::try_lock(lock_path.clone()).unwrap().is_none());
+        assert_eq!(fs::read(lock_path).unwrap(), b"preserve contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_rejects_symlinks_without_modifying_their_target() {
+        use std::os::unix::fs::symlink;
+        let temp_dir = new_temp_dir();
+        let target_path = temp_dir.path().join("target");
+        let lock_path = temp_dir.path().join("test.lock");
+        fs::write(&target_path, b"preserve contents").unwrap();
+        symlink(&target_path, &lock_path).unwrap();
+        assert!(FileLock::lock(lock_path.clone()).is_err());
+        assert!(FileLock::try_lock(lock_path.clone()).is_err());
+        assert_eq!(fs::read(&target_path).unwrap(), b"preserve contents");
+        assert!(
+            fs::symlink_metadata(lock_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
     fn lock_concurrent() {
         let temp_dir = new_temp_dir();
         let data_path = temp_dir.path().join("test");

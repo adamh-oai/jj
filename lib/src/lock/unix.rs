@@ -15,6 +15,8 @@
 #![expect(missing_docs)]
 
 use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 use rustix::fs::FlockOperation;
@@ -49,11 +51,18 @@ impl FileLock {
         };
         loop {
             // Create lockfile, or open pre-existing one
-            let file = File::create(&path).map_err(|err| FileLockError {
-                message: "Failed to open lock file",
-                path: path.clone(),
-                err,
-            })?;
+            // Existing lock files may contain data, and a sibling lock path
+            // can be a symlink. Never truncate or follow the final component.
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+                .open(&path)
+                .map_err(|err| FileLockError {
+                    message: "Failed to open lock file",
+                    path: path.clone(),
+                    err,
+                })?;
             // If the lock was already held, block until it's released, or (in
             // non-blocking mode) report that it's currently unavailable.
             match rustix::fs::flock(&file, operation) {
