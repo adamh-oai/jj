@@ -1144,6 +1144,134 @@ fn source_index_has_submodules(git: &Path, source: &Path) -> Result<bool, String
         .any(|entry| entry.starts_with(b"160000 ")))
 }
 
+/// The snapshot handoff uses one worktree's own index as the baseline for
+/// another. Git's repository overrides are valid for ordinary Git commands,
+/// but would make this cross-worktree copy ambiguous. Git itself exports
+/// GIT_PREFIX for commands run inside a worktree; it describes the caller's
+/// original directory and does not redirect the repository or its index.
+fn snapshot_git_environment_is_safe() -> bool {
+    [
+        "GIT_INDEX_FILE",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_GRAFT_FILE",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_QUARANTINE_PATH",
+        "GIT_CONFIG",
+    ]
+    .iter()
+    .all(|name| env::var_os(name).is_none())
+}
+
+/// Verify that the Git administrative directory belongs to this worktree.
+/// Linked worktrees use a gitfile and an administrative `gitdir` backreference;
+/// both paths may be relative. A gitfile pointing at a different repository
+/// can otherwise make Git report the requested root while using a foreign index.
+fn snapshot_git_metadata_matches(source: &Path, git_dir: &Path) -> bool {
+    let marker = source.join(".git");
+    let opened = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&marker)
+    {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let Ok(metadata) = opened.metadata() else {
+        return false;
+    };
+    let associated = if metadata.is_dir() {
+        git_dir.to_owned()
+    } else if metadata.is_file() {
+        let Ok(backreference) = fs::read(git_dir.join("gitdir")) else {
+            return false;
+        };
+        let backreference = PathBuf::from(OsString::from_vec(
+            backreference
+                .strip_suffix(b"\n")
+                .unwrap_or(&backreference)
+                .to_vec(),
+        ));
+        if backreference.is_absolute() {
+            backreference
+        } else {
+            git_dir.join(backreference)
+        }
+    } else {
+        return false;
+    };
+    let (Ok(marker_path), Ok(associated_path), Ok(associated_metadata)) = (
+        fs::canonicalize(&marker),
+        fs::canonicalize(&associated),
+        fs::metadata(&associated),
+    ) else {
+        return false;
+    };
+    marker_path == associated_path
+        && metadata.dev() == associated_metadata.dev()
+        && metadata.ino() == associated_metadata.ino()
+}
+
+/// Git may use a different worktree through repository configuration even
+/// when no environment override is present. Only snapshot the tree whose
+/// index Git actually describes.
+fn snapshot_git_worktree_matches(git: &Path, source: &Path) -> Result<bool, String> {
+    let output = git_capture(git, source, &["rev-parse", "--show-toplevel"])?;
+    let path = PathBuf::from(OsString::from_vec(
+        output.strip_suffix(b"\n").unwrap_or(&output).to_vec(),
+    ));
+    let worktree =
+        fs::canonicalize(path).map_err(|error| format!("canonicalize Git worktree: {error}"))?;
+    if worktree != source {
+        return Ok(false);
+    }
+    let output = git_capture(git, source, &["rev-parse", "--absolute-git-dir"])?;
+    let git_dir = PathBuf::from(OsString::from_vec(
+        output.strip_suffix(b"\n").unwrap_or(&output).to_vec(),
+    ));
+    Ok(snapshot_git_metadata_matches(source, &git_dir))
+}
+
+/// Open the source index without following a symlink. The returned descriptor
+/// is used for the handoff so a later path replacement cannot redirect it.
+fn open_snapshot_source_git_index(index: &Path) -> Result<Option<File>, String> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(index)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+        Err(error) => return Err(format!("open source Git index: {error}")),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect source Git index: {error}"))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+fn fallback_git_worktree_add(options: &GitWorktreeAdd<'_>, reason: &str) -> Result<(), String> {
+    snapshot_ineligible(options, reason)?;
+    if options.check_only {
+        return Ok(());
+    }
+    git_status(
+        options.git,
+        options.source,
+        &git_worktree_args(options, false),
+        &[],
+    )
+}
+
 fn snapshot_eligibility(options: &GitWorktreeAdd<'_>) -> Result<bool, String> {
     if options.destination.exists() {
         return snapshot_ineligible(options, "snapshot destination already exists");
@@ -1579,6 +1707,25 @@ fn run_git_worktree_add_inner(options: &GitWorktreeAdd<'_>) -> Result<(), String
         return Err("--check-only and --no-check cannot be used together".to_owned());
     }
     reject_jj_conflicted_git_target(options.git, options.source, options.reference)?;
+    if !snapshot_git_environment_is_safe() {
+        return fallback_git_worktree_add(
+            &options,
+            "Git repository or index is redirected by the environment",
+        );
+    }
+    if !snapshot_git_worktree_matches(options.git, &source)? {
+        return fallback_git_worktree_add(
+            &options,
+            "Git worktree or metadata does not match the snapshot source",
+        );
+    }
+    let source_index = git_path(options.git, &source, "index")?;
+    if open_snapshot_source_git_index(&source_index)?.is_none() {
+        return fallback_git_worktree_add(
+            &options,
+            "source Git index is missing, linked, or not a regular file",
+        );
+    }
     let mut jj_working_copy_lock = timed_git_phase("lock_source_jj", || {
         lock_jj_working_copy_for_snapshot(&source)
     })?;
@@ -1626,11 +1773,26 @@ fn run_git_worktree_add_inner(options: &GitWorktreeAdd<'_>) -> Result<(), String
         return Ok(());
     }
 
-    let source_index = git_path(options.git, &source, "index")?;
     let hash_len = git_object_hash_len(options.git, &source)?;
+    // The source Git marker can change while eligibility checks are running.
+    if !snapshot_git_worktree_matches(options.git, &source)? {
+        drop(jj_working_copy_lock.take());
+        return fallback_git_worktree_add(
+            &options,
+            "Git worktree or metadata does not match the snapshot source",
+        );
+    }
+    // The worktree's Git directory can change during eligibility checks.
+    // Resolve the index again and open it immediately before capture.
+    let source_index = git_path(options.git, &source, "index")?;
+    let Some(index) = open_snapshot_source_git_index(&source_index)? else {
+        drop(jj_working_copy_lock.take());
+        return fallback_git_worktree_add(
+            &options,
+            "source Git index is missing, linked, or not a regular file",
+        );
+    };
     let mut handoff = timed_git_phase("capture_source_index_and_cut", || {
-        let index =
-            File::open(&source_index).map_err(|error| format!("open source Git index: {error}"))?;
         GitIndexHandoff::capture(&source, &source_index, index, hash_len)
     })?;
     let target = String::from_utf8(git_capture(
@@ -3545,6 +3707,329 @@ mod tests {
                 "split indexes must use Git's authoritative reader"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_git_index_open_rejects_links_and_pins_the_open_file() {
+        use std::io::Read as _;
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("snapshot-index-links");
+        let index = root.path.join("index");
+        let foreign = root.path.join("foreign");
+        fs::write(&index, b"source index").unwrap();
+        fs::write(&foreign, b"foreign index").unwrap();
+        let mut opened = super::open_snapshot_source_git_index(&index)
+            .unwrap()
+            .unwrap();
+        fs::rename(&index, root.path.join("old-index")).unwrap();
+        symlink(&foreign, &index).unwrap();
+        assert!(
+            super::open_snapshot_source_git_index(&index)
+                .unwrap()
+                .is_none()
+        );
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"source index");
+        fs::remove_file(&index).unwrap();
+        fs::hard_link(&foreign, &index).unwrap();
+        assert!(
+            super::open_snapshot_source_git_index(&index)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fs::read(&foreign).unwrap(), b"foreign index");
+    }
+
+    #[test]
+    fn direct_worktree_add_rejects_foreign_index_handoff() {
+        use std::os::unix::fs::symlink;
+
+        fn git(repo: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let root = TestDir::new("foreign-index-handoff");
+        let source = root.path.join("source");
+        let foreign = root.path.join("foreign");
+        let destination = root.path.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        for repo in [&source, &foreign] {
+            git(repo, &["init", "-q"]);
+            git(repo, &["config", "user.name", "Fixture"]);
+            git(repo, &["config", "user.email", "fixture@example.invalid"]);
+            fs::write(repo.join("tracked"), b"same object\n").unwrap();
+            git(repo, &["add", "tracked"]);
+            git(repo, &["commit", "-q", "-m", "fixture"]);
+        }
+        let foreign_index = foreign.join(".git/index");
+        let before = fs::read(&foreign_index).unwrap();
+        let source_index = source.join(".git/index");
+        fs::remove_file(&source_index).unwrap();
+        symlink(&foreign_index, &source_index).unwrap();
+        let options = GitWorktreeAdd {
+            source: &source,
+            destination: &destination,
+            reference: "HEAD",
+            git: Path::new("git"),
+            required: true,
+            detach: true,
+            force: 0,
+            relative_paths: false,
+            lock_reason: None,
+            quiet: true,
+            check_only: false,
+            no_check: true,
+        };
+        let error = run_git_worktree_add(&options).unwrap_err();
+        assert!(
+            error.contains("source Git index is missing, linked, or not a regular file"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&foreign_index).unwrap(), before);
+        // Optional preflight allows the caller's normal Git fallback.
+        run_git_worktree_add(&GitWorktreeAdd {
+            required: false,
+            check_only: true,
+            no_check: false,
+            ..options
+        })
+        .unwrap();
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&foreign_index).unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_git_metadata_accepts_relative_linked_worktree_backreference() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("git-worktree-backreference");
+        let source = root.path.join("source");
+        let git_dir = root.path.join("admin/worktrees/source");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
+        let marker = source.join(".git");
+        fs::write(&marker, "gitdir: ../admin/worktrees/source\n").unwrap();
+        fs::write(git_dir.join("gitdir"), "../../../source/.git\n").unwrap();
+        assert!(super::snapshot_git_metadata_matches(&source, &git_dir));
+        fs::write(git_dir.join("gitdir"), marker.to_str().unwrap()).unwrap();
+        assert!(super::snapshot_git_metadata_matches(&source, &git_dir));
+        let other = root.path.join("other-gitfile");
+        fs::write(&other, "different worktree\n").unwrap();
+        fs::write(git_dir.join("gitdir"), other.to_str().unwrap()).unwrap();
+        assert!(!super::snapshot_git_metadata_matches(&source, &git_dir));
+        fs::remove_file(&marker).unwrap();
+        symlink(&other, &marker).unwrap();
+        assert!(!super::snapshot_git_metadata_matches(&source, &git_dir));
+    }
+
+    #[test]
+    fn direct_worktree_add_rejects_foreign_git_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new("foreign-git-metadata");
+        let source = root.path.join("source");
+        let foreign = root.path.join("foreign");
+        let destination = root.path.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&foreign)
+                .args(args)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Fixture"]);
+        git(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(foreign.join("private"), b"fixture\n").unwrap();
+        git(&["add", "private"]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        let before = fs::read(foreign.join(".git/index")).unwrap();
+        let marker = source.join(".git");
+        for gitfile in [false, true] {
+            if gitfile {
+                fs::write(
+                    &marker,
+                    format!("gitdir: {}\n", foreign.join(".git").display()),
+                )
+                .unwrap();
+            } else {
+                symlink(foreign.join(".git"), &marker).unwrap();
+            }
+            let error = run_git_worktree_add(&GitWorktreeAdd {
+                source: &source,
+                destination: &destination,
+                reference: "HEAD",
+                git: Path::new("git"),
+                required: true,
+                detach: true,
+                force: 0,
+                relative_paths: false,
+                lock_reason: None,
+                quiet: true,
+                check_only: false,
+                no_check: true,
+            })
+            .unwrap_err();
+            assert!(
+                error.contains("Git worktree or metadata does not match the snapshot source"),
+                "{error}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(fs::read(foreign.join(".git/index")).unwrap(), before);
+            fs::remove_file(&marker).unwrap();
+        }
+    }
+
+    #[test]
+    fn direct_worktree_add_rejects_configured_worktree_redirect() {
+        let root = TestDir::new("configured-worktree-handoff");
+        let source = root.path.join("source");
+        let foreign = root.path.join("foreign");
+        let destination = root.path.join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&foreign).unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "Fixture"]);
+        run(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(source.join("tracked"), b"fixture\n").unwrap();
+        run(&["add", "tracked"]);
+        run(&["commit", "-q", "-m", "fixture"]);
+        run(&["config", "core.worktree", foreign.to_str().unwrap()]);
+        let error = run_git_worktree_add(&GitWorktreeAdd {
+            source: &source,
+            destination: &destination,
+            reference: "HEAD",
+            git: Path::new("git"),
+            required: true,
+            detach: true,
+            force: 0,
+            relative_paths: false,
+            lock_reason: None,
+            quiet: true,
+            check_only: false,
+            no_check: true,
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("Git worktree or metadata does not match the snapshot source"),
+            "{error}"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn direct_worktree_add_rejects_environment_redirected_index() {
+        const CHILD: &str = "AWACS_TEST_DIRECT_INDEX_OVERRIDE_CHILD";
+        const SOURCE: &str = "AWACS_TEST_DIRECT_INDEX_SOURCE";
+        const DESTINATION: &str = "AWACS_TEST_DIRECT_INDEX_DESTINATION";
+        if std::env::var_os(CHILD).is_some() {
+            let source = PathBuf::from(std::env::var_os(SOURCE).unwrap());
+            let destination = PathBuf::from(std::env::var_os(DESTINATION).unwrap());
+            let index = PathBuf::from(std::env::var_os("GIT_INDEX_FILE").unwrap());
+            let before = fs::read(&index).unwrap();
+            let options = GitWorktreeAdd {
+                source: &source,
+                destination: &destination,
+                reference: "HEAD",
+                git: Path::new("git"),
+                required: true,
+                detach: true,
+                force: 0,
+                relative_paths: false,
+                lock_reason: None,
+                quiet: true,
+                check_only: false,
+                no_check: true,
+            };
+            let error = run_git_worktree_add(&options).unwrap_err();
+            assert!(
+                error.contains("Git repository or index is redirected by the environment"),
+                "{error}"
+            );
+            assert!(!destination.exists());
+            assert_eq!(fs::read(&index).unwrap(), before);
+            return;
+        }
+        let root = TestDir::new("environment-index-handoff");
+        let source = root.path.join("source");
+        let destination = root.path.join("destination");
+        fs::create_dir(&source).unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "Fixture"]);
+        run(&["config", "user.email", "fixture@example.invalid"]);
+        fs::write(source.join("tracked"), b"fixture\n").unwrap();
+        run(&["add", "tracked"]);
+        run(&["commit", "-q", "-m", "fixture"]);
+        let foreign = root.path.join("foreign-index");
+        fs::copy(source.join(".git/index"), &foreign).unwrap();
+        let test_name = std::thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test_name, "--nocapture"])
+            .env(CHILD, "1")
+            .env(SOURCE, &source)
+            .env(DESTINATION, &destination)
+            .env("GIT_INDEX_FILE", &foreign)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]
