@@ -15,6 +15,8 @@
 //! Repository synchronization without sharing live workspace state.
 
 pub mod anchor;
+pub mod endpoint;
+pub mod gc;
 #[cfg(feature = "git")]
 mod metadata_limits;
 pub mod normalize;
@@ -23,6 +25,7 @@ pub mod objects;
 pub mod protocol;
 pub mod reconcile;
 pub mod shared;
+pub mod state;
 
 use thiserror::Error;
 
