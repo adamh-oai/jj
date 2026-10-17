@@ -642,9 +642,15 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
             "the warmed index must retain a valid cache tree for its semantic source"
         );
     }
-    // Establish a durable starting cursor explicitly. Only subsequent
-    // commands suppress optional index writes to exercise stale-cursor replay.
+    // Establish a durable starting cursor explicitly. A writable status is
+    // also needed to persist the clean fsmonitor bits after refreshing the
+    // index; subsequent commands suppress optional writes to exercise replay
+    // from that unchanged, warm cursor.
     run(git_command(&root).args(["update-index", "--refresh", "--force-write-index"]))?;
+    let warmed = run(git_command(&root)
+        .env("GIT_OPTIONAL_LOCKS", "1")
+        .args(["status", "--porcelain=v1"]))?;
+    assert!(warmed.stdout.is_empty(), "the source must be clean");
     let index_path = root.join(".git/index");
     let mut original_index = std::fs::read(&index_path)?;
     let source_stat_cache = if scenario == GitSnapshotHandoffScenario::ColocatedJjReuse {
@@ -710,6 +716,22 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
                     && event["value"] == "0"
             }),
             "status must use exact empty replay, not a failed hook or full invalidation"
+        );
+        let lstats = events
+            .iter()
+            .filter(|event| {
+                event["event"] == "data"
+                    && event["category"] == "index"
+                    && matches!(
+                        event["key"].as_str(),
+                        Some("refresh/sum_lstat" | "preload/sum_lstat")
+                    )
+            })
+            .map(|event| event["value"].as_str().unwrap().parse::<u64>())
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(
+            !lstats.is_empty() && lstats.iter().sum::<u64>() == 0,
+            "source index must be warm before copying: {lstats:?}"
         );
         assert!(!trace.contains("query/trivial-response"));
         assert!(
@@ -858,11 +880,22 @@ fi
             .args(["--ref", "HEAD"])
             .output()?
     } else {
-        git_command(&root)
+        // Git exports GIT_PREFIX even when the caller supplied no repository
+        // overrides. Exercise a subdirectory invocation with a relative
+        // destination as well as the root invocation in the other scenarios.
+        let (directory, destination) = if scenario == GitSnapshotHandoffScenario::MissingCursor {
+            let directory = root.join("invocation-subdirectory");
+            std::fs::create_dir(&directory)?;
+            let destination = std::path::Path::new("../..").join(child.file_name().unwrap());
+            (directory, destination)
+        } else {
+            (root.clone(), child.clone())
+        };
+        git_command(&directory)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TRACE2_EVENT", &creation_trace)
             .args(["worktree", "add", "--btrfs-snapshot", "--detach"])
-            .arg(&child)
+            .arg(&destination)
             .arg("HEAD")
             .output()?
     };
@@ -1227,30 +1260,15 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
         inspect_git_index(&root.join(".git/index"))?.fsmonitor,
         GitFsmonitorStatus::Baseline(_)
     ));
-    let real_btrfs = Command::new("sh")
-        .args(["-c", "command -v btrfs"])
-        .output()?;
-    assert!(real_btrfs.status.success());
-    let real_btrfs = std::path::PathBuf::from(String::from_utf8(real_btrfs.stdout)?.trim());
-    assert!(real_btrfs.is_absolute());
-    let race_bin = runtime.join("race-bin");
-    std::fs::create_dir(&race_bin)?;
-    let race_wrapper = race_bin.join("btrfs");
-    std::fs::write(
-        &race_wrapper,
-        r#"#!/bin/sh
-last=
-for argument do last=$argument; done
-if [ "$1" = subvolume ] && [ "$2" = snapshot ] && [ "$last" = "$JJ_TEST_RACE_DEST" ]; then
-    printf '%s\n' 'edit between the JJ scan and physical clone' > "$JJ_TEST_RACE_ROOT/tracked/002"
-    printf ran > "$JJ_TEST_RACE_MARKER"
-fi
-exec "$JJ_TEST_REAL_BTRFS" "$@"
-"#,
-    )?;
-    std::fs::set_permissions(&race_wrapper, std::fs::Permissions::from_mode(0o755))?;
-    let race_path =
-        std::env::join_paths(std::iter::once(race_bin).chain(std::env::split_paths(&path)))?;
+    // Kill and reap a paused command even if an assertion or file operation
+    // fails, so a failed test cannot leave a lock-holding process behind.
+    struct TestChild(std::process::Child);
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
 
     // The source Git cursor intentionally predates this edit. Copying its
     // clean bitmap and replacing only the cursor would not be a valid seed.
@@ -1294,28 +1312,71 @@ exec "$JJ_TEST_REAL_BTRFS" "$@"
         let child = base.join(format!("jj-git-seed-{name}-{suffix}"));
         cleanup.track_subvolume_root(child.clone());
         let creation_trace = runtime.join(format!("{name}-creation.jsonl"));
-        let race_marker = runtime.join("source-race-ran");
-        main.run_jj_with(|cmd| {
-            configure(cmd);
-            cmd.env("GIT_TRACE2_EVENT", &creation_trace);
-            if name == "race" {
-                cmd.env("PATH", &race_path)
-                    .env("JJ_TEST_REAL_BTRFS", &real_btrfs)
-                    .env("JJ_TEST_RACE_ROOT", &root)
-                    .env("JJ_TEST_RACE_DEST", &child)
-                    .env("JJ_TEST_RACE_MARKER", &race_marker);
-            }
-            cmd.args(["workspace", "add", "--name", name]);
-            if let Some(revision) = revision {
-                cmd.args(["-r", revision]);
-            }
-            cmd.arg(&child)
-        })
-        .success();
+        let mut cmd = test_env.new_jj_cmd();
+        configure(&mut cmd);
+        cmd.current_dir(&root)
+            .env("GIT_TRACE2_EVENT", &creation_trace)
+            .args(["workspace", "add", "--colocate", "--name", name]);
+        if let Some(revision) = revision {
+            cmd.args(["-r", revision]);
+        }
+        cmd.arg(&child);
         if name == "race" {
+            let pause = runtime.join("race-pause");
+            std::fs::create_dir(&pause)?;
+            cmd.env("JJ_TEST_RECURSIVE_SNAPSHOT_PAUSE_DIR", &pause);
+            let stdout_path = runtime.join("race-stdout");
+            let stderr_path = runtime.join("race-stderr");
+            let mut process = Command::new(cmd.get_program());
+            process.env_clear();
+            for (key, value) in cmd.get_envs() {
+                if let Some(value) = value {
+                    process.env(key, value);
+                }
+            }
+            process
+                .current_dir(&root)
+                .args(cmd.get_args())
+                .stdout(std::fs::File::create(&stdout_path)?)
+                .stderr(std::fs::File::create(&stderr_path)?);
+            let mut process = TestChild(process.spawn()?);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+            while !pause.join("ready").is_file() {
+                assert!(
+                    process.0.try_wait()?.is_none() && std::time::Instant::now() < deadline,
+                    "workspace creation did not reach the clone barrier\nstdout:\n{}\nstderr:\n{}",
+                    std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            main.write_file("tracked/002", "edit between the JJ scan and physical clone\n");
+            std::fs::write(pause.join("release"), b"release\n")?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = process.0.try_wait()? {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "workspace creation timed out after the clone barrier"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
             assert!(
-                race_marker.is_file(),
-                "the source edit must happen before the physical clone"
+                status.success(),
+                "workspace creation failed: {status}\nstdout:\n{}\nstderr:\n{}",
+                std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        } else {
+            let output = cmd.output()?;
+            assert!(
+                output.status.success(),
+                "workspace creation failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
         }
         // Moving the full refresh into workspace creation is not a fix.
@@ -1530,6 +1591,7 @@ exec "$JJ_TEST_REAL_BTRFS" "$@"
                 cmd.args([
                     "workspace",
                     "add",
+                    "--colocate",
                     "--name",
                     "failed",
                     "-r",
@@ -1538,7 +1600,10 @@ exec "$JJ_TEST_REAL_BTRFS" "$@"
                 .arg(&failed_child)
             });
             assert!(!failed.status.success(), "{failed}");
-            assert!(failed.stderr.raw().contains("missing-git-seed-revision"));
+            assert!(
+                failed.stderr.raw().contains("missing-git-seed-revision"),
+                "{failed}"
+            );
             assert!(failed_child.join(".git").is_file());
             let diff = git_command(&failed_child)
                 .args(["status", "--porcelain=v1", "-z", "--untracked-files=no"])
@@ -1726,10 +1791,17 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
         assert_default_awacs_layout(&repo_root);
         let after = inspect_git_index(&repo_root.join(".git/index"))?.fsmonitor;
         assert!(matches!(after, GitFsmonitorStatus::Baseline(_)));
-        assert_ne!(
-            after, before,
-            "migration/rebuild must replace the old manager cursor"
-        );
+        if operation.ends_with("--rebuild-baseline") {
+            assert_eq!(
+                after, before,
+                "rebuilding the JJ baseline must preserve a still-valid Git cursor"
+            );
+        } else {
+            assert_ne!(
+                after, before,
+                "migration must replace the old manager cursor"
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(repo_root.join("file"))?,
             "modified before migration\n"
@@ -1761,6 +1833,19 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
             .status
             .success()
     );
+    // A valid existing cursor does not require a refresh. Force the v1 hook
+    // failure first so Git writes a timestamp, exercising finalization's
+    // attempt to replace an invalid baseline under the same configuration.
+    let refresh = run_git(&["update-index", "--refresh", "--force-write-index"])?;
+    assert!(
+        matches!(refresh.status.code(), Some(0 | 1)),
+        "refresh Git index with incompatible hook: {}",
+        String::from_utf8_lossy(&refresh.stderr)
+    );
+    assert!(matches!(
+        inspect_git_index(&repo_root.join(".git/index"))?.fsmonitor,
+        GitFsmonitorStatus::TimestampPlaceholder
+    ));
     let failed = main_dir.run_jj_with(|cmd| {
         configure(cmd);
         cmd.args(["util", "subvolume", "enable", "--rebuild-baseline"])
@@ -3576,6 +3661,14 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             cmd.args(["new", "@--"])
         })
         .success();
+    // A checkout invalidates the old adoption seed. Publish a seed for the
+    // new source tree before introducing the intentionally dirty state below.
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.arg("status")
+        })
+        .success();
     let source_head = Command::new("git")
         .env("PATH", &path)
         .env_remove("BTRFS_AWACS_STATE_DIR")
@@ -3734,7 +3827,8 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         source_journal,
         "deferred adoption must retain the compact journal omitted by the root snapshot"
     );
-    let seeded_index = std::fs::read(&seeded_index)?;
+    let seeded_index_path = seeded_index;
+    let seeded_index = std::fs::read(&seeded_index_path)?;
     assert!(
         btrfs_awacs::status::git_index_extension_data_range(&seeded_index, 20, b"TREE")
             .expect("the snapshot worktree's Git index must remain parseable")
@@ -3813,6 +3907,106 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         "malformed cursor recovery must explain why no snapshot can safely be adopted: {}",
         String::from_utf8_lossy(&malformed_hook.stderr)
     );
+    // An index previously read by Git's built-in fsmonitor can contain its
+    // sentinel. The hook must migrate it without trusting any cached entries.
+    let builtin_hook = Command::new(&git_fsmonitor_hook)
+        .env("PATH", &path)
+        .env_remove("BTRFS_AWACS_STATE_DIR")
+        .env_remove("BTRFS_AWACS_STATE_ROOT")
+        .env_remove("BTRFS_AWACS_MANAGED_DIR")
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
+        .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
+        .args(["2", "builtin:fake"])
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        builtin_hook.status.success(),
+        "migrate Git's built-in fsmonitor token: {}",
+        String::from_utf8_lossy(&builtin_hook.stderr)
+    );
+    let mut builtin_response = builtin_hook.stdout.split(|byte| *byte == 0);
+    let builtin_cursor = builtin_response.next().unwrap_or_default();
+    assert!(
+        builtin_cursor.starts_with(b"awacs-git-v2:"),
+        "the migrated cursor must belong to AWACS"
+    );
+    assert_eq!(
+        builtin_response.next(),
+        Some(b"/".as_slice()),
+        "the first query must invalidate the whole index before reusing the cursor"
+    );
+    assert_eq!(builtin_response.next(), Some(b"".as_slice()));
+    assert_eq!(builtin_response.next(), None);
+
+    // Simulate an index last written by the built-in fsmonitor. A real Git
+    // status must see both tracked and untracked changes, then persist the
+    // AWACS cursor so subsequent snapshot worktrees can inherit a warm index.
+    let extension = btrfs_awacs::status::git_index_extension_data_range(&seeded_index, 20, b"FSMN")
+        .expect("the seeded index must be parseable")
+        .expect("the seeded index must have an fsmonitor extension");
+    let token_start = extension.start + 4;
+    let token_end = token_start
+        + seeded_index[token_start..extension.end]
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("the seeded cursor must be NUL terminated");
+    let mut builtin_index = seeded_index.clone();
+    builtin_index.splice(token_start..token_end, b"builtin:fake".iter().copied());
+    let payload_len = extension.len() - (token_end - token_start) + b"builtin:fake".len();
+    builtin_index[extension.start - 4..extension.start]
+        .copy_from_slice(&(payload_len as u32).to_be_bytes());
+    let checksum_start = builtin_index.len() - 20;
+    let checksum = btrfs_awacs::status::git_index_checksum(&builtin_index[..checksum_start], 20)
+        .expect("the test index must use a supported checksum");
+    builtin_index[checksum_start..].copy_from_slice(&checksum);
+    std::fs::write(&seeded_index_path, builtin_index)?;
+    let tracked_path = adopted_root.join("file");
+    let original_file = std::fs::read(&tracked_path)?;
+    let untracked_path = adopted_root.join("awacs-bootstrap-untracked");
+    std::fs::write(&tracked_path, b"changed during fsmonitor migration\n")?;
+    std::fs::write(&untracked_path, b"untracked during fsmonitor migration\n")?;
+    let migrated_status = Command::new("git")
+        .env("PATH", &path)
+        .env("GIT_OPTIONAL_LOCKS", "1")
+        .env_remove("BTRFS_AWACS_STATE_DIR")
+        .env_remove("BTRFS_AWACS_STATE_ROOT")
+        .env_remove("BTRFS_AWACS_MANAGED_DIR")
+        .env("XDG_RUNTIME_DIR", &runtime_dir)
+        .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
+        .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
+        .args(["status", "--porcelain"])
+        .current_dir(&adopted_root)
+        .output()?;
+    assert!(
+        migrated_status.status.success(),
+        "refresh the migrated Git index: {}",
+        String::from_utf8_lossy(&migrated_status.stderr)
+    );
+    let migrated_status = String::from_utf8(migrated_status.stdout)?;
+    assert!(migrated_status.lines().any(|line| line.ends_with(" file")));
+    assert!(
+        migrated_status
+            .lines()
+            .any(|line| line == "?? awacs-bootstrap-untracked")
+    );
+    let migrated_index = std::fs::read(&seeded_index_path)?;
+    let extension =
+        btrfs_awacs::status::git_index_extension_data_range(&migrated_index, 20, b"FSMN")
+            .expect("the migrated index must be parseable")
+            .expect("the migrated index must retain its fsmonitor extension");
+    let token_start = extension.start + 4;
+    let token_end = token_start
+        + migrated_index[token_start..extension.end]
+            .iter()
+            .position(|byte| *byte == 0)
+            .expect("the migrated cursor must be NUL terminated");
+    assert!(
+        btrfs_awacs::status::decode_git_fsmonitor_token(&migrated_index[token_start..token_end])
+            .is_some()
+    );
+    std::fs::write(&tracked_path, original_file)?;
+    std::fs::remove_file(untracked_path)?;
     let adopted_git_status = Command::new("git")
         .env("PATH", &path)
         .env_remove("BTRFS_AWACS_STATE_DIR")
@@ -4071,6 +4265,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             cmd.args([
                 "workspace",
                 "add",
+                "--colocate",
                 "-r",
                 "root()",
                 "--name",
@@ -4638,6 +4833,7 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
                 cmd.args([
                     "workspace",
                     "add",
+                    "--colocate",
                     "-r",
                     &base_commit,
                     "--name",

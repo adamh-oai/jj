@@ -95,6 +95,9 @@ pub(super) fn subvolume_operation_lock_path(
 
 /// Snapshots the source and all descendant subvolumes into a writable root.
 pub(super) fn recursive_btrfs_snapshot(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(feature = "test-fakes")]
+    pause_recursive_snapshot_for_test()?;
+
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     if !use_test_btrfs_cli() {
         return btrfs_awacs::recursive_snapshot::recursive_snapshot(source, destination);
@@ -115,6 +118,26 @@ pub(super) fn recursive_btrfs_snapshot(source: &Path, destination: &Path) -> io:
             String::from_utf8_lossy(&output.stderr)
         )))
     }
+}
+
+#[cfg(feature = "test-fakes")]
+fn pause_recursive_snapshot_for_test() -> io::Result<()> {
+    let Some(path) = std::env::var_os("JJ_TEST_RECURSIVE_SNAPSHOT_PAUSE_DIR") else {
+        return Ok(());
+    };
+    let path = Path::new(&path);
+    std::fs::write(path.join("ready"), b"ready\n")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !path.join("release").exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recursive snapshot test barrier timed out",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Returns whether `path` is on a Btrfs filesystem.
