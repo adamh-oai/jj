@@ -28,6 +28,11 @@ use jj_lib::op_store::OperationId;
 use jj_lib::op_store::RootOperationData;
 use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::sync::anchor::AnchorStore;
+use jj_lib::sync::protocol::Direction;
+use jj_lib::sync::protocol::Hello;
+use jj_lib::sync::protocol::Message;
+use jj_lib::sync::protocol::PROTOCOL_VERSION;
+use jj_lib::sync::protocol::Session;
 use jj_lib::sync::shared::SharedEventId;
 use jj_lib::sync::state::SyncStateStore;
 use pollster::FutureExt as _;
@@ -195,6 +200,334 @@ fn test_sync_unrelated_local_repositories(direction: &str) {
     }
     assert!(!left.root().join("right.txt").exists());
     assert!(!right.root().join("left.txt").exists());
+}
+
+#[test_case("--send"; "send")]
+#[test_case("--bidi"; "bidirectional")]
+fn test_sync_initializes_missing_peer_at_exact_path(direction: &str) {
+    let env = TestEnvironment::default();
+    let source = init_repo(&env, "source");
+    describe_and_bookmark(&source, "source");
+    let source_wc = revision_id(&source, "@");
+    let source_op = source.current_operation_id();
+    // The destination's parent is itself a repository. Loading an ancestor
+    // instead of initializing this exact path would silently sync with source.
+    let receiver = source.dir("new-peer");
+    source
+        .run_jj(["--ignore-working-copy", "sync", direction, "new-peer"])
+        .success();
+    // TestEnvironment sets git.colocate=false; destination creation overrides it.
+    assert!(receiver.root().join(".git").is_dir());
+    assert!(receiver.root().join(".jj").is_dir());
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
+    assert_imported_history(&source, &receiver, &source_op);
+    assert_eq!(revision_id(&source, "@"), source_wc);
+    assert_ne!(revision_id(&receiver, "@"), source_wc);
+    assert!(!receiver.root().join("source.txt").exists());
+    assert_eq!(
+        receiver
+            .run_jj([
+                "--ignore-working-copy",
+                "file",
+                "show",
+                "-r",
+                "source",
+                "source.txt",
+            ])
+            .success()
+            .stdout
+            .raw(),
+        "source contents\n",
+    );
+
+    let received = receiver.current_operation_id();
+    source
+        .run_jj(["--ignore-working-copy", "sync", direction, "new-peer"])
+        .success();
+    assert_eq!(receiver.current_operation_id(), received);
+    receiver.run_jj(["undo"]).success();
+    assert!(bookmarks(&receiver).is_empty());
+    receiver.run_jj(["redo"]).success();
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
+}
+
+#[test_case("--receive", false; "receive_explicit_missing_repository")]
+#[test_case("--receive", true; "receive_empty_current_directory")]
+#[test_case("--bidi", false; "bidirectional_explicit_missing_repository")]
+fn test_sync_initializes_missing_local_receiver(direction: &str, use_cwd: bool) {
+    let env = TestEnvironment::default();
+    let source = init_repo(&env, "source");
+    describe_and_bookmark(&source, "source");
+    let source_op = source.current_operation_id();
+    let receiver = env.work_dir("receiver");
+    if use_cwd {
+        fs::create_dir(receiver.root()).unwrap();
+        receiver.run_jj(["sync", direction, "../source"]).success();
+    } else {
+        env.run_jj_in(".", ["-R", "receiver", "sync", direction, "source"])
+            .success();
+    }
+    assert!(receiver.root().join(".git").is_dir());
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
+    assert_imported_history(&source, &receiver, &source_op);
+    assert!(!receiver.root().join("source.txt").exists());
+}
+
+#[test_case(false; "snapshot_existing_files")]
+#[test_case(true; "leave_existing_files_unsnapshotted")]
+fn test_sync_new_receiver_preserves_existing_files(ignore: bool) {
+    let env = TestEnvironment::default();
+    let source = init_repo(&env, "source");
+    describe_and_bookmark(&source, "source");
+    let receiver = env.work_dir("receiver");
+    receiver.write_file("existing.txt", "local destination contents\n");
+    let mut args = vec!["sync", "--receive", "../source"];
+    if ignore {
+        args.push("--ignore-working-copy");
+    }
+    receiver.run_jj(args).success();
+    assert!(receiver.root().join(".git").is_dir());
+    assert_eq!(
+        receiver.read_file("existing.txt"),
+        "local destination contents\n"
+    );
+    assert!(!receiver.root().join("source.txt").exists());
+    let contents = receiver.run_jj([
+        "--ignore-working-copy",
+        "file",
+        "show",
+        "-r",
+        "@",
+        "existing.txt",
+    ]);
+    if ignore {
+        assert!(!contents.status.success());
+    } else {
+        assert_eq!(
+            contents.success().stdout.raw(),
+            "local destination contents\n"
+        );
+    }
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
+}
+
+#[test]
+fn test_sync_new_receiver_matches_source_object_hash() {
+    let env = TestEnvironment::default();
+    env.run_jj_in(".", ["git", "init", "--object-hash", "sha256", "source"])
+        .success();
+    let source = env.work_dir("source");
+    describe_and_bookmark(&source, "source");
+    // The receiver must inherit the source's format rather than its default SHA-1.
+    env.run_jj_in(".", ["-R", "receiver", "sync", "--receive", "source"])
+        .success();
+    let receiver = env.work_dir("receiver");
+    assert_eq!(revision_id(&source, "source").len(), 64);
+    assert_eq!(
+        revision_id(&receiver, "source"),
+        revision_id(&source, "source")
+    );
+    assert_eq!(revision_id(&receiver, "@").len(), 64);
+    assert!(receiver.root().join(".git").is_dir());
+}
+
+#[test]
+fn test_sync_initializes_destination_with_existing_git_repository() {
+    let env = TestEnvironment::default();
+    let source = init_repo(&env, "source");
+    describe_and_bookmark(&source, "source");
+    let receiver = env.work_dir("receiver");
+    let git_repo = testutils::git::init(receiver.root());
+    let config_path = git_repo.path().join("config");
+    let existing_config = fs::read(&config_path).unwrap();
+    source.run_jj(["sync", "--send", "../receiver"]).success();
+    assert_eq!(fs::read(&config_path).unwrap(), existing_config);
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
+    assert!(receiver.root().join(".git").is_dir());
+    assert!(!receiver.root().join("source.txt").exists());
+}
+
+#[test]
+fn test_sync_does_not_initialize_existing_git_with_incompatible_object_hash() {
+    let env = TestEnvironment::default();
+    env.run_jj_in(".", ["git", "init", "--object-hash", "sha256", "source"])
+        .success();
+    let source = env.work_dir("source");
+    describe_and_bookmark(&source, "source");
+    let receiver = env.work_dir("receiver");
+    let git_repo = testutils::git::init(receiver.root());
+    let config_path = git_repo.path().join("config");
+    let existing_config = fs::read(&config_path).unwrap();
+    let output = source.run_jj(["sync", "--send", "../receiver"]);
+    assert!(!output.status.success());
+    assert!(output.stderr.raw().contains("object hash"));
+    assert!(!receiver.root().join(".jj").exists());
+    assert_eq!(fs::read(config_path).unwrap(), existing_config);
+}
+
+#[test_case("version")]
+#[test_case("backend")]
+#[test_case("operation_store")]
+#[test_case("object_hash")]
+#[test_case("required_capability")]
+#[test_case("missing_capability")]
+fn test_sync_helper_rejects_incompatible_request_before_initialization(field: &str) {
+    let env = TestEnvironment::default();
+    let receiver = env.env_root().join("receiver");
+    let capabilities: Vec<_> = [
+        "raw-history-v1",
+        "shared-causal-v1",
+        "streaming-objects-v1",
+        "local-workspaces-v1",
+    ]
+    .map(str::to_owned)
+    .into();
+    let mut request = Hello {
+        version: PROTOCOL_VERSION,
+        direction: Direction::Send,
+        repository_path: receiver.as_os_str().as_encoded_bytes().to_vec(),
+        ignore_working_copy: false,
+        backend: "git".to_owned(),
+        object_hash: "sha1".to_owned(),
+        operation_store: "simple-op-v1".to_owned(),
+        capabilities: capabilities.clone(),
+        required_capabilities: capabilities,
+    };
+    let diagnostic = match field {
+        "version" => "protocol version",
+        "backend" => {
+            request.backend = "unknown-backend".to_owned();
+            "backend"
+        }
+        "operation_store" => {
+            request.operation_store = "unknown-store".to_owned();
+            "operation store format"
+        }
+        "object_hash" => {
+            request.object_hash = "sha512".to_owned();
+            "object hash"
+        }
+        "required_capability" => {
+            request.capabilities.push("unknown-required".to_owned());
+            request
+                .required_capabilities
+                .push("unknown-required".to_owned());
+            "capability"
+        }
+        "missing_capability" => {
+            request.capabilities.pop();
+            request.required_capabilities.pop();
+            "capability"
+        }
+        _ => unreachable!(),
+    };
+    let mut session = Session::new(io::empty(), Vec::new());
+    session.send(&Message::Hello(request)).unwrap();
+    let mut input = session.into_inner().1;
+    if field == "version" {
+        // The sender validates versions too. Alter an otherwise valid wire frame
+        // to exercise rejection by the receiving process, with a valid checksum.
+        const HEADER_LEN: usize = 8 + 1 + 8 + 32;
+        input[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&(PROTOCOL_VERSION + 1).to_be_bytes());
+        let mut digest = gix::hash::hasher(gix::hash::Kind::Sha256);
+        digest.update(&input[8..17]);
+        digest.update(&input[HEADER_LEN..]);
+        input[17..HEADER_LEN].copy_from_slice(digest.try_finalize().unwrap().as_bytes());
+    }
+    let output = env
+        .new_jj_cmd()
+        .args(["util", "sync-server"])
+        .write_stdin(input)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let mut response = Session::new(io::Cursor::new(output.stdout), io::sink());
+    let Message::Error(message) = response.receive().unwrap() else {
+        panic!("helper accepted incompatible {field}");
+    };
+    assert!(message.contains(diagnostic), "{message}");
+    assert!(!receiver.exists());
+}
+
+#[test]
+fn test_sync_does_not_initialize_missing_source() {
+    let env = TestEnvironment::default();
+    let receiver = init_repo(&env, "receiver");
+    let missing_peer = env.env_root().join("missing-peer");
+    assert!(
+        !receiver
+            .run_jj(["sync", "--receive", "../missing-peer"])
+            .status
+            .success()
+    );
+    assert!(!missing_peer.exists());
+    assert!(
+        !env.run_jj_in(
+            ".",
+            ["-R", "missing-source", "sync", "--send", "missing-peer"],
+        )
+        .status
+        .success()
+    );
+    assert!(!env.env_root().join("missing-source").exists());
+    assert!(!missing_peer.exists());
+    assert!(
+        !env.run_jj_in(
+            ".",
+            ["-R", "missing-local", "sync", "--bidi", "missing-peer"],
+        )
+        .status
+        .success()
+    );
+    assert!(!env.env_root().join("missing-local").exists());
+    assert!(!missing_peer.exists());
+    // Initialization follows `jj git init`: the destination's parent must exist.
+    assert!(
+        !receiver
+            .run_jj(["sync", "--send", "../missing-parent/peer"])
+            .status
+            .success()
+    );
+    assert!(!env.env_root().join("missing-parent").exists());
+}
+
+#[test_case(false; "jj_file")]
+#[test_case(true; "malformed_jj_directory")]
+fn test_sync_does_not_overwrite_malformed_destination(jj_directory: bool) {
+    let env = TestEnvironment::default();
+    let source = init_repo(&env, "source");
+    let receiver = env.work_dir("receiver");
+    let marker = if jj_directory { ".jj/sentinel" } else { ".jj" };
+    receiver.write_file(marker, "existing invalid metadata\n");
+    let output = if jj_directory {
+        env.run_jj_in(".", ["-R", "receiver", "sync", "--receive", "source"])
+    } else {
+        source.run_jj(["sync", "--send", "../receiver"])
+    };
+    assert!(!output.status.success());
+    assert_eq!(receiver.read_file(marker), "existing invalid metadata\n");
+    assert!(!receiver.root().join(".git").exists());
+    assert!(!receiver.root().join(".jj/repo").exists());
+}
+
+#[cfg(unix)]
+#[test_case(".jj")]
+#[test_case(".git")]
+fn test_sync_does_not_replace_dangling_destination_marker(marker: &str) {
+    use std::os::unix::fs::symlink;
+
+    let env = TestEnvironment::default();
+    let source = init_repo(&env, "source");
+    let receiver = env.work_dir("receiver");
+    fs::create_dir(receiver.root()).unwrap();
+    let target = env.env_root().join("missing-marker-target");
+    let marker_path = receiver.root().join(marker);
+    symlink(&target, &marker_path).unwrap();
+    let output = source.run_jj(["sync", "--send", "../receiver"]);
+    assert!(!output.status.success());
+    assert_eq!(fs::read_link(marker_path).unwrap(), target);
+    assert!(!target.exists());
+    assert!(!receiver.root().join(".jj/repo").exists());
 }
 
 #[test]
@@ -925,10 +1258,8 @@ fn test_sync_undo_survives_pruning_interrupted_publication(divergent_heads: bool
 }
 
 #[cfg(unix)]
-#[test]
-fn test_sync_ssh_paths_are_protocol_data() {
+fn configure_fake_sync_ssh(env: &mut TestEnvironment) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
-    let mut env = TestEnvironment::default();
     let bin = env.env_root().join("fake-bin");
     fs::create_dir(&bin).unwrap();
     let ssh = bin.join("ssh");
@@ -945,16 +1276,29 @@ fn test_sync_ssh_paths_are_protocol_data() {
         assert_cmd::cargo::cargo_bin!("jj").as_os_str(),
     );
     env.add_env_var("JJ_SYNC_SSH_ARGUMENTS", arguments.as_os_str());
-    let left = init_repo(&env, "left");
-    let right = init_repo(&env, "peer ' ; $(touch escaped)");
-    describe_and_bookmark(&right, "right");
+    arguments
+}
+
+#[cfg(unix)]
+fn ssh_sync_url(peer: &TestWorkDir<'_>) -> String {
     let encoded = percent_encoding::utf8_percent_encode(
-        right.root().to_str().unwrap(),
+        peer.root().to_str().unwrap(),
         percent_encoding::NON_ALPHANUMERIC,
     )
     .to_string()
     .replace("%2F", "/");
-    let url = format!("ssh://user@example.com:2222{encoded}");
+    format!("ssh://user@example.com:2222{encoded}")
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sync_ssh_paths_are_protocol_data() {
+    let mut env = TestEnvironment::default();
+    let arguments = configure_fake_sync_ssh(&mut env);
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "peer ' ; $(touch escaped)");
+    describe_and_bookmark(&right, "right");
+    let url = ssh_sync_url(&right);
     left.run_jj(["sync", "--receive", &url]).success();
     assert!(bookmarks(&left).contains("right"));
     assert_eq!(
@@ -972,6 +1316,40 @@ fn test_sync_ssh_paths_are_protocol_data() {
         ]
     );
     assert!(!left.root().join("escaped").exists());
+}
+
+#[cfg(unix)]
+#[test_case("--send"; "send")]
+#[test_case("--bidi"; "bidirectional")]
+fn test_sync_initializes_missing_ssh_peer(direction: &str) {
+    let mut env = TestEnvironment::default();
+    let arguments = configure_fake_sync_ssh(&mut env);
+    let source = init_repo(&env, "source");
+    describe_and_bookmark(&source, "source");
+    let source_op = source.current_operation_id();
+    let receiver = env.work_dir("peer ' ; $(touch escaped)");
+    let url = ssh_sync_url(&receiver);
+    source.run_jj(["sync", direction, &url]).success();
+    assert!(receiver.root().join(".git").is_dir());
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
+    assert_imported_history(&source, &receiver, &source_op);
+    assert!(!receiver.root().join("source.txt").exists());
+    assert_eq!(
+        fs::read_to_string(arguments)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "-T",
+            "-p",
+            "2222",
+            "--",
+            "user@example.com",
+            "jj util sync-server"
+        ]
+    );
+    assert!(!source.root().join("escaped").exists());
+    assert!(!env.env_root().join("escaped").exists());
 }
 
 #[test]

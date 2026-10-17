@@ -68,6 +68,8 @@ const CAPABILITIES: [&str; 4] = [
     "streaming-objects-v1",
     "local-workspaces-v1",
 ];
+const INITIALIZE_RECEIVER_CAPABILITY: &str = "initialize-receiver-v1";
+const NEGOTIATE_OBJECT_HASH: &str = "auto";
 const INVENTORY_BATCH_SIZE: usize = 512;
 const MAX_INVENTORY_BATCH_BYTES: usize = INVENTORY_BATCH_SIZE * 192;
 // Phase controls contain captured roots or publication acknowledgments. Object
@@ -628,7 +630,7 @@ async fn retire_interrupted_publications(
     Ok(())
 }
 
-/// Runs the public command against an existing filesystem or SSH endpoint.
+/// Runs the public command against a filesystem or SSH endpoint.
 pub(crate) async fn synchronize(
     ui: &Ui,
     command: &CommandHelper,
@@ -636,27 +638,70 @@ pub(crate) async fn synchronize(
     direction: Direction,
 ) -> Result<(), CommandError> {
     check_command_options(command)?;
-    let local_root = command.workspace_loader()?.workspace_root().to_owned();
+    let local_root = match command.workspace_loader() {
+        Ok(loader) => loader.workspace_root().to_owned(),
+        Err(err) => {
+            let root = command
+                .global_args()
+                .repository
+                .as_ref()
+                .map_or_else(|| command.cwd().to_owned(), |path| command.cwd().join(path));
+            if direction == Direction::Send || !workspace_is_missing(&root)? {
+                return Err(err);
+            }
+            root
+        }
+    };
     let ignore = command.global_args().ignore_working_copy;
-    let profile = command.load_workspace_for_sync_profile(ui, &local_root)?;
+    let local_missing = workspace_is_missing(&local_root)?;
+    if local_missing && direction == Direction::Send {
+        return Err(user_error(
+            "Synchronization source repository does not exist",
+        ));
+    }
+    let profile = (!local_missing)
+        .then(|| command.load_workspace_for_sync_profile(ui, &local_root))
+        .transpose()?;
     if let sync_transport::Endpoint::Local(path) = peer {
-        let peer_profile = command.load_workspace_for_sync_profile(ui, path)?;
-        if dunce::canonicalize(profile.repo_path())?
-            == dunce::canonicalize(peer_profile.repo_path())?
-        {
-            return Err(user_error(
-                "Cannot synchronize a repository with its own shared store",
-            ));
+        if !workspace_is_missing(path)? {
+            let peer_profile = command.load_workspace_for_sync_profile(ui, path)?;
+            if let Some(profile) = &profile
+                && dunce::canonicalize(profile.repo_path())?
+                    == dunce::canonicalize(peer_profile.repo_path())?
+            {
+                return Err(user_error(
+                    "Cannot synchronize a repository with its own shared store",
+                ));
+            }
         }
     }
-    let hello = profile_hello(&profile, direction, peer.repository_path(), ignore)?;
+    let mut hello = match &profile {
+        Some(profile) => profile_hello(profile, direction, peer.repository_path(), ignore)?,
+        None => {
+            let mut hello = format_hello(
+                direction,
+                peer.repository_path(),
+                ignore,
+                NEGOTIATE_OBJECT_HASH,
+            );
+            hello
+                .required_capabilities
+                .push(INITIALIZE_RECEIVER_CAPABILITY.to_owned());
+            hello
+        }
+    };
     drop(profile);
     let mut transport = Transport::connect(peer).map_err(failed)?;
     transport
         .send(&Message::Hello(hello.clone()))
         .map_err(failed)?;
     match transport.receive().map_err(failed)? {
-        Message::HelloReply(reply) => hello.validate_peer(&reply).map_err(failed)?,
+        Message::HelloReply(reply) => {
+            if local_missing {
+                hello.object_hash.clone_from(&reply.object_hash);
+            }
+            hello.validate_peer(&reply).map_err(failed)?;
+        }
         Message::Error(error) => {
             return Err(user_error(format!("Peer synchronization failed: {error}")));
         }
@@ -665,6 +710,10 @@ pub(crate) async fn synchronize(
                 "Peer did not negotiate a synchronization session",
             ));
         }
+    }
+    if local_missing {
+        let object_hash = parse_object_hash(&hello.object_hash)?;
+        crate::commands::init_colocated_for_sync(ui, command, &local_root, object_hash).await?;
     }
     let mut local = PreparedEndpoint::open(ui, command, &local_root, ignore).await?;
     hello
@@ -767,6 +816,23 @@ async fn serve_session(
         return Err(user_error("Expected synchronization negotiation"));
     };
     let path = sync_transport::decode_repository_path(&request.repository_path).map_err(failed)?;
+    let negotiate_hash = request.object_hash == NEGOTIATE_OBJECT_HASH;
+    if negotiate_hash
+        && (request.direction == Direction::Send
+            || !request
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == INITIALIZE_RECEIVER_CAPABILITY))
+    {
+        return Err(user_error(
+            "Only a missing receiver can negotiate its object hash",
+        ));
+    }
+    if workspace_is_missing(&path)? {
+        // Validate formats and capabilities before creating any destination data.
+        let object_hash = validate_receiver_request(&request)?;
+        crate::commands::init_colocated_for_sync(ui, command, &path, object_hash).await?;
+    }
     let profile = command.load_workspace_for_sync_profile(ui, &path)?;
     let reply = profile_hello(
         &profile,
@@ -775,7 +841,13 @@ async fn serve_session(
         request.ignore_working_copy,
     )?;
     drop(profile);
-    reply.validate_peer(&request).map_err(failed)?;
+    if negotiate_hash {
+        let mut negotiated = request.clone();
+        negotiated.object_hash.clone_from(&reply.object_hash);
+        reply.validate_peer(&negotiated).map_err(failed)?;
+    } else {
+        reply.validate_peer(&request).map_err(failed)?;
+    }
     stream.send(&Message::HelloReply(reply.clone()))?;
     let mut local = PreparedEndpoint::open(ui, command, &path, request.ignore_working_copy).await?;
     reply
@@ -878,7 +950,11 @@ fn profile_hello(
             ));
         }
     };
-    Ok(Hello {
+    Ok(format_hello(direction, path, ignore, hash))
+}
+
+fn format_hello(direction: Direction, path: Vec<u8>, ignore: bool, hash: &str) -> Hello {
+    Hello {
         version: PROTOCOL_VERSION,
         direction,
         repository_path: path,
@@ -886,9 +962,55 @@ fn profile_hello(
         backend: "git".to_owned(),
         object_hash: hash.to_owned(),
         operation_store: "simple-op-v1".to_owned(),
-        capabilities: CAPABILITIES.iter().map(|name| (*name).to_owned()).collect(),
+        capabilities: CAPABILITIES
+            .iter()
+            .copied()
+            .chain([INITIALIZE_RECEIVER_CAPABILITY])
+            .map(str::to_owned)
+            .collect(),
         required_capabilities: CAPABILITIES.iter().map(|name| (*name).to_owned()).collect(),
-    })
+    }
+}
+
+/// An invalid marker is an existing broken repository, never an init request.
+fn workspace_is_missing(path: &Path) -> Result<bool, CommandError> {
+    match std::fs::symlink_metadata(path.join(".jj")) {
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(user_error_with_message(
+            format!(
+                "Failed to inspect synchronization endpoint {}",
+                path.display()
+            ),
+            err,
+        )),
+    }
+}
+
+fn validate_receiver_request(request: &Hello) -> Result<gix::hash::Kind, CommandError> {
+    if request.direction == Direction::Receive || request.object_hash == NEGOTIATE_OBJECT_HASH {
+        return Err(user_error(
+            "Synchronization source repository does not exist",
+        ));
+    }
+    let expected = format_hello(
+        request.direction,
+        Vec::new(),
+        request.ignore_working_copy,
+        &request.object_hash,
+    );
+    expected.validate_peer(request).map_err(failed)?;
+    parse_object_hash(&request.object_hash)
+}
+
+fn parse_object_hash(hash: &str) -> Result<gix::hash::Kind, CommandError> {
+    match hash {
+        "sha1" => Ok(gix::hash::Kind::Sha1),
+        "sha256" => Ok(gix::hash::Kind::Sha256),
+        _ => Err(user_error(
+            "Unsupported Git object hash for synchronization",
+        )),
+    }
 }
 
 fn send_inventory(stream: &mut impl Stream, inventory: &Inventory) -> Result<(), CommandError> {
@@ -1064,6 +1186,43 @@ fn command_error_message(error: &CommandError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_receiver_rejects_incompatible_negotiation_before_initialization() {
+        let valid = format_hello(Direction::Send, b"/missing".to_vec(), false, "sha1");
+        assert_eq!(
+            validate_receiver_request(&valid).unwrap(),
+            gix::hash::Kind::Sha1
+        );
+        let sha256 = Hello {
+            object_hash: "sha256".to_owned(),
+            ..valid.clone()
+        };
+        assert_eq!(
+            validate_receiver_request(&sha256).unwrap(),
+            gix::hash::Kind::Sha256
+        );
+        for field in 0..8 {
+            let mut request = valid.clone();
+            match field {
+                0 => request.version += 1,
+                1 => request.backend = "other".to_owned(),
+                2 => request.operation_store = "other".to_owned(),
+                3 => request.object_hash = "sha512".to_owned(),
+                4 => request
+                    .required_capabilities
+                    .push("unknown-required".to_owned()),
+                5 => request.capabilities.clear(),
+                6 => request.direction = Direction::Receive,
+                7 => request.object_hash = NEGOTIATE_OBJECT_HASH.to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_receiver_request(&request).is_err(),
+                "accepted field {field}"
+            );
+        }
+    }
 
     #[test]
     fn incoming_ids_are_full_lowercase_and_typed() {

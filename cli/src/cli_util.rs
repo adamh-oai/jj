@@ -380,6 +380,16 @@ impl CommandHelper {
         self.settings_for_workspace_paths(ui, workspace_root, &repo_path, None)
     }
 
+    /// Resolves receiver-local configuration before creating a sync destination.
+    pub(crate) fn settings_for_new_sync_workspace(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+    ) -> Result<(UserSettings, ConfigEnv), CommandError> {
+        let repo_path = workspace_root.join(".jj").join("repo");
+        self.settings_for_workspace_paths(ui, workspace_root, &repo_path, Some("sync"))
+    }
+
     fn settings_for_workspace_paths(
         &self,
         ui: &Ui,
@@ -4935,16 +4945,31 @@ impl<'a> CliRunner<'a> {
             // TODO: maybe path should be canonicalized by WorkspaceLoader?
             let abs_path = cwd.join(path);
             let abs_path = dunce::canonicalize(&abs_path).unwrap_or(abs_path);
-            // Invalid -R path is an error. No need to proceed.
-            let loader = self
-                .workspace_loader_factory
-                .create(&abs_path)
-                .map_err(|err| map_workspace_load_error(err, Some(path)))?;
-            config_env.reset_repo_path(loader.repo_path());
-            config_env.reload_repo_config(ui, &mut raw_config)?;
-            config_env.reset_workspace_path(loader.workspace_root());
-            config_env.reload_workspace_config(ui, &mut raw_config)?;
-            Ok(loader)
+            match self.workspace_loader_factory.create(&abs_path) {
+                Ok(loader) => {
+                    config_env.reset_repo_path(loader.repo_path());
+                    config_env.reload_repo_config(ui, &mut raw_config)?;
+                    config_env.reset_workspace_path(loader.workspace_root());
+                    config_env.reload_workspace_config(ui, &mut raw_config)?;
+                    Ok(loader)
+                }
+                Err(err @ WorkspaceLoadError::NoWorkspaceHere(_))
+                    if matches.subcommand().is_some_and(|(name, args)| {
+                        name == "sync" && (args.get_flag("receive") || args.get_flag("bidi"))
+                    }) && std::fs::symlink_metadata(abs_path.join(".jj"))
+                        .is_err_and(|err| err.kind() == io::ErrorKind::NotFound) =>
+                {
+                    // Receive can create its missing destination after negotiating
+                    // the source format. Retain the load error for other users,
+                    // while resolving conditional config for this destination.
+                    config_env.reset_repo_path(&abs_path.join(".jj/repo"));
+                    config_env.reload_repo_config(ui, &mut raw_config)?;
+                    config_env.reset_workspace_path(&abs_path);
+                    config_env.reload_workspace_config(ui, &mut raw_config)?;
+                    Err(map_workspace_load_error(err, Some(path)))
+                }
+                Err(err) => return Err(map_workspace_load_error(err, Some(path))),
+            }
         } else {
             maybe_cwd_workspace_loader
         };

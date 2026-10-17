@@ -25,9 +25,14 @@ use crate::ui::Ui;
 
 /// Exchange repository data and operation history with another jj repository
 ///
-/// The peer is an existing workspace path or an SSH URL such as
-/// ssh://user@host/path/to/repository. Select exactly one direction. Both
-/// endpoints snapshot their selected working copies by default; use
+/// The peer is a workspace path or an SSH URL such as
+/// ssh://user@host/path/to/repository. A missing destination is initialized as
+/// a colocated Git repository before synchronization. To receive into a new
+/// local destination, select it with -R; this also works with --bidi. At least
+/// one endpoint must already contain a repository.
+///
+/// Select exactly one direction. Both endpoints snapshot their selected
+/// working copies by default; use
 /// --ignore-working-copy to skip snapshots and checkout updates at both ends.
 /// Workspace names, checkout pointers, and local Git observations stay local.
 ///
@@ -46,7 +51,7 @@ pub(crate) struct SyncArgs {
     /// Exchange histories and apply one shared captured result at both ends
     #[arg(long)]
     bidi: bool,
-    /// Existing peer workspace path or ssh://[user@]host[:port]/path
+    /// Peer workspace path or ssh://[user@]host[:port]/path
     #[arg(value_name = "PEER", value_hint = clap::ValueHint::DirPath, allow_hyphen_values = true)]
     peer: OsString,
 }

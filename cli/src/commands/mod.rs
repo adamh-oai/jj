@@ -77,6 +77,8 @@ use clap::builder::styling::AnsiColor;
 use clap_complete::engine::SubcommandCandidates;
 use tracing::instrument;
 
+#[cfg(feature = "git")]
+pub(crate) use self::git::init_colocated_for_sync;
 use crate::cli_util::Args;
 use crate::cli_util::CommandHelper;
 use crate::command_error::CommandError;

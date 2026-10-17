@@ -28,6 +28,39 @@ The remote machine needs a compatible `jj` executable on its command search
 path. Local paths and SSH use the same synchronization protocol. Quote paths
 containing spaces as you would for other shell commands.
 
+## Creating a destination
+
+Sending to a path without a Jujutsu repository initializes a colocated
+Git-backed repository there, then synchronizes normally. This works for local
+paths and SSH destinations, with both `--send` and `--bidi`:
+
+```shell
+jj sync --send ../new-repository
+jj sync --bidi 'ssh://user@example.com/home/user/new-repository'
+```
+
+To receive or sync bidirectionally into a new local destination, select it with
+`-R`, or run from the destination directory outside any existing Jujutsu
+workspace:
+
+```shell
+jj -R ../new-repository sync --receive ../source-repository
+```
+
+Initialization follows `jj git init --colocate`, even when `git.colocate` is
+disabled. The destination's parent directory must already exist. New Git
+storage uses the source's object hash algorithm. Existing files are preserved
+and participate in the usual working-copy snapshot unless
+`--ignore-working-copy` is given. Existing repositories are opened normally;
+an unreadable or broken `.jj` is an error. A missing source is also an error
+and is never initialized automatically. At least one endpoint must already
+contain a repository.
+
+The destination has its own initialized workspace; synchronization does not
+check out the source's `@`. If a transfer fails after initialization, the new
+repository remains available for retry. Undoing the integration restores its
+previous view, rather than deleting the initialized repository.
+
 ## Shared history and local workspaces
 
 Synchronization reconciles visible commit heads, bookmarks, tags, and remote
