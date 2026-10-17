@@ -82,6 +82,7 @@ use crate::revset::RevsetEvaluationError;
 use crate::revset::RevsetExpression;
 use crate::revset::RevsetStreamExt as _;
 use crate::settings::UserSettings;
+use crate::simple_op_store::SimpleOpStore;
 use crate::store::Store;
 use crate::str_util::StringExpression;
 use crate::str_util::StringMatcher;
@@ -602,6 +603,53 @@ pub async fn import_refs(
     import_some_refs(mut_repo, options, |_, _| true).await
 }
 
+/// Records this repository's current fetched remote-tag observations.
+///
+/// Enabling sync must call this once before applying an incoming shared view.
+/// Ordinary repositories use the shared remote-tag target as their observation,
+/// so older views have no separate baseline for the reserved Git namespace.
+/// This changes only receiver-local Git observations, without importing commits
+/// or changing local or remote tags. Calling it after shared state has been
+/// applied could hide a genuine Git update from the next scoped fetch.
+pub fn record_remote_tag_observations(mut_repo: &mut MutableRepo) -> Result<(), GitImportError> {
+    let git_repo = get_git_repo(mut_repo.store())?;
+    let references = git_repo.references().map_err(GitImportError::from_git)?;
+    let mut observations = Vec::new();
+    for git_ref in references
+        .prefixed(REMOTE_TAG_REF_NAMESPACE)
+        .map_err(GitImportError::from_git)?
+    {
+        let git_ref = git_ref.map_err(GitImportError::from_git)?;
+        let Ok(full_name) = str::from_utf8(git_ref.name().as_bstr()) else {
+            continue;
+        };
+        let full_name = GitRefName::new(full_name);
+        if parse_remote_tag_ref(full_name).is_none() {
+            continue;
+        }
+        if let Some(id) = resolve_git_ref_to_commit_id(&git_ref, None) {
+            observations.push((
+                full_name.to_owned(),
+                RefTarget::normal(CommitId::from_bytes(id.as_bytes())),
+            ));
+        }
+    }
+    let previous_observations = mut_repo
+        .view()
+        .git_refs()
+        .keys()
+        .filter(|name| parse_remote_tag_ref(name).is_some())
+        .cloned()
+        .collect_vec();
+    for name in previous_observations {
+        mut_repo.set_git_ref_target(&name, RefTarget::absent());
+    }
+    for (name, target) in observations {
+        mut_repo.set_git_ref_target(&name, target);
+    }
+    Ok(())
+}
+
 /// Reflect changes made in the underlying Git repo in the Jujutsu repo.
 ///
 /// Only bookmarks and tags whose remote symbol pass the filter will be
@@ -622,8 +670,14 @@ pub async fn import_some_refs(
 
     // Exclude real remote tags, which should never be updated by Git.
     let all_remote_tags = false;
-    let refs_to_import =
-        diff_refs_to_import(mut_repo.view(), &git_repo, all_remote_tags, git_ref_filter)?;
+    let only_changed_git_refs = mut_repo.op_store().name() == SimpleOpStore::SYNC_NAME;
+    let refs_to_import = diff_refs_to_import(
+        mut_repo.view(),
+        &git_repo,
+        all_remote_tags,
+        only_changed_git_refs,
+        git_ref_filter,
+    )?;
     import_refs_inner(mut_repo, refs_to_import, options).await
 }
 
@@ -905,6 +959,7 @@ fn diff_refs_to_import(
     view: &View,
     git_repo: &gix::Repository,
     all_remote_tags: bool,
+    only_changed_git_refs: bool,
     git_ref_filter: impl Fn(GitRefKind, RemoteRefSymbol<'_>) -> bool,
 ) -> Result<RefsToImport, GitImportError> {
     let mut known_git_refs = view
@@ -912,8 +967,18 @@ fn diff_refs_to_import(
         .iter()
         .filter_map(|(full_name, target)| {
             // TODO: or clean up invalid ref in case it was stored due to historical bug?
-            let (kind, symbol) =
-                parse_git_ref(full_name).expect("stored git ref should be parsable");
+            let (kind, symbol) = if let Some(parsed) = parse_git_ref(full_name) {
+                parsed
+            } else if let Some(parsed) = parse_remote_tag_ref(full_name) {
+                // Remote-tag observations are local to a sync-enabled repo.
+                // Automatic imports must leave them for a scoped fetch.
+                if !all_remote_tags || !only_changed_git_refs {
+                    return None;
+                }
+                parsed
+            } else {
+                panic!("stored git ref should be parsable");
+            };
             git_ref_filter(kind, symbol).then_some((full_name.as_ref(), target))
         })
         .collect();
@@ -944,30 +1009,32 @@ fn diff_refs_to_import(
     let mut changed_remote_bookmarks = Vec::new();
     let mut changed_remote_tags = Vec::new();
     let mut failed_ref_names = Vec::new();
+    let mut observations = GitRefImportObservations {
+        known: &mut known_git_refs,
+        changed: &mut changed_git_refs,
+        only_changed: only_changed_git_refs,
+    };
     let actual = git_repo.references().map_err(GitImportError::from_git)?;
     collect_changed_refs_to_import(
         actual.local_branches().map_err(GitImportError::from_git)?,
-        &mut known_git_refs,
+        &mut observations,
         &mut known_remote_bookmarks,
-        &mut changed_git_refs,
         &mut changed_remote_bookmarks,
         &mut failed_ref_names,
         &git_ref_filter,
     )?;
     collect_changed_refs_to_import(
         actual.remote_branches().map_err(GitImportError::from_git)?,
-        &mut known_git_refs,
+        &mut observations,
         &mut known_remote_bookmarks,
-        &mut changed_git_refs,
         &mut changed_remote_bookmarks,
         &mut failed_ref_names,
         &git_ref_filter,
     )?;
     collect_changed_refs_to_import(
         actual.tags().map_err(GitImportError::from_git)?,
-        &mut known_git_refs,
+        &mut observations,
         &mut known_remote_tags,
-        &mut changed_git_refs,
         &mut changed_remote_tags,
         &mut failed_ref_names,
         &git_ref_filter,
@@ -977,17 +1044,21 @@ fn diff_refs_to_import(
             actual
                 .prefixed(REMOTE_TAG_REF_NAMESPACE)
                 .map_err(GitImportError::from_git)?,
+            &mut observations,
             &mut known_remote_tags,
             &mut changed_remote_tags,
             &mut failed_ref_names,
             &git_ref_filter,
         )?;
     }
-    for full_name in known_git_refs.into_keys() {
-        changed_git_refs.push((full_name.to_owned(), RefTarget::absent()));
+    let deleted_git_refs: HashSet<_> = known_git_refs.into_keys().collect();
+    for full_name in &deleted_git_refs {
+        changed_git_refs.push(((*full_name).to_owned(), RefTarget::absent()));
     }
     for (RemoteRefKey(symbol), old) in known_remote_bookmarks {
-        if old.is_present() {
+        let git_ref_deleted = to_git_ref_name(GitRefKind::Bookmark, symbol)
+            .is_some_and(|name| deleted_git_refs.contains::<GitRefName>(name.as_ref()));
+        if old.is_present() && (!only_changed_git_refs || git_ref_deleted) {
             changed_remote_bookmarks.push(GitImportRefUpdate::new(
                 symbol.to_owned(),
                 old.clone(),
@@ -996,7 +1067,9 @@ fn diff_refs_to_import(
         }
     }
     for (RemoteRefKey(symbol), old) in known_remote_tags {
-        if old.is_present() {
+        let full_name = to_git_or_remote_tag_ref_name(symbol);
+        let git_ref_deleted = deleted_git_refs.contains::<GitRefName>(full_name.as_ref());
+        if old.is_present() && (!only_changed_git_refs || git_ref_deleted) {
             changed_remote_tags.push(GitImportRefUpdate::new(
                 symbol.to_owned(),
                 old.clone(),
@@ -1019,11 +1092,17 @@ fn diff_refs_to_import(
     })
 }
 
+/// Local physical Git observations, distinct from the shared remote targets.
+struct GitRefImportObservations<'a, 'view> {
+    known: &'a mut HashMap<&'view GitRefName, &'view RefTarget>,
+    changed: &'a mut Vec<(GitRefNameBuf, RefTarget)>,
+    only_changed: bool,
+}
+
 fn collect_changed_refs_to_import(
     actual_git_refs: gix::reference::iter::Iter,
-    known_git_refs: &mut HashMap<&GitRefName, &RefTarget>,
+    observations: &mut GitRefImportObservations<'_, '_>,
     known_remote_refs: &mut HashMap<RemoteRefKey<'_>, &RemoteRef>,
-    changed_git_refs: &mut Vec<(GitRefNameBuf, RefTarget)>,
     changed_remote_refs: &mut Vec<GitImportRefUpdate>,
     failed_ref_names: &mut Vec<BString>,
     git_ref_filter: impl Fn(GitRefKind, RemoteRefSymbol<'_>) -> bool,
@@ -1048,23 +1127,28 @@ fn collect_changed_refs_to_import(
         if !git_ref_filter(kind, symbol) {
             continue;
         }
-        let old_git_target = known_git_refs.get(full_name).copied().flatten();
+        let old_git_target = observations.known.get(full_name).copied().flatten();
         let old_git_oid = old_git_target.as_normal().map(oid_from_commit_id);
         let Some(oid) = resolve_git_ref_to_commit_id(&git_ref, old_git_oid) else {
             // Skip (or remove existing) invalid refs.
             continue;
         };
         let new_target = RefTarget::normal(CommitId::from_bytes(oid.as_bytes()));
-        known_git_refs.remove(full_name);
-        if new_target != *old_git_target {
-            changed_git_refs.push((full_name.to_owned(), new_target.clone()));
+        observations.known.remove(full_name);
+        let git_ref_changed = new_target != *old_git_target;
+        if git_ref_changed {
+            observations
+                .changed
+                .push((full_name.to_owned(), new_target.clone()));
         }
         // TODO: Make it configurable which remotes are publishing and update public
         // heads here.
         let old_remote_ref = known_remote_refs
             .remove(&symbol)
             .unwrap_or(&ABSENT_REMOTE_REF);
-        if new_target != old_remote_ref.target {
+        // Synchronized remote targets may differ from this machine's Git
+        // observations. Only a new physical change can replace those targets.
+        if (!observations.only_changed || git_ref_changed) && new_target != old_remote_ref.target {
             changed_remote_refs.push(GitImportRefUpdate::new(
                 symbol.to_owned(),
                 old_remote_ref.clone(),
@@ -1075,10 +1159,12 @@ fn collect_changed_refs_to_import(
     Ok(())
 }
 
-/// Similar to [`collect_changed_refs_to_import()`], but doesn't track Git ref
-/// changes. Remote tags should be managed solely by jj.
+/// Similar to [`collect_changed_refs_to_import()`], but scans the reserved
+/// namespace for fetched remote tags. Sync repos record local observations;
+/// other repos use the remote target itself as their previous observation.
 fn collect_changed_remote_tags_to_import(
     actual_git_refs: gix::reference::iter::Iter,
+    observations: &mut GitRefImportObservations<'_, '_>,
     known_remote_refs: &mut HashMap<RemoteRefKey<'_>, &RemoteRef>,
     changed_remote_refs: &mut Vec<GitImportRefUpdate>,
     failed_ref_names: &mut Vec<BString>,
@@ -1104,14 +1190,28 @@ fn collect_changed_remote_tags_to_import(
             .get(&symbol)
             .copied()
             .unwrap_or(&ABSENT_REMOTE_REF);
-        let old_git_oid = old_remote_ref.target.as_normal().map(oid_from_commit_id);
+        let old_git_target = if observations.only_changed {
+            observations.known.get(full_name).copied().flatten()
+        } else {
+            &old_remote_ref.target
+        };
+        let old_git_oid = old_git_target.as_normal().map(oid_from_commit_id);
         let Some(oid) = resolve_git_ref_to_commit_id(&git_ref, old_git_oid) else {
             // Skip (or remove existing) invalid refs.
             continue;
         };
         let new_target = RefTarget::normal(CommitId::from_bytes(oid.as_bytes()));
         known_remote_refs.remove(&symbol);
-        if new_target != old_remote_ref.target {
+        let git_ref_changed = new_target != *old_git_target;
+        if observations.only_changed {
+            observations.known.remove(full_name);
+            if git_ref_changed {
+                observations
+                    .changed
+                    .push((full_name.to_owned(), new_target.clone()));
+            }
+        }
+        if (!observations.only_changed || git_ref_changed) && new_target != old_remote_ref.target {
             changed_remote_refs.push(GitImportRefUpdate::new(
                 symbol.to_owned(),
                 old_remote_ref.clone(),
@@ -1569,10 +1669,15 @@ fn diff_refs_to_export(
     let known_git_refs = view
         .git_refs()
         .iter()
-        .map(|(full_name, target)| {
+        .filter_map(|(full_name, target)| {
+            // These receiver-local fetch observations must never be exported
+            // as local tags or interpreted as a requested remote deletion.
+            if parse_remote_tag_ref(full_name).is_some() {
+                return None;
+            }
             let (kind, symbol) =
                 parse_git_ref(full_name).expect("stored git ref should be parsable");
-            ((kind, symbol), target)
+            Some(((kind, symbol), target))
         })
         // There are two situations where remote refs get out of sync:
         // 1. `jj bookmark forget --include-remotes`
@@ -2690,11 +2795,12 @@ fn remove_remote_refs(mut_repo: &mut MutableRepo, remote: &RemoteName) {
         "{REMOTE_BOOKMARK_REF_NAMESPACE}{remote}/",
         remote = remote.as_str()
     );
+    let tag_prefix = format!("{REMOTE_TAG_REF_NAMESPACE}{}/", remote.as_str());
     let git_refs_to_delete = mut_repo
         .view()
         .git_refs()
         .keys()
-        .filter(|&r| r.as_str().starts_with(&prefix))
+        .filter(|&r| r.as_str().starts_with(&prefix) || r.as_str().starts_with(&tag_prefix))
         .cloned()
         .collect_vec();
     for git_ref in git_refs_to_delete {
@@ -2860,14 +2966,21 @@ fn rename_remote_refs(
         "{REMOTE_BOOKMARK_REF_NAMESPACE}{remote}/",
         remote = old_remote_name.as_str()
     );
+    let tag_prefix = format!("{REMOTE_TAG_REF_NAMESPACE}{}/", old_remote_name.as_str());
     let git_refs = mut_repo
         .view()
         .git_refs()
         .iter()
         .filter_map(|(old, target)| {
-            old.as_str().strip_prefix(&prefix).map(|p| {
+            let (namespace, suffix) = if let Some(suffix) = old.as_str().strip_prefix(&prefix) {
+                (REMOTE_BOOKMARK_REF_NAMESPACE, suffix)
+            } else {
+                let suffix = old.as_str().strip_prefix(&tag_prefix)?;
+                (REMOTE_TAG_REF_NAMESPACE, suffix)
+            };
+            Some({
                 let new: GitRefNameBuf = format!(
-                    "{REMOTE_BOOKMARK_REF_NAMESPACE}{remote}/{p}",
+                    "{namespace}{remote}/{suffix}",
                     remote = new_remote_name.as_str()
                 )
                 .into();
@@ -3362,10 +3475,12 @@ impl<'a> GitFetch<'a> {
     pub async fn import_refs(&mut self) -> Result<GitImportStats, GitImportError> {
         tracing::debug!("import_refs");
         let all_remote_tags = true;
+        let only_changed_git_refs = self.mut_repo.op_store().name() == SimpleOpStore::SYNC_NAME;
         let refs_to_import = diff_refs_to_import(
             self.mut_repo.view(),
             &self.git_repo,
             all_remote_tags,
+            only_changed_git_refs,
             |kind, symbol| match kind {
                 GitRefKind::Bookmark => self
                     .fetched

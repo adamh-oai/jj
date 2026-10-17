@@ -119,6 +119,9 @@ impl GitSubprocessContext {
             // In a colocated workspace, the daemon will still get started the first
             // time a `git` command is run manually if the gitconfigs are set up that way.
             .args(["-c", "core.fsmonitor=false"])
+            // Disabling fsmonitor must not let an optional index refresh strip
+            // a colocated workspace's existing FSMN extension.
+            .env("GIT_OPTIONAL_LOCKS", "0")
             // Avoids an error message when fetching repos with submodules if
             // user has `submodule.recurse` configured to true in their Git
             // config (#7565).
