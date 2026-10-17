@@ -318,13 +318,11 @@ async fn cmd_workspace_add_impl(
                 // Capture Git independently of JJ's committed physical seed.
                 // A persisted Git cursor can outlive its named snapshot; the
                 // shared handoff leases a fresh cut and retains replay from it.
-                // Take this lock before acquiring the working-copy journal lock.
-                let _git_lock = FileLock::lock(
-                    old_workspace_command
-                        .repo_path()
-                        .join("git_import_export.lock"),
-                )
-                .map_err(|err| user_error(format!("Failed to lock source Git index: {err}")))?;
+                // This index belongs only to the source worktree. The open
+                // descriptor and immutable copy survive Git's atomic index
+                // replacement, while the gate keeps this worktree's JJ
+                // operations from racing the capture.
+                let _worktree_gate = old_workspace_command.lock_git_worktree_gate()?;
                 if let Some(source_git) =
                     snapshot_git_handoff_worktree(old_workspace_command.workspace_root())?
                     && let Some(index_file) = open_snapshot_git_index(&source_git.index_path())?
@@ -334,24 +332,30 @@ async fn cmd_workspace_add_impl(
                         &source_git,
                     )?
                 {
-                    let handoff = GitIndexHandoff::capture(
-                        old_workspace_command.workspace_root(),
-                        &source_git.index_path(),
-                        index_file,
-                        source_git.object_hash().len_in_bytes(),
-                    )
-                    .map_err(|err| {
-                        user_error(format!("Failed to capture source Git index: {err}"))
-                    })?;
-                    snapshot_git_index = Some(SnapshotGitIndex {
-                        handoff,
-                        git_executable: plan.git_executable.clone(),
-                        config,
-                        ignored_jj_metadata: git_ignores_jj_metadata(
-                            &plan.git_executable,
+                    match timed_snapshot_git_index_phase("capture source Git index", || {
+                        GitIndexHandoff::capture(
                             old_workspace_command.workspace_root(),
-                        )?,
-                    });
+                            &source_git.index_path(),
+                            index_file,
+                            source_git.object_hash().len_in_bytes(),
+                        )
+                    }) {
+                        Ok(handoff) => {
+                            snapshot_git_index = Some(SnapshotGitIndex {
+                                handoff,
+                                git_executable: plan.git_executable.clone(),
+                                config,
+                                ignored_jj_metadata: git_ignores_jj_metadata(
+                                    &plan.git_executable,
+                                    old_workspace_command.workspace_root(),
+                                )?,
+                            });
+                        }
+                        Err(_) => tracing::warn!(
+                            "Could not capture source Git index; building child index \
+                             conservatively"
+                        ),
+                    }
                 }
             }
             #[cfg(all(target_os = "linux", feature = "awacs"))]
@@ -768,29 +772,51 @@ async fn cmd_workspace_add_impl(
         );
     }
     #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
-    if let Some(preparation) = snapshot_preparation.as_ref()
-        && preparation.initialized_awacs_git_consumer
-        && let Some(snapshot_identity) = preparation.initialized_awacs_snapshot.as_ref()
-    {
-        // Retain both consumers' A through checkout, then publish Git's first
-        // cursor. Otherwise checkout's directory metadata changes make Git
-        // invalidate every entry below those directories on its first query.
-        seed_snapshot_git_index(
-            &new_workspace_command,
-            snapshot_source_commit
-                .as_ref()
-                .expect("snapshot workspaces always retain the source commit"),
-            &new_wc_commit,
-            snapshot_identity,
-            snapshot_source_sparse_patterns
-                .as_deref()
-                .expect("snapshot source has sparse patterns"),
-            snapshot_git_index.as_mut(),
-        )?;
-    }
-    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
     if snapshot && git_worktree_plan.is_some() {
-        ensure_snapshot_child_git_index(&new_workspace_command, &new_wc_commit).await?;
+        // Index seeding reads immutable commits and mutates only this
+        // worktree's index and AWACS lane. Keep the worktree gate and journal
+        // locked without taking the repository-wide Git lock.
+        let _worktree_gate = timed_snapshot_git_index_phase("acquire child worktree gate", || {
+            new_workspace_command.lock_git_worktree_gate()
+        })?;
+        let journal_started = Instant::now();
+        let working_copy = new_workspace_command.working_copy();
+        let locked = working_copy.start_mutation().await?;
+        tracing::info!(
+            elapsed_ms = journal_started.elapsed().as_millis() as u64,
+            "locked snapshot workspace journal for Git index seeding"
+        );
+        if locked.old_tree().tree_ids_and_labels() == new_wc_commit.tree().tree_ids_and_labels()
+            && locked.old_operation_id() == working_copy.operation_id()
+            && locked.sparse_patterns()? == working_copy.sparse_patterns()?
+        {
+            #[cfg(feature = "test-fakes")]
+            crate::cli_util::pause_for_test("JJ_TEST_SNAPSHOT_SEED_GIT_INDEX_PAUSE_DIR");
+            if let Some(preparation) = snapshot_preparation.as_ref()
+                && preparation.initialized_awacs_git_consumer
+                && let Some(snapshot_identity) = preparation.initialized_awacs_snapshot.as_ref()
+            {
+                // Retain both consumers' A through checkout, then publish Git's first
+                // cursor. Otherwise checkout's directory metadata changes make Git
+                // invalidate every entry below those directories on its first query.
+                seed_snapshot_git_index(
+                    &new_workspace_command,
+                    snapshot_source_commit
+                        .as_ref()
+                        .expect("snapshot workspaces always retain the source commit"),
+                    &new_wc_commit,
+                    snapshot_identity,
+                    snapshot_source_sparse_patterns
+                        .as_deref()
+                        .expect("snapshot source has sparse patterns"),
+                    snapshot_git_index.as_mut(),
+                )?;
+            }
+            ensure_snapshot_child_git_index(&new_workspace_command, &new_wc_commit).await?;
+        } else {
+            tracing::info!("snapshot workspace changed before Git index seeding; skipping");
+        }
+        drop(locked);
     }
     drop(lifecycle_lock);
     Ok(())
@@ -985,6 +1011,23 @@ fn initialize_snapshot_awacs_root(
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+fn timed_snapshot_git_index_phase<T, E>(
+    phase: &'static str,
+    run: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    tracing::info!(phase, "snapshot Git index phase started");
+    let started = Instant::now();
+    let result = run();
+    tracing::info!(
+        phase,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        success = result.is_ok(),
+        "snapshot Git index phase completed"
+    );
+    result
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
 fn seed_snapshot_git_index(
     workspace_command: &crate::cli_util::WorkspaceCommandHelper,
     source_commit: &jj_lib::commit::Commit,
@@ -1010,19 +1053,14 @@ fn seed_snapshot_git_index(
     let Some(git_repo) = snapshot_git_handoff_worktree(root)? else {
         return Ok(());
     };
-    let lock_path = workspace_command.repo_path().join("git_import_export.lock");
-    let _git_lock = FileLock::lock(lock_path.clone()).map_err(|err| {
-        user_error(format!(
-            "Failed to take lock for Git import/export at {}: {err}",
-            lock_path.display()
-        ))
-    })?;
     if let Some(inherited) = inherited
         && source_tree.tree_ids() == final_commit.tree().tree_ids()
         && source_sparse_patterns == [jj_lib::repo_path::RepoPathBuf::root()]
         && workspace_command.working_copy().sparse_patterns()?
             == [jj_lib::repo_path::RepoPathBuf::root()]
-        && reuse_snapshot_git_index(inherited, &git_repo, root, tree_id, snapshot_identity)?
+        && timed_snapshot_git_index_phase("reuse inherited Git index", || {
+            reuse_snapshot_git_index(inherited, &git_repo, root, tree_id, snapshot_identity)
+        })?
     {
         return Ok(());
     }
@@ -1048,47 +1086,58 @@ fn seed_snapshot_git_index(
                 .map_err(|err| user_error(format!("Failed to seed snapshot Git index: {err}")))
         }
     };
-    let source_index = index_from_tree(tree_id)?;
-    let (index, previous_index) = match open_snapshot_git_index(&git_repo.index_path())? {
-        Some(file) => {
-            let Some((index, bytes)) =
-                read_snapshot_git_index(file, &git_repo.index_path(), git_repo.object_hash())?
-            else {
-                return Ok(());
-            };
-            (index, Some(bytes))
-        }
-        None if git_repo
-            .index_path()
-            .symlink_metadata()
-            .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            // If the requested revision already matches the source, JJ can
-            // skip Git checkout entirely. The no-checkout worktree then has
-            // no index; the new empty working-copy commit is its parent tree.
-            let final_tree = final_commit.tree();
-            let Some(tree_id) = final_tree.tree_ids().as_resolved() else {
-                return Ok(());
-            };
-            let index = if tree_id == workspace_command.repo().store().empty_tree_id() {
-                index_from_tree(tree_id)?
-            } else {
-                jj_lib::git_index_cache::index_from_tree(
-                    &git_repo,
-                    &gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()),
-                )
-                .map_err(|err| user_error(format!("Failed to seed snapshot Git index: {err}")))?
-            };
-            (index, None)
-        }
-        None => return Ok(()),
+    let source_index =
+        timed_snapshot_git_index_phase("construct source index", || index_from_tree(tree_id))?;
+    let Some((index, previous_index)) =
+        timed_snapshot_git_index_phase("load checkout index", || -> Result<_, CommandError> {
+            match open_snapshot_git_index(&git_repo.index_path())? {
+                Some(file) => Ok(read_snapshot_git_index(
+                    file,
+                    &git_repo.index_path(),
+                    git_repo.object_hash(),
+                )?
+                .map(|(index, bytes)| (index, Some(bytes)))),
+                None if git_repo
+                    .index_path()
+                    .symlink_metadata()
+                    .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    // If the requested revision already matches the source, JJ can
+                    // skip Git checkout entirely. The no-checkout worktree then has
+                    // no index; the new empty working-copy commit is its parent tree.
+                    let final_tree = final_commit.tree();
+                    let Some(tree_id) = final_tree.tree_ids().as_resolved() else {
+                        return Ok(None);
+                    };
+                    let index = if tree_id == workspace_command.repo().store().empty_tree_id() {
+                        index_from_tree(tree_id)?
+                    } else {
+                        jj_lib::git_index_cache::index_from_tree(
+                            &git_repo,
+                            &gix::ObjectId::from_bytes_or_panic(tree_id.as_bytes()),
+                        )
+                        .map_err(|err| {
+                            user_error(format!("Failed to seed snapshot Git index: {err}"))
+                        })?
+                    };
+                    Ok(Some((index, None)))
+                }
+                None => Ok(None),
+            }
+        })?
+    else {
+        return Ok(());
     };
 
-    let mut client = DirectScanClient::for_root(root)
-        .map_err(|err| user_error(format!("Failed to open AWACS Git index baseline: {err}")))?;
-    let initial = client
-        .initial_baseline(root)
-        .map_err(|err| user_error(format!("Failed to load AWACS Git index baseline: {err}")))?;
+    let mut client = timed_snapshot_git_index_phase("open AWACS client", || {
+        DirectScanClient::for_root(root)
+            .map_err(|err| user_error(format!("Failed to open AWACS Git index baseline: {err}")))
+    })?;
+    let initial = timed_snapshot_git_index_phase("load AWACS baseline", || {
+        client
+            .initial_baseline(root)
+            .map_err(|err| user_error(format!("Failed to load AWACS Git index baseline: {err}")))
+    })?;
     if initial.identity.filesystem_uuid != snapshot_identity.fs_uuid
         || initial.identity.subvolume_uuid != snapshot_identity.subvol_uuid
         || !initial.identity.read_only
@@ -1102,89 +1151,116 @@ fn seed_snapshot_git_index(
         .as_slice()
         .try_into()
         .map_err(|_| user_error("AWACS Git index baseline has an invalid owner"))?;
-    let mut lease = client
-        .begin_scan(&BeginScanRequest {
-            live_root: root.to_owned(),
-            baseline_owner_id: owner_id,
-            previous_baseline: Some(initial),
-            allow_full_invalidation: false,
-        })
-        .map_err(|err| {
-            user_error(format!(
-                "Failed to establish AWACS Git index baseline: {err}"
-            ))
-        })?;
+    let mut lease = timed_snapshot_git_index_phase("begin AWACS scan", || {
+        client
+            .begin_scan(&BeginScanRequest {
+                live_root: root.to_owned(),
+                baseline_owner_id: owner_id,
+                previous_baseline: Some(initial),
+                allow_full_invalidation: false,
+            })
+            .map_err(|err| {
+                user_error(format!(
+                    "Failed to establish AWACS Git index baseline: {err}"
+                ))
+            })
+    })?;
     let result = (|| {
-        client.validate_scan_root(&lease).map_err(|err| {
-            user_error(format!(
-                "Failed to validate AWACS Git index baseline: {err}"
-            ))
+        timed_snapshot_git_index_phase("validate AWACS scan", || {
+            client.validate_scan_root(&lease).map_err(|err| {
+                user_error(format!(
+                    "Failed to validate AWACS Git index baseline: {err}"
+                ))
+            })
         })?;
         let changed = snapshot_git_invalidation_matcher(&lease.invalidation);
         let materialized = PrefixMatcher::new(source_sparse_patterns);
-        let mut source_entries = source_index.entries().iter().peekable();
-        let mut dirty = index
-            .entries()
-            .iter()
-            .map(|entry| {
-                let path = entry.path(&index);
-                // Both indexes are sorted. Walk them once instead of looking
-                // up each entry or reading each worktree file.
-                while source_entries
-                    .peek()
-                    .is_some_and(|source| source.path(&source_index) < path)
-                {
-                    source_entries.next();
-                }
-                let matches_source = source_entries.peek().is_some_and(|source| {
-                    source.path(&source_index) == path
-                        && source.stage() == entry.stage()
-                        && source.id == entry.id
-                        && source.mode == entry.mode
-                });
-                !matches_source
-                    || entry
-                        .flags
-                        .contains(gix::index::entry::Flags::INTENT_TO_ADD)
-                    || snapshot_git_entry_is_dirty(
-                        path,
-                        entry.mode,
-                        entry.stage(),
-                        changed.as_ref(),
-                        &materialized,
-                    )
-            })
-            .collect_vec();
+        let mut dirty = timed_snapshot_git_index_phase("compare index entries", || {
+            let mut source_entries = source_index.entries().iter().peekable();
+            let dirty = index
+                .entries()
+                .iter()
+                .map(|entry| {
+                    let path = entry.path(&index);
+                    // Both indexes are sorted. Walk them once instead of looking
+                    // up each entry or reading each worktree file.
+                    while source_entries
+                        .peek()
+                        .is_some_and(|source| source.path(&source_index) < path)
+                    {
+                        source_entries.next();
+                    }
+                    let matches_source = source_entries.peek().is_some_and(|source| {
+                        source.path(&source_index) == path
+                            && source.stage() == entry.stage()
+                            && source.id == entry.id
+                            && source.mode == entry.mode
+                    });
+                    !matches_source
+                        || entry
+                            .flags
+                            .contains(gix::index::entry::Flags::INTENT_TO_ADD)
+                        || snapshot_git_entry_is_dirty(
+                            path,
+                            entry.mode,
+                            entry.stage(),
+                            changed.as_ref(),
+                            &materialized,
+                        )
+                })
+                .collect_vec();
+            tracing::info!(
+                entry_count = dirty.len(),
+                dirty_count = dirty.iter().filter(|dirty| **dirty).count(),
+                "classified snapshot Git index entries"
+            );
+            Ok::<_, CommandError>(dirty)
+        })?;
         let token = encode_git_fsmonitor_token(&lease.next_baseline).map_err(|err| {
             user_error(format!("Failed to encode AWACS Git index baseline: {err}"))
         })?;
         // Git compares cleaned contents rather than JJ's raw blobs. Inspect
         // the final checkout's attributes before publishing any clean bits.
-        invalidate_snapshot_git_conversions_in_index(&git_repo, &index, &mut dirty)?;
-        let mut index_lock = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
-        jj_lib::git_index_cache::write_with_monitor(
-            &index,
-            &token,
-            &dirty,
-            previous_index.as_deref(),
-            &mut index_lock,
-        )
-        .map_err(|err| user_error(format!("Failed to write snapshot Git index: {err}")))?;
-        let index_lock = index_lock
-            .into_inner()
-            .map_err(|err| user_error(format!("Failed to flush snapshot Git index: {err}")))?;
-        index_lock
-            .commit()
-            .map_err(|err| user_error(format!("Failed to publish snapshot Git index: {err}")))?;
-        client
-            .observe_persisted_git_index(root, &lease.next_baseline)
-            .map_err(|err| user_error(format!("Failed to retain published Git index: {err}")))?;
-        lease.promote().map_err(|err| {
-            user_error(format!("Failed to promote AWACS Git index baseline: {err}"))
+        timed_snapshot_git_index_phase("check Git conversions", || {
+            invalidate_snapshot_git_conversions_in_index(&git_repo, &index, &mut dirty)
         })?;
-        lease
-            .finish(ScanOutcome::Committed)
-            .map_err(|err| user_error(format!("Failed to commit AWACS Git index baseline: {err}")))
+        let mut index_lock = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
+        timed_snapshot_git_index_phase("write Git index", || {
+            jj_lib::git_index_cache::write_with_monitor(
+                &index,
+                &token,
+                &dirty,
+                previous_index.as_deref(),
+                &mut index_lock,
+            )
+            .map_err(|err| user_error(format!("Failed to write snapshot Git index: {err}")))
+        })?;
+        let index_lock = timed_snapshot_git_index_phase("flush Git index", || {
+            index_lock
+                .into_inner()
+                .map_err(|err| user_error(format!("Failed to flush snapshot Git index: {err}")))
+        })?;
+        timed_snapshot_git_index_phase("publish Git index", || {
+            index_lock
+                .commit()
+                .map_err(|err| user_error(format!("Failed to publish snapshot Git index: {err}")))
+        })?;
+        timed_snapshot_git_index_phase("retain Git index cursor", || {
+            client
+                .observe_persisted_git_index(root, &lease.next_baseline)
+                .map_err(|err| user_error(format!("Failed to retain published Git index: {err}")))
+        })?;
+        timed_snapshot_git_index_phase("promote AWACS baseline", || {
+            lease.promote().map_err(|err| {
+                user_error(format!("Failed to promote AWACS Git index baseline: {err}"))
+            })
+        })?;
+        timed_snapshot_git_index_phase("finish AWACS scan", || {
+            lease.finish(ScanOutcome::Committed).map_err(|err| {
+                user_error(format!("Failed to commit AWACS Git index baseline: {err}"))
+            })
+        })?;
+        Ok(())
     })();
     if result.is_err() {
         drop(lease.finish(ScanOutcome::Aborted));
@@ -1402,24 +1478,33 @@ fn reuse_snapshot_git_index(
     use gix::index::entry::Flags;
     use gix::index::entry::Stage;
 
-    if snapshot_git_index_config(&inherited.git_executable, root, git_repo)?.as_ref()
+    if timed_snapshot_git_index_phase("inspect inherited index configuration", || {
+        snapshot_git_index_config(&inherited.git_executable, root, git_repo)
+    })?
+    .as_ref()
         != Some(&inherited.config)
     {
         return Ok(false);
     }
-    let temporary = tempfile::Builder::new()
-        .prefix("jj-index-handoff-")
-        .tempdir_in(git_repo.path())
-        .map_err(|err| user_error(format!("Failed to prepare Git index handoff: {err}")))?;
+    let temporary = timed_snapshot_git_index_phase("prepare inherited index copy", || {
+        tempfile::Builder::new()
+            .prefix("jj-index-handoff-")
+            .tempdir_in(git_repo.path())
+            .map_err(|err| user_error(format!("Failed to prepare Git index handoff: {err}")))
+    })?;
     let index_path = temporary.path().join("index");
-    inherited
-        .handoff
-        .copy_index(&index_path)
-        .map_err(user_error)?;
+    timed_snapshot_git_index_phase("copy inherited Git index", || {
+        inherited
+            .handoff
+            .copy_index(&index_path)
+            .map_err(user_error)
+    })?;
     let Some(index_file) = open_snapshot_git_index(&index_path)? else {
         return Ok(false);
     };
-    let index = match read_snapshot_git_index(index_file, &index_path, git_repo.object_hash()) {
+    let index = match timed_snapshot_git_index_phase("read inherited Git index", || {
+        read_snapshot_git_index(index_file, &index_path, git_repo.object_hash())
+    }) {
         Ok(Some((index, _))) => index,
         Ok(None) => return Ok(false),
         Err(err) => {
@@ -1432,34 +1517,46 @@ fn reuse_snapshot_git_index(
     };
     // TREE is invalidated by staged edits. A valid full root proves that this
     // index describes JJ's requested tree without reconstructing every entry.
-    if !index.tree().is_some_and(|tree| {
-        tree.name.is_empty()
-            && tree.id.as_bytes() == tree_id.as_bytes()
-            && tree.num_entries.map(|count| count as usize) == Some(index.entries().len())
-    }) || index.is_sparse()
-        || index.entries().iter().any(|entry| {
-            entry.stage() != Stage::Unconflicted
-                || entry
-                    .flags
-                    .intersects(Flags::INTENT_TO_ADD | Flags::SKIP_WORKTREE)
-        })
-    {
+    let eligible = timed_snapshot_git_index_phase("validate inherited index entries", || {
+        Ok::<_, CommandError>(
+            index.tree().is_some_and(|tree| {
+                tree.name.is_empty()
+                    && tree.id.as_bytes() == tree_id.as_bytes()
+                    && tree.num_entries.map(|count| count as usize) == Some(index.entries().len())
+            }) && !index.is_sparse()
+                && !index.entries().iter().any(|entry| {
+                    entry.stage() != Stage::Unconflicted
+                        || entry
+                            .flags
+                            .intersects(Flags::INTENT_TO_ADD | Flags::SKIP_WORKTREE)
+                }),
+        )
+    })?;
+    if !eligible {
         return Ok(false);
     }
     drop(index);
-    let ignored_jj_metadata =
-        inherited.ignored_jj_metadata && git_ignores_jj_metadata(&inherited.git_executable, root)?;
+    let ignored_jj_metadata = inherited.ignored_jj_metadata
+        && timed_snapshot_git_index_phase("check inherited metadata exclusion", || {
+            git_ignores_jj_metadata(&inherited.git_executable, root)
+        })?;
 
-    let mut index_lock = gix::lock::File::acquire_to_update_resource(
-        git_repo.index_path(),
-        gix::lock::acquire::Fail::Immediately,
-        None,
-    )
-    .map_err(|err| user_error(format!("Failed to lock snapshot Git index: {err}")))?;
-    let mut client = DirectScanClient::for_root(root).map_err(|err| user_error(err.to_string()))?;
-    let initial = client
-        .initial_baseline(root)
-        .map_err(|err| user_error(err.to_string()))?;
+    let mut index_lock = timed_snapshot_git_index_phase("lock inherited Git index", || {
+        gix::lock::File::acquire_to_update_resource(
+            git_repo.index_path(),
+            gix::lock::acquire::Fail::Immediately,
+            None,
+        )
+        .map_err(|err| user_error(format!("Failed to lock snapshot Git index: {err}")))
+    })?;
+    let mut client = timed_snapshot_git_index_phase("open inherited AWACS client", || {
+        DirectScanClient::for_root(root).map_err(|err| user_error(err.to_string()))
+    })?;
+    let initial = timed_snapshot_git_index_phase("load inherited AWACS baseline", || {
+        client
+            .initial_baseline(root)
+            .map_err(|err| user_error(err.to_string()))
+    })?;
     if initial.identity.filesystem_uuid != snapshot_identity.fs_uuid
         || initial.identity.subvolume_uuid != snapshot_identity.subvol_uuid
         || !initial.identity.read_only
@@ -1473,22 +1570,29 @@ fn reuse_snapshot_git_index(
         .as_slice()
         .try_into()
         .map_err(|_| user_error("AWACS Git index baseline has an invalid owner"))?;
-    let mut lease = client
-        .begin_scan(&BeginScanRequest {
-            live_root: root.to_owned(),
-            baseline_owner_id: owner_id,
-            previous_baseline: Some(initial),
-            allow_full_invalidation: false,
-        })
-        .map_err(|err| user_error(err.to_string()))?;
-    let result = (|| {
+    let mut lease = timed_snapshot_git_index_phase("begin inherited AWACS scan", || {
         client
-            .validate_scan_root(&lease)
-            .map_err(|err| user_error(err.to_string()))?;
-        let mut invalidation = inherited
-            .handoff
-            .reconcile(&mut client, &mut lease, root)
-            .map_err(user_error)?;
+            .begin_scan(&BeginScanRequest {
+                live_root: root.to_owned(),
+                baseline_owner_id: owner_id,
+                previous_baseline: Some(initial),
+                allow_full_invalidation: false,
+            })
+            .map_err(|err| user_error(err.to_string()))
+    })?;
+    let result = (|| {
+        timed_snapshot_git_index_phase("validate inherited AWACS scan", || {
+            client
+                .validate_scan_root(&lease)
+                .map_err(|err| user_error(err.to_string()))
+        })?;
+        let mut invalidation =
+            timed_snapshot_git_index_phase("reconcile inherited snapshots", || {
+                inherited
+                    .handoff
+                    .reconcile(&mut client, &mut lease, root)
+                    .map_err(user_error)
+            })?;
         // JJ reserves this directory, but Git can still expose it as
         // untracked. Its replacement is irrelevant to UNTR only if Git
         // excludes the directory in both worktrees.
@@ -1500,29 +1604,41 @@ fn reuse_snapshot_git_index(
             }
             _ => {}
         }
-        seed_git_fsmonitor_index(
-            &index_path,
-            root,
-            git_repo.object_hash().len_in_bytes(),
-            &lease.next_baseline,
-            &invalidation,
-        )
-        .map_err(user_error)?;
-        let source = fs::File::open(&index_path)
-            .map_err(|err| user_error(format!("Failed to open reconciled Git index: {err}")))?;
-        index_lock
-            .with_mut(|destination| clone_or_copy_index(&source, destination))
-            .map_err(|err| user_error(format!("Failed to write snapshot Git index: {err}")))?;
-        index_lock
-            .commit()
-            .map_err(|err| user_error(format!("Failed to publish snapshot Git index: {err}")))?;
-        client
-            .observe_persisted_git_index(root, &lease.next_baseline)
-            .map_err(|err| user_error(format!("Failed to retain published Git index: {err}")))?;
-        lease.promote().map_err(|err| user_error(err.to_string()))?;
-        lease
-            .finish(ScanOutcome::Committed)
-            .map_err(|err| user_error(err.to_string()))?;
+        timed_snapshot_git_index_phase("seed inherited Git invalidations", || {
+            seed_git_fsmonitor_index(
+                &index_path,
+                root,
+                git_repo.object_hash().len_in_bytes(),
+                &lease.next_baseline,
+                &invalidation,
+            )
+            .map_err(user_error)
+        })?;
+        timed_snapshot_git_index_phase("write inherited Git index", || {
+            let source = fs::File::open(&index_path)
+                .map_err(|err| user_error(format!("Failed to open reconciled Git index: {err}")))?;
+            index_lock
+                .with_mut(|destination| clone_or_copy_index(&source, destination))
+                .map_err(|err| user_error(format!("Failed to write snapshot Git index: {err}")))
+        })?;
+        timed_snapshot_git_index_phase("publish inherited Git index", || {
+            index_lock
+                .commit()
+                .map_err(|err| user_error(format!("Failed to publish snapshot Git index: {err}")))
+        })?;
+        timed_snapshot_git_index_phase("retain inherited Git cursor", || {
+            client
+                .observe_persisted_git_index(root, &lease.next_baseline)
+                .map_err(|err| user_error(format!("Failed to retain published Git index: {err}")))
+        })?;
+        timed_snapshot_git_index_phase("promote inherited AWACS baseline", || {
+            lease.promote().map_err(|err| user_error(err.to_string()))
+        })?;
+        timed_snapshot_git_index_phase("finish inherited AWACS scan", || {
+            lease
+                .finish(ScanOutcome::Committed)
+                .map_err(|err| user_error(err.to_string()))
+        })?;
         Ok(true)
     })();
     if result.is_err() {

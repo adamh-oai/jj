@@ -359,6 +359,111 @@ fn test_git_head_race_condition() -> TestResult {
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", feature = "awacs", feature = "test-fakes", debug_assertions))]
+#[test]
+fn test_snapshot_workspace_index_seeding_only_blocks_its_worktree() -> TestResult {
+    use std::process::Command;
+    use std::time::Duration;
+
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    let child = test_env.work_dir("child");
+    main.write_file("file", "contents\n");
+    main.run_jj(["commit", "-m", "first"]).success();
+    main.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
+    let path = crate::test_workspaces::install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    exit 0
+fi
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "snapshot" ]; then
+    /bin/cp -a "$3" "$4"
+    exit $?
+fi
+exit 1
+"#,
+    );
+    main.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env("JJ_TEST_AWACS_SCAN_ROOT", main.root())
+            .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+    })
+    .success();
+
+    let pause = test_env.env_root().join("pause-index-seeding");
+    std::fs::create_dir(&pause)?;
+    let spawn = |work_dir: &TestWorkDir, label: &str, args: &[&str], paused: bool| {
+        let template = test_env.new_jj_cmd();
+        let stdout_path = test_env.env_root().join(format!("{label}.stdout"));
+        let stderr_path = test_env.env_root().join(format!("{label}.stderr"));
+        let mut command = Command::new(template.get_program());
+        command.env_clear();
+        for (key, value) in template.get_envs() {
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        command
+            .current_dir(work_dir.root())
+            .env("PATH", &path)
+            .env("JJ_LOG", "info")
+            .env("JJ_TEST_AWACS_SCAN_ROOT", work_dir.root())
+            .args(args)
+            .stdout(std::fs::File::create(&stdout_path)?)
+            .stderr(std::fs::File::create(&stderr_path)?);
+        if paused {
+            command.env("JJ_TEST_SNAPSHOT_SEED_GIT_INDEX_PAUSE_DIR", &pause);
+        }
+        Ok::<_, std::io::Error>(TestChild {
+            child: command.spawn()?,
+            stdout_path,
+            stderr_path,
+        })
+    };
+    let mut creator = spawn(
+        &main,
+        "snapshot-workspace-creator",
+        &["workspace", "add", "--colocate", "../child"],
+        true,
+    )?;
+    wait_for_child_event(&mut creator, || pause.join("ready").exists());
+
+    // The new workspace is visible, but index seeding holds its worktree
+    // gate. Wait for an actual lock-wait message, not just a process start.
+    let mut waiter = spawn(&child, "snapshot-workspace-waiter", &["status"], false)?;
+    let waiter_stderr = waiter.stderr_path.clone();
+    wait_for_child_event(&mut waiter, || {
+        std::fs::read_to_string(&waiter_stderr).is_ok_and(|log| {
+            log.lines()
+                .any(|line| line.contains("Waiting for lock") && line.contains("git-worktree-"))
+        })
+    });
+
+    // A status in the source worktree must complete while both the creator
+    // and the child-worktree waiter are still blocked at the barrier.
+    main.run_jj_with(|cmd| {
+        cmd.timeout(Duration::from_secs(10))
+            .env("PATH", &path)
+            .env("JJ_TEST_AWACS_SCAN_ROOT", main.root())
+            .arg("status")
+    })
+    .success();
+    assert!(creator.child.try_wait()?.is_none());
+    assert!(waiter.child.try_wait()?.is_none());
+    std::fs::write(pause.join("release"), b"release\n")?;
+    creator.assert_success();
+    waiter.assert_success();
+    Ok(())
+}
+
 #[cfg(feature = "test-fakes")]
 #[test]
 fn test_slow_snapshot_does_not_block_other_worktrees() -> TestResult {
