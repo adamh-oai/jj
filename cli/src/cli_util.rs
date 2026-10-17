@@ -131,6 +131,7 @@ use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::str_util::StringExpression;
 use jj_lib::str_util::StringMatcher;
+use jj_lib::sync::state::LockedSyncState;
 use jj_lib::template_parser::TemplateAliasesMap;
 use jj_lib::template_parser::TemplateDiagnostics;
 use jj_lib::transaction::Transaction;
@@ -375,10 +376,23 @@ impl CommandHelper {
         ui: &Ui,
         workspace_root: &Path,
     ) -> Result<(UserSettings, ConfigEnv), CommandError> {
+        let repo_path = workspace_root.join(".jj").join("repo");
+        self.settings_for_workspace_paths(ui, workspace_root, &repo_path, None)
+    }
+
+    fn settings_for_workspace_paths(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+        repo_path: &Path,
+        command_name: Option<&str>,
+    ) -> Result<(UserSettings, ConfigEnv), CommandError> {
         let mut config_env = self.data.config_env.clone();
         let mut raw_config = self.data.raw_config.clone();
-        let repo_path = workspace_root.join(".jj").join("repo");
-        config_env.reset_repo_path(&repo_path);
+        if let Some(command_name) = command_name {
+            config_env.set_command_name(command_name.to_owned());
+        }
+        config_env.reset_repo_path(repo_path);
         config_env.reload_repo_config(ui, &mut raw_config)?;
         config_env.reset_workspace_path(workspace_root);
         config_env.reload_workspace_config(ui, &mut raw_config)?;
@@ -476,11 +490,79 @@ impl CommandHelper {
     ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
         let workspace = self.load_workspace()?;
         let env = self.workspace_environment(ui, &workspace)?;
+        self.workspace_helper_from_workspace_with_stats(ui, workspace, env)
+            .await
+    }
+
+    /// Prepares a synchronization endpoint using its own repository and
+    /// workspace settings, and the normal snapshot and stale-copy recovery.
+    ///
+    /// The hidden helper receives its path and working-copy policy in the
+    /// protocol, so its process's initial working directory is not the endpoint
+    /// configuration context. Linked workspaces resolve their shared repository
+    /// through the workspace loader, rather than assuming `.jj/repo` is a
+    /// directory. Conditional command settings use the public `sync` command.
+    pub(crate) async fn workspace_helper_for_sync(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+        ignore_working_copy: bool,
+    ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
+        let workspace = self.load_workspace_for_sync_profile(ui, workspace_root)?;
+        let env = WorkspaceCommandEnvironment::new_with_context(
+            ui,
+            self,
+            &workspace,
+            workspace.workspace_root(),
+            ignore_working_copy,
+        )?;
+        self.workspace_helper_from_workspace_with_stats(ui, workspace, env)
+            .await
+    }
+
+    /// Loads endpoint-specific configuration and stores for read-only protocol
+    /// negotiation. No working-copy snapshot or operation resolution occurs.
+    pub(crate) fn load_workspace_for_sync_profile(
+        &self,
+        ui: &Ui,
+        workspace_root: &Path,
+    ) -> Result<Workspace, CommandError> {
+        let workspace_root = dunce::canonicalize(workspace_root).map_err(|err| {
+            user_error_with_message(
+                format!(
+                    "Failed to access synchronization endpoint {}",
+                    workspace_root.display()
+                ),
+                err,
+            )
+        })?;
+        let loader = self.new_workspace_loader_at(&workspace_root)?;
+        let (settings, _) = self.settings_for_workspace_paths(
+            ui,
+            loader.workspace_root(),
+            loader.repo_path(),
+            Some("sync"),
+        )?;
+        loader
+            .load(
+                &settings,
+                &self.data.store_factories,
+                &self.data.working_copy_factories,
+            )
+            .map_err(|err| map_workspace_load_error(err, None))
+    }
+
+    async fn workspace_helper_from_workspace_with_stats(
+        &self,
+        ui: &Ui,
+        workspace: Workspace,
+        env: WorkspaceCommandEnvironment,
+    ) -> Result<(WorkspaceCommandHelper, SnapshotStats, bool), CommandError> {
         // Acquire the lock to ensure that the loaded repo points to the head
         // operation whose refs should be synchronized with the Git repo. This
         // prevents races with other processes during Git HEAD and refs
         // import/export.
-        let git_import_export_lock = self
+        let git_import_export_lock = env
             .is_working_copy_writable()
             .then(|| env.lock_git_import_export(&workspace))
             .transpose()?;
@@ -497,7 +579,9 @@ impl CommandHelper {
             Ok(stats) => (workspace_command, stats),
             Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
-                let auto_update_stale = self.settings().get_bool("snapshot.auto-update-stale")?;
+                let auto_update_stale = workspace_command
+                    .settings()
+                    .get_bool("snapshot.auto-update-stale")?;
                 if !auto_update_stale {
                     return Err(err);
                 }
@@ -560,7 +644,7 @@ impl CommandHelper {
                 .expect("valid syntax");
             env.reload_revset_expressions(ui)?;
         }
-        let may_snapshot_working_copy = self.is_working_copy_writable();
+        let may_snapshot_working_copy = env.is_working_copy_writable();
         WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy)
     }
 
@@ -635,7 +719,7 @@ impl CommandHelper {
             Ok(op) => {
                 // self.for_workable_repo(), but reuse loaded env.
                 let repo = workspace.repo_loader().load_at(&op).await?;
-                let may_snapshot_working_copy = !self.global_args().ignore_working_copy;
+                let may_snapshot_working_copy = !env.ignore_working_copy;
                 let mut workspace_command = WorkspaceCommandHelper::new(
                     ui,
                     workspace,
@@ -946,6 +1030,7 @@ fn load_advance_bookmarks_matcher(
 pub struct WorkspaceCommandEnvironment {
     command: CommandHelper,
     settings: UserSettings,
+    ignore_working_copy: bool,
     fileset_aliases_map: FilesetAliasesMap,
     revset_aliases_map: RevsetAliasesMap,
     template_aliases_map: TemplateAliasesMap,
@@ -961,13 +1046,29 @@ pub struct WorkspaceCommandEnvironment {
 impl WorkspaceCommandEnvironment {
     #[instrument(skip_all)]
     fn new(ui: &Ui, command: &CommandHelper, workspace: &Workspace) -> Result<Self, CommandError> {
+        Self::new_with_context(
+            ui,
+            command,
+            workspace,
+            command.cwd(),
+            command.global_args().ignore_working_copy,
+        )
+    }
+
+    fn new_with_context(
+        ui: &Ui,
+        command: &CommandHelper,
+        workspace: &Workspace,
+        cwd: &Path,
+        ignore_working_copy: bool,
+    ) -> Result<Self, CommandError> {
         let settings = workspace.settings();
         let fileset_aliases_map = load_fileset_aliases(ui, settings.config())?;
         let revset_aliases_map = load_revset_aliases(ui, settings.config())?;
         let template_aliases_map = load_template_aliases(ui, settings.config())?;
         let default_ignored_remote = default_ignored_remote_name(workspace.repo_loader().store());
         let path_converter = RepoPathUiConverter::Fs {
-            cwd: command.cwd().to_owned(),
+            cwd: cwd.to_owned(),
             base: workspace.workspace_root().to_owned(),
         };
         #[cfg(feature = "git")]
@@ -977,6 +1078,7 @@ impl WorkspaceCommandEnvironment {
         let mut env = Self {
             command: command.clone(),
             settings: settings.clone(),
+            ignore_working_copy,
             fileset_aliases_map,
             revset_aliases_map,
             template_aliases_map,
@@ -994,6 +1096,10 @@ impl WorkspaceCommandEnvironment {
 
     pub(crate) fn path_converter(&self) -> &RepoPathUiConverter {
         &self.path_converter
+    }
+
+    fn is_working_copy_writable(&self) -> bool {
+        self.command.is_at_head_operation() && !self.ignore_working_copy
     }
 
     pub(crate) fn cwd(&self) -> &Path {
@@ -1227,6 +1333,9 @@ pub struct GitImportExportLock {
     _lock: Option<FileLock>,
 }
 
+type PublishHook<'a> =
+    dyn FnMut(&mut LockedSyncState<'_>, &Operation) -> Result<(), CommandError> + 'a;
+
 /// Provides utilities for writing a command that works on a [`Workspace`]
 /// (which most commands do).
 pub struct WorkspaceCommandHelper {
@@ -1302,7 +1411,7 @@ impl WorkspaceCommandHelper {
         if self.may_update_working_copy {
             Ok(())
         } else {
-            let hint = if self.env.command.global_args().ignore_working_copy {
+            let hint = if self.env.ignore_working_copy {
                 "Don't use --ignore-working-copy."
             } else if self.env.command.global_args().no_integrate_operation {
                 "Don't use --no-integrate-operation."
@@ -1440,7 +1549,7 @@ impl WorkspaceCommandHelper {
             if num_rebased > 0 {
                 writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;
             }
-            self.finish_transaction(ui, tx, "import git head", git_import_export_lock)
+            self.finish_transaction(ui, tx, "import git head", git_import_export_lock, None)
                 .await?;
         }
         Ok(())
@@ -1481,7 +1590,7 @@ impl WorkspaceCommandHelper {
                 "Rebased {num_rebased} descendant commits off of commits rewritten from Git."
             )?;
         }
-        self.finish_transaction(ui, tx, "import git refs", git_import_export_lock)
+        self.finish_transaction(ui, tx, "import git refs", git_import_export_lock, None)
             .await?;
         writeln!(
             ui.status(),
@@ -2344,7 +2453,54 @@ to the current parents may contain changes from multiple commits.
             helper: self,
             tx,
             id_prefix_context,
+            record_empty_operation: false,
         }
+    }
+
+    /// Finalizes a prepared synchronization transaction through the ordinary
+    /// workspace path, recording its exact result before publication.
+    ///
+    /// The callback must durably retain the written operation and its imported
+    /// closure. A callback failure leaves that operation unpublished. A later
+    /// checkout failure can occur after publication; callers must inspect the
+    /// durable operation heads before deciding how to recover.
+    pub(crate) async fn finish_sync_transaction(
+        &mut self,
+        ui: &Ui,
+        mut tx: Transaction,
+        description: impl Into<String>,
+        mut record: impl FnMut(&mut LockedSyncState<'_>, &Operation) -> Result<(), CommandError>,
+    ) -> Result<(), CommandError> {
+        if !self.env.command.should_commit_transaction() {
+            return Err(user_error(
+                "Synchronization requires operation publication; remove --no-integrate-operation",
+            ));
+        }
+        if tx.base_repo().op_id() != self.repo().op_id()
+            || tx.parent_ops().len() != 1
+            || tx.parent_ops()[0].id() != self.repo().op_id()
+        {
+            return Err(user_error(
+                "The synchronization baseline changed; retry the command",
+            ));
+        }
+        tx.set_workspace_name(self.workspace_name());
+        for (key, value) in command_args_to_transaction_attribute(self.env.command.string_args()) {
+            tx.set_attribute(key, value);
+        }
+        let num_rebased = rebase_mutable_descendants(&self.env, &mut tx).await?;
+        if num_rebased > 0 {
+            writeln!(ui.status(), "Rebased {num_rebased} descendant commits.")?;
+        }
+        let git_import_export_lock = self.lock_git_import_export()?;
+        self.finish_transaction(
+            ui,
+            tx,
+            description,
+            &git_import_export_lock,
+            Some(&mut record),
+        )
+        .await
     }
 
     async fn finish_transaction(
@@ -2353,6 +2509,7 @@ to the current parents may contain changes from multiple commits.
         mut tx: Transaction,
         description: impl Into<String>,
         git_import_export_lock: &GitImportExportLock,
+        before_publish: Option<&mut PublishHook<'_>>,
     ) -> Result<(), CommandError> {
         let old_repo = tx.base_repo().clone();
 
@@ -2397,7 +2554,11 @@ to the current parents may contain changes from multiple commits.
 
         #[cfg(feature = "git")]
         if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
-            if let Some(wc_commit) = &maybe_new_wc_commit {
+            if (self.may_update_working_copy
+                || tx.base_repo().op_store().name()
+                    != jj_lib::simple_op_store::SimpleOpStore::SYNC_NAME)
+                && let Some(wc_commit) = &maybe_new_wc_commit
+            {
                 try_reset_git_head(
                     ui,
                     tx.repo_mut(),
@@ -2412,12 +2573,43 @@ to the current parents may contain changes from multiple commits.
             crate::git_util::print_git_export_stats(ui, &stats)?;
         }
 
-        self.user_repo = ReadonlyUserRepo::new(
+        let new_repo = if let Some(before_publish) = before_publish {
+            // Native Git finalization is complete. Keep this lock through the
+            // exact operation write, durable receipt, and publication so GC
+            // cannot race a written result before its receipt becomes a root.
+            // Release it before the ordinary working-copy checkout takes its lock.
+            let sync_state_store = jj_lib::sync::state::SyncStateStore::load(self.repo_path());
+            let mut state = sync_state_store.lock().map_err(|err| {
+                user_error_with_message("Cannot lock synchronization publication state", err)
+            })?;
+            let unpublished = tx.write(description).await?;
+            before_publish(&mut state, unpublished.operation())?;
+            state.save().map_err(|err| {
+                user_error_with_message("Cannot persist synchronization publication result", err)
+            })?;
+            #[cfg(feature = "test-fakes")]
+            if env::var_os("JJ_TEST_SYNC_FAIL_BEFORE_PUBLISH").is_some() {
+                return Err(internal_error_with_message(
+                    "Injected failure before synchronization publication",
+                    io::Error::other("JJ_TEST_SYNC_FAIL_BEFORE_PUBLISH"),
+                ));
+            }
+            let new_repo = unpublished.publish().await?;
+            #[cfg(feature = "test-fakes")]
+            if env::var_os("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH").is_some() {
+                return Err(internal_error_with_message(
+                    "Injected failure after synchronization publication",
+                    io::Error::other("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH"),
+                ));
+            }
+            new_repo
+        } else {
             self.env
                 .command
                 .maybe_commit_transaction(tx, description)
-                .await?,
-        );
+                .await?
+        };
+        self.user_repo = ReadonlyUserRepo::new(new_repo);
 
         // Update working copy before reporting repo changes, so that
         // potential errors while reporting changes (broken pipe, etc)
@@ -2769,9 +2961,23 @@ pub struct WorkspaceCommandTransaction<'a> {
     tx: Transaction,
     /// Cache of index built against the current MutableRepo state.
     id_prefix_context: OnceCell<IdPrefixContext>,
+    record_empty_operation: bool,
 }
 
 impl WorkspaceCommandTransaction<'_> {
+    /// Records causal progress even if the repository view is unchanged.
+    ///
+    /// Synchronization and its undo/redo can acknowledge new history without
+    /// changing visible commits or references.
+    pub fn record_empty_operation(&mut self) {
+        self.record_empty_operation = true;
+    }
+
+    /// Attaches metadata to the local operation produced by this transaction.
+    pub fn set_attribute(&mut self, key: String, value: String) {
+        self.tx.set_attribute(key, value);
+    }
+
     /// Workspace helper that may use the base repo.
     pub fn base_workspace_helper(&self) -> &WorkspaceCommandHelper {
         self.helper
@@ -2850,8 +3056,13 @@ impl WorkspaceCommandTransaction<'_> {
     }
 
     pub async fn finish(self, ui: &Ui, description: impl Into<String>) -> Result<(), CommandError> {
-        let Self { helper, mut tx, .. } = self;
-        if !tx.repo().has_changes() {
+        let Self {
+            helper,
+            mut tx,
+            record_empty_operation,
+            ..
+        } = self;
+        if !tx.repo().has_changes() && !record_empty_operation {
             writeln!(ui.status(), "Nothing changed.")?;
             return Ok(());
         }
@@ -2863,7 +3074,7 @@ impl WorkspaceCommandTransaction<'_> {
         // Git HEAD export happens atomically with the transaction commit.
         let git_import_export_lock = helper.lock_git_import_export()?;
         helper
-            .finish_transaction(ui, tx, description, &git_import_export_lock)
+            .finish_transaction(ui, tx, description, &git_import_export_lock, None)
             .await
     }
 
@@ -3004,6 +3215,23 @@ async fn rebase_mutable_descendants(
         )
         .await?;
     Ok(num_rebased)
+}
+
+#[cfg(feature = "test-fakes")]
+pub(crate) fn pause_for_test(variable: &str) {
+    let Some(dir) = std::env::var_os(variable) else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    std::fs::write(dir.join("ready"), b"ready\n").expect("write test barrier");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !dir.join("release").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test barrier timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// Check if the working copy is stale and reload the repo if the repo is ahead

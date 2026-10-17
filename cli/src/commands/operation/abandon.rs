@@ -19,12 +19,15 @@ use std::slice;
 use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
 use jj_lib::op_walk;
+use jj_lib::simple_op_store::SimpleOpStore;
+use jj_lib::sync::endpoint::Endpoint;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::short_operation_hash;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
 use crate::command_error::user_error;
+use crate::command_error::user_error_with_message;
 use crate::complete;
 use crate::ui::Ui;
 
@@ -104,6 +107,31 @@ pub async fn cmd_op_abandon(
         return Err(err);
     }
 
+    // Preserve causal knowledge before native history is reparented. Hold its
+    // GC guard through publication of the new operation heads, then release it
+    // before acquiring a working-copy lock.
+    let sync_endpoint = (op_store.name() == SimpleOpStore::SYNC_NAME)
+        .then(|| Endpoint::load(workspace.repo_path()));
+    let sync_history_guard = if let Some(endpoint) = &sync_endpoint {
+        let head_ids = current_head_ops
+            .iter()
+            .map(|op| op.id().clone())
+            .collect_vec();
+        Some(
+            endpoint
+                .preserve_pruned_heads(op_store.as_ref(), &head_ids)
+                .await
+                .map_err(|err| {
+                    user_error_with_message(
+                        "Cannot preserve synchronization history before abandoning operations",
+                        err,
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+
     // Reparent descendants, count the number of abandoned operations.
     let stats = op_walk::reparent_range(
         op_store.as_ref(),
@@ -133,6 +161,7 @@ pub async fn cmd_op_abandon(
             .update_op_heads(slice::from_ref(old.id()), new_id)
             .await?;
     }
+    drop(sync_history_guard);
     // Remap the operation id of the current workspace. If there were any
     // divergent operations, user will need to re-abandon their ancestors.
     if !command.global_args().ignore_working_copy {

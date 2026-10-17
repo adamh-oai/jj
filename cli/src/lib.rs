@@ -35,6 +35,9 @@ pub mod operation_templater;
 mod progress;
 pub mod revset_util;
 mod source_symbol;
+#[cfg(feature = "git")]
+pub(crate) mod sync_endpoint;
+pub(crate) mod sync_transport;
 pub mod template_builder;
 pub mod templater;
 pub mod text_util;

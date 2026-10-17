@@ -61,6 +61,11 @@ max-new-file-size = "1MiB"
 auto-track = "all()"
 auto-update-stale = false
 
+[sync]
+# The byte quota is derived from free space in the receiving repository.
+max-records = 1_000_000
+max-dependencies = 1_000_000
+
 # TODO: https://github.com/jj-vcs/jj/issues/3419 - Remove when fully deprecated.
 # The behavior when this flag is set to false is experimental and may be changed
 # in the future.
