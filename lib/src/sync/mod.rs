@@ -15,7 +15,12 @@
 //! Repository synchronization without sharing live workspace state.
 
 pub mod anchor;
+#[cfg(feature = "git")]
+mod metadata_limits;
 pub mod normalize;
+#[cfg(feature = "git")]
+pub mod objects;
+pub mod protocol;
 pub mod reconcile;
 pub mod shared;
 
