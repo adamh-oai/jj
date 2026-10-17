@@ -14,14 +14,18 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io;
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
 use futures::executor::block_on_stream;
+use gix::objs::Exists as _;
 use itertools::Itertools as _;
 use jj_lib::backend::Backend as _;
+use jj_lib::backend::ChangeId;
 use jj_lib::backend::CommitId;
 use jj_lib::backend::CopyRecord;
 use jj_lib::backend::TreeId;
@@ -30,6 +34,7 @@ use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::git_backend::GitBackend;
+use jj_lib::git_backend::GitObjectHeader;
 use jj_lib::git_backend::GitObjectRecord;
 use jj_lib::git_backend::JJ_TREES_COMMIT_HEADER;
 use jj_lib::merge::Merge;
@@ -113,6 +118,21 @@ fn list_dir(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+struct ShortReader<R>(R);
+
+impl<R: io::Read> io::Read for ShortReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let length = buffer.len().min(3);
+        self.0.read(&mut buffer[..length])
+    }
+}
+
+impl<R: io::Seek> io::Seek for ShortReader<R> {
+    fn seek(&mut self, position: io::SeekFrom) -> io::Result<u64> {
+        self.0.seek(position)
+    }
+}
+
 fn transfer_object_closure(
     source: &GitBackend,
     destination: &GitBackend,
@@ -151,6 +171,16 @@ fn transfer_object_closure(
             gix::objs::ObjectRef::Tag(tag) => pending.push(tag.target()),
             gix::objs::ObjectRef::Blob(_) => {}
         }
+        let header = source.export_object_header(&id)?;
+        assert_eq!(header.kind, record.kind);
+        assert_eq!(header.size, record.data.len() as u64);
+        assert_eq!(header.commit_extras, record.commit_extras);
+        let mut streamed = Vec::new();
+        source.export_object_stream(&header, &mut streamed)?;
+        assert_eq!(streamed, record.data);
+        destination
+            .validate_object_stream(&header, &mut ShortReader(io::Cursor::new(&streamed)))?;
+        destination.import_object_stream(&header, &mut ShortReader(io::Cursor::new(&streamed)))?;
         destination.validate_object_import(&record)?;
         destination.import_object(&record)?;
         // Importing an identical record is idempotent, including its metadata.
@@ -167,28 +197,208 @@ fn test_object_transfer_exports_unmaterialized_empty_tree() -> TestResult {
     let pinned = TestRepo::init_with_backend(TestRepoBackend::Git);
     let source_backend = get_git_backend(&source.repo);
     let id = gix::ObjectId::from_bytes_or_panic(source_backend.empty_tree_id().as_bytes());
-    assert!(source_backend.git_repo().try_find_object(id)?.is_none());
+    assert!(!source_backend.git_repo().objects.exists(&id));
     let record = source_backend.export_object(&id)?;
     assert_eq!(record.kind, gix::objs::Kind::Tree);
     assert!(record.data.is_empty());
     assert!(record.commit_extras.is_none());
-    assert!(source_backend.git_repo().try_find_object(id)?.is_none());
+    let header = source_backend.export_object_header(&id)?;
+    assert_eq!(header.kind, gix::objs::Kind::Tree);
+    assert_eq!(header.size, 0);
+    assert!(header.commit_extras.is_none());
+    let mut streamed = Vec::new();
+    source_backend.export_object_stream(&header, &mut streamed)?;
+    assert!(streamed.is_empty());
+    assert!(!source_backend.git_repo().objects.exists(&id));
     let destination_backend = get_git_backend(&destination.repo);
     destination_backend.validate_object_import(&record)?;
     destination_backend.import_object(&record)?;
-    assert!(
-        destination_backend
-            .git_repo()
-            .try_find_object(id)?
-            .is_some()
-    );
+    assert!(destination_backend.git_repo().objects.exists(&id));
     assert_eq!(destination_backend.export_object(&id)?, record);
 
     // Pinning a logically valid empty tree also creates its physical object,
     // even if no commit has ever needed to materialize it.
     let pinned_backend = get_git_backend(&pinned.repo);
     pinned_backend.pin_sync_trees([pinned_backend.empty_tree_id()])?;
-    assert!(pinned_backend.git_repo().try_find_object(id)?.is_some());
+    assert!(pinned_backend.git_repo().objects.exists(&id));
+    Ok(())
+}
+
+#[test]
+fn test_object_stream_large_loose_and_packed_blob() -> TestResult {
+    if !is_external_tool_installed("git") {
+        return Ok(());
+    }
+    let source = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let destination = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let source_backend = get_git_backend(&source.repo);
+    let destination_backend = get_git_backend(&destination.repo);
+    let size = 65 * 1024 * 1024u64;
+    let mut body = tempfile::NamedTempFile::new()?;
+    let mut input = io::repeat(42).take(size);
+    io::copy(&mut input, &mut body)?;
+    let mut hash = gix::hash::hasher(source_backend.git_repo().object_hash());
+    hash.update(&gix::objs::encode::loose_header(
+        gix::objs::Kind::Blob,
+        size,
+    ));
+    let block = [42; 64 * 1024];
+    for _ in 0..size / block.len() as u64 {
+        hash.update(&block);
+    }
+    let id = hash.try_finalize().unwrap();
+    let header = GitObjectHeader {
+        id,
+        kind: gix::objs::Kind::Blob,
+        size,
+        commit_extras: None,
+    };
+    source_backend.import_object_stream(&header, &mut body.reopen()?)?;
+    assert_eq!(source_backend.export_object_header(&id)?, header);
+    destination_backend.validate_object_stream(&header, &mut body.reopen()?)?;
+    assert!(
+        destination_backend
+            .git_repo()
+            .try_find_header(id)?
+            .is_none()
+    );
+    destination_backend.import_object_stream(&header, &mut body.reopen()?)?;
+
+    struct CompareWriter<R> {
+        expected: R,
+        size: u64,
+    }
+    impl<R: io::Read> io::Write for CompareWriter<R> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            assert!(bytes.len() <= 64 * 1024);
+            let mut expected = [0u8; 64 * 1024];
+            self.expected.read_exact(&mut expected[..bytes.len()])?;
+            assert_eq!(bytes, &expected[..bytes.len()]);
+            self.size += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = CompareWriter {
+        expected: body.reopen()?,
+        size: 0,
+    };
+    source_backend.export_object_stream(&header, &mut output)?;
+    assert_eq!(output.size, size);
+
+    // Force the same object into a pack, then exercise exactly the same export
+    // path. The test itself retains only fixed-size comparison buffers.
+    source_backend.git_repo().reference(
+        "refs/jj/test-stream-blob",
+        id,
+        gix::refs::transaction::PreviousValue::Any,
+        "stream test",
+    )?;
+    source_backend.gc(source.repo.index(), SystemTime::now())?;
+    let packed = gix::open(source_backend.git_repo_path())?
+        .try_find_header(id)?
+        .unwrap();
+    assert!(packed.num_deltas().is_some());
+    assert_eq!(source_backend.export_object_header(&id)?, header);
+    let mut output = CompareWriter {
+        expected: body.reopen()?,
+        size: 0,
+    };
+    source_backend.export_object_stream(&header, &mut output)?;
+    assert_eq!(output.size, size);
+    assert_eq!(destination_backend.export_object_header(&id)?, header);
+    Ok(())
+}
+
+#[test]
+fn test_object_stream_large_commit_header_and_message() -> TestResult {
+    use gix::objs::Write as _;
+    if !is_external_tool_installed("git") {
+        return Ok(());
+    }
+    let source = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let destination = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let source_backend = get_git_backend(&source.repo);
+    let destination_backend = get_git_backend(&destination.repo);
+    let change_id = ChangeId::from_bytes(&[42; 16]);
+    let prefix = format!(
+        "tree {}\nauthor A <a@example.com> 0 +0000\ncommitter C <c@example.com> 0 \
+         +0000\nchange-id {}\ngpgsig ",
+        source_backend.empty_tree_id().hex(),
+        change_id.reverse_hex(),
+    );
+    let signature_size = 65 * 1024 * 1024u64;
+    let suffix = "\n\nA message whose bytes remain immutable.\n";
+    let size = prefix.len() as u64 + signature_size + suffix.len() as u64;
+    let mut input = io::Cursor::new(prefix.as_bytes())
+        .chain(io::repeat(b'a').take(signature_size))
+        .chain(io::Cursor::new(suffix.as_bytes()));
+    let id = source_backend
+        .git_repo()
+        .objects
+        .write_stream(gix::objs::Kind::Commit, size, &mut input)
+        .unwrap();
+    // No metadata entry exists: header export must recover the change ID while
+    // discarding the arbitrarily large signature, without an import or rewrite.
+    let header = source_backend.export_object_header(&id)?;
+    let extras =
+        jj_lib::protos::git_store::Commit::decode(header.commit_extras.as_deref().unwrap())?;
+    assert_eq!(extras.change_id, change_id.as_bytes());
+    assert_eq!(header.size, size);
+    let metadata = TableStore::load(source.repo_path().join("store/extra"), id.as_bytes().len());
+    assert!(metadata.get_head()?.get_value(id.as_bytes()).is_none());
+    let mut body = tempfile::NamedTempFile::new()?;
+    source_backend.export_object_stream(&header, &mut body)?;
+    destination_backend.validate_object_stream(&header, &mut body.reopen()?)?;
+    destination_backend.import_object_stream(&header, &mut body.reopen()?)?;
+    assert_eq!(destination_backend.export_object_header(&id)?, header);
+    Ok(())
+}
+
+#[test]
+fn test_object_stream_rejects_invalid_bodies_before_writing() -> TestResult {
+    let destination = TestRepo::init_with_backend(TestRepoBackend::Git);
+    let backend = get_git_backend(&destination.repo);
+    let data = b"valid streamed blob";
+    let id = gix::objs::compute_hash(
+        backend.git_repo().object_hash(),
+        gix::objs::Kind::Blob,
+        data,
+    )
+    .unwrap();
+    let header = GitObjectHeader {
+        id,
+        kind: gix::objs::Kind::Blob,
+        size: data.len() as u64,
+        commit_extras: None,
+    };
+    for body in [
+        &data[..data.len() - 1],
+        b"valid streamed blop",
+        b"valid streamed blob trailing",
+    ] {
+        assert!(
+            backend
+                .validate_object_stream(&header, &mut io::Cursor::new(body))
+                .is_err()
+        );
+        assert!(
+            backend
+                .import_object_stream(&header, &mut io::Cursor::new(body))
+                .is_err()
+        );
+        assert!(backend.git_repo().try_find_header(id)?.is_none());
+    }
+    let mut invalid = header.clone();
+    invalid.commit_extras = Some(vec![]);
+    assert!(
+        backend
+            .import_object_stream(&invalid, &mut io::Cursor::new(data))
+            .is_err()
+    );
+    assert!(backend.git_repo().try_find_header(id)?.is_none());
     Ok(())
 }
 
@@ -405,6 +615,22 @@ fn test_object_transfer_rejects_conflicting_metadata() -> TestResult {
             _ => unreachable!(),
         }
         incompatible.commit_extras = Some(extras.encode_to_vec());
+        let header = GitObjectHeader {
+            id,
+            kind: incompatible.kind,
+            size: incompatible.data.len() as u64,
+            commit_extras: incompatible.commit_extras.clone(),
+        };
+        assert!(
+            destination_backend
+                .validate_object_stream(&header, &mut ShortReader(io::Cursor::new(&record.data)))
+                .is_err()
+        );
+        assert!(
+            destination_backend
+                .import_object_stream(&header, &mut ShortReader(io::Cursor::new(&record.data)))
+                .is_err()
+        );
         let error = destination_backend
             .validate_object_import(&incompatible)
             .unwrap_err();
@@ -434,6 +660,14 @@ fn test_object_transfer_accepts_equivalent_legacy_extras() -> TestResult {
     legacy.commit_extras = Some(extras.encode_to_vec());
     let backend = get_git_backend(&destination.repo);
     backend.import_object(&legacy)?;
+    let header = GitObjectHeader {
+        id,
+        kind: record.kind,
+        size: record.data.len() as u64,
+        commit_extras: record.commit_extras.clone(),
+    };
+    backend.validate_object_stream(&header, &mut ShortReader(io::Cursor::new(&record.data)))?;
+    backend.import_object_stream(&header, &mut ShortReader(io::Cursor::new(&record.data)))?;
     backend.validate_object_import(&record)?;
     backend.import_object(&record)?;
     assert_eq!(backend.export_object(&id)?, legacy);

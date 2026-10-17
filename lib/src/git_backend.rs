@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Command;
 use std::process::ExitStatus;
+use std::process::Stdio;
 use std::str::Utf8Error;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -179,6 +180,15 @@ pub struct GitObjectRecord {
     pub kind: gix::objs::Kind,
     pub data: Vec<u8>,
     /// Present for commits, including Git commits without a stored jj entry.
+    pub commit_extras: Option<Vec<u8>>,
+}
+
+/// Metadata for a Git object whose body is transferred separately.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitObjectHeader {
+    pub id: gix::ObjectId,
+    pub kind: gix::objs::Kind,
+    pub size: u64,
     pub commit_extras: Option<Vec<u8>>,
 }
 
@@ -544,6 +554,199 @@ impl GitBackend {
             data: object.data.clone(),
             commit_extras,
         })
+    }
+
+    /// Exports an object's kind, size, and exact per-commit metadata.
+    ///
+    /// No body-sized buffer is allocated. A commit without stored extras is
+    /// scanned to recover its change ID without retaining its message or signature.
+    pub fn export_object_header(&self, id: &gix::oid) -> BackendResult<GitObjectHeader> {
+        let mut git_repo = self.git_repo();
+        git_repo.objects.ignore_replacements = true;
+        if id.as_bytes() == self.empty_tree_id.as_bytes() {
+            return Ok(GitObjectHeader {
+                id: id.to_owned(),
+                kind: gix::objs::Kind::Tree,
+                size: 0,
+                commit_extras: None,
+            });
+        }
+        let object = git_repo
+            .try_find_header(id)
+            .map_err(|err| BackendError::Other(err.into()))?
+            .ok_or_else(|| BackendError::ObjectNotFound {
+                object_type: "Git object".to_owned(),
+                hash: id.to_string(),
+                source: None,
+            })?;
+        let mut header = GitObjectHeader {
+            id: id.to_owned(),
+            kind: object.kind(),
+            size: object.size(),
+            commit_extras: None,
+        };
+        if header.kind == gix::objs::Kind::Commit {
+            let (table, table_lock) = self.read_extra_metadata_table_locked()?;
+            header.commit_extras = table.get_value(id.as_bytes()).map(<[u8]>::to_vec);
+            drop(table_lock);
+            if let Some(extras) = &header.commit_extras {
+                validate_object_extras(id, extras)?;
+            } else {
+                let identity = self
+                    .read_object_stream(&header, &mut io::sink())?
+                    .expect("commit header was scanned");
+                header.commit_extras = Some(
+                    crate::protos::git_store::Commit {
+                        change_id: identity.change_id.to_bytes(),
+                        uses_tree_conflict_format: true,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                );
+            }
+        }
+        Ok(header)
+    }
+
+    /// Streams exact Git bytes from loose or packed storage to the writer.
+    ///
+    /// Only fixed-size buffers are used. Local replacement refs are ignored.
+    pub fn export_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        to: &mut dyn io::Write,
+    ) -> BackendResult<()> {
+        validate_stream_header(&self.git_repo(), header)?;
+        self.read_object_stream(header, to)?;
+        Ok(())
+    }
+
+    fn read_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        to: &mut dyn io::Write,
+    ) -> BackendResult<Option<StreamedCommitIdentity>> {
+        if header.id == gix::ObjectId::empty_tree(header.id.kind()) {
+            return scan_object_stream(header, &mut io::empty(), to);
+        }
+        let mut command = Command::new(&self.git_executable);
+        command
+            .current_dir(self.git_repo_path())
+            .args(["--git-dir=.", "--no-replace-objects", "cat-file"])
+            .arg(header.kind.to_string())
+            .arg(header.id.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        crate::subprocess_util::suppress_console_window(&mut command);
+        let mut child = command
+            .spawn()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let mut output = child.stdout.take().unwrap();
+        let result = scan_object_stream(header, &mut output, to);
+        drop(output);
+        if result.is_err() {
+            // A failed destination must not leave a blocked producer behind.
+            child.kill().ok();
+        }
+        let status = child
+            .wait()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let identity = result?;
+        if !status.success() {
+            return Err(invalid_stream(
+                header,
+                "Git object streaming command failed",
+            ));
+        }
+        Ok(identity)
+    }
+
+    /// Authenticates a complete body and checks existing commit metadata.
+    ///
+    /// This writes no objects, metadata, or refs. The caller separately validates
+    /// typed dependency closure, including tree entries and commit/tag parents.
+    pub fn validate_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        from: &mut dyn io::Read,
+    ) -> BackendResult<()> {
+        validate_stream_header(&self.git_repo(), header)?;
+        let Some(identity) = scan_object_stream(header, from, &mut io::sink())? else {
+            return Ok(());
+        };
+        let (tables, _lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        for table in tables {
+            if let Some(existing) = table.get_value(header.id.as_bytes()) {
+                identity.validate_existing(header, existing)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Imports a validated file-backed body without publishing refs or heads.
+    ///
+    /// The body starts at the reader's current position and must end at EOF.
+    /// Hash validation precedes writing; commit metadata is rechecked under the
+    /// ordinary writer lock. The caller protects staged objects from GC and
+    /// validates their complete typed dependency closure before activation.
+    pub fn import_object_stream(
+        &self,
+        header: &GitObjectHeader,
+        from: &mut (impl io::Read + io::Seek),
+    ) -> BackendResult<()> {
+        let git_repo = self.git_repo();
+        validate_stream_header(&git_repo, header)?;
+        let start = from
+            .stream_position()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let identity = scan_object_stream(header, from, &mut io::sink())?;
+        let locked_metadata = if let Some(identity) = identity {
+            let (tables, lock) = self
+                .extra_metadata_store
+                .get_head_tables_locked()
+                .map_err(GitBackendError::ReadMetadata)?;
+            for table in &tables {
+                if let Some(existing) = table.get_value(header.id.as_bytes()) {
+                    identity.validate_existing(header, existing)?;
+                }
+            }
+            let table = self
+                .extra_metadata_store
+                .merge_head_tables_locked(tables, &lock)
+                .map_err(GitBackendError::ReadMetadata)?;
+            Some((table, lock))
+        } else {
+            None
+        };
+        from.seek(io::SeekFrom::Start(start))
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let actual = git_repo
+            .objects
+            .write_stream(header.kind, header.size, from)
+            .map_err(|err| BackendError::WriteObject {
+                object_type: "Git object",
+                source: err.into(),
+            })?;
+        if actual != header.id {
+            return Err(invalid_stream(
+                header,
+                "object changed after stream validation",
+            ));
+        }
+        if let Some((table, lock)) = locked_metadata
+            && table.get_value(header.id.as_bytes()).is_none()
+        {
+            let mut mutation = table.start_mutation();
+            mutation.add_entry(
+                header.id.as_bytes().to_vec(),
+                header.commit_extras.clone().unwrap(),
+            );
+            self.save_extra_metadata_table(mutation, &lock)?;
+        }
+        Ok(())
     }
 
     /// Checks an object and its compatibility with existing jj metadata.
@@ -1054,6 +1257,337 @@ fn serialize_extras(commit: &Commit) -> Vec<u8> {
 }
 
 // Returns the commit's interpretation before applying extras, if applicable.
+fn invalid_stream(header: &GitObjectHeader, reason: &'static str) -> BackendError {
+    GitBackendError::InvalidObjectRecord {
+        id: header.id,
+        reason,
+    }
+    .into()
+}
+
+fn validate_stream_header(
+    git_repo: &gix::Repository,
+    header: &GitObjectHeader,
+) -> BackendResult<()> {
+    if header.id.kind() != git_repo.object_hash() {
+        return Err(invalid_stream(
+            header,
+            "object hash format does not match the repository",
+        ));
+    }
+    match (header.kind, header.commit_extras.as_deref()) {
+        (gix::objs::Kind::Commit, Some(extras)) => {
+            validate_object_extras(&header.id, extras)?;
+        }
+        (gix::objs::Kind::Commit, None) => {
+            return Err(invalid_stream(header, "commit metadata is missing"));
+        }
+        (_, Some(_)) => return Err(invalid_stream(header, "only commits can have jj metadata")),
+        (_, None) => {}
+    }
+    Ok(())
+}
+
+fn scan_object_stream(
+    header: &GitObjectHeader,
+    from: &mut dyn io::Read,
+    to: &mut dyn io::Write,
+) -> BackendResult<Option<StreamedCommitIdentity>> {
+    let mut hash = gix::hash::hasher(header.id.kind());
+    hash.update(&gix::objs::encode::loose_header(header.kind, header.size));
+    let mut commit =
+        (header.kind == gix::objs::Kind::Commit).then(|| CommitIdentityScanner::new(header.id));
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let length = from
+            .read(&mut buffer)
+            .map_err(|err| BackendError::Other(err.into()))?;
+        if length == 0 {
+            break;
+        }
+        size = size
+            .checked_add(length as u64)
+            .filter(|size| *size <= header.size)
+            .ok_or_else(|| invalid_stream(header, "object stream exceeds its advertised size"))?;
+        let bytes = &buffer[..length];
+        hash.update(bytes);
+        if let Some(commit) = &mut commit {
+            commit.update(bytes)?;
+        }
+        to.write_all(bytes)
+            .map_err(|err| BackendError::Other(err.into()))?;
+    }
+    if size != header.size {
+        return Err(invalid_stream(header, "object stream is truncated"));
+    }
+    let actual = hash
+        .try_finalize()
+        .map_err(|err| BackendError::Other(err.into()))?;
+    if actual != header.id {
+        return Err(invalid_stream(
+            header,
+            "object contents do not match the advertised hash",
+        ));
+    }
+    commit.map(CommitIdentityScanner::finish).transpose()
+}
+
+/// The only native commit fields that extras can change. All other fields are
+/// already fixed by the Git ID, including arbitrarily large messages/signatures.
+struct StreamedCommitIdentity {
+    change_id: ChangeId,
+    physical_tree: TreeId,
+    has_tree_conflict: bool,
+}
+
+impl StreamedCommitIdentity {
+    fn validate_existing(&self, header: &GitObjectHeader, existing: &[u8]) -> BackendResult<()> {
+        let incoming =
+            validate_object_extras(&header.id, header.commit_extras.as_deref().unwrap())?;
+        let existing = validate_object_extras(&header.id, existing)?;
+        let effective = |proto: crate::protos::git_store::Commit| {
+            let change_id = if proto.change_id.is_empty() {
+                self.change_id.to_bytes()
+            } else {
+                proto.change_id
+            };
+            let tree_terms = if self.has_tree_conflict {
+                None
+            } else if proto.uses_tree_conflict_format && !proto.root_tree.is_empty() {
+                Some(proto.root_tree)
+            } else {
+                Some(vec![self.physical_tree.to_bytes()])
+            };
+            (change_id, tree_terms, proto.predecessors)
+        };
+        if effective(incoming) != effective(existing) {
+            return Err(GitBackendError::ConflictingMetadata {
+                id: CommitId::from_bytes(header.id.as_bytes()),
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CommitIdentityHeader {
+    Name,
+    Tree,
+    ChangeId,
+    ConflictTrees,
+    Ignore,
+}
+
+// Retains at most one hash-width token, regardless of line or message size.
+// Even jj:trees can be checked token-by-token without storing all its terms.
+struct CommitIdentityScanner {
+    id: gix::ObjectId,
+    kind: CommitIdentityHeader,
+    previous: CommitIdentityHeader,
+    key: Vec<u8>,
+    value: Vec<u8>,
+    value_too_long: bool,
+    line_has_bytes: bool,
+    in_message: bool,
+    saw_tree: bool,
+    saw_change_id: bool,
+    saw_conflict_trees: bool,
+    conflict_terms: u64,
+    tree_id: Option<TreeId>,
+    change_id: ChangeId,
+}
+
+impl CommitIdentityScanner {
+    fn new(id: gix::ObjectId) -> Self {
+        Self {
+            id,
+            kind: CommitIdentityHeader::Name,
+            previous: CommitIdentityHeader::Ignore,
+            key: Vec::new(),
+            value: Vec::new(),
+            value_too_long: false,
+            line_has_bytes: false,
+            in_message: false,
+            saw_tree: false,
+            saw_change_id: false,
+            saw_conflict_trees: false,
+            conflict_terms: 0,
+            tree_id: None,
+            change_id: synthetic_change_id_from_git_commit_id(&CommitId::from_bytes(id.as_bytes())),
+        }
+    }
+
+    fn invalid(&self, reason: &'static str) -> BackendError {
+        GitBackendError::InvalidObjectRecord {
+            id: self.id,
+            reason,
+        }
+        .into()
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> BackendResult<()> {
+        if self.in_message {
+            return Ok(());
+        }
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let newline = part.last() == Some(&b'\n');
+            let part = if newline {
+                &part[..part.len() - 1]
+            } else {
+                part
+            };
+            self.line_part(part)?;
+            if newline {
+                self.end_line()?;
+                if self.in_message {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn line_part(&mut self, mut bytes: &[u8]) -> BackendResult<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !self.line_has_bytes && bytes[0] == b' ' {
+            match self.previous {
+                CommitIdentityHeader::Tree | CommitIdentityHeader::ConflictTrees => {
+                    return Err(self.invalid("invalid continuation of commit tree header"));
+                }
+                CommitIdentityHeader::ChangeId => {
+                    self.change_id = synthetic_change_id_from_git_commit_id(&CommitId::from_bytes(
+                        self.id.as_bytes(),
+                    ));
+                }
+                _ => {}
+            }
+            self.kind = CommitIdentityHeader::Ignore;
+        }
+        self.line_has_bytes = true;
+        if self.kind == CommitIdentityHeader::Name {
+            let separator = bytes.iter().position(|byte| *byte == b' ');
+            let prefix = separator.map_or(bytes, |index| &bytes[..index]);
+            if self.key.len() + prefix.len() > CHANGE_ID_COMMIT_HEADER.len() {
+                self.kind = CommitIdentityHeader::Ignore;
+                return Ok(());
+            }
+            self.key.extend_from_slice(prefix);
+            let Some(separator) = separator else {
+                return Ok(());
+            };
+            self.kind = match self.key.as_slice() {
+                b"tree" if !self.saw_tree => {
+                    self.saw_tree = true;
+                    CommitIdentityHeader::Tree
+                }
+                b"change-id" if !self.saw_change_id => {
+                    self.saw_change_id = true;
+                    CommitIdentityHeader::ChangeId
+                }
+                b"jj:trees" if !self.saw_conflict_trees => {
+                    self.saw_conflict_trees = true;
+                    CommitIdentityHeader::ConflictTrees
+                }
+                _ => CommitIdentityHeader::Ignore,
+            };
+            bytes = &bytes[separator + 1..];
+        }
+        if self.kind == CommitIdentityHeader::ConflictTrees {
+            for byte in bytes {
+                if *byte == b' ' {
+                    self.end_tree_term()?;
+                } else if self.value.len() < self.id.as_bytes().len() * 2 {
+                    self.value.push(*byte);
+                } else {
+                    return Err(self.invalid("invalid jj:trees header"));
+                }
+            }
+        } else if matches!(
+            self.kind,
+            CommitIdentityHeader::Tree | CommitIdentityHeader::ChangeId
+        ) {
+            let limit = self.id.as_bytes().len() * 2;
+            let available = limit.saturating_sub(self.value.len());
+            self.value
+                .extend_from_slice(&bytes[..bytes.len().min(available)]);
+            self.value_too_long |= bytes.len() > available;
+        }
+        Ok(())
+    }
+
+    fn end_tree_term(&mut self) -> BackendResult<()> {
+        if self.value.len() != self.id.as_bytes().len() * 2
+            || gix::ObjectId::from_hex(&self.value).is_err()
+        {
+            return Err(self.invalid("invalid jj:trees header"));
+        }
+        self.conflict_terms = self
+            .conflict_terms
+            .checked_add(1)
+            .ok_or_else(|| self.invalid("too many jj:trees terms"))?;
+        self.value.clear();
+        Ok(())
+    }
+
+    fn end_line(&mut self) -> BackendResult<()> {
+        if !self.line_has_bytes {
+            self.in_message = true;
+            return Ok(());
+        }
+        match self.kind {
+            CommitIdentityHeader::Tree => {
+                let id = gix::ObjectId::from_hex(&self.value)
+                    .ok()
+                    .filter(|id| id.kind() == self.id.kind() && !self.value_too_long)
+                    .ok_or_else(|| self.invalid("invalid commit tree header"))?;
+                self.tree_id = Some(TreeId::from_bytes(id.as_bytes()));
+            }
+            CommitIdentityHeader::ChangeId => {
+                if !self.value_too_long
+                    && let Some(id) = ChangeId::try_from_reverse_hex(&self.value)
+                    && id.as_bytes().len() == CHANGE_ID_LENGTH
+                {
+                    self.change_id = id;
+                }
+            }
+            CommitIdentityHeader::ConflictTrees => {
+                self.end_tree_term()?;
+                if self.conflict_terms < 3 || self.conflict_terms.is_multiple_of(2) {
+                    return Err(self.invalid("invalid jj:trees header"));
+                }
+            }
+            CommitIdentityHeader::Name => return Err(self.invalid("invalid commit header")),
+            CommitIdentityHeader::Ignore => {}
+        }
+        self.previous = self.kind;
+        self.kind = CommitIdentityHeader::Name;
+        self.key.clear();
+        self.value.clear();
+        self.value_too_long = false;
+        self.line_has_bytes = false;
+        Ok(())
+    }
+
+    fn finish(self) -> BackendResult<StreamedCommitIdentity> {
+        if !self.in_message {
+            return Err(self.invalid("commit header is not terminated"));
+        }
+        let tree_id = self
+            .tree_id
+            .clone()
+            .ok_or_else(|| self.invalid("commit tree header is missing"))?;
+        Ok(StreamedCommitIdentity {
+            change_id: self.change_id,
+            physical_tree: tree_id,
+            has_tree_conflict: self.saw_conflict_trees,
+        })
+    }
+}
+
 fn validate_object_record(
     git_repo: &gix::Repository,
     record: &GitObjectRecord,
@@ -1211,6 +1745,20 @@ fn update_sync_tree_refs(
     let mut updates = Vec::with_capacity(tree_ids.len());
     for id in &tree_ids {
         let oid = validate_git_object_id(&git_repo, id)?;
+        // Repository::try_find_object() synthesizes the empty tree, even when
+        // it does not exist in the ODB. A Git retention ref needs a physical
+        // object, so check the raw database before relying on that wrapper.
+        if oid == gix::ObjectId::empty_tree(git_repo.object_hash())
+            && !git_repo.objects.exists(&oid)
+        {
+            git_repo
+                .objects
+                .write_buf_with_known_id(gix::objs::Kind::Tree, &[], oid)
+                .map_err(|err| BackendError::WriteObject {
+                    object_type: "tree",
+                    source: err.into(),
+                })?;
+        }
         let object = git_repo
             .try_find_object(oid)
             .map_err(|err| to_read_object_err(err, id))?;
@@ -1222,15 +1770,6 @@ fn update_sync_tree_refs(
                     reason: "sync tree root is not a tree",
                 }
                 .into());
-            }
-            None if oid == gix::ObjectId::empty_tree(git_repo.object_hash()) => {
-                git_repo
-                    .objects
-                    .write_buf_with_known_id(gix::objs::Kind::Tree, &[], oid)
-                    .map_err(|err| BackendError::WriteObject {
-                        object_type: "tree",
-                        source: err.into(),
-                    })?;
             }
             None => return Err(not_found_err(id)),
         }

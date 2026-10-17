@@ -698,9 +698,10 @@ mod tests {
         };
         let previous_files = files(temp_dir.path())?;
         let previous_heads = files(&temp_dir.path().join("heads"))?;
-        let (tables, _lock) = store.get_head_tables_locked()?;
+        let (tables, lock) = store.get_head_tables_locked()?;
         let names: HashSet<_> = tables.iter().map(|table| table.name()).collect();
         assert_eq!(names, HashSet::from([left.name(), right.name()]));
+        drop(lock);
         assert_eq!(files(temp_dir.path())?, previous_files);
         assert_eq!(files(&temp_dir.path().join("heads"))?, previous_heads);
         Ok(())

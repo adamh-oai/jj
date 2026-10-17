@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use std::fs;
 use std::io;
 use std::io::ErrorKind;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -144,14 +145,32 @@ impl SimpleOpStore {
         self.path.join("operations")
     }
 
+    pub(crate) fn store_path(&self) -> &Path {
+        &self.path
+    }
+
     /// Exports the stored bytes without re-encoding the operation or changing its ID.
     /// Synthetic root objects have no stored representation and must be skipped.
     pub fn export_operation(&self, id: &OperationId) -> OpStoreResult<Vec<u8>> {
+        self.export_operation_with_limit(id, None)
+    }
+
+    pub(crate) fn export_operation_bounded(
+        &self,
+        id: &OperationId,
+        limit: usize,
+    ) -> OpStoreResult<Vec<u8>> {
+        self.export_operation_with_limit(id, Some(limit))
+    }
+
+    fn export_operation_with_limit(
+        &self,
+        id: &OperationId,
+        limit: Option<usize>,
+    ) -> OpStoreResult<Vec<u8>> {
         self.check_raw_id(id, OPERATION_ID_LENGTH)?;
         let path = self.operations_dir().join(id.hex());
-        let bytes = fs::read(&path)
-            .context(&path)
-            .map_err(|err| io_to_read_error(err, id))?;
+        let bytes = read_raw_export(&path, id, limit)?;
         self.decode_raw_operation(id, &bytes)?;
         Ok(bytes)
     }
@@ -172,11 +191,17 @@ impl SimpleOpStore {
     /// Exports the stored bytes without applying view migrations to those bytes.
     /// Synthetic root objects have no stored representation and must be skipped.
     pub fn export_view(&self, id: &ViewId) -> OpStoreResult<Vec<u8>> {
+        self.export_view_with_limit(id, None)
+    }
+
+    pub(crate) fn export_view_bounded(&self, id: &ViewId, limit: usize) -> OpStoreResult<Vec<u8>> {
+        self.export_view_with_limit(id, Some(limit))
+    }
+
+    fn export_view_with_limit(&self, id: &ViewId, limit: Option<usize>) -> OpStoreResult<Vec<u8>> {
         self.check_raw_id(id, VIEW_ID_LENGTH)?;
         let path = self.views_dir().join(id.hex());
-        let bytes = fs::read(&path)
-            .context(&path)
-            .map_err(|err| io_to_read_error(err, id))?;
+        let bytes = read_raw_export(&path, id, limit)?;
         self.decode_raw_view(id, &bytes)?;
         Ok(bytes)
     }
@@ -593,6 +618,45 @@ enum RawObjectError {
     HashMismatch,
     #[error("Existing object with this ID has different content")]
     ExistingObjectMismatch,
+    #[error("Operation-store metadata exceeds the {limit}-byte export limit")]
+    ExportLimit { limit: usize },
+}
+
+fn read_raw_export(
+    path: &Path,
+    id: &impl ObjectId,
+    limit: Option<usize>,
+) -> OpStoreResult<Vec<u8>> {
+    let file = fs::File::open(path)
+        .context(path)
+        .map_err(|err| io_to_read_error(err, id))?;
+    if let Some(limit) = limit {
+        let size = file
+            .metadata()
+            .context(path)
+            .map_err(|err| io_to_read_error(err, id))?
+            .len();
+        if size > limit as u64 {
+            return Err(to_read_error(
+                RawObjectError::ExportLimit { limit }.into(),
+                id,
+            ));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.map_or(u64::MAX, |limit| (limit as u64).saturating_add(1)))
+        .read_to_end(&mut bytes)
+        .context(path)
+        .map_err(|err| io_to_read_error(err, id))?;
+    if let Some(limit) = limit
+        && bytes.len() > limit
+    {
+        return Err(to_read_error(
+            RawObjectError::ExportLimit { limit }.into(),
+            id,
+        ));
+    }
+    Ok(bytes)
 }
 
 fn import_raw_object<T: PartialEq>(
@@ -1532,6 +1596,15 @@ mod tests {
         let view = create_view();
         let view_id = source.write_view(&view).block_on()?;
         let view_bytes = source.export_view(&view_id)?;
+        assert_eq!(
+            source.export_view_bounded(&view_id, view_bytes.len())?,
+            view_bytes
+        );
+        assert!(
+            source
+                .export_view_bounded(&view_id, view_bytes.len() - 1)
+                .is_err()
+        );
         assert_eq!(destination.import_view(&view_id, &view_bytes)?, view);
         assert_eq!(destination.export_view(&view_id)?, view_bytes);
         assert_eq!(destination.import_view(&view_id, &view_bytes)?, view);
@@ -1540,6 +1613,15 @@ mod tests {
         operation.view_id = view_id;
         let operation_id = source.write_operation(&operation).block_on()?;
         let operation_bytes = source.export_operation(&operation_id)?;
+        assert_eq!(
+            source.export_operation_bounded(&operation_id, operation_bytes.len())?,
+            operation_bytes
+        );
+        assert!(
+            source
+                .export_operation_bounded(&operation_id, operation_bytes.len() - 1)
+                .is_err()
+        );
         assert_eq!(
             destination.import_operation(&operation_id, &operation_bytes)?,
             operation
