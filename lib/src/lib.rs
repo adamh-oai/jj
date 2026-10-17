@@ -107,6 +107,7 @@ pub use jj_core::store;
 pub use jj_core::str_util;
 pub mod submodule_store;
 pub mod subprocess_util;
+pub mod sync;
 #[cfg(feature = "testing")]
 pub mod test_signing_backend;
 pub use jj_core::time_util;

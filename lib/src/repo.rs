@@ -2061,6 +2061,25 @@ impl MutableRepo {
         self.index.merge_in(other_repo.readonly_index())
     }
 
+    /// Reconciles repository fields while keeping this receiver's local maps.
+    ///
+    /// Mask both the base and incoming side before computing any differences.
+    /// Installing a foreign full view and repairing workspace maps afterward
+    /// would already have applied its workspace rewrites.
+    pub(crate) async fn merge_shared_view(
+        &mut self,
+        base: &op_store::View,
+        other: &op_store::View,
+    ) -> Result<(), RepoLoaderError> {
+        let base = crate::sync::shared::SharedView::from_view(base);
+        let other = crate::sync::shared::SharedView::from_view(other);
+        self.merge_view(
+            &View::new(base.as_view().clone(), true),
+            &View::new(other.as_view().clone(), true),
+        )
+        .await
+    }
+
     async fn merge_view(&mut self, base: &View, other: &View) -> Result<(), RepoLoaderError> {
         let changed_wc_commits = diff_named_commit_ids(base.wc_commit_ids(), other.wc_commit_ids());
         for (name, (base_id, other_id)) in changed_wc_commits {
