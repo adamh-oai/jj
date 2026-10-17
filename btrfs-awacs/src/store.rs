@@ -121,15 +121,24 @@ impl Store {
     }
 
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let mut connection = open_connection(path)?;
-        configure_manager_connection(&connection)?;
-        migrate_manager_schema(&mut connection)?;
-        verify_database_header(&connection, MANAGER_APPLICATION_ID)?;
-        let count: i64 = connection.query_row(
-            "SELECT count(*) FROM service_metadata WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
+        let mut connection =
+            crate::diagnostics::timed("sqlite open connection", || open_connection(path))?;
+        crate::diagnostics::timed("sqlite configure connection", || {
+            configure_manager_connection(&connection)
+        })?;
+        crate::diagnostics::timed("sqlite migrate schema", || {
+            migrate_manager_schema(&mut connection)
+        })?;
+        crate::diagnostics::timed("sqlite verify database header", || {
+            verify_database_header(&connection, MANAGER_APPLICATION_ID)
+        })?;
+        let count: i64 = crate::diagnostics::timed("sqlite read service metadata", || {
+            connection.query_row(
+                "SELECT count(*) FROM service_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+        })?;
         if count != 1 {
             return Err(StoreError::new(
                 "manager database does not contain exactly one service metadata row",

@@ -204,34 +204,38 @@ impl FacadeService {
         lease_expires_ns: i64,
         allow_replay_invalidation: bool,
     ) -> Result<PreparedQueryResult, FacadeError> {
-        self.check_continuity_or_invalidate(watch_id, "pre-cut namespace check")?;
+        crate::diagnostics::timed("query pre-cut namespace check", || {
+            self.check_continuity_or_invalidate(watch_id, "pre-cut namespace check")
+        })?;
         let view = self.views.get(&watch_id).expect("checked active view");
         let authorization_id = view.authorization_id;
         let activation = view.activation.clone();
-        let published = self
-            .service
-            .changes(&ChangesOptions {
+        let published = crate::diagnostics::timed("query take synchronized cut", || {
+            self.service.changes(&ChangesOptions {
                 watch_id,
                 authorization_id,
                 requester_uid,
                 requester_gid,
                 now_ns,
             })
-            .map_err(|error| FacadeError::context("take synchronized scan cut", error))?;
+        })
+        .map_err(|error| FacadeError::context("take synchronized scan cut", error))?;
         // The opaque cursor identifies this exact immutable snapshot
         // identity. Direct mode can resolve its logical cut from the durable
         // journal even after the old snapshot pathname has been collected.
         let previous_snapshot_uuid = previous_baseline
             .filter(|baseline| baseline.identity.read_only)
             .map(|baseline| baseline.identity.subvolume_uuid);
-        self.prepare_scan_after_cut(PreparedScanInput {
-            activation,
-            authorization_id,
-            published,
-            previous_snapshot_uuid,
-            requester_uid,
-            lease_expires_ns,
-            allow_replay_invalidation,
+        crate::diagnostics::timed("query prepare after cut", || {
+            self.prepare_scan_after_cut(PreparedScanInput {
+                activation,
+                authorization_id,
+                published,
+                previous_snapshot_uuid,
+                requester_uid,
+                lease_expires_ns,
+                allow_replay_invalidation,
+            })
         })
     }
 
@@ -248,7 +252,9 @@ impl FacadeService {
         watch_id: [u8; 16],
         baseline: &crate::scan::SnapshotBaseline,
     ) -> Result<bool, FacadeError> {
-        let claims = self.logical_git_baseline_claims(watch_id, baseline)?;
+        let claims = crate::diagnostics::timed("validate logical Git cursor claims", || {
+            self.logical_git_baseline_claims(watch_id, baseline)
+        })?;
         let sequence = i64::try_from(claims.cut_sequence)
             .map_err(|_| FacadeError::new("Git logical cursor sequence exceeds SQLite range"))?;
         let (filesystem_uuid, indexed_sequence, replay_floor): (Vec<u8>, i64, i64) = self
@@ -313,7 +319,9 @@ impl FacadeService {
         baseline: &crate::scan::SnapshotBaseline,
         now_ns: i64,
     ) -> Result<bool, FacadeError> {
-        let claims = self.logical_git_baseline_claims(watch_id, baseline)?;
+        let claims = crate::diagnostics::timed("observe logical Git cursor claims", || {
+            self.logical_git_baseline_claims(watch_id, baseline)
+        })?;
         let observation = crate::manager::GitCursorObservation {
             watch_id,
             authorization_id: claims.owner_grant_id,
@@ -326,10 +334,12 @@ impl FacadeService {
             now_ns,
             grace_ns: self.service.git_cursor_grace_ns(),
         };
-        self.service
-            .store_mut()
-            .record_git_cursor_observation(&observation)
-            .map_err(|error| FacadeError::context("observe Git query cursor", error))
+        crate::diagnostics::timed("record logical Git cursor", || {
+            self.service
+                .store_mut()
+                .record_git_cursor_observation(&observation)
+        })
+        .map_err(|error| FacadeError::context("observe Git query cursor", error))
     }
 
     fn logical_git_baseline_claims(

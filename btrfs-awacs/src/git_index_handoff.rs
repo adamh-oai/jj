@@ -75,6 +75,19 @@ pub struct GitIndexHandoff {
     nested_paths: Vec<Vec<u8>>,
 }
 
+fn capture_index_error(phase: &'static str, error: io::Error) -> String {
+    // The optimization may fall back to a cold index. Report enough to
+    // distinguish unsupported filesystems, permissions, and I/O failures
+    // without logging a worktree path or Git index contents.
+    tracing::warn!(
+        phase,
+        error_kind = ?error.kind(),
+        os_error = error.raw_os_error(),
+        "source Git index capture failed"
+    );
+    format!("{phase}: {error}")
+}
+
 impl GitIndexHandoff {
     pub fn capture(
         source: &Path,
@@ -91,16 +104,17 @@ impl GitIndexHandoff {
             .custom_flags(libc::O_TMPFILE)
             .mode(0o600)
             .open(index_path.parent().ok_or("source index has no parent")?)
-            .map_err(|error| format!("capture source Git index: {error}"))?;
+            .map_err(|error| capture_index_error("open temporary index", error))?;
         clone_or_copy_index(&source_index, &mut index)
-            .map_err(|error| format!("capture source Git index: {error}"))?;
+            .map_err(|error| capture_index_error("copy source index", error))?;
         let permissions = source_index
             .metadata()
-            .map_err(|error| format!("inspect source Git index permissions: {error}"))?
+            .map_err(|error| capture_index_error("inspect index permissions", error))?
             .permissions();
-        let root = File::open(source).map_err(|error| format!("open source subvolume: {error}"))?;
+        let root = File::open(source)
+            .map_err(|error| capture_index_error("open source subvolume", error))?;
         let nested_paths = child_subvolume_paths(root.as_fd())
-            .map_err(|error| format!("inspect source nested subvolumes: {error}"))?
+            .map_err(|error| capture_index_error("inspect nested subvolumes", error))?
             .into_iter()
             .map(|path| path.into_os_string().into_vec())
             .collect();

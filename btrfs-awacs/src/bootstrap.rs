@@ -645,9 +645,10 @@ fn timed_descendant_phase<T>(
 /// The caller must hold this root's `root.lock` through service startup.
 pub fn open_initialized_root_service(root: &Path) -> Result<Service, BootstrapError> {
     let (canonical_root, service) = open_existing_root_service(root)?;
-    service
-        .require_initialized_root(&canonical_root)
-        .map_err(|error| BootstrapError::new(format!("verify AWACS root state: {error}")))?;
+    crate::diagnostics::timed("verify initialized root", || {
+        service.require_initialized_root(&canonical_root)
+    })
+    .map_err(|error| BootstrapError::new(format!("verify AWACS root state: {error}")))?;
     Ok(service)
 }
 
@@ -682,17 +683,19 @@ pub fn finalize_root_path(root: &Path) -> Result<(), BootstrapError> {
 fn rebind_root_path(root: &Path, store: &mut Store) -> Result<bool, BootstrapError> {
     // Read both identities from the same live descriptor. A copied manager
     // database or another checkout at the old name is not proof of a move.
-    let live = OpenedSubvolume::open(root)
-        .map_err(|error| BootstrapError::new(format!("open AWACS root: {error}")))?;
-    let rebound = store
-        .rebind_active_uid_watch_path_by_subvolume(
+    let live =
+        crate::diagnostics::timed("rebind open live subvolume", || OpenedSubvolume::open(root))
+            .map_err(|error| BootstrapError::new(format!("open AWACS root: {error}")))?;
+    let rebound = crate::diagnostics::timed("rebind watch in store", || {
+        store.rebind_active_uid_watch_path_by_subvolume(
             live.filesystem.fs_uuid,
             live.subvolume.uuid,
             root.as_os_str().as_bytes(),
             unsafe { libc::geteuid() },
             PERMISSION_READ | PERMISSION_CUT,
         )
-        .map_err(|error| BootstrapError::new(format!("finalize AWACS root paths: {error}")))?;
+    })
+    .map_err(|error| BootstrapError::new(format!("finalize AWACS root paths: {error}")))?;
     Ok(rebound.is_some())
 }
 
@@ -709,22 +712,27 @@ fn open_existing_root_service(root: &Path) -> Result<(PathBuf, Service), Bootstr
             canonical_root.display(),
         )));
     }
-    let mut store = Store::open(&paths.manager_db)
-        .map_err(|error| BootstrapError::new(format!("open manager store: {error}")))?;
+    let mut store =
+        crate::diagnostics::timed("open manager store", || Store::open(&paths.manager_db))
+            .map_err(|error| BootstrapError::new(format!("open manager store: {error}")))?;
     // Recovery reads snapshot and operation paths immediately. Lazy facade
     // registration is too late when .git/awacs moved with the live root.
     // A partially initialized store may not have an active watch until
     // recovery finishes. No match means no namespace edits; the existing
     // initialized-root and scan authorization checks still apply afterward.
-    rebind_root_path(&canonical_root, &mut store)?;
+    crate::diagnostics::timed("rebind root path", || {
+        rebind_root_path(&canonical_root, &mut store)
+    })?;
     let config = external_service_config(
         paths.managed_dir,
         paths.snapshot_trash_dir,
         paths.spool_dir,
         read_boot_id()?,
     );
-    let service = Service::new_external(store, config)
-        .map_err(|error| BootstrapError::new(format!("open AWACS root service: {error}")))?;
+    let service = crate::diagnostics::timed("open external root service", || {
+        Service::new_external(store, config)
+    })
+    .map_err(|error| BootstrapError::new(format!("open AWACS root service: {error}")))?;
     Ok((canonical_root, service))
 }
 

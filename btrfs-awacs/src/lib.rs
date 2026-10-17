@@ -4,6 +4,7 @@ pub mod broker_protocol;
 pub mod broker_transport;
 pub mod btrfs;
 pub mod compat;
+mod diagnostics;
 pub mod facade;
 pub mod git_index_handoff;
 pub mod git_index_invalidation;

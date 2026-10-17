@@ -440,9 +440,11 @@ impl Store {
             return Err(ManagerError::new("invalid active-watch rebind"));
         }
         let principal = encode_u64(u64::from(requester_uid));
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = crate::diagnostics::timed("rebind watch begin transaction", || {
+            self.connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+        })?;
+        let statements = crate::diagnostics::ScopeTimer::start("rebind watch statements");
         let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = transaction
             .query_row(
                 r#"SELECT w.id, g.id, w.live_path, w.fsmonitor_root
@@ -464,7 +466,8 @@ impl Store {
             )
             .optional()?;
         let Some((watch, grant, old_path, fsmonitor_root)) = row else {
-            transaction.commit()?;
+            drop(statements);
+            crate::diagnostics::timed("rebind watch commit", || transaction.commit())?;
             return Ok(None);
         };
         let ids = (
@@ -472,7 +475,8 @@ impl Store {
             fixed_manager_blob(&grant, "grant ID")?,
         );
         if old_path == live_path {
-            transaction.commit()?;
+            drop(statements);
+            crate::diagnostics::timed("rebind watch commit", || transaction.commit())?;
             return Ok(Some(ids));
         }
         // This is a per-root manager operation, not authorization to move
@@ -563,7 +567,8 @@ impl Store {
             )?,
             "rebind active watch path",
         )?;
-        transaction.commit()?;
+        drop(statements);
+        crate::diagnostics::timed("rebind watch commit", || transaction.commit())?;
         Ok(Some(ids))
     }
 
@@ -880,10 +885,14 @@ impl Store {
         &mut self,
         current_boot_id: [u8; 16],
     ) -> Result<RecoveryReport, ManagerError> {
-        let previous_boot_id = self.metadata()?.last_boot_id;
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous_boot_id =
+            crate::diagnostics::timed("recover process read metadata", || self.metadata())?
+                .last_boot_id;
+        let transaction = crate::diagnostics::timed("recover process begin transaction", || {
+            self.connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+        })?;
+        let statements = crate::diagnostics::ScopeTimer::start("recover process statements");
         let active_queries: i64 = transaction.query_row(
             "SELECT count(*) FROM query_leases WHERE state = 'active'",
             [],
@@ -966,7 +975,8 @@ impl Store {
             "UPDATE service_metadata SET last_boot_id = ?1 WHERE singleton = 1",
             [current_boot_id.as_slice()],
         )?;
-        transaction.commit()?;
+        drop(statements);
+        crate::diagnostics::timed("recover process commit", || transaction.commit())?;
         Ok(RecoveryReport {
             invalidated_facades: watch_ids.len(),
             released_queries: usize::try_from(active_queries)
@@ -1189,9 +1199,11 @@ impl Store {
         binding: &ViewBinding,
     ) -> Result<FacadeActivation, ManagerError> {
         let clock_epoch = random_id();
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction = crate::diagnostics::timed("facade activation begin transaction", || {
+            self.connection_mut()
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+        })?;
+        let statements = crate::diagnostics::ScopeTimer::start("facade activation statements");
         let valid: Option<i64> = transaction
             .query_row(
                 r#"SELECT 1
@@ -1250,7 +1262,8 @@ impl Store {
             )?,
             "activate snapshot facade",
         )?;
-        transaction.commit()?;
+        drop(statements);
+        crate::diagnostics::timed("facade activation commit", || transaction.commit())?;
         Ok(FacadeActivation {
             watch_id,
             authorization_id,
@@ -3335,9 +3348,12 @@ impl Store {
             .now_ns
             .checked_add(observation.grace_ns)
             .ok_or_else(|| ManagerError::new("Git cursor grace deadline overflow"))?;
-        let transaction = self
-            .connection_mut()
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let transaction =
+            crate::diagnostics::timed("observe Git cursor begin transaction", || {
+                self.connection_mut()
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+            })?;
+        let statements = crate::diagnostics::ScopeTimer::start("observe Git cursor statements");
         let watch: Option<(i64, i64, Vec<u8>)> = transaction
             .query_row(
                 r#"SELECT w.indexed_seq, w.replay_floor_seq, f.fs_uuid
@@ -3390,12 +3406,14 @@ impl Store {
                 "Git cursor observation boundary identity differs",
             ));
         }
-        if !has_complete_retained_replay(
-            &transaction,
-            observation.watch_id,
-            observation.sequence,
-            indexed_sequence,
-        )? {
+        if !crate::diagnostics::timed("observe Git cursor validate replay", || {
+            has_complete_retained_replay(
+                &transaction,
+                observation.watch_id,
+                observation.sequence,
+                indexed_sequence,
+            )
+        })? {
             return Ok(false);
         }
         let head: Option<(i64, i64)> = transaction
@@ -3440,7 +3458,8 @@ impl Store {
                 retain_until,
             ],
         )?;
-        transaction.commit()?;
+        drop(statements);
+        crate::diagnostics::timed("observe Git cursor commit", || transaction.commit())?;
         Ok(true)
     }
 

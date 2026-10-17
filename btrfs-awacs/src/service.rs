@@ -502,14 +502,17 @@ impl Service {
             .broker_directory
             .as_ref()
             .ok_or_else(|| ServiceError::new("external broker directory is not configured"))?;
-        let manager_store_uuid = store
-            .metadata()
-            .map_err(|error| ServiceError::context("read manager metadata", error))?
-            .store_uuid;
-        store
-            .recover_process_state(config.boot_id)
-            .map_err(|error| ServiceError::context("recover manager process state", error))?;
-        let broker = connect_external_broker(broker_directory, manager_store_uuid)?;
+        let manager_store_uuid =
+            crate::diagnostics::timed("service read manager metadata", || store.metadata())
+                .map_err(|error| ServiceError::context("read manager metadata", error))?
+                .store_uuid;
+        crate::diagnostics::timed("service recover process state", || {
+            store.recover_process_state(config.boot_id)
+        })
+        .map_err(|error| ServiceError::context("recover manager process state", error))?;
+        let broker = crate::diagnostics::timed("service connect broker", || {
+            connect_external_broker(broker_directory, manager_store_uuid)
+        })?;
         let manager_session_id = broker.session_id();
         let lease_owner = random_id();
         let mut service = Self {
@@ -523,30 +526,40 @@ impl Service {
             last_maintenance_watches_processed: 0,
             last_maintenance_more_watches: false,
         };
-        service.request_snapshot_trash_drain()?;
+        crate::diagnostics::timed("service request trash drain", || {
+            service.request_snapshot_trash_drain()
+        })?;
         if !recover_state {
             return Ok(service);
         }
         let recovery_now = current_unix_time_ns()?;
-        service
-            .store
-            .abort_planned_operations(recovery_now)
-            .map_err(|error| ServiceError::context("abort pre-effect operations", error))?;
-        service
-            .store
-            .takeover_recovery_leases(
-                lease_owner,
-                lease_expiry(recovery_now, service.config.lease_ns)?,
+        crate::diagnostics::timed("service abort planned operations", || {
+            service.store.abort_planned_operations(recovery_now)
+        })
+        .map_err(|error| ServiceError::context("abort pre-effect operations", error))?;
+        let recovery_expiry = lease_expiry(recovery_now, service.config.lease_ns)?;
+        crate::diagnostics::timed("service take over recovery leases", || {
+            service
+                .store
+                .takeover_recovery_leases(lease_owner, recovery_expiry)
+        })
+        .map_err(|error| ServiceError::context("take over recovery leases", error))?;
+        crate::diagnostics::timed("service recover initializations", || {
+            service.recover_initialize_operations()
+        })?;
+        crate::diagnostics::timed("service recover cuts", || service.recover_cut_operations())?;
+        crate::diagnostics::timed("service recover deletions", || {
+            service.recover_snapshot_delete_operations()
+        })?;
+        crate::diagnostics::timed("service clean stale spool files", || {
+            cleanup_stale_spool_files(&service.config.spool_directory)
+        })?;
+        crate::diagnostics::timed("service quarantine unexpected entries", || {
+            quarantine_unexpected_managed_entries(
+                &service.store,
+                &service.config.managed_snapshot_directory,
             )
-            .map_err(|error| ServiceError::context("take over recovery leases", error))?;
-        service.recover_initialize_operations()?;
-        service.recover_cut_operations()?;
-        service.recover_snapshot_delete_operations()?;
-        cleanup_stale_spool_files(&service.config.spool_directory)?;
-        quarantine_unexpected_managed_entries(
-            &service.store,
-            &service.config.managed_snapshot_directory,
-        )?;
+        })?;
         Ok(service)
     }
 
@@ -1324,9 +1337,8 @@ impl Service {
 
     pub fn changes(&mut self, options: &ChangesOptions) -> Result<PublishedCut, ServiceError> {
         let admission_expiry = lease_expiry(options.now_ns, self.config.lease_ns)?;
-        if let Some(admission) = self
-            .store
-            .admit_planned_cut(
+        if let Some(admission) = crate::diagnostics::timed("cut check existing admission", || {
+            self.store.admit_planned_cut(
                 options.watch_id,
                 options.authorization_id,
                 self.manager_session_id,
@@ -1334,15 +1346,23 @@ impl Service {
                 options.now_ns,
                 admission_expiry,
             )
-            .map_err(|error| ServiceError::context("join planned cut", error))?
+        })
+        .map_err(|error| ServiceError::context("join planned cut", error))?
         {
-            return self.wait_for_cut_admission(&admission, options.now_ns, admission_expiry);
+            return crate::diagnostics::timed("cut wait for existing admission", || {
+                self.wait_for_cut_admission(&admission, options.now_ns, admission_expiry)
+            });
         }
-        let write_access = self.preflight_snapshot_lifecycle_writable()?;
-        let (live_path, _base_path) = self.watch_paths(options.watch_id)?;
-        let live = self
-            .open_subvolume(&live_path)
-            .map_err(|error| ServiceError::context("open watched subvolume", error))?;
+        let write_access = crate::diagnostics::timed("cut preflight writable", || {
+            self.preflight_snapshot_lifecycle_writable()
+        })?;
+        let (live_path, _base_path) = crate::diagnostics::timed("cut load watch paths", || {
+            self.watch_paths(options.watch_id)
+        })?;
+        let live = crate::diagnostics::timed("cut open live subvolume", || {
+            self.open_subvolume(&live_path)
+        })
+        .map_err(|error| ServiceError::context("open watched subvolume", error))?;
         let destination_name = operation_name(b"cut-");
         let destination_path =
             managed_snapshot_path(&self.config.managed_snapshot_directory, &destination_name);
@@ -1356,33 +1376,33 @@ impl Service {
             now_ns: options.now_ns,
             lease_expires_ns: lease_expiry(options.now_ns, self.config.lease_ns)?,
         };
-        let reservation = match self.store.reserve_cut(&request) {
-            Ok(reservation) => reservation,
-            Err(reserve_error) => {
-                if let Some(admission) = self
-                    .store
-                    .admit_planned_cut(
-                        options.watch_id,
-                        options.authorization_id,
-                        self.manager_session_id,
-                        "query",
-                        options.now_ns,
-                        admission_expiry,
-                    )
-                    .map_err(|error| ServiceError::context("retry cut admission", error))?
-                {
-                    return self.wait_for_cut_admission(
-                        &admission,
-                        options.now_ns,
-                        admission_expiry,
-                    );
+        let reservation =
+            match crate::diagnostics::timed("cut reserve", || self.store.reserve_cut(&request)) {
+                Ok(reservation) => reservation,
+                Err(reserve_error) => {
+                    if let Some(admission) = self
+                        .store
+                        .admit_planned_cut(
+                            options.watch_id,
+                            options.authorization_id,
+                            self.manager_session_id,
+                            "query",
+                            options.now_ns,
+                            admission_expiry,
+                        )
+                        .map_err(|error| ServiceError::context("retry cut admission", error))?
+                    {
+                        return self.wait_for_cut_admission(
+                            &admission,
+                            options.now_ns,
+                            admission_expiry,
+                        );
+                    }
+                    return Err(ServiceError::context("reserve cut", reserve_error));
                 }
-                return Err(ServiceError::context("reserve cut", reserve_error));
-            }
-        };
-        let admission = self
-            .store
-            .admit_planned_cut(
+            };
+        let admission = crate::diagnostics::timed("cut admit leader", || {
+            self.store.admit_planned_cut(
                 options.watch_id,
                 options.authorization_id,
                 self.manager_session_id,
@@ -1390,8 +1410,9 @@ impl Service {
                 options.now_ns,
                 admission_expiry,
             )
-            .map_err(|error| ServiceError::context("admit cut leader", error))?
-            .ok_or_else(|| ServiceError::new("reserved cut was closed before leader admission"))?;
+        })
+        .map_err(|error| ServiceError::context("admit cut leader", error))?
+        .ok_or_else(|| ServiceError::new("reserved cut was closed before leader admission"))?;
         if admission.reservation.operation_id != reservation.operation_id {
             return Err(ServiceError::new(
                 "leader admission attached to a different cut operation",
@@ -1402,9 +1423,11 @@ impl Service {
                 "watched live subvolume no longer matches the reserved UUID",
             ));
         }
-        self.store
-            .start_cut_filesystem_effect(&reservation, self.lease_owner, options.now_ns)
-            .map_err(|error| ServiceError::context("start cut effect", error))?;
+        crate::diagnostics::timed("cut start filesystem effect", || {
+            self.store
+                .start_cut_filesystem_effect(&reservation, self.lease_owner, options.now_ns)
+        })
+        .map_err(|error| ServiceError::context("start cut effect", error))?;
         let snapshot_started = std::time::Instant::now();
         let target = self.create_snapshot(&write_access, &live, &destination_name, true)?;
         tracing::info!(
@@ -1416,20 +1439,23 @@ impl Service {
                 "injected failure after cut snapshot effect",
             ));
         }
-        self.finish_cut(CutCompletion {
-            reservation,
-            lease_owner: self.lease_owner,
-            target: Some(target),
-            destination_path,
-            recorded: None,
-            physical_published: false,
-            reuse_staged_spool: false,
-            now_ns: options.now_ns,
+        crate::diagnostics::timed("cut finish and publish", || {
+            self.finish_cut(CutCompletion {
+                reservation,
+                lease_owner: self.lease_owner,
+                target: Some(target),
+                destination_path,
+                recorded: None,
+                physical_published: false,
+                reuse_staged_spool: false,
+                now_ns: options.now_ns,
+            })
         })?;
-        self.store
-            .poll_cut_admission(&admission, options.now_ns)
-            .map_err(|error| ServiceError::context("validate fulfilled cut admission", error))?
-            .ok_or_else(|| ServiceError::new("published cut admission is still waiting"))
+        crate::diagnostics::timed("cut poll published admission", || {
+            self.store.poll_cut_admission(&admission, options.now_ns)
+        })
+        .map_err(|error| ServiceError::context("validate fulfilled cut admission", error))?
+        .ok_or_else(|| ServiceError::new("published cut admission is still waiting"))
     }
 
     pub fn historical_changes(
