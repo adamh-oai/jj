@@ -540,15 +540,31 @@ impl TableStore {
     }
 
     pub fn get_head_locked(&self) -> TableStoreResult<(Arc<ReadonlyTable>, FileLock)> {
-        let lock = self.lock()?;
-        let mut tables = self.get_head_tables()?;
-        let merged_table = match tables.len() {
-            0 => self.save_table(MutableTable::full(self.key_size))?,
-            // Don't write a table with no changes compared to its parent
-            1 => tables.pop().unwrap(),
-            _ => self.resolve_multiple_heads(tables)?,
-        };
+        let (tables, lock) = self.get_head_tables_locked()?;
+        let merged_table = self.merge_head_tables_locked(tables, &lock)?;
         Ok((merged_table, lock))
+    }
+
+    /// Reads current heads under the table lock without merging or saving them.
+    pub(crate) fn get_head_tables_locked(
+        &self,
+    ) -> TableStoreResult<(Vec<Arc<ReadonlyTable>>, FileLock)> {
+        let lock = self.lock()?;
+        Ok((self.get_head_tables()?, lock))
+    }
+
+    /// Merges heads previously read under the supplied table lock.
+    pub(crate) fn merge_head_tables_locked(
+        &self,
+        mut tables: Vec<Arc<ReadonlyTable>>,
+        _lock: &FileLock,
+    ) -> TableStoreResult<Arc<ReadonlyTable>> {
+        match tables.len() {
+            0 => self.save_table(MutableTable::full(self.key_size)),
+            // Don't write a table with no changes compared to its parent.
+            1 => Ok(tables.pop().unwrap()),
+            _ => self.resolve_multiple_heads(tables),
+        }
     }
 
     fn resolve_multiple_heads(
@@ -655,6 +671,38 @@ mod tests {
         assert_eq!(table.get_value(b"\0\0\0"), None);
         assert_eq!(table.get_value(b"aaa"), None);
         assert_eq!(table.get_value(b"\xff\xff\xff"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn stacked_table_read_heads_without_writing() -> TestResult {
+        let temp_dir = new_temp_dir();
+        let store = TableStore::init(temp_dir.path().to_path_buf(), 3);
+        let (tables, lock) = store.get_head_tables_locked()?;
+        assert!(tables.is_empty());
+        assert_eq!(std::fs::read_dir(temp_dir.path().join("heads"))?.count(), 0);
+        drop(lock);
+
+        // Independent writers may leave multiple heads. Reading for a preflight
+        // must not reconcile them or replace their on-disk heads.
+        let mut left = MutableTable::full(3);
+        left.add_entry(b"abc".to_vec(), b"left".to_vec());
+        let left = store.save_table(left)?;
+        let mut right = MutableTable::full(3);
+        right.add_entry(b"def".to_vec(), b"right".to_vec());
+        let right = store.save_table(right)?;
+        let files = |dir: &std::path::Path| -> io::Result<HashSet<_>> {
+            std::fs::read_dir(dir)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect()
+        };
+        let previous_files = files(temp_dir.path())?;
+        let previous_heads = files(&temp_dir.path().join("heads"))?;
+        let (tables, _lock) = store.get_head_tables_locked()?;
+        let names: HashSet<_> = tables.iter().map(|table| table.name()).collect();
+        assert_eq!(names, HashSet::from([left.name(), right.name()]));
+        assert_eq!(files(temp_dir.path())?, previous_files);
+        assert_eq!(files(&temp_dir.path().join("heads"))?, previous_heads);
         Ok(())
     }
 

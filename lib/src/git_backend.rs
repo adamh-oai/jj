@@ -14,6 +14,7 @@
 
 #![expect(missing_docs)]
 
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fmt::Debug;
@@ -98,6 +99,9 @@ use crate::stacked_table::TableStoreError;
 const CHANGE_ID_LENGTH: usize = 16;
 /// Ref namespace used only for preventing GC.
 const NO_GC_REF_NAMESPACE: &str = "refs/jj/keep/";
+// Kept outside NO_GC_REF_NAMESPACE so older jj garbage collectors leave these
+// refs intact. Legacy conflict trees may exist only in the jj metadata table.
+const SYNC_TREE_REF_NAMESPACE: &str = "refs/jj/sync/trees/";
 
 pub const JJ_CONFLICT_README_FILE_NAME: &str = "JJ-CONFLICT-README";
 
@@ -150,12 +154,32 @@ pub enum GitBackendError {
     ReadMetadata(#[source] TableStoreError),
     #[error("Failed to write non-git metadata")]
     WriteMetadata(#[source] TableStoreError),
+    #[error("Invalid Git object record {id}: {reason}")]
+    InvalidObjectRecord {
+        id: gix::ObjectId,
+        reason: &'static str,
+    },
+    #[error("Incompatible jj metadata for Git commit {id}")]
+    ConflictingMetadata { id: CommitId },
 }
 
 impl From<GitBackendError> for BackendError {
     fn from(err: GitBackendError) -> Self {
         Self::Other(err.into())
     }
+}
+
+/// An immutable Git object and the jj metadata needed to interpret a commit.
+///
+/// Object data does not include the loose-object header. Commit extras are the
+/// individual serialized metadata entry, never a mutable metadata table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitObjectRecord {
+    pub id: gix::ObjectId,
+    pub kind: gix::objs::Kind,
+    pub data: Vec<u8>,
+    /// Present for commits, including Git commits without a stored jj entry.
+    pub commit_extras: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Error)]
@@ -468,6 +492,191 @@ impl GitBackend {
         // If it's not, cache will be reloaded when entry can't be found.
         *self.cached_extra_metadata.lock().unwrap() = Some(table);
         Ok(())
+    }
+
+    /// Exports one object's exact bytes and its commit metadata, if applicable.
+    ///
+    /// This does not import the commit or create refs. Metadata is read under
+    /// the normal table lock. The caller must separately transfer referenced objects,
+    /// including predecessor commits and legacy conflict trees in the extras.
+    pub fn export_object(&self, id: &gix::oid) -> BackendResult<GitObjectRecord> {
+        let mut git_repo = self.git_repo();
+        // Replacement refs are a local interpretation, not the immutable object
+        // identified by the requested hash.
+        git_repo.objects.ignore_replacements = true;
+        let object = git_repo
+            .try_find_object(id)
+            .map_err(|err| BackendError::Other(err.into()))?;
+        let Some(object) = object else {
+            // The backend supports this tree without requiring an on-disk
+            // object. Its exact bytes and hash are nevertheless well-defined.
+            if id.as_bytes() == self.empty_tree_id.as_bytes() {
+                return Ok(GitObjectRecord {
+                    id: id.to_owned(),
+                    kind: gix::objs::Kind::Tree,
+                    data: vec![],
+                    commit_extras: None,
+                });
+            }
+            return Err(BackendError::ObjectNotFound {
+                object_type: "Git object".to_owned(),
+                hash: id.to_string(),
+                source: None,
+            });
+        };
+        let commit_extras = if object.kind == gix::objs::Kind::Commit {
+            let commit_id = CommitId::from_bytes(id.as_bytes());
+            let commit = commit_from_git_without_root_parent(&commit_id, &object, false)?;
+            let (table, _table_lock) = self.read_extra_metadata_table_locked()?;
+            Some(match table.get_value(id.as_bytes()) {
+                Some(extras) => {
+                    validate_object_extras(id, extras)?;
+                    extras.to_vec()
+                }
+                None => serialize_extras(&commit),
+            })
+        } else {
+            None
+        };
+        Ok(GitObjectRecord {
+            id: id.to_owned(),
+            kind: object.kind,
+            data: object.data.clone(),
+            commit_extras,
+        })
+    }
+
+    /// Checks an object and its compatibility with existing jj metadata.
+    ///
+    /// This does not write objects, metadata, or refs. It is a preflight check,
+    /// not a reservation: importing repeats the checks under the metadata lock
+    /// to detect a concurrent writer after validation.
+    pub fn validate_object_import(&self, record: &GitObjectRecord) -> BackendResult<()> {
+        let git_repo = self.git_repo();
+        let Some(commit) = validate_object_record(&git_repo, record)? else {
+            return Ok(());
+        };
+        let (tables, _table_lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        for table in tables {
+            if let Some(existing_extras) = table.get_value(record.id.as_bytes()) {
+                validate_existing_object_extras(record, &commit, existing_extras)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Imports one immutable object without publishing any commits or refs.
+    ///
+    /// Hashes and metadata are checked before writing. Existing metadata is
+    /// compared under the same table lock used by ordinary commit writers;
+    /// incompatible identities are rejected rather than rewritten. The caller
+    /// is responsible for validating the full object closure before activation
+    /// and protecting staged objects from concurrent garbage collection.
+    pub fn import_object(&self, record: &GitObjectRecord) -> BackendResult<()> {
+        let mut git_repo = self.git_repo();
+        git_repo.objects.ignore_replacements = true;
+        let Some(commit) = validate_object_record(&git_repo, record)? else {
+            git_repo
+                .objects
+                .write_buf_with_known_id(record.kind, &record.data, record.id)
+                .map_err(|err| BackendError::WriteObject {
+                    object_type: "Git object",
+                    source: err.into(),
+                })?;
+            return Ok(());
+        };
+        let extras = record.commit_extras.as_deref().unwrap();
+        let id = CommitId::from_bytes(record.id.as_bytes());
+        let (tables, table_lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        // Compare every head before merging: merging must not hide a competing
+        // metadata identity for the same immutable Git commit.
+        for table in &tables {
+            if let Some(existing_extras) = table.get_value(id.as_bytes()) {
+                validate_existing_object_extras(record, &commit, existing_extras)?;
+            }
+        }
+        let table = self
+            .extra_metadata_store
+            .merge_head_tables_locked(tables, &table_lock)
+            .map_err(GitBackendError::ReadMetadata)?;
+        git_repo
+            .objects
+            .write_buf_with_known_id(record.kind, &record.data, record.id)
+            .map_err(|err| BackendError::WriteObject {
+                object_type: "commit",
+                source: err.into(),
+            })?;
+        if table.get_value(id.as_bytes()).is_none() {
+            let mut mut_table = table.start_mutation();
+            mut_table.add_entry(id.to_bytes(), extras.to_vec());
+            self.save_extra_metadata_table(mut_table, &table_lock)?;
+        }
+        Ok(())
+    }
+
+    /// Protects existing trees and their contents from Git garbage collection.
+    ///
+    /// In particular, legacy conflict trees stored only in commit extras are
+    /// not necessarily reachable from the physical Git commit. Callers must
+    /// install these pins before activating incoming operation history.
+    pub fn pin_sync_trees<'a>(
+        &self,
+        tree_ids: impl IntoIterator<Item = &'a TreeId>,
+    ) -> BackendResult<()> {
+        update_sync_tree_refs(
+            self.git_repo(),
+            tree_ids.into_iter().cloned().collect(),
+            false,
+        )
+    }
+
+    /// Collects legacy tree terms which may be absent from Git commit ancestry.
+    ///
+    /// Modern conflict trees are reachable through their physical Git commit
+    /// tree. Only old metadata entries containing tree overrides need extra
+    /// retention refs. The virtual root has no physical tree to pin.
+    pub fn sync_legacy_tree_roots<'a>(
+        &self,
+        commit_ids: impl IntoIterator<Item = &'a CommitId>,
+    ) -> BackendResult<BTreeSet<TreeId>> {
+        let git_repo = self.git_repo();
+        let (table, _lock) = self.read_extra_metadata_table_locked()?;
+        let mut tree_ids = BTreeSet::new();
+        for id in commit_ids {
+            if id == &self.root_commit_id {
+                continue;
+            }
+            let git_id = validate_git_object_id(&git_repo, id)?;
+            if let Some(extras) = table.get_value(id.as_bytes()) {
+                let proto = validate_object_extras(&git_id, extras)?;
+                if proto.uses_tree_conflict_format {
+                    tree_ids.extend(proto.root_tree.iter().map(|id| TreeId::from_bytes(id)));
+                }
+            }
+        }
+        Ok(tree_ids)
+    }
+
+    /// Replaces the sync tree pins with the complete set of retained tree roots.
+    ///
+    /// The caller must hold the repository's sync/GC lock and include any
+    /// active transfers before removing obsolete pins. Virtual root trees
+    /// without a physical Git object must be excluded.
+    pub fn replace_sync_tree_roots<'a>(
+        &self,
+        tree_ids: impl IntoIterator<Item = &'a TreeId>,
+    ) -> BackendResult<()> {
+        update_sync_tree_refs(
+            self.git_repo(),
+            tree_ids.into_iter().cloned().collect(),
+            true,
+        )
     }
 
     /// Imports the given commits and ancestors from the backing Git repo.
@@ -844,6 +1053,100 @@ fn serialize_extras(commit: &Commit) -> Vec<u8> {
     proto.encode_to_vec()
 }
 
+// Returns the commit's interpretation before applying extras, if applicable.
+fn validate_object_record(
+    git_repo: &gix::Repository,
+    record: &GitObjectRecord,
+) -> BackendResult<Option<Commit>> {
+    let invalid = |reason| GitBackendError::InvalidObjectRecord {
+        id: record.id,
+        reason,
+    };
+    if record.id.kind() != git_repo.object_hash() {
+        return Err(invalid("object hash format does not match the repository").into());
+    }
+    let actual_id =
+        gix::objs::compute_hash(record.id.kind(), record.kind, &record.data).map_err(|err| {
+            BackendError::WriteObject {
+                object_type: "Git object",
+                source: err.into(),
+            }
+        })?;
+    if actual_id != record.id {
+        return Err(invalid("object contents do not match the advertised hash").into());
+    }
+    gix::objs::ObjectRef::from_bytes(&record.data, record.kind, record.id.kind())
+        .map_err(|err| BackendError::Other(err.into()))?;
+    if record.kind != gix::objs::Kind::Commit {
+        if record.commit_extras.is_some() {
+            return Err(invalid("only commits can have jj metadata").into());
+        }
+        return Ok(None);
+    }
+    let extras = record
+        .commit_extras
+        .as_deref()
+        .ok_or_else(|| invalid("commit metadata is missing"))?;
+    validate_object_extras(&record.id, extras)?;
+    let id = CommitId::from_bytes(record.id.as_bytes());
+    let object = gix::Object {
+        id: record.id,
+        kind: record.kind,
+        data: record.data.clone(),
+        repo: git_repo,
+    };
+    commit_from_git_without_root_parent(&id, &object, false).map(Some)
+}
+
+fn validate_existing_object_extras(
+    record: &GitObjectRecord,
+    commit: &Commit,
+    existing_extras: &[u8],
+) -> BackendResult<()> {
+    validate_object_extras(&record.id, existing_extras)?;
+    let mut incoming_commit = commit.clone();
+    deserialize_extras(
+        &mut incoming_commit,
+        record.commit_extras.as_deref().unwrap(),
+    );
+    let mut existing_commit = commit.clone();
+    deserialize_extras(&mut existing_commit, existing_extras);
+    if existing_commit != incoming_commit {
+        return Err(GitBackendError::ConflictingMetadata {
+            id: CommitId::from_bytes(record.id.as_bytes()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_object_extras(
+    id: &gix::oid,
+    bytes: &[u8],
+) -> BackendResult<crate::protos::git_store::Commit> {
+    let invalid = |reason| GitBackendError::InvalidObjectRecord {
+        id: id.to_owned(),
+        reason,
+    };
+    let proto = crate::protos::git_store::Commit::decode(bytes)
+        .map_err(|_| invalid("invalid commit metadata encoding"))?;
+    if proto
+        .predecessors
+        .iter()
+        .chain(&proto.root_tree)
+        .any(|id_bytes| id_bytes.len() != id.as_bytes().len())
+    {
+        return Err(invalid("invalid object ID length in commit metadata").into());
+    }
+    if proto.uses_tree_conflict_format
+        && !proto.root_tree.is_empty()
+        && proto.root_tree.len() % 2 == 0
+    {
+        return Err(invalid("invalid legacy conflict-tree terms").into());
+    }
+    Ok(proto)
+}
+
 fn deserialize_extras(commit: &mut Commit, bytes: &[u8]) {
     let proto = crate::protos::git_store::Commit::decode(bytes).unwrap();
     if !proto.change_id.is_empty() {
@@ -895,6 +1198,78 @@ fn to_ref_deletion(git_ref: gix::refs::Reference) -> gix::refs::transaction::Ref
         name: git_ref.name,
         deref: false,
     }
+}
+
+fn update_sync_tree_refs(
+    mut git_repo: gix::Repository,
+    tree_ids: HashSet<TreeId>,
+    replace: bool,
+) -> BackendResult<()> {
+    git_repo.objects.ignore_replacements = true;
+    // Validate all roots before changing refs. In particular, don't prune old
+    // pins if the newly captured retained closure is incomplete.
+    let mut updates = Vec::with_capacity(tree_ids.len());
+    for id in &tree_ids {
+        let oid = validate_git_object_id(&git_repo, id)?;
+        let object = git_repo
+            .try_find_object(oid)
+            .map_err(|err| to_read_object_err(err, id))?;
+        match object {
+            Some(object) if object.kind == gix::objs::Kind::Tree => {}
+            Some(_) => {
+                return Err(GitBackendError::InvalidObjectRecord {
+                    id: oid,
+                    reason: "sync tree root is not a tree",
+                }
+                .into());
+            }
+            None if oid == gix::ObjectId::empty_tree(git_repo.object_hash()) => {
+                git_repo
+                    .objects
+                    .write_buf_with_known_id(gix::objs::Kind::Tree, &[], oid)
+                    .map_err(|err| BackendError::WriteObject {
+                        object_type: "tree",
+                        source: err.into(),
+                    })?;
+            }
+            None => return Err(not_found_err(id)),
+        }
+        let name = format!("{SYNC_TREE_REF_NAMESPACE}{id}");
+        let new = gix::refs::Target::Object(oid);
+        updates.push(gix::refs::transaction::RefEdit {
+            change: gix::refs::transaction::Change::Update {
+                log: gix::refs::transaction::LogChange {
+                    message: "retained by jj sync".into(),
+                    ..Default::default()
+                },
+                expected: gix::refs::transaction::PreviousValue::ExistingMustMatch(new.clone()),
+                new,
+            },
+            name: name.try_into().unwrap(),
+            deref: false,
+        });
+    }
+    if replace {
+        let references = git_repo
+            .references()
+            .map_err(|err| BackendError::Other(err.into()))?;
+        for git_ref in references
+            .prefixed(SYNC_TREE_REF_NAMESPACE)
+            .map_err(|err| BackendError::Other(err.into()))?
+        {
+            let git_ref = git_ref.map_err(|err| BackendError::Other(err.into()))?;
+            let name = git_ref.name().as_bstr();
+            let maybe_id = gix::ObjectId::from_hex(&name[SYNC_TREE_REF_NAMESPACE.len()..]).ok();
+            if maybe_id.is_some_and(|id| tree_ids.contains(&TreeId::from_bytes(id.as_bytes()))) {
+                continue;
+            }
+            updates.push(to_ref_deletion(git_ref.detach()));
+        }
+    }
+    git_repo
+        .edit_references(updates)
+        .map_err(|err| BackendError::Other(err.into()))?;
+    Ok(())
 }
 
 /// Recreates `refs/jj/keep` refs for the `new_heads`, and removes the other
