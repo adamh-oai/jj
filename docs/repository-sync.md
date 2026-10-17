@@ -98,9 +98,11 @@ idempotent. A success covers the captured histories, rather than promising that
 both native operation tips are identical or that later concurrent work has
 already been exchanged.
 
-If checkout was interrupted after publication, normal Jujutsu recovery retains
-the physical files as working-copy edits, including edits made after the
-interruption, while the published operation remains available in history.
+If checkout was interrupted after publication, the workspace may be stale.
+Run `jj workspace update-stale` before retrying synchronization. Normal recovery
+saves local edits before reconciling the workspace with the published operation;
+inspect any divergent changes reported during recovery. The published operation
+remains available in history.
 
 Garbage collection retains the histories and objects referenced by
 synchronization tracking, including legacy conflict trees referenced only by

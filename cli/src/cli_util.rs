@@ -2598,7 +2598,7 @@ to the current parents may contain changes from multiple commits.
             #[cfg(feature = "test-fakes")]
             if env::var_os("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH").is_some() {
                 return Err(internal_error_with_message(
-                    "Injected failure after synchronization publication",
+                    "Injected failure after operation publication",
                     io::Error::other("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH"),
                 ));
             }

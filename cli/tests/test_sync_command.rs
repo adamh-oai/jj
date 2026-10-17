@@ -751,25 +751,56 @@ fn test_sync_rewritten_ancestor_checkout_recovers_after_publication() {
     let published_op = left.current_operation_id();
     assert_ne!(published_op, old_op);
     // Publication has committed the ancestor rewrite and descendant rebase,
-    // while the worktree still needs the journaled checkout.
+    // while the worktree still records the previous operation and tree.
     let rebased = revision_id(&left, "@");
     assert_ne!(rebased, old_wc);
     assert_eq!(revision_id(&left, "@-"), rewritten);
     assert_eq!(left.read_file("base"), "old base contents\n");
     assert_eq!(left.read_file("child"), "local child contents\n");
-    let pending_checkout = left.root().join(".jj/working_copy/pending_checkout");
-    assert!(pending_checkout.exists());
     left.write_file("child", "user edits after interruption\n");
 
-    left.run_jj(["sync", "--receive", "../right"]).success();
-    // Normal pending-checkout recovery snapshots physical files as edits
-    // against the intended tree, including writes made after the failure.
+    // The default stale-workspace policy requires explicit recovery. A failed
+    // retry must leave the published operation and physical edits intact.
+    let output = left.run_jj(["sync", "--receive", "../right"]);
+    assert!(!output.status.success());
+    assert!(
+        output.stderr.raw().contains("working copy is stale"),
+        "{output}"
+    );
+    assert_eq!(left.current_operation_id(), published_op);
     assert_eq!(left.read_file("base"), "old base contents\n");
     assert_eq!(left.read_file("child"), "user edits after interruption\n");
-    assert!(!pending_checkout.exists());
-    assert_ne!(revision_id(&left, "@"), rebased);
+
+    left.run_jj(["workspace", "update-stale"]).success();
+    left.run_jj(["status"]).success();
+    assert_eq!(left.read_file("base"), "rewritten base contents\n");
     assert_eq!(revision_id(&left, "@-"), rewritten);
-    for (path, current, published) in [
+
+    // Native stale recovery saves edits against the old workspace operation
+    // before reconciling it with the published rewrite. The saved edit may be
+    // a divergent change rather than the commit selected as the new @.
+    let operations = left
+        .run_jj([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "-T",
+            "id ++ \"\\n\"",
+        ])
+        .success();
+    let old_op_id = OperationId::try_from_hex(&old_op).unwrap();
+    let snapshots = operations
+        .stdout
+        .raw()
+        .lines()
+        .filter(|id| {
+            let op = operation(&left, id);
+            op.parents == [old_op_id.clone()] && op.metadata.description == "snapshot working copy"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(snapshots.len(), 1);
+    for (path, saved, published) in [
         ("base", "old base contents\n", "rewritten base contents\n"),
         (
             "child",
@@ -778,11 +809,20 @@ fn test_sync_rewritten_ancestor_checkout_recovers_after_publication() {
         ),
     ] {
         assert_eq!(
-            left.run_jj(["--ignore-working-copy", "file", "show", "-r", "@", path])
-                .success()
-                .stdout
-                .raw(),
-            current,
+            left.run_jj([
+                "--ignore-working-copy",
+                "--at-op",
+                snapshots[0],
+                "file",
+                "show",
+                "-r",
+                "@",
+                path,
+            ])
+            .success()
+            .stdout
+            .raw(),
+            saved,
         );
         assert_eq!(
             left.run_jj([
@@ -801,6 +841,7 @@ fn test_sync_rewritten_ancestor_checkout_recovers_after_publication() {
             published,
         );
     }
+    left.run_jj(["sync", "--receive", "../right"]).success();
     let finished = left.current_operation_id();
     left.run_jj(["sync", "--receive", "../right"]).success();
     assert_eq!(left.current_operation_id(), finished);
@@ -901,7 +942,7 @@ fn test_sync_ssh_paths_are_protocol_data() {
     env.add_env_var("PATH", path);
     env.add_env_var(
         "JJ_SYNC_REAL_JJ",
-        TestEnvironment::jj_executable().into_os_string(),
+        assert_cmd::cargo::cargo_bin!("jj").as_os_str(),
     );
     env.add_env_var("JJ_SYNC_SSH_ARGUMENTS", arguments.as_os_str());
     let left = init_repo(&env, "left");
