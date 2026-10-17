@@ -2734,6 +2734,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width 0.2.2",
  "whoami",
+ "windows-sys",
 ]
 
 [[package]]
@@ -2835,6 +2836,7 @@ dependencies = [
  "rustix",
  "rustversion",
  "serde",
+ "sha2 0.10.9",
  "smallvec",
  "tempfile",
  "test-case",
