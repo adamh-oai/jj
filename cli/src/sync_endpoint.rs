@@ -20,6 +20,8 @@ use std::io::Read;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
+use std::time::Instant;
 
 use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::lock::FileLock;
@@ -58,6 +60,7 @@ use crate::cli_util::print_snapshot_stats;
 use crate::command_error::CommandError;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
+use crate::progress::ProgressWriter;
 use crate::sync_transport;
 use crate::sync_transport::Transport;
 use crate::ui::Ui;
@@ -78,6 +81,75 @@ const MAX_PHASE_CONTROL_BYTES: usize = 64 * 1024;
 // Known IDs only avoid retransmission. Bound this peer-controlled cache and
 // resend anything omitted from it, so large repositories remain supported.
 const MAX_KNOWN_RECORD_IDS: usize = 65_536;
+
+struct TransferProgress<'a> {
+    root: &'a Path,
+    action: &'static str,
+    writer: Option<ProgressWriter<'static>>,
+    objects: usize,
+    total_objects: Option<usize>,
+    transferred_bytes: u64,
+    started: Instant,
+    next_update: Instant,
+}
+
+impl<'a> TransferProgress<'a> {
+    fn new(ui: &Ui, root: &'a Path, action: &'static str, total_objects: Option<usize>) -> Self {
+        let started = Instant::now();
+        Self {
+            root,
+            action,
+            writer: ProgressWriter::new(ui, "Synchronizing"),
+            objects: 0,
+            total_objects,
+            transferred_bytes: 0,
+            started,
+            next_update: started + Duration::from_secs(1),
+        }
+    }
+
+    fn record(&mut self, record: &Record, encoded_bytes: usize) {
+        if !matches!(record, Record::GitHeader(_) | Record::GitChunk { .. }) {
+            self.objects += 1;
+        }
+        self.transferred_bytes = self.transferred_bytes.saturating_add(encoded_bytes as u64);
+        let now = Instant::now();
+        if now >= self.next_update {
+            self.report(false);
+            self.next_update = now + Duration::from_secs(1);
+        }
+    }
+
+    fn finish(mut self) {
+        self.report(true);
+    }
+
+    fn report(&mut self, complete: bool) {
+        tracing::debug!(
+            path = %self.root.display(),
+            action = self.action,
+            completed_objects = self.objects,
+            total_objects = ?self.total_objects,
+            transferred_bytes = self.transferred_bytes,
+            elapsed_seconds = self.started.elapsed().as_secs_f64(),
+            complete,
+            "Synchronization transfer progress"
+        );
+        if let Some(writer) = &mut self.writer {
+            let objects = match self.total_objects {
+                Some(total) => format!("{}/{total}", self.objects),
+                None => self.objects.to_string(),
+            };
+            writer
+                .display(&format!(
+                    "{}: {objects} objects, {:.1} MiB transferred",
+                    self.action,
+                    self.transferred_bytes as f64 / (1024.0 * 1024.0)
+                ))
+                .ok();
+        }
+    }
+}
 
 trait Stream {
     fn send(&mut self, message: &Message) -> Result<(), CommandError>;
@@ -240,9 +312,11 @@ impl PreparedEndpoint {
         if helper.repo().op_store().name() == SimpleOpStore::NAME {
             writeln!(
                 ui.status(),
-                "Enabling repository synchronization. Other processes must be stopped for this \
-                 first format transition; already-open old jj processes are not excluded by its \
-                 marker."
+                "Enabling repository synchronization in \"{}\". The first sync checks retained \
+                 history and transfers missing Git objects. Other processes must be stopped for \
+                 this first format transition; already-open old jj processes are not excluded by \
+                 its marker.",
+                root.display()
             )?;
             Endpoint::enable_quiescent(helper.repo_path()).map_err(failed)?;
             helper = load_helper(ui, command, &root, ignore_working_copy).await?;
@@ -285,9 +359,12 @@ impl PreparedEndpoint {
             &transfer,
         )
         .await?;
-        let inventory = objects(&helper, &endpoint)?
-            .inventory(&capture.raw_heads, &capture.shared_heads)
-            .map_err(failed)?;
+        let inventory = collect_inventory(
+            &helper,
+            &endpoint,
+            &capture.raw_heads,
+            &capture.shared_heads,
+        )?;
         Ok(Self {
             helper,
             endpoint,
@@ -329,6 +406,7 @@ impl PreparedEndpoint {
 
     fn send_offer(
         &self,
+        ui: &Ui,
         stream: &mut impl Stream,
         inventory: &Inventory,
         shared: &SharedEventId,
@@ -344,21 +422,33 @@ impl PreparedEndpoint {
             &self.advertise_inventory(inventory, shared)?,
         )?;
         let objects = objects(&self.helper, &self.endpoint)?;
+        let mut progress = TransferProgress::new(
+            ui,
+            &self.root,
+            "Sending",
+            Some(inventory.missing(known).count()),
+        );
         for id in inventory.missing(known) {
             objects
                 .export_records(id, |record| {
                     let bytes = record.encode()?;
+                    let encoded_bytes = bytes.len();
                     stream
                         .send(&Message::Record(bytes))
-                        .map_err(|err| SyncError::InvalidData(command_error_message(&err)))
+                        .map_err(|err| SyncError::InvalidData(command_error_message(&err)))?;
+                    progress.record(&record, encoded_bytes);
+                    Ok(())
                 })
                 .map_err(failed)?;
         }
-        stream.send(&Message::Done(Vec::new()))
+        stream.send(&Message::Done(Vec::new()))?;
+        progress.finish();
+        Ok(())
     }
 
     fn receive_offer(
         &self,
+        ui: &Ui,
         stream: &mut impl Stream,
         expected_peer: &str,
         captured: Option<&Advertisement>,
@@ -382,12 +472,13 @@ impl PreparedEndpoint {
             self.quarantine_limits()?,
         )
         .map_err(failed)?;
+        let mut progress = TransferProgress::new(ui, &self.root, "Receiving", None);
         loop {
             match stream.receive()? {
                 Message::Record(bytes) => {
-                    quarantine
-                        .stage(&objects, &Record::decode(&bytes).map_err(failed)?)
-                        .map_err(failed)?;
+                    let record = Record::decode(&bytes).map_err(failed)?;
+                    quarantine.stage(&objects, &record).map_err(failed)?;
+                    progress.record(&record, bytes.len());
                 }
                 Message::Done(bytes) if bytes.is_empty() => break,
                 _ => {
@@ -397,12 +488,31 @@ impl PreparedEndpoint {
                 }
             }
         }
+        progress.finish();
+        tracing::debug!(
+            path = %self.root.display(),
+            "Validating received synchronization history"
+        );
         let inventory = quarantine
             .validate(&objects, &offered.raw_heads()?, &offered.shared_heads()?)
             .map_err(failed)?;
+        tracing::debug!(
+            path = %self.root.display(),
+            objects = inventory.records.len(),
+            "Received synchronization history validated"
+        );
+        tracing::debug!(
+            path = %self.root.display(),
+            "Installing synchronized objects"
+        );
         self.endpoint
             .install_and_retain(self.helper.repo(), &quarantine, &inventory, &offered.peer)
             .map_err(failed)?;
+        tracing::debug!(
+            path = %self.root.display(),
+            objects = inventory.records.len(),
+            "Synchronized objects installed"
+        );
         Ok(offered)
     }
 
@@ -453,9 +563,12 @@ impl PreparedEndpoint {
     }
 
     fn selected_inventory(&self, selected: &SharedEventId) -> Result<Inventory, CommandError> {
-        objects(&self.helper, &self.endpoint)?
-            .inventory(&self.capture.raw_heads, std::slice::from_ref(selected))
-            .map_err(failed)
+        collect_inventory(
+            &self.helper,
+            &self.endpoint,
+            &self.capture.raw_heads,
+            std::slice::from_ref(selected),
+        )
     }
 
     async fn apply(
@@ -628,6 +741,27 @@ fn objects<'a>(
     ))
 }
 
+fn collect_inventory(
+    helper: &WorkspaceCommandHelper,
+    endpoint: &Endpoint,
+    raw_heads: &[OperationId],
+    shared_heads: &[SharedEventId],
+) -> Result<Inventory, CommandError> {
+    tracing::debug!(
+        path = %helper.workspace_root().display(),
+        "Collecting synchronization object inventory"
+    );
+    let inventory = objects(helper, endpoint)?
+        .inventory(raw_heads, shared_heads)
+        .map_err(failed)?;
+    tracing::debug!(
+        path = %helper.workspace_root().display(),
+        objects = inventory.records.len(),
+        "Synchronization object inventory collected"
+    );
+    Ok(inventory)
+}
+
 async fn retire_interrupted_publications(
     endpoint: &Endpoint,
     repo: &std::sync::Arc<jj_lib::repo::ReadonlyRepo>,
@@ -757,11 +891,11 @@ pub(crate) async fn synchronize(
     crate::cli_util::pause_for_test("JJ_TEST_SYNC_AFTER_CAPTURE_PAUSE_DIR");
     let local_applied = match direction {
         Direction::Receive | Direction::Bidirectional => {
-            let incoming = local.receive_offer(&mut transport, &remote.peer, Some(&remote))?;
+            let incoming = local.receive_offer(ui, &mut transport, &remote.peer, Some(&remote))?;
             let selected = local.select(&incoming).await?;
             if direction == Direction::Bidirectional {
                 let inventory = local.selected_inventory(&selected)?;
-                local.send_offer(&mut transport, &inventory, &selected, &remote_known)?;
+                local.send_offer(ui, &mut transport, &inventory, &selected, &remote_known)?;
                 let ready: String = receive_command(&mut transport, "ready")?;
                 if ready != selected.hex() {
                     return Err(user_error("Peer changed the selected shared result"));
@@ -788,6 +922,7 @@ pub(crate) async fn synchronize(
         }
         Direction::Send => {
             local.send_offer(
+                ui,
                 &mut transport,
                 &local.inventory,
                 &local.capture.current_shared,
@@ -900,6 +1035,7 @@ async fn serve_session(
     match request.direction {
         Direction::Receive => {
             local.send_offer(
+                ui,
                 stream,
                 &local.inventory,
                 &local.capture.current_shared,
@@ -907,19 +1043,20 @@ async fn serve_session(
             )?;
         }
         Direction::Send => {
-            let incoming = local.receive_offer(stream, &peer.peer, Some(&peer))?;
+            let incoming = local.receive_offer(ui, stream, &peer.peer, Some(&peer))?;
             let selected = local.select(&incoming).await?;
             let applied = local.apply(ui, command, &selected, &incoming).await?;
             send_command(stream, "result", &applied)?;
         }
         Direction::Bidirectional => {
             local.send_offer(
+                ui,
                 stream,
                 &local.inventory,
                 &local.capture.current_shared,
                 &peer_known,
             )?;
-            let incoming = local.receive_offer(stream, &peer.peer, None)?;
+            let incoming = local.receive_offer(ui, stream, &peer.peer, None)?;
             let selected = parse_shared(&incoming.current_shared)?;
             for original in [
                 &local.capture.current_shared,

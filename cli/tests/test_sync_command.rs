@@ -1386,12 +1386,24 @@ fn test_sync_debug_reports_helper_phases(ssh: bool) {
         "Opening peer synchronization repository",
         "Initializing synchronization destination",
         "Peer accepted synchronization handshake",
+        "Collecting synchronization object inventory",
+        "Synchronization object inventory collected",
         "Sending synchronization objects",
         "Receiving synchronization objects",
+        "Synchronization transfer progress",
+        "Validating received synchronization history",
+        "Received synchronization history validated",
+        "Installing synchronized objects",
+        "Synchronized objects installed",
         "Applying synchronized history",
     ] {
         assert!(stderr.contains(phase), "missing {phase}: {stderr}");
     }
+    assert!(stderr.contains("completed_objects="), "{stderr}");
+    assert!(stderr.contains("total_objects=Some("), "{stderr}");
+    assert!(stderr.contains("total_objects=None"), "{stderr}");
+    assert!(stderr.contains("transferred_bytes="), "{stderr}");
+    assert!(stderr.contains("complete=true"), "{stderr}");
     assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
 }
 
