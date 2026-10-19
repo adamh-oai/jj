@@ -199,6 +199,26 @@ impl GitPackRepository {
                 Some(gix::objs::Kind::Commit),
             )?;
         }
+        // Native Git follows commit parents, so only the physical DAG heads
+        // need refs. Unrelated predecessor histories retain their own heads.
+        if !inventory.git_commits.is_empty() {
+            let mut reader =
+                GitPackReader::new(backend.git_executable_path().as_os_str(), directory.path())?;
+            for id in &inventory.git_commits {
+                let id = gix::ObjectId::from_bytes_or_panic(id.as_bytes());
+                if id.is_null() {
+                    continue;
+                }
+                reader.with_object(&id, |kind, _, from| {
+                    if kind != gix::objs::Kind::Commit {
+                        return Err(invalid("packed commit root has an unexpected type"));
+                    }
+                    remove_commit_parent_roots(&mut roots, object_hash, from)
+                })?;
+            }
+        }
+        // Explicit roots may be ancestors of a retained commit, or non-commit
+        // objects such as annotated tags and legacy conflict trees.
         for id in &inventory.legacy_tree_roots {
             insert_root(
                 &mut roots,
@@ -213,8 +233,8 @@ impl GitPackRepository {
         if roots.len() > limits.max_records {
             return Err(invalid("packed roots exceed the record limit"));
         }
-        // A ref per historical commit is useful for native negotiation, but a
-        // loose file per ref would dominate scratch space on large histories.
+        // Keep the frozen frontier packed: a loose file per root can dominate
+        // scratch space when many independent histories are retained.
         let header = b"# pack-refs with: sorted\n";
         let line_size =
             format!("{empty_tree} refs/jj-sync/{namespace}/{empty_tree}\n").len() as u64;
@@ -629,6 +649,42 @@ impl Drop for GitPackReader {
     }
 }
 
+// Inventories already authenticate the complete body. Only its canonical
+// tree/parent prefix is needed to find DAG heads; signatures, author names and
+// messages can be arbitrarily large and are drained by the batch reader.
+fn remove_commit_parent_roots(
+    roots: &mut BTreeMap<gix::ObjectId, Option<gix::objs::Kind>>,
+    object_hash: gix::hash::Kind,
+    from: &mut dyn Read,
+) -> SyncResult<()> {
+    let hex_size = object_hash.len_in_bytes() * 2;
+    let mut line = [0; 72];
+    let tree = &mut line[..hex_size + 6];
+    from.read_exact(tree)?;
+    if !tree.starts_with(b"tree ") || tree.last() != Some(&b'\n') {
+        return Err(invalid("invalid packed commit tree header"));
+    }
+    gix::ObjectId::from_hex(&tree[5..5 + hex_size])
+        .map_err(|_| invalid("invalid packed commit tree identity"))?;
+    loop {
+        from.read_exact(&mut line[..7])?;
+        if &line[..7] == b"author " {
+            return Ok(());
+        }
+        if &line[..7] != b"parent " {
+            return Err(invalid("invalid packed commit parent header"));
+        }
+        let parent = &mut line[..hex_size + 1];
+        from.read_exact(parent)?;
+        if parent.last() != Some(&b'\n') {
+            return Err(invalid("invalid packed commit parent header"));
+        }
+        let id = gix::ObjectId::from_hex(&parent[..hex_size])
+            .map_err(|_| invalid("invalid packed commit parent identity"))?;
+        roots.remove(&id);
+    }
+}
+
 fn insert_root(
     roots: &mut BTreeMap<gix::ObjectId, Option<gix::objs::Kind>>,
     bytes: &[u8],
@@ -789,4 +845,169 @@ fn git_command(executable: &OsStr, git_dir: &Path) -> Command {
 
 fn invalid(message: impl Into<String>) -> SyncError {
     SyncError::InvalidData(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt::Write as _;
+
+    use test_case::test_case;
+
+    use super::*;
+    use crate::backend::CommitId;
+    use crate::backend::TreeId;
+    use crate::config::StackedConfig;
+    use crate::settings::UserSettings;
+    use crate::tests::TestResult;
+    use crate::tests::new_temp_dir;
+
+    #[test_case(gix::hash::Kind::Sha1; "sha1")]
+    #[test_case(gix::hash::Kind::Sha256; "sha256")]
+    fn parent_scan_stops_before_unbounded_commit_headers_and_message(
+        hash: gix::hash::Kind,
+    ) -> TestResult {
+        struct UnboundedCommitSuffix;
+
+        impl Read for UnboundedCommitSuffix {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other(
+                    "parent scan reached an arbitrarily large author, signature or message",
+                ))
+            }
+        }
+
+        let id = |byte| gix::ObjectId::from_bytes_or_panic(&[byte; 32][..hash.len_in_bytes()]);
+        let left = id(1);
+        let right = id(2);
+        let head = id(3);
+        let mut roots = [left, right, head]
+            .into_iter()
+            .map(|id| (id, Some(gix::objs::Kind::Commit)))
+            .collect();
+        let tree = gix::ObjectId::empty_tree(hash);
+        let prefix = format!("tree {tree}\nparent {left}\nparent {right}\nauthor ").into_bytes();
+        let prefix_size = prefix.len();
+        let mut from = io::Cursor::new(prefix).chain(UnboundedCommitSuffix);
+        remove_commit_parent_roots(&mut roots, hash, &mut from)?;
+        assert_eq!(from.get_ref().0.position(), prefix_size as u64);
+        assert_eq!(
+            roots,
+            BTreeMap::from([(head, Some(gix::objs::Kind::Commit))])
+        );
+        Ok(())
+    }
+
+    #[test_case(gix::hash::Kind::Sha1; "sha1")]
+    #[test_case(gix::hash::Kind::Sha256; "sha256")]
+    fn frozen_refs_keep_dag_heads_and_explicit_roots_without_losing_objects(
+        hash: gix::hash::Kind,
+    ) -> TestResult {
+        let directory = new_temp_dir();
+        let settings =
+            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
+        let backend = GitBackend::init_internal(&settings, directory.path(), hash)?;
+        let repo = backend.git_repo();
+        let tree = repo.objects.write_buf(gix::objs::Kind::Tree, &[])?;
+        let commit = |parents: &[gix::ObjectId], message: &str| {
+            let mut data = format!("tree {tree}\n");
+            for parent in parents {
+                writeln!(&mut data, "parent {parent}").unwrap();
+            }
+            data.push_str(
+                "author A <a@example.com> 0 +0000\ncommitter A <a@example.com> 0 +0000\n\n",
+            );
+            data.push_str(message);
+            repo.objects
+                .write_buf(gix::objs::Kind::Commit, data.as_bytes())
+        };
+        let ancestor = commit(&[], "ancestor")?;
+        let left = commit(&[ancestor], "left")?;
+        let right = commit(&[ancestor], "right")?;
+        let merged = commit(&[left, right], "merge")?;
+        // These commits are retained through jj predecessors, not Git parents
+        // of the main history. Their independent head must still be exported.
+        let predecessor_parent = commit(&[], "predecessor parent")?;
+        let predecessor = commit(&[predecessor_parent], "predecessor")?;
+        let blob = repo
+            .objects
+            .write_buf(gix::objs::Kind::Blob, b"legacy contents")?;
+        let mut legacy_data = b"100644 file\0".to_vec();
+        legacy_data.extend(blob.as_bytes());
+        let legacy = repo
+            .objects
+            .write_buf(gix::objs::Kind::Tree, &legacy_data)?;
+        let tag = repo.objects.write_buf(
+            gix::objs::Kind::Tag,
+            format!(
+                "object {ancestor}\ntype commit\ntag retained\ntagger A <a@example.com> 0 \
+                 +0000\n\nretained tag\n"
+            )
+            .as_bytes(),
+        )?;
+        let commits = [
+            ancestor,
+            left,
+            right,
+            merged,
+            predecessor_parent,
+            predecessor,
+        ];
+        let all_objects: BTreeSet<_> = commits
+            .into_iter()
+            .chain([tree, blob, legacy, tag])
+            .collect();
+        let inventory = Inventory {
+            git_commits: commits
+                .into_iter()
+                .map(|id| CommitId::from_bytes(id.as_bytes()))
+                .collect(),
+            git_roots: [ancestor, tag].into_iter().collect(),
+            legacy_tree_roots: [TreeId::from_bytes(legacy.as_bytes())]
+                .into_iter()
+                .collect(),
+            records: all_objects.iter().copied().map(RecordId::Git).collect(),
+            ..Default::default()
+        };
+        let expected_roots: BTreeSet<_> = [merged, predecessor, ancestor, tag, legacy]
+            .into_iter()
+            .collect();
+        let limits = QuarantineLimits::for_directory(directory.path())?;
+        for namespace in ["export", "have"] {
+            let frozen = GitPackRepository::create(
+                &directory.path().join("sync"),
+                &backend,
+                &inventory,
+                &limits,
+                namespace,
+            )?;
+            let refs = fs::read_to_string(frozen.path().join("packed-refs"))?;
+            let actual_roots: BTreeSet<_> = refs
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .map(|line| {
+                    let (id, name) = line.split_once(' ').unwrap();
+                    assert!(name.starts_with(&format!("refs/jj-sync/{namespace}/")));
+                    gix::ObjectId::from_hex(id.as_bytes()).unwrap()
+                })
+                .collect();
+            assert_eq!(actual_roots, expected_roots);
+            let output = git_command(backend.git_executable_path().as_os_str(), frozen.path())
+                .args(["rev-list", "--objects", "--all"])
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let reachable: BTreeSet<_> = String::from_utf8(output.stdout)?
+                .lines()
+                .map(|line| {
+                    gix::ObjectId::from_hex(line.split_whitespace().next().unwrap().as_bytes())
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(reachable, all_objects);
+        }
+        Ok(())
+    }
 }
