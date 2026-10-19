@@ -113,7 +113,7 @@ enum GitTransportError {
     },
     #[error("Native Git transfer failed{diagnostic}")]
     Transfer {
-        source: Box<GitTransportError>,
+        source: Box<Self>,
         diagnostic: String,
     },
 }

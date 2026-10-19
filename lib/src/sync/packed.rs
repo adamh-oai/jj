@@ -73,7 +73,6 @@ pub struct GitPackRepository {
 #[derive(Clone, Debug)]
 struct ValidatedFiles {
     packs: Vec<(PathBuf, PathBuf)>,
-    empty_tree: PathBuf,
     physical_bytes: u64,
     limits: QuarantineLimits,
 }
@@ -399,7 +398,6 @@ impl GitPackRepository {
         }
         *self.validated.lock().unwrap() = Some(ValidatedFiles {
             packs: validated_packs,
-            empty_tree: self.empty_tree_file.clone(),
             physical_bytes,
             limits: limits.clone(),
         });
@@ -444,21 +442,41 @@ impl GitPackRepository {
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(err) => return Err(err.into()),
             }
-            install_immutable_file(&pack, &target_pack)?;
+            install_immutable_file(&pack, &target_pack, || {
+                if fs::metadata(&pack)?.len() != fs::metadata(&target_pack)?.len() {
+                    return Err(invalid(
+                        "existing content-addressed Git pack has a different size",
+                    ));
+                }
+                Ok(())
+            })?;
             // Install the index last so readers never discover an incomplete pack.
-            install_immutable_file(&index, &target_index)?;
+            install_immutable_file(&index, &target_index, || {
+                validate_existing_index(&index, &target_index, live_repo.object_hash())
+            })?;
         }
-        let name = files.empty_tree.file_name().unwrap();
-        let fanout = files.empty_tree.parent().unwrap().file_name().unwrap();
-        let directory = objects.join(fanout);
-        fs::create_dir_all(&directory)?;
-        install_immutable_file(&files.empty_tree, &directory.join(name))?;
+        // Loose objects may use different valid zlib encodings for the same
+        // identity. Preserve an existing object and let the ordinary ODB writer
+        // materialize the canonical empty tree only when it is missing.
+        let empty_tree = gix::ObjectId::empty_tree(live_repo.object_hash());
+        if !live_repo.objects.exists(&empty_tree) {
+            live_repo
+                .objects
+                .write_buf_with_known_id(gix::objs::Kind::Tree, &[], empty_tree)
+                .map_err(|err| invalid(format!("failed to write the empty tree: {err}")))?;
+            #[cfg(unix)]
+            {
+                let name = empty_tree.to_string();
+                let path = objects.join(&name[..2]).join(&name[2..]);
+                File::open(&path)?.sync_data()?;
+                File::open(path.parent().unwrap())?.sync_all()?;
+            }
+        }
         #[cfg(unix)]
         {
             // Retention state may be persisted immediately after promotion.
             // Make its referenced directory entries durable before returning.
             File::open(&pack_directory)?.sync_all()?;
-            File::open(&directory)?.sync_all()?;
             File::open(objects)?.sync_all()?;
         }
         Ok(protection)
@@ -578,7 +596,7 @@ impl GitPackReader {
             .map_err(|_| invalid("invalid native Git object header encoding"))?;
         let fields = line.trim_end().split(' ').collect::<Vec<_>>();
         if fields.len() != 3
-            || fields[0] != id.to_string()
+            || id.to_hex() != fields[0]
             || fields[1] != kind.to_string()
             || fields[2].parse::<u64>().ok() != Some(size)
         {
@@ -594,7 +612,7 @@ impl GitPackReader {
         }
         let mut terminator = [0];
         self.output.read_exact(&mut terminator)?;
-        if terminator != [b'\n'] {
+        if terminator != *b"\n" {
             return Err(invalid("invalid native Git object body terminator"));
         }
         self.failed = false;
@@ -690,18 +708,44 @@ fn add_budget(current: u64, additional: u64, limits: &QuarantineLimits) -> SyncR
         .ok_or_else(|| invalid("packed scratch exceeds sync.max-quarantine-bytes"))
 }
 
-fn install_immutable_file(source: &Path, target: &Path) -> SyncResult<()> {
+fn validate_existing_index(source: &Path, target: &Path, hash: gix::hash::Kind) -> SyncResult<()> {
+    let incoming = gix::odb::pack::index::File::at(source, hash)
+        .map_err(|err| invalid(format!("failed to read validated pack index: {err}")))?;
+    let existing = gix::odb::pack::index::File::at(target, hash)
+        .map_err(|err| invalid(format!("existing pack index is invalid: {err}")))?;
+    existing
+        .verify_checksum(&mut gix::utils::progress::Discard, &AtomicBool::new(false))
+        .map_err(|err| invalid(format!("existing pack index checksum failed: {err}")))?;
+    if existing.pack_checksum() != incoming.pack_checksum()
+        || existing.num_objects() != incoming.num_objects()
+        || existing
+            .iter()
+            .zip(incoming.iter())
+            .any(|(existing, incoming)| {
+                existing.oid != incoming.oid
+                    || existing.pack_offset != incoming.pack_offset
+                    || existing
+                        .crc32
+                        .zip(incoming.crc32)
+                        .is_some_and(|(a, b)| a != b)
+            })
+    {
+        return Err(invalid("existing pack index describes different objects"));
+    }
+    Ok(())
+}
+
+fn install_immutable_file(
+    source: &Path,
+    target: &Path,
+    check_existing: impl Fn() -> SyncResult<()>,
+) -> SyncResult<()> {
     #[cfg(unix)]
     File::open(source)?.sync_data()?;
     match fs::hard_link(source, target) {
         Ok(()) => return Ok(()),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            if fs::metadata(source)?.len() != fs::metadata(target)?.len() {
-                return Err(invalid(
-                    "existing content-addressed Git file has a different size",
-                ));
-            }
-            return Ok(());
+            return check_existing();
         }
         Err(_) => {}
     }
@@ -710,14 +754,7 @@ fn install_immutable_file(source: &Path, target: &Path) -> SyncResult<()> {
     temporary.as_file().sync_data()?;
     match temporary.persist_noclobber(target) {
         Ok(_) => Ok(()),
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            if fs::metadata(source)?.len() != fs::metadata(target)?.len() {
-                return Err(invalid(
-                    "existing content-addressed Git file has a different size",
-                ));
-            }
-            Ok(())
-        }
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => check_existing(),
         Err(error) => Err(error.error.into()),
     }
 }

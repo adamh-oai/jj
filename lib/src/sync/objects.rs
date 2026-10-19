@@ -538,14 +538,18 @@ impl<'a> RepositoryObjects<'a> {
             shared_heads,
             git_roots,
             None,
-            |id| match id {
-                RecordId::Git(id) => Ok(Record::GitCommitMetadata(
-                    self.backend.export_commit_metadata(id)?,
-                )),
-                _ => self.export_record(id),
+            InventoryReaders {
+                read: |id: &RecordId| match id {
+                    RecordId::Git(id) => Ok(Record::GitCommitMetadata(
+                        self.backend.export_commit_metadata(id)?,
+                    )),
+                    _ => self.export_record(id),
+                },
+                stream: |_: &GitObjectHeader, _: &mut dyn std::io::Write| {
+                    Err(invalid("packed inventory cannot stream raw Git records"))
+                },
+                packed: Some(&reader),
             },
-            |_, _| Err(invalid("packed inventory cannot stream raw Git records")),
-            Some(&reader),
         )
     }
 
@@ -571,13 +575,15 @@ impl<'a> RepositoryObjects<'a> {
             shared_heads,
             git_roots,
             None,
-            |id| self.export_record(id),
-            |header, to| {
-                self.backend
-                    .export_object_stream(header, to)
-                    .map_err(Into::into)
+            InventoryReaders {
+                read: |id: &RecordId| self.export_record(id),
+                stream: |header: &GitObjectHeader, to: &mut dyn std::io::Write| {
+                    self.backend
+                        .export_object_stream(header, to)
+                        .map_err(Into::into)
+                },
+                packed: None,
             },
-            None,
         )
     }
 
@@ -596,7 +602,7 @@ impl<'a> RepositoryObjects<'a> {
             }
             Record::Git(record) => self.backend.validate_object_import(record)?,
             Record::GitCommitMetadata(metadata) => {
-                self.backend.validate_commit_metadata_encoding(metadata)?
+                self.backend.validate_commit_metadata_encoding(metadata)?;
             }
             Record::GitHeader(header) => {
                 if header.id.kind() != self.backend.git_repo().object_hash()
@@ -886,29 +892,31 @@ impl Quarantine {
             shared_heads,
             git_roots,
             Some((&self.limits, self.directory.path())),
-            |id| {
-                if self.staged.contains(id) {
-                    self.read_record(id)
-                } else if self.packed.is_some() && matches!(id, RecordId::Git(_)) {
-                    Err(invalid(
-                        "native Git transfer omitted mandatory commit metadata",
-                    ))
-                } else {
-                    receiver.export_record(id)
-                }
+            InventoryReaders {
+                read: |id: &RecordId| {
+                    if self.staged.contains(id) {
+                        self.read_record(id)
+                    } else if self.packed.is_some() && matches!(id, RecordId::Git(_)) {
+                        Err(invalid(
+                            "native Git transfer omitted mandatory commit metadata",
+                        ))
+                    } else {
+                        receiver.export_record(id)
+                    }
+                },
+                stream: |header: &GitObjectHeader, to: &mut dyn std::io::Write| {
+                    if self.staged.contains(&RecordId::Git(header.id)) {
+                        std::io::copy(&mut fs::File::open(self.body_path(&header.id))?, to)?;
+                        Ok(())
+                    } else {
+                        receiver
+                            .backend
+                            .export_object_stream(header, to)
+                            .map_err(Into::into)
+                    }
+                },
+                packed: packed_reader.as_ref(),
             },
-            |header, to| {
-                if self.staged.contains(&RecordId::Git(header.id)) {
-                    std::io::copy(&mut fs::File::open(self.body_path(&header.id))?, to)?;
-                    Ok(())
-                } else {
-                    receiver
-                        .backend
-                        .export_object_stream(header, to)
-                        .map_err(Into::into)
-                }
-            },
-            packed_reader.as_ref(),
         )?;
         if let Some(packed) = &self.packed {
             let mut limits = self.limits.clone();
@@ -1021,16 +1029,29 @@ impl Quarantine {
     }
 }
 
+struct InventoryReaders<'a, R, S> {
+    read: R,
+    stream: S,
+    packed: Option<&'a RefCell<GitPackReader>>,
+}
+
 fn build_inventory(
     receiver: &RepositoryObjects<'_>,
     raw_heads: &[OperationId],
     shared_heads: &[SharedEventId],
     git_roots: &[gix::ObjectId],
     limits: Option<(&QuarantineLimits, &Path)>,
-    read: impl Fn(&RecordId) -> SyncResult<Record>,
-    stream: impl Fn(&GitObjectHeader, &mut dyn std::io::Write) -> SyncResult<()>,
-    packed: Option<&RefCell<GitPackReader>>,
+    readers: InventoryReaders<
+        '_,
+        impl Fn(&RecordId) -> SyncResult<Record>,
+        impl Fn(&GitObjectHeader, &mut dyn std::io::Write) -> SyncResult<()>,
+    >,
 ) -> SyncResult<Inventory> {
+    let InventoryReaders {
+        read,
+        stream,
+        packed,
+    } = readers;
     if limits.is_some_and(|(limits, _)| {
         raw_heads
             .len()
@@ -1978,6 +1999,33 @@ mod tests {
         let source = Fixture::new(hash);
         let destination = Fixture::new(hash);
         let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let objects_path = destination.backend.git_repo_path().join("objects");
+        let empty_hex = empty.id.to_string();
+        let receiver_empty_path = objects_path.join(&empty_hex[..2]).join(&empty_hex[2..]);
+        if receiver_empty_path.try_exists()? {
+            fs::remove_file(&receiver_empty_path)?;
+        }
+        let output = std::process::Command::new(destination.backend.git_executable_path())
+            .arg("--git-dir")
+            .arg(destination.backend.git_repo_path())
+            .args([
+                "-c",
+                "core.compression=0",
+                "hash-object",
+                "-w",
+                "-t",
+                "tree",
+                "--stdin",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, format!("{empty_hex}\n").as_bytes());
+        let receiver_empty_bytes = fs::read(&receiver_empty_path)?;
         let blob = source.object(gix::objs::Kind::Blob, b"legacy tree body".to_vec(), None);
         let mut bytes = b"100644 file\0".to_vec();
         bytes.extend(blob.id.as_bytes());
@@ -2020,7 +2068,61 @@ mod tests {
             &receiver_inventory,
             &limits,
         )?;
+        assert_ne!(
+            receiver_empty_bytes.len(),
+            fs::metadata(
+                packed
+                    .path()
+                    .join("objects")
+                    .join(&empty_hex[..2])
+                    .join(&empty_hex[2..]),
+            )?
+            .len() as usize
+        );
         fetch_test_pack(&sender, &packed, &destination.backend);
+        let existing_index = if hash == gix::hash::Kind::Sha1 {
+            let incoming_pack = fs::read_dir(packed.path().join("objects/pack"))?
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "pack")
+                })
+                .unwrap();
+            assert_eq!(
+                gix::odb::pack::index::File::at(incoming_pack.with_extension("idx"), hash)?
+                    .version(),
+                gix::odb::pack::index::Version::V2
+            );
+            let live_pack_directory = objects_path.join("pack");
+            fs::create_dir_all(&live_pack_directory)?;
+            let live_pack = live_pack_directory.join(incoming_pack.file_name().unwrap());
+            fs::copy(&incoming_pack, &live_pack)?;
+            let live_index = live_pack.with_extension("idx");
+            let output = std::process::Command::new(destination.backend.git_executable_path())
+                .arg("--git-dir")
+                .arg(destination.backend.git_repo_path())
+                .args(["index-pack", "--index-version=1", "-o"])
+                .arg(&live_index)
+                .arg(&live_pack)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                gix::odb::pack::index::File::at(&live_index, hash)?.version(),
+                gix::odb::pack::index::Version::V1
+            );
+            let bytes = fs::read(&live_index)?;
+            assert_ne!(
+                bytes.len() as u64,
+                fs::metadata(incoming_pack.with_extension("idx"))?.len()
+            );
+            Some((live_index, bytes))
+        } else {
+            None
+        };
         let mut quarantine = Quarantine::with_limits(
             destination.directory.path(),
             destination.backend.root_commit_id().clone(),
@@ -2051,6 +2153,10 @@ mod tests {
             quarantine.validate(&destination.objects(), std::slice::from_ref(&head), &[])?;
         assert_eq!(validated, inventory);
         quarantine.install(&destination.objects(), &validated)?;
+        assert_eq!(fs::read(&receiver_empty_path)?, receiver_empty_bytes);
+        if let Some((path, bytes)) = existing_index {
+            assert_eq!(fs::read(path)?, bytes);
+        }
         assert_eq!(destination.backend.export_object(&commit.id)?, commit);
         assert_eq!(
             destination.backend.export_object(&predecessor.id)?,
@@ -2061,7 +2167,6 @@ mod tests {
             source.operations.export_operation(&head)?
         );
         let blob_hex = blob.id.to_string();
-        let objects_path = destination.backend.git_repo_path().join("objects");
         assert!(
             !objects_path
                 .join(&blob_hex[..2])

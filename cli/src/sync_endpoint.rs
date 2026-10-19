@@ -1021,17 +1021,17 @@ pub(crate) async fn synchronize(
     let profile = (!local_missing)
         .then(|| command.load_workspace_for_sync_profile(ui, &local_root))
         .transpose()?;
-    if let sync_transport::Endpoint::Local(path) = peer {
-        if !workspace_is_missing(path)? {
-            let peer_profile = command.load_workspace_for_sync_profile(ui, path)?;
-            if let Some(profile) = &profile
-                && dunce::canonicalize(profile.repo_path())?
-                    == dunce::canonicalize(peer_profile.repo_path())?
-            {
-                return Err(user_error(
-                    "Cannot synchronize a repository with its own shared store",
-                ));
-            }
+    if let sync_transport::Endpoint::Local(path) = peer
+        && !workspace_is_missing(path)?
+    {
+        let peer_profile = command.load_workspace_for_sync_profile(ui, path)?;
+        if let Some(profile) = &profile
+            && dunce::canonicalize(profile.repo_path())?
+                == dunce::canonicalize(peer_profile.repo_path())?
+        {
+            return Err(user_error(
+                "Cannot synchronize a repository with its own shared store",
+            ));
         }
     }
     let mut hello = match &profile {
