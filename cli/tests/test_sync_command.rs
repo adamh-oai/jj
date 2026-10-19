@@ -1063,6 +1063,165 @@ fn test_sync_publication_failure_retry(direction: &str, before_publication: bool
     assert_eq!(receiver.current_operation_id(), finished);
 }
 
+#[test_case(false; "local_gc")]
+#[test_case(true; "peer_gc")]
+fn test_sync_first_transition_waits_for_legacy_gc(gc_in_peer: bool) {
+    let env = TestEnvironment::default();
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    describe_and_bookmark(&left, "left");
+    describe_and_bookmark(&right, "right");
+    let protected = if gc_in_peer { &right } else { &left };
+    let marker = protected.root().join(".jj/repo/op_store/type");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), SimpleOpStore::NAME);
+    let gc_pause = env.env_root().join("legacy-gc");
+    let sync_pause = env.env_root().join("before-transition");
+    fs::create_dir(&gc_pause).unwrap();
+    fs::create_dir(&sync_pause).unwrap();
+    let mut gc_command = env.new_jj_cmd();
+    gc_command
+        .current_dir(protected.root())
+        .args(["--ignore-working-copy", "util", "gc", "--expire", "now"])
+        .env("JJ_TEST_SYNC_BEFORE_LEGACY_GC_PAUSE_DIR", &gc_pause)
+        .timeout(Duration::from_secs(40));
+    let mut sync_command = env.new_jj_cmd();
+    sync_command
+        .current_dir(left.root())
+        .args(["--ignore-working-copy", "sync", "--send", "../right"])
+        .env(
+            "JJ_TEST_SYNC_BEFORE_FORMAT_TRANSITION_PAUSE_DIR",
+            &sync_pause,
+        )
+        .timeout(Duration::from_secs(40));
+
+    std::thread::scope(|scope| {
+        let gc_barrier = SyncBarrier(gc_pause);
+        let sync_barrier = SyncBarrier(sync_pause);
+        let gc = scope.spawn(move || gc_command.output().unwrap());
+        gc_barrier.wait_ready();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sync = scope.spawn(move || sender.send(sync_command.output().unwrap()).unwrap());
+        sync_barrier.wait_ready();
+        sync_barrier.release();
+
+        // GC has loaded the legacy operation store. The transition must wait
+        // for that process to finish before publishing a different format.
+        let early_result = receiver.recv_timeout(Duration::from_millis(200));
+        assert!(
+            matches!(
+                &early_result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "first synchronization completed while legacy GC was paused: {early_result:?}"
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), SimpleOpStore::NAME);
+        gc_barrier.release();
+        let gc_output = gc.join().unwrap();
+        assert!(
+            gc_output.status.success(),
+            "legacy GC failed: {}",
+            String::from_utf8_lossy(&gc_output.stderr)
+        );
+        let output = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("first synchronization did not resume after legacy GC finished");
+        sync.join().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "first sync failed: {stderr}");
+        assert!(
+            !stderr.contains("Other processes must be stopped"),
+            "{stderr}"
+        );
+        assert!(
+            !stderr.contains("already-open old jj processes"),
+            "{stderr}"
+        );
+    });
+
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        SimpleOpStore::SYNC_NAME
+    );
+    assert_eq!(
+        bookmarks(&right),
+        BTreeSet::from(["left".to_owned(), "right".to_owned()])
+    );
+}
+
+#[test]
+fn test_sync_crossed_first_transitions_do_not_deadlock() {
+    let env = TestEnvironment::default();
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    describe_and_bookmark(&left, "left");
+    describe_and_bookmark(&right, "right");
+    let left_operation = left.current_operation_id();
+    let right_operation = right.current_operation_id();
+    let left_pause = env.env_root().join("left-transition");
+    let right_pause = env.env_root().join("right-transition");
+    fs::create_dir(&left_pause).unwrap();
+    fs::create_dir(&right_pause).unwrap();
+    let mut left_command = env.new_jj_cmd();
+    left_command
+        .current_dir(left.root())
+        .args(["--ignore-working-copy", "sync", "--bidi", "../right"])
+        .env(
+            "JJ_TEST_SYNC_BEFORE_FORMAT_TRANSITION_PAUSE_DIR",
+            &left_pause,
+        )
+        .timeout(Duration::from_secs(40));
+    let mut right_command = env.new_jj_cmd();
+    right_command
+        .current_dir(right.root())
+        .args(["--ignore-working-copy", "sync", "--bidi", "../left"])
+        .env(
+            "JJ_TEST_SYNC_BEFORE_FORMAT_TRANSITION_PAUSE_DIR",
+            &right_pause,
+        )
+        .timeout(Duration::from_secs(40));
+
+    std::thread::scope(|scope| {
+        let left_barrier = SyncBarrier(left_pause);
+        let right_barrier = SyncBarrier(right_pause);
+        let first = scope.spawn(move || left_command.output().unwrap());
+        left_barrier.wait_ready();
+        let second = scope.spawn(move || right_command.output().unwrap());
+        right_barrier.wait_ready();
+        // Both sessions have reached their first transition. Neither can
+        // hold a legacy loader while acquiring exclusive repository access.
+        for dir in [&left, &right] {
+            assert_eq!(dir.read_file(".jj/repo/op_store/type"), SimpleOpStore::NAME);
+        }
+        left_barrier.release();
+        right_barrier.release();
+        for (name, command) in [("left", first), ("right", second)] {
+            let output = command.join().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{name} first sync failed: {stderr}"
+            );
+            assert!(
+                !stderr.contains("Other processes must be stopped"),
+                "{stderr}"
+            );
+        }
+    });
+
+    for dir in [&left, &right] {
+        assert_eq!(
+            dir.read_file(".jj/repo/op_store/type"),
+            SimpleOpStore::SYNC_NAME
+        );
+        assert_eq!(
+            bookmarks(dir),
+            BTreeSet::from(["left".to_owned(), "right".to_owned()])
+        );
+    }
+    assert_imported_history(&left, &right, &left_operation);
+    assert_imported_history(&right, &left, &right_operation);
+}
+
 #[test_case(false; "concurrent_edits_and_gc")]
 #[test_case(true; "crossed_sessions_with_concurrent_edits_and_gc")]
 fn test_sync_preserves_changes_after_capture(crossed_session: bool) {

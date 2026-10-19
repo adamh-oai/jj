@@ -16,7 +16,7 @@
 //!
 //! This store does not update active operation heads or enable synchronization
 //! on a repository. Enabling the operation-store format requires a separate,
-//! quiescent transition; a tracking file cannot exclude already running readers.
+//! exclusive format transition; the tracking file is not a repository access lock.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

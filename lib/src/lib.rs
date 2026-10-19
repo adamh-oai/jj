@@ -82,6 +82,7 @@ pub mod protos;
 pub use jj_core::ref_name;
 pub mod refs;
 pub mod repo;
+mod repo_lock;
 pub use jj_core::repo_path;
 pub mod revset;
 use jj_core::revset_backend;

@@ -207,10 +207,17 @@ history has been transferred.
 
 The first version supports Git-backed repositories with Jujutsu's built-in
 operation store. First use enables synchronization storage in each participating
-repository. Finish commands already running in older Jujutsu binaries before
-enabling it, and use compatible binaries afterward. Older binaries reject the
-synchronization-enabled operation-store type when opening it; changing that
-type cannot stop an older process that has already opened the repository.
+repository. Commands using the original format hold a shared repository lock.
+The first sync waits for those commands to finish, enables synchronization under
+an exclusive lock, and reopens the repository. New commands wait until that
+transition finishes. Repositories already using the synchronization format do
+not retain this shared lock, so simultaneous syncs can proceed independently.
+
+Binaries predating this locking protocol do not participate in it. Commands
+already running in those binaries must finish once before the first transition;
+an advisory lock cannot exclude a process that never acquires it. Older binaries
+that do not support synchronization reject its operation-store type on later
+opens. The deployed synchronization marker and operation/view bytes are unchanged.
 
 An exchange is not a transaction spanning two machines. One endpoint can finish
 before the connection fails or the other endpoint reports an error. Retry the

@@ -345,6 +345,7 @@ impl From<WorkspaceStoreError> for CommandError {
 impl From<WorkspaceInitError> for CommandError {
     fn from(err: WorkspaceInitError) -> Self {
         match err {
+            WorkspaceInitError::RepositoryLock(err) => user_error(err),
             WorkspaceInitError::DestinationExists(_) => {
                 user_error("The target repo already exists")
             }

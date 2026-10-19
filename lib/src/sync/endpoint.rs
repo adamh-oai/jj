@@ -40,6 +40,7 @@ use super::state::SyncStateError;
 use super::state::SyncStateStore;
 use crate::file_util::persist_temp_file;
 use crate::lock::FileLock;
+use crate::lock::FileLockError;
 use crate::object_id::ObjectId as _;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store::OpStore;
@@ -47,11 +48,15 @@ use crate::op_store::OpStoreError;
 use crate::op_store::OperationId;
 use crate::repo::ReadonlyRepo;
 use crate::repo::Repo as _;
+use crate::repo_lock::RepoFormatLock;
 use crate::simple_op_store::SimpleOpStore;
 
 /// Failure to capture or finalize one local synchronization endpoint.
 #[derive(Debug, Error)]
 pub enum EndpointError {
+    /// The operation-store format could not be locked.
+    #[error(transparent)]
+    RepositoryLock(#[from] FileLockError),
     /// Shared history or referenced data is invalid.
     #[error(transparent)]
     Sync(#[from] SyncError),
@@ -111,12 +116,15 @@ impl Endpoint {
         }
     }
 
-    /// Enables the format after the caller has stopped other repository processes.
+    /// Enables synchronization after waiting for plain operation-store users.
     ///
-    /// Quiescence is a precondition, not something this local lock can prove.
-    /// The marker rejects future old-binary opens; it cannot revoke a repository
-    /// already opened by an older process. No active operation head is changed.
-    pub fn enable_quiescent(repo_path: &Path) -> EndpointResult<Self> {
+    /// Drop this process's existing repository handles before calling: loaders
+    /// opened with the plain format keep shared access until their last clone
+    /// is dropped. New loaders wait until the transition has finished. Binaries
+    /// predating this lock do not participate, so their already-open handles
+    /// must finish before upgrading. No active operation head is changed.
+    pub fn enable(repo_path: &Path) -> EndpointResult<Self> {
+        let _format_lock = RepoFormatLock::exclusive(repo_path)?;
         let marker = repo_path.join("op_store/type");
         let current = fs::read_to_string(&marker)?;
         if current == SimpleOpStore::SYNC_NAME {
@@ -605,6 +613,8 @@ mod tests {
     use crate::tests::new_temp_dir;
 
     fn make_repository(path: &Path, marker: &str) -> std::io::Result<()> {
+        fs::create_dir(path.join("store"))?;
+        fs::write(path.join("store/type"), b"git")?;
         fs::create_dir(path.join("op_store"))?;
         fs::write(path.join("op_store/type"), marker)?;
         fs::create_dir(path.join("op_heads"))?;
@@ -616,7 +626,7 @@ mod tests {
         let directory = new_temp_dir();
         make_repository(directory.path(), SimpleOpStore::NAME)?;
         assert!(Endpoint::load(directory.path()).identity().is_err());
-        let endpoint = Endpoint::enable_quiescent(directory.path())?;
+        let endpoint = Endpoint::enable(directory.path())?;
         let identity = endpoint.identity()?;
         assert_eq!(identity.len(), 32);
         assert_eq!(
@@ -628,10 +638,7 @@ mod tests {
             fs::read(directory.path().join("op_heads/local-head"))?,
             b"original active head"
         );
-        assert_eq!(
-            Endpoint::enable_quiescent(directory.path())?.identity()?,
-            identity
-        );
+        assert_eq!(Endpoint::enable(directory.path())?.identity()?, identity);
         Ok(())
     }
 
@@ -639,17 +646,17 @@ mod tests {
     fn enabled_missing_state_is_not_reinitialized() -> TestResult {
         let directory = new_temp_dir();
         make_repository(directory.path(), SimpleOpStore::SYNC_NAME)?;
-        assert!(Endpoint::enable_quiescent(directory.path()).is_err());
+        assert!(Endpoint::enable(directory.path()).is_err());
         assert!(!directory.path().join("sync").exists());
         Ok(())
     }
 
     #[test]
-    fn enabling_rejects_an_unrecognized_store_without_writes() -> TestResult {
+    fn enabling_rejects_an_unrecognized_store_without_initializing_sync() -> TestResult {
         let directory = new_temp_dir();
         make_repository(directory.path(), "other backend")?;
         assert!(matches!(
-            Endpoint::enable_quiescent(directory.path()),
+            Endpoint::enable(directory.path()),
             Err(EndpointError::WrongRepository)
         ));
         assert!(!directory.path().join("sync").exists());
@@ -660,7 +667,7 @@ mod tests {
     fn transfer_pins_survive_reopen_and_release_after_peer_retention() -> TestResult {
         let directory = new_temp_dir();
         make_repository(directory.path(), SimpleOpStore::NAME)?;
-        let endpoint = Endpoint::enable_quiescent(directory.path())?;
+        let endpoint = Endpoint::enable(directory.path())?;
         let raw = OperationId::new(vec![1; 64]);
         let shared = SharedEventId::new(vec![2; 64]);
         endpoint.pin_transfer(

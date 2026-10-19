@@ -74,6 +74,8 @@ pub async fn cmd_util_gc(
             ));
         }
     }
+    #[cfg(feature = "test-fakes")]
+    crate::cli_util::pause_for_test("JJ_TEST_SYNC_BEFORE_LEGACY_GC_PAUSE_DIR");
     repo.op_store()
         .gc(slice::from_ref(repo.op_id()), keep_newer)
         .await?;

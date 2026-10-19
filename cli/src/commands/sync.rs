@@ -39,8 +39,9 @@ use crate::ui::Ui;
 /// Workspace names, checkout pointers, and local Git observations stay local.
 ///
 /// The first use enables a repository format that older jj versions reject.
-/// Stop other repository processes before that first transition. An already
-/// running old process is not excluded by the new format marker.
+/// This transition waits for other commands using updated jj versions to finish.
+/// Already-running older binaries do not participate in the lock and must finish
+/// before the first sync.
 #[derive(clap::Args, Clone, Debug)]
 #[command(group(clap::ArgGroup::new("direction").required(true).multiple(false).args(["receive", "send", "bidi"])))]
 pub(crate) struct SyncArgs {

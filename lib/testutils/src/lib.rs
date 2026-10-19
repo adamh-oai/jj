@@ -70,6 +70,7 @@ use jj_lib::signing::Signer;
 use jj_lib::signing_factory::signer_from_settings;
 use jj_lib::simple_backend::SimpleBackend;
 use jj_lib::store::Store;
+use jj_lib::sync::endpoint::Endpoint;
 use jj_lib::transaction::Transaction;
 use jj_lib::tree::Tree;
 use jj_lib::tree_builder::TreeBuilder;
@@ -305,6 +306,24 @@ impl TestRepo {
             env,
             repo,
             repo_path: repo_dir,
+        }
+    }
+
+    /// Enable synchronization after releasing the plain-format repository handle.
+    pub fn enable_sync(self) -> Self {
+        let Self {
+            env,
+            repo,
+            repo_path,
+        } = self;
+        let settings = repo.settings().clone();
+        drop(repo);
+        Endpoint::enable(&repo_path).unwrap();
+        let repo = env.load_repo_at_head(&settings, &repo_path);
+        Self {
+            env,
+            repo,
+            repo_path,
         }
     }
 

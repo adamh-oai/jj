@@ -13,6 +13,11 @@
 // limitations under the License.
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::fs::TryLockError;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_store::RefTarget;
@@ -21,6 +26,7 @@ use jj_lib::ref_name::GitRefName;
 use jj_lib::ref_name::RefName;
 use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::Repo as _;
+use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::sync::anchor::AnchorStore;
 use jj_lib::sync::endpoint::Endpoint;
 use jj_lib::sync::endpoint::EndpointError;
@@ -33,6 +39,154 @@ use pollster::FutureExt as _;
 use testutils::TestRepo;
 use testutils::TestResult;
 use testutils::write_random_commit;
+
+#[test]
+fn plain_repository_and_loader_clones_hold_the_format_gate() -> TestResult {
+    let test = TestRepo::init();
+    let repo_path = test.repo_path().to_owned();
+    let gate = File::options()
+        .read(true)
+        .write(true)
+        .open(repo_path.join("store/type"))?;
+    assert!(matches!(gate.try_lock(), Err(TryLockError::WouldBlock)));
+
+    let loader = test.repo.loader().clone();
+    let cloned_loader = loader.clone();
+    let reloaded = cloned_loader.load_at_head().block_on()?;
+    drop(test.repo);
+    assert!(matches!(gate.try_lock(), Err(TryLockError::WouldBlock)));
+    drop(loader);
+    assert!(matches!(gate.try_lock(), Err(TryLockError::WouldBlock)));
+    drop(cloned_loader);
+    assert!(matches!(gate.try_lock(), Err(TryLockError::WouldBlock)));
+    drop(reloaded);
+
+    gate.try_lock()?;
+    gate.unlock()?;
+    assert!(repo_path.join("store/type").is_file());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn plain_repository_load_does_not_require_a_writable_directory_or_lock_file() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    struct RestorePermissions(Vec<(std::path::PathBuf, std::fs::Permissions)>);
+
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            for (path, permissions) in self.0.iter().rev() {
+                let _restore_result = std::fs::set_permissions(path, permissions.clone());
+            }
+        }
+    }
+
+    let test = TestRepo::init();
+    let repo_path = test.repo_path().to_owned();
+    let marker = repo_path.join("store/type");
+    let original_marker = std::fs::read(&marker)?;
+    let settings = test.repo.settings().clone();
+    let operation = test.repo.op_id().clone();
+    drop(test.repo);
+    let original_entries = std::fs::read_dir(&repo_path)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let _restore_permissions = RestorePermissions(vec![
+        (
+            repo_path.clone(),
+            std::fs::metadata(&repo_path)?.permissions(),
+        ),
+        (marker.clone(), std::fs::metadata(&marker)?.permissions()),
+    ]);
+    std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o444))?;
+    std::fs::set_permissions(&repo_path, std::fs::Permissions::from_mode(0o555))?;
+
+    let loaded = test.env.load_repo_at_head(&settings, &repo_path);
+    assert_eq!(loaded.op_id(), &operation);
+    assert_eq!(loaded.op_store().name(), SimpleOpStore::NAME);
+    assert_eq!(std::fs::read(&marker)?, original_marker);
+    assert_eq!(
+        std::fs::read_dir(&repo_path)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<BTreeSet<_>, _>>()?,
+        original_entries
+    );
+    Ok(())
+}
+
+#[test]
+fn enabling_sync_waits_for_plain_repositories_and_preserves_concurrent_work() -> TestResult {
+    let test = TestRepo::init();
+    let repo_path = test.repo_path().to_owned();
+    let settings = test.repo.settings().clone();
+    let loader = test.repo.loader().clone();
+    let (started, starting) = mpsc::channel();
+    let (completed, completion) = mpsc::channel();
+    let transition_path = repo_path.clone();
+    let transition = thread::spawn(move || {
+        started.send(()).unwrap();
+        let result = Endpoint::enable(&transition_path).map(|_| ());
+        completed.send(result).unwrap();
+    });
+    starting.recv_timeout(Duration::from_secs(10))?;
+    assert!(matches!(
+        completion.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("op_store/type"))?,
+        SimpleOpStore::NAME
+    );
+
+    let mut tx = test.repo.start_transaction();
+    let commit = write_random_commit(tx.repo_mut());
+    tx.repo_mut().set_local_bookmark_target(
+        RefName::new("concurrent-work"),
+        RefTarget::normal(commit.id().clone()),
+    );
+    let written = tx.commit("work before the format transition").block_on()?;
+    let operation = written.op_id().clone();
+    drop(written);
+    drop(test.repo);
+    assert!(matches!(
+        completion.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(loader);
+    completion.recv_timeout(Duration::from_secs(10))??;
+    transition.join().unwrap();
+
+    let current = test.env.load_repo_at_head(&settings, &repo_path);
+    assert_eq!(current.op_id(), &operation);
+    assert_eq!(
+        current
+            .view()
+            .get_local_bookmark(RefName::new("concurrent-work")),
+        &RefTarget::normal(commit.id().clone())
+    );
+    assert_eq!(current.op_store().name(), SimpleOpStore::SYNC_NAME);
+    Ok(())
+}
+
+#[test]
+fn enabled_repositories_release_the_format_gate_and_allow_repeat_enable() -> TestResult {
+    let test = TestRepo::init().enable_sync();
+    let gate = File::options()
+        .read(true)
+        .write(true)
+        .open(test.repo_path().join("store/type"))?;
+    let loader = test.repo.loader().clone();
+    let reloaded = loader.load_at_head().block_on()?;
+    gate.try_lock()?;
+    gate.unlock()?;
+
+    let endpoint = Endpoint::enable(test.repo_path())?;
+    assert!(endpoint.state_store().read()?.shared_anchors.is_empty());
+    assert_eq!(reloaded.op_id(), test.repo.op_id());
+    assert_eq!(reloaded.op_store().name(), SimpleOpStore::SYNC_NAME);
+    Ok(())
+}
 
 #[test]
 fn merge_and_local_integration_preserve_workspace_maps_and_undo() -> TestResult {
@@ -153,8 +307,8 @@ fn same_view_causal_integration_writes_an_undoable_operation() -> TestResult {
 
 #[test]
 fn endpoint_capture_rejects_stale_and_parallel_heads_without_advancing_boundary() -> TestResult {
-    let test = TestRepo::init();
-    let endpoint = Endpoint::enable_quiescent(test.repo_path())?;
+    let test = TestRepo::init().enable_sync();
+    let endpoint = Endpoint::load(test.repo_path());
     let base = &test.repo;
     let original = endpoint.capture(base, "initial").block_on()?;
     let newer = base.start_transaction().commit("newer").block_on()?;
@@ -186,8 +340,8 @@ fn endpoint_capture_rejects_stale_and_parallel_heads_without_advancing_boundary(
 
 #[test]
 fn endpoint_recapture_after_op_abandon_keeps_shared_causal_checkpoint() -> TestResult {
-    let test = TestRepo::init();
-    let endpoint = Endpoint::enable_quiescent(test.repo_path())?;
+    let test = TestRepo::init().enable_sync();
+    let endpoint = Endpoint::load(test.repo_path());
     let base = &test.repo;
     let a = base.start_transaction().commit("A").block_on()?;
     let mut tx = a.start_transaction();
@@ -232,8 +386,8 @@ fn endpoint_recapture_after_op_abandon_keeps_shared_causal_checkpoint() -> TestR
 
 #[test]
 fn endpoint_reconcile_result_is_retained_before_the_caller_can_pin_it() -> TestResult {
-    let test = TestRepo::init();
-    let endpoint = Endpoint::enable_quiescent(test.repo_path())?;
+    let test = TestRepo::init().enable_sync();
+    let endpoint = Endpoint::load(test.repo_path());
     let base = &test.repo;
     let a = base.start_transaction().commit("A").block_on()?;
     let captured = endpoint.capture(&a, "outgoing").block_on()?;
@@ -259,8 +413,8 @@ fn endpoint_reconcile_result_is_retained_before_the_caller_can_pin_it() -> TestR
 
 #[test]
 fn endpoint_recovers_a_published_receipt_from_ancestor_history_exactly_once() -> TestResult {
-    let test = TestRepo::init();
-    let endpoint = Endpoint::enable_quiescent(test.repo_path())?;
+    let test = TestRepo::init().enable_sync();
+    let endpoint = Endpoint::load(test.repo_path());
     let base = &test.repo;
     let initial = endpoint.capture(base, "initial").block_on()?;
     let unpublished = base.start_transaction().write("sync result").block_on()?;
@@ -331,8 +485,8 @@ fn endpoint_recovers_a_published_receipt_from_ancestor_history_exactly_once() ->
 
 #[test]
 fn endpoint_retires_never_published_receipt_without_losing_installed_history() -> TestResult {
-    let test = TestRepo::init();
-    let endpoint = Endpoint::enable_quiescent(test.repo_path())?;
+    let test = TestRepo::init().enable_sync();
+    let endpoint = Endpoint::load(test.repo_path());
     let base = &test.repo;
     let initial = endpoint.capture(base, "initial").block_on()?;
     let mut incoming_tx = base.start_transaction();
@@ -415,8 +569,8 @@ fn endpoint_retires_never_published_receipt_without_losing_installed_history() -
 
 #[test]
 fn pruning_an_interrupted_published_integration_preserves_its_undo() -> TestResult {
-    let test = TestRepo::init();
-    let endpoint = Endpoint::enable_quiescent(test.repo_path())?;
+    let test = TestRepo::init().enable_sync();
+    let endpoint = Endpoint::load(test.repo_path());
     let base = &test.repo;
     let initial = endpoint.capture(base, "initial").block_on()?;
     let mut peer_tx = base.start_transaction();
@@ -552,8 +706,8 @@ fn pruning_an_interrupted_published_integration_preserves_its_undo() -> TestResu
 #[test]
 fn pruning_multiple_raw_heads_preserves_each_causal_frontier_without_selecting_its_view()
 -> TestResult {
-    let test = TestRepo::init();
-    let endpoint = Endpoint::enable_quiescent(test.repo_path())?;
+    let test = TestRepo::init().enable_sync();
+    let endpoint = Endpoint::load(test.repo_path());
     let base = &test.repo;
     endpoint.capture(base, "initial").block_on()?;
     let common = base

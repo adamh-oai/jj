@@ -31,6 +31,7 @@ use crate::file_util;
 use crate::file_util::BadPathEncoding;
 use crate::file_util::IoResultExt as _;
 use crate::file_util::PathError;
+use crate::lock::FileLockError;
 use crate::merged_tree::MergedTree;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store::OperationId;
@@ -66,6 +67,8 @@ use crate::workspace_store::WorkspaceStoreError;
 
 #[derive(Error, Debug)]
 pub enum WorkspaceInitError {
+    #[error(transparent)]
+    RepositoryLock(#[from] FileLockError),
     #[error("The destination repo ({0}) already exists")]
     DestinationExists(PathBuf),
     #[error("Repo path could not be encoded")]
@@ -323,6 +326,7 @@ impl Workspace {
             )
             .await
             .map_err(|repo_init_err| match repo_init_err {
+                RepoInitError::RepositoryLock(err) => WorkspaceInitError::RepositoryLock(err),
                 RepoInitError::Backend(err) => WorkspaceInitError::Backend(err),
                 RepoInitError::OpHeadsStore(err) => WorkspaceInitError::OpHeadsStore(err),
                 RepoInitError::Path(err) => WorkspaceInitError::Path(err),

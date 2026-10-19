@@ -460,15 +460,18 @@ impl PreparedEndpoint {
         }
         let root = helper.workspace_root().to_owned();
         if helper.repo().op_store().name() == SimpleOpStore::NAME {
-            writeln!(
-                ui.status(),
-                "Enabling repository synchronization in \"{}\". The first sync checks retained \
-                 history and transfers missing Git objects. Other processes must be stopped for \
-                 this first format transition; already-open old jj processes are not excluded by \
-                 its marker.",
-                root.display()
+            progress.phase(
+                ui,
+                "Enabling synchronization; waiting for repository access",
             )?;
-            Endpoint::enable_quiescent(helper.repo_path()).map_err(failed)?;
+            // Release this command's shared format access before requesting
+            // exclusive access. Another command may finish the transition while
+            // we wait, so enable() checks the marker again under its lock.
+            let repo_path = helper.repo_path().to_owned();
+            drop(helper);
+            #[cfg(feature = "test-fakes")]
+            crate::cli_util::pause_for_test("JJ_TEST_SYNC_BEFORE_FORMAT_TRANSITION_PAUSE_DIR");
+            Endpoint::enable(&repo_path).map_err(failed)?;
             helper = load_helper(ui, command, &root, ignore_working_copy).await?;
         }
         let endpoint = Endpoint::load(helper.repo_path());
