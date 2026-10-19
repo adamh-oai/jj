@@ -705,6 +705,33 @@ impl GitBackend {
         Ok(())
     }
 
+    /// Rejects competing identities before a snapshot can authenticate an export.
+    pub(crate) fn validate_commit_metadata_snapshot(
+        &self,
+        metadata: &GitCommitMetadata,
+        snapshot: &GitMetadataSnapshot,
+    ) -> BackendResult<()> {
+        self.validate_commit_metadata_encoding(metadata)?;
+        if snapshot.heads.iter().any(|table| {
+            table
+                .get_value(metadata.id.as_bytes())
+                .is_some_and(|existing| existing != metadata.extras.as_slice())
+        }) {
+            // Normal snapshots have one identical entry and need no body read.
+            // Only competing encodings require checking their effective identity.
+            let header = self.export_object_header_with_metadata(&metadata.id, Some(snapshot))?;
+            let identity = self
+                .read_object_stream(&header, &mut io::sink())?
+                .expect("commit metadata references a commit");
+            for table in &snapshot.heads {
+                if let Some(existing) = table.get_value(metadata.id.as_bytes()) {
+                    identity.validate_existing(&metadata.header(), existing)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Inspects a natively verified packed commit and checks its jj identity.
     /// The body is streamed once, without hashing or copying it into staging again.
     pub(crate) fn inspect_packed_commit<T, E>(

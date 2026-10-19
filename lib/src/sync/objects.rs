@@ -34,6 +34,9 @@ use tempfile::TempDir;
 use super::SyncError;
 use super::SyncResult;
 use super::anchor::AnchorStore;
+use super::metadata::KnownCommitMetadata;
+use super::metadata::MetadataInventory;
+use super::metadata::fingerprint;
 use super::normalize::INTEGRATION_ANCHOR_ATTRIBUTE;
 use super::packed::GitPackReader;
 use super::packed::GitPackRepository;
@@ -493,12 +496,33 @@ impl<'a> RepositoryObjects<'a> {
         }
     }
 
-    /// Emits jj records and mandatory per-commit sidecars for a native Git transfer.
-    /// Knowing the Git object does not authenticate its sender's jj interpretation.
+    /// Fingerprints exact jj sidecars from this immutable metadata snapshot.
+    pub fn commit_metadata_inventory(
+        &self,
+        inventory: &Inventory,
+    ) -> SyncResult<MetadataInventory> {
+        let mut metadata = MetadataInventory::new(self.backend.git_repo().object_hash());
+        for id in &inventory.git_commits {
+            let id = gix::ObjectId::from_bytes_or_panic(id.as_bytes());
+            let record = self
+                .backend
+                .export_commit_metadata_with_metadata(&id, Some(&self.metadata))?;
+            let digest = fingerprint(&record);
+            self.backend
+                .validate_commit_metadata_snapshot(&record, &self.metadata)?;
+            self.validate_record(&Record::GitCommitMetadata(record))?;
+            metadata.insert(id, digest)?;
+        }
+        Ok(metadata)
+    }
+
+    /// Emits jj records and unmatched per-commit sidecars for a native Git transfer.
+    /// A Git ID alone never permits skipping its sender's jj interpretation.
     pub fn export_metadata_records(
         &self,
         inventory: &Inventory,
         known: &BTreeSet<RecordId>,
+        known_metadata: &KnownCommitMetadata,
         mut emit: impl FnMut(Record) -> SyncResult<()>,
     ) -> SyncResult<()> {
         for id in inventory.missing(known) {
@@ -508,12 +532,20 @@ impl<'a> RepositoryObjects<'a> {
                         .git_commits
                         .contains(&CommitId::from_bytes(id.as_bytes())) =>
                 {
-                    let record = Record::GitCommitMetadata(
-                        self.backend
-                            .export_commit_metadata_with_metadata(id, Some(&self.metadata))?,
-                    );
+                    let metadata = self
+                        .backend
+                        .export_commit_metadata_with_metadata(id, Some(&self.metadata))?;
+                    let digest = fingerprint(&metadata);
+                    self.backend
+                        .validate_commit_metadata_snapshot(&metadata, &self.metadata)?;
+                    let record = Record::GitCommitMetadata(metadata);
                     self.validate_record(&record)?;
-                    emit(record)?;
+                    // Recheck the exact bytes against this export snapshot. A
+                    // newer metadata head must not be omitted using an older
+                    // negotiation result.
+                    if known_metadata.get(id) != Some(&digest) {
+                        emit(record)?;
+                    }
                 }
                 RecordId::Git(_) => {}
                 _ => emit(self.export_record(id)?)?,
@@ -644,6 +676,7 @@ pub struct Quarantine {
     reserved_bytes: u64,
     reserved_records: usize,
     packed: Option<GitPackRepository>,
+    known_commit_metadata: KnownCommitMetadata,
 }
 
 struct PendingStream {
@@ -679,6 +712,7 @@ impl Quarantine {
             reserved_bytes: 0,
             reserved_records: 0,
             packed: None,
+            known_commit_metadata: KnownCommitMetadata::new(),
         })
     }
 
@@ -701,6 +735,58 @@ impl Quarantine {
         }
         self.packed = Some(repository);
         Ok(())
+    }
+
+    /// Records locally verified metadata fingerprints agreed with this peer.
+    /// This is only valid for native Git, before any incoming records are staged.
+    pub fn set_known_commit_metadata(&mut self, known: KnownCommitMetadata) -> SyncResult<()> {
+        if self.packed.is_none() || !self.staged.is_empty() || !self.streams.is_empty() {
+            return Err(invalid(
+                "known commit metadata requires an unstaged native Git receiver",
+            ));
+        }
+        if known.len() > self.limits.max_records {
+            return Err(invalid(
+                "known commit metadata exceeds the local record limit",
+            ));
+        }
+        if known
+            .keys()
+            .any(|id| id.as_bytes().len() != self.root_commit_id.as_bytes().len())
+        {
+            return Err(invalid(
+                "known commit metadata uses a different object format",
+            ));
+        }
+        self.known_commit_metadata = known;
+        Ok(())
+    }
+
+    fn commit_metadata(
+        &self,
+        receiver: &RepositoryObjects<'_>,
+        id: &gix::oid,
+    ) -> SyncResult<GitCommitMetadata> {
+        let record_id = RecordId::Git(id.to_owned());
+        if self.staged.contains(&record_id) {
+            return match self.read_record(&record_id)? {
+                Record::GitCommitMetadata(metadata) => Ok(metadata),
+                _ => Err(invalid("packed commit sidecar has the wrong record type")),
+            };
+        }
+        let expected = self
+            .known_commit_metadata
+            .get(id)
+            .ok_or_else(|| invalid("native Git transfer omitted mandatory commit metadata"))?;
+        let metadata = receiver
+            .backend
+            .export_commit_metadata_with_metadata(id, Some(&receiver.metadata))?;
+        if &fingerprint(&metadata) != expected {
+            return Err(invalid(
+                "agreed commit metadata changed; retry synchronization",
+            ));
+        }
+        Ok(metadata)
     }
 
     /// Byte allowance left for native packs after immutable metadata staging.
@@ -911,10 +997,11 @@ impl Quarantine {
                 read: |id: &RecordId| {
                     if self.staged.contains(id) {
                         self.read_record(id)
-                    } else if self.packed.is_some() && matches!(id, RecordId::Git(_)) {
-                        Err(invalid(
-                            "native Git transfer omitted mandatory commit metadata",
-                        ))
+                    } else if let RecordId::Git(id) = id
+                        && self.packed.is_some()
+                    {
+                        self.commit_metadata(receiver, id)
+                            .map(Record::GitCommitMetadata)
                     } else {
                         receiver.export_record(id)
                     }
@@ -972,14 +1059,10 @@ impl Quarantine {
                     .git_commits
                     .iter()
                     .map(|id| gix::ObjectId::from_bytes_or_panic(id.as_bytes())),
-                |id| match self
-                    .read_record(&RecordId::Git(id.to_owned()))
-                    .map_err(|err| crate::backend::BackendError::Other(err.into()))?
-                {
-                    Record::GitCommitMetadata(metadata) => Ok(metadata.extras),
-                    _ => Err(crate::backend::BackendError::Other(
-                        "packed commit sidecar is missing".into(),
-                    )),
+                |id| {
+                    self.commit_metadata(receiver, id)
+                        .map(|metadata| metadata.extras)
+                        .map_err(|err| crate::backend::BackendError::Other(err.into()))
                 },
                 |id, to| {
                     reader
@@ -2014,6 +2097,197 @@ mod tests {
     }
 
     #[test]
+    fn metadata_added_after_inventory_cannot_hide_competing_export_identities() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let tables = TableStore::load(source.directory.path().join("store/extra"), 20);
+        let parent = tables.get_head()?;
+        let commit = source.commit(empty.id, &[], &[], "captured identity");
+        let head = source.operation(commit.id, None, "captured operation");
+        let inventory = source
+            .objects()
+            .inventory_packed(std::slice::from_ref(&head), &[])?;
+        let mut competing = parent.start_mutation();
+        let mut extras =
+            crate::protos::git_store::Commit::decode(commit.commit_extras.as_deref().unwrap())?;
+        extras.change_id[0] ^= 1;
+        competing.add_entry(commit.id.as_bytes().to_vec(), extras.encode_to_vec());
+        tables.save_table(competing)?;
+        assert_eq!(
+            fs::read_dir(source.directory.path().join("store/extra/heads"))?.count(),
+            2
+        );
+        let objects = source.objects();
+        assert!(objects.commit_metadata_inventory(&inventory).is_err());
+        assert!(
+            objects
+                .export_metadata_records(
+                    &inventory,
+                    &BTreeSet::new(),
+                    &KnownCommitMetadata::new(),
+                    |_| Ok(())
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agreed_metadata_omits_only_exact_sidecars_and_installs_the_full_closure() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let common = source.commit(empty.id, &[], &[], "common history");
+        destination.backend.import_object(&common)?;
+        let incoming = source.commit(empty.id, &[common.id], &[], "small edit");
+        let head = source.operation(incoming.id, None, "incoming operation");
+        let objects = source.objects();
+        let receiver = destination.objects();
+        let inventory = objects.inventory_packed(std::slice::from_ref(&head), &[])?;
+        let local_inventory = receiver.inventory_packed_with_git_roots(&[], &[], &[common.id])?;
+        let mut agreed = KnownCommitMetadata::new();
+        receiver
+            .commit_metadata_inventory(&local_inventory)?
+            .append_matching("", &mut agreed)?;
+        let limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        let sending = GitPackRepository::sender(
+            source.directory.path(),
+            &source.backend,
+            &inventory,
+            &limits,
+        )?;
+        let receiving = GitPackRepository::receiver(
+            destination.directory.path(),
+            &destination.backend,
+            &local_inventory,
+            &limits,
+        )?;
+        fetch_test_pack(&sending, &receiving, &destination.backend);
+        let mut quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        quarantine.set_git_pack_repository(receiving)?;
+        quarantine.set_known_commit_metadata(agreed.clone())?;
+        let mut sidecars = vec![];
+        objects.export_metadata_records(&inventory, &BTreeSet::new(), &agreed, |record| {
+            if let Record::GitCommitMetadata(metadata) = &record {
+                sidecars.push(metadata.id);
+            }
+            quarantine.stage(&receiver, &record)
+        })?;
+        assert_eq!(sidecars, vec![incoming.id]);
+        assert!(!quarantine.staged.contains(&RecordId::Git(common.id)));
+        let verified = quarantine.validate(&receiver, std::slice::from_ref(&head), &[])?;
+        assert_eq!(verified, inventory);
+        quarantine.install(&receiver, &verified)?;
+        assert_eq!(destination.backend.export_object(&incoming.id)?, incoming);
+        assert_eq!(destination.backend.export_object(&common.id)?, common);
+        assert_eq!(
+            destination.operations.export_operation(&head)?,
+            source.operations.export_operation(&head)?
+        );
+
+        // A known Git ID with a different metadata fingerprint still needs its
+        // sidecar, even when the physical object itself is already present.
+        agreed.get_mut(&common.id).unwrap()[0] ^= 1;
+        let mut sent = BTreeSet::new();
+        objects.export_metadata_records(&inventory, &inventory.records, &agreed, |record| {
+            if let Record::GitCommitMetadata(metadata) = record {
+                sent.insert(metadata.id);
+            }
+            Ok(())
+        })?;
+        assert_eq!(sent, BTreeSet::from([common.id, incoming.id]));
+        Ok(())
+    }
+
+    #[test_case(false; "forged agreement")]
+    #[test_case(true; "late writer conflict")]
+    fn agreed_metadata_cannot_hide_forged_fingerprints_or_later_writes(
+        late_conflict: bool,
+    ) -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(empty.id, &[], &[], "agreed identity");
+        destination.backend.import_object(&commit)?;
+        let head = source.operation(commit.id, None, "incoming operation");
+        let objects = source.objects();
+        let receiver = destination.objects();
+        let inventory = objects.inventory_packed(std::slice::from_ref(&head), &[])?;
+        let local_inventory = receiver.inventory_packed_with_git_roots(&[], &[], &[commit.id])?;
+        let mut agreed = KnownCommitMetadata::new();
+        receiver
+            .commit_metadata_inventory(&local_inventory)?
+            .append_matching("", &mut agreed)?;
+        let limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        let receiving = GitPackRepository::receiver(
+            destination.directory.path(),
+            &destination.backend,
+            &local_inventory,
+            &limits,
+        )?;
+        let mut quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        quarantine.set_git_pack_repository(receiving)?;
+        if !late_conflict {
+            agreed.get_mut(&commit.id).unwrap()[0] ^= 1;
+        }
+        quarantine.set_known_commit_metadata(agreed)?;
+        // Deliberately omit every sidecar, as a dishonest peer could do.
+        objects.export_metadata_records(
+            &inventory,
+            &BTreeSet::new(),
+            &KnownCommitMetadata::new(),
+            |record| {
+                if !matches!(record, Record::GitCommitMetadata(_)) {
+                    quarantine.stage(&receiver, &record)?;
+                }
+                Ok(())
+            },
+        )?;
+        if !late_conflict {
+            assert!(
+                quarantine
+                    .validate(&receiver, std::slice::from_ref(&head), &[])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("agreed commit metadata changed")
+            );
+            return Ok(());
+        }
+        let verified = quarantine.validate(&receiver, std::slice::from_ref(&head), &[])?;
+        // A current writer changes identity after agreement and validation. The
+        // immutable read snapshot remains valid, but cannot authorize an import.
+        let tables = TableStore::load(
+            destination.directory.path().join("store/extra"),
+            commit.id.as_bytes().len(),
+        );
+        let mut update = tables.get_head()?.start_mutation();
+        let mut extras =
+            crate::protos::git_store::Commit::decode(commit.commit_extras.as_deref().unwrap())?;
+        extras.change_id[0] ^= 1;
+        let changed = extras.encode_to_vec();
+        update.add_entry(commit.id.as_bytes().to_vec(), changed.clone());
+        tables.save_table(update)?;
+        assert!(quarantine.install(&receiver, &verified).is_err());
+        assert_eq!(
+            destination
+                .backend
+                .export_commit_metadata(&commit.id)?
+                .extras,
+            changed
+        );
+        assert!(destination.operations.export_operation(&head).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn inventories_and_exports_release_the_metadata_writer_lock() -> TestResult {
         let source = Fixture::new(gix::hash::Kind::Sha1);
         let empty = source.object(gix::objs::Kind::Tree, vec![], None);
@@ -2036,10 +2310,15 @@ mod tests {
                         objects.export_records(id, |_| Ok(()))?;
                     }
                     let mut commits = 0;
-                    objects.export_metadata_records(&packed, &BTreeSet::new(), |record| {
-                        commits += usize::from(matches!(record, Record::GitCommitMetadata(_)));
-                        Ok(())
-                    })?;
+                    objects.export_metadata_records(
+                        &packed,
+                        &BTreeSet::new(),
+                        &KnownCommitMetadata::new(),
+                        |record| {
+                            commits += usize::from(matches!(record, Record::GitCommitMetadata(_)));
+                            Ok(())
+                        },
+                    )?;
                     Ok(commits)
                 })();
                 completed.send(result).unwrap();
@@ -2141,9 +2420,12 @@ mod tests {
             )?;
             fetch_test_pack(&sending, &receiving, &destination.backend);
             quarantine.set_git_pack_repository(receiving)?;
-            objects.export_metadata_records(&inventory, &BTreeSet::new(), |record| {
-                quarantine.stage(&receiver, &record)
-            })?;
+            objects.export_metadata_records(
+                &inventory,
+                &BTreeSet::new(),
+                &KnownCommitMetadata::new(),
+                |record| quarantine.stage(&receiver, &record),
+            )?;
         } else {
             for id in &inventory.records {
                 objects.export_records(id, |record| quarantine.stage(&receiver, &record))?;
@@ -2312,17 +2594,25 @@ mod tests {
             .cloned()
             .collect();
         let mut sidecars = 0;
-        objects.export_metadata_records(&inventory, &known, |record| {
-            assert!(!matches!(
-                record,
-                Record::Git(_) | Record::GitHeader(_) | Record::GitChunk { .. } | Record::GitEnd(_)
-            ));
-            if matches!(record, Record::GitCommitMetadata(_)) {
-                sidecars += 1;
-            }
-            assert_eq!(Record::decode(&record.encode()?)?, record);
-            quarantine.stage(&destination.objects(), &record)
-        })?;
+        objects.export_metadata_records(
+            &inventory,
+            &known,
+            &KnownCommitMetadata::new(),
+            |record| {
+                assert!(!matches!(
+                    record,
+                    Record::Git(_)
+                        | Record::GitHeader(_)
+                        | Record::GitChunk { .. }
+                        | Record::GitEnd(_)
+                ));
+                if matches!(record, Record::GitCommitMetadata(_)) {
+                    sidecars += 1;
+                }
+                assert_eq!(Record::decode(&record.encode()?)?, record);
+                quarantine.stage(&destination.objects(), &record)
+            },
+        )?;
         assert_eq!(sidecars, inventory.git_commits.len());
         let validated =
             quarantine.validate(&destination.objects(), std::slice::from_ref(&head), &[])?;
@@ -2398,14 +2688,17 @@ mod tests {
             limits,
         )?;
         quarantine.set_git_pack_repository(packed)?;
-        source
-            .objects()
-            .export_metadata_records(&inventory, &BTreeSet::new(), |record| {
+        source.objects().export_metadata_records(
+            &inventory,
+            &BTreeSet::new(),
+            &KnownCommitMetadata::new(),
+            |record| {
                 if matches!(record, Record::GitCommitMetadata(_)) {
                     return Ok(());
                 }
                 quarantine.stage(&destination.objects(), &record)
-            })?;
+            },
+        )?;
         assert!(
             quarantine
                 .validate(&destination.objects(), std::slice::from_ref(&head), &[])
@@ -2464,11 +2757,12 @@ mod tests {
             limits,
         )?;
         quarantine.set_git_pack_repository(packed)?;
-        source
-            .objects()
-            .export_metadata_records(&inventory, &BTreeSet::new(), |record| {
-                quarantine.stage(&destination.objects(), &record)
-            })?;
+        source.objects().export_metadata_records(
+            &inventory,
+            &BTreeSet::new(),
+            &KnownCommitMetadata::new(),
+            |record| quarantine.stage(&destination.objects(), &record),
+        )?;
         assert!(
             quarantine
                 .validate(&destination.objects(), std::slice::from_ref(&head), &[])
@@ -2517,9 +2811,11 @@ mod tests {
             limits,
         )?;
         quarantine.set_git_pack_repository(packed)?;
-        source
-            .objects()
-            .export_metadata_records(&inventory, &BTreeSet::new(), |record| {
+        source.objects().export_metadata_records(
+            &inventory,
+            &BTreeSet::new(),
+            &KnownCommitMetadata::new(),
+            |record| {
                 assert!(!matches!(
                     record,
                     Record::Git(_)
@@ -2528,7 +2824,8 @@ mod tests {
                         | Record::GitEnd(_)
                 ));
                 quarantine.stage(&destination.objects(), &record)
-            })?;
+            },
+        )?;
         // Control files and incoming refs consume the same physical allowance
         // as object packs, even though they are never promoted to the live ODB.
         fs::write(&extra_scratch, vec![0; 512 * 1024])?;

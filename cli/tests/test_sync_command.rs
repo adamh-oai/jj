@@ -1611,6 +1611,109 @@ fn test_sync_native_git_preserves_packed_history_on_repeat(direction: &str, ssh:
 }
 
 #[cfg(unix)]
+#[test_case(false; "adaptive_metadata")]
+#[test_case(true; "older_native_peer")]
+fn test_sync_remote_edit_transfers_only_changed_commit_metadata(old_peer: bool) {
+    let mut env = TestEnvironment::default();
+    configure_fake_sync_ssh(&mut env);
+    if old_peer {
+        env.add_env_var("JJ_TEST_SYNC_DISABLE_METADATA_NEGOTIATION", "helper");
+    }
+    let source = init_repo(&env, "source");
+    let remote = init_repo(&env, "remote");
+    for index in 0..64 {
+        source
+            .run_jj(["new", "-m", &format!("retained history {index}")])
+            .success();
+    }
+    source.run_jj(["bookmark", "create", "source"]).success();
+    let peer = ssh_sync_url(&remote);
+    source.run_jj(["sync", "--send", &peer]).success();
+    remote.write_file("remote.txt", "new work on the remote machine\n");
+    remote.run_jj(["describe", "-m", "remote edit"]).success();
+    remote.run_jj(["bookmark", "create", "remote"]).success();
+    let remote_commit = revision_id(&remote, "remote");
+    let remote_op = remote.current_operation_id();
+    let remote_change = remote
+        .run_jj(["log", "--no-graph", "-r", "remote", "-T", "change_id"])
+        .success();
+    let output = source
+        .run_jj(["--debug", "sync", "--receive", &peer])
+        .success();
+    let stderr = anstream::adapter::strip_str(output.stderr.raw()).to_string();
+    let counts = regex::Regex::new(r"commit_metadata_records=(\d+)").unwrap();
+    let largest_transfer = counts
+        .captures_iter(&stderr)
+        .map(|captures| captures[1].parse::<usize>().unwrap())
+        .max()
+        .expect("debug output must report actual metadata records");
+    if old_peer {
+        assert!(
+            largest_transfer >= 64,
+            "legacy metadata was skipped: {stderr}"
+        );
+        assert!(!stderr.contains("Commit metadata negotiation completed"));
+    } else {
+        assert!(
+            largest_transfer < 8,
+            "unchanged metadata was resent: {stderr}"
+        );
+        assert!(stderr.contains("Commit metadata negotiation completed"));
+    }
+    assert!(stderr.contains("Transferring Git objects with native Git"));
+    assert_eq!(revision_id(&source, "remote"), remote_commit);
+    let received_change = source
+        .run_jj(["log", "--no-graph", "-r", "remote", "-T", "change_id"])
+        .success();
+    assert_eq!(received_change.stdout.raw(), remote_change.stdout.raw());
+    assert_imported_history(&remote, &source, &remote_op);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sync_adaptive_metadata_rejects_incompatible_existing_sidecar() {
+    use jj_lib::stacked_table::TableSegment as _;
+    use jj_lib::stacked_table::TableStore;
+
+    let env = TestEnvironment::default();
+    let source = init_repo(&env, "source");
+    let receiver = init_repo(&env, "receiver");
+    describe_and_bookmark(&source, "base");
+    let base = gix::ObjectId::from_hex(revision_id(&source, "base").as_bytes()).unwrap();
+    source.run_jj(["new", "-m", "shared history"]).success();
+    source.run_jj(["bookmark", "create", "source"]).success();
+    let commit = gix::ObjectId::from_hex(revision_id(&source, "source").as_bytes()).unwrap();
+    source.run_jj(["sync", "--send", "../receiver"]).success();
+    let receiver_op = receiver.current_operation_id();
+    let tables = TableStore::load(receiver.root().join(".jj/repo/store/extra"), 20);
+    let head = tables.get_head().unwrap();
+    let mut different = head.get_value(commit.as_bytes()).unwrap().to_vec();
+    // Add a valid protobuf predecessors entry (field 2) without changing the
+    // physical Git commit. Its existing base commit is already present here.
+    different.extend_from_slice(&[0x12, 20]);
+    different.extend_from_slice(base.as_bytes());
+    let mut mutation = head.start_mutation();
+    mutation.add_entry(commit.as_bytes().to_vec(), different.clone());
+    tables.save_table(mutation).unwrap();
+
+    let output = source.run_jj(["--debug", "sync", "--send", "../receiver"]);
+    assert!(!output.status.success());
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Incompatible jj metadata for Git commit"),
+        "{}",
+        output.stderr.raw()
+    );
+    assert_eq!(receiver.current_operation_id(), receiver_op);
+    assert_eq!(
+        tables.get_head().unwrap().get_value(commit.as_bytes()),
+        Some(different.as_slice())
+    );
+}
+
+#[cfg(unix)]
 #[test_case("helper"; "mixed_capabilities")]
 #[test_case("all"; "raw_only")]
 fn test_sync_raw_fallback_preserves_metadata_and_undo(disabled: &str) {

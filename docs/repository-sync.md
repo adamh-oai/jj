@@ -45,8 +45,9 @@ jj --debug sync --send 'ssh://host/home/user/code/project'
 
 When both peers support native packed transfers and have Git available, Unix
 endpoints use Git's ordinary push or fetch transport for Git objects. Temporary
-refs cover the frozen retained history, including commits needed only by old
-operations, predecessor metadata, and legacy conflict trees. These refs live in
+refs cover the heads of the frozen retained history, including disconnected
+histories needed only by old operations or predecessor metadata, and legacy
+conflict trees. Ancestor commits do not need individual refs. These refs live in
 disposable bare repositories; they do not change either repository's bookmarks
 or ordinary Git refs.
 
@@ -58,9 +59,22 @@ receiving never requires a reverse SSH connection. Bidirectional sync runs the
 two transfers in sequence.
 
 Original operations, views, shared events, and exact Jujutsu commit metadata
-travel separately. Commit metadata is checked even when Git already knows the
-commit's object ID. The receiver validates the complete history before retaining
-objects and publishing its integration operation.
+travel separately. Operations and views are content-addressed files in the
+operation store; commit metadata lives in the Git backend's extra metadata
+tables. They are not stored as Git objects.
+
+Peers supporting incremental commit metadata compare hashes of the exact
+metadata in progressively smaller commit-ID ranges. Matching ranges need no
+metadata payloads. A known Git commit ID alone cannot prove that its Jujutsu
+change ID, predecessors, or legacy conflict data match. Installation still
+checks current local metadata under its writer lock before accepting incoming
+data. Older packed-transfer peers continue to send every commit's metadata.
+
+Operations, views, and shared events use a separate inventory of their IDs,
+followed by only the records missing from the receiver's known-ID cache. This
+makes their payload transfer incremental, but collecting and exchanging that
+inventory still walks the retained history. Complete dependency validation also
+walks the history before objects are retained and the integration is published.
 
 Older peers and endpoints without native Git support continue to use the
 existing object-record transfer. That path expands each object it sends, so

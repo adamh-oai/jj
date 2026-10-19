@@ -15,6 +15,7 @@
 //! Endpoint preparation, frozen transfers, and independent local publication.
 
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::io;
 use std::io::Read;
 use std::io::Write as _;
@@ -35,6 +36,9 @@ use jj_lib::sync::SyncError;
 use jj_lib::sync::endpoint::Capture;
 use jj_lib::sync::endpoint::Endpoint;
 use jj_lib::sync::endpoint::EndpointError;
+use jj_lib::sync::metadata::KnownCommitMetadata;
+use jj_lib::sync::metadata::MetadataInventory;
+use jj_lib::sync::metadata::MetadataSummary;
 use jj_lib::sync::objects::Inventory;
 use jj_lib::sync::objects::Quarantine;
 use jj_lib::sync::objects::QuarantineLimits;
@@ -75,6 +79,8 @@ const CAPABILITIES: [&str; 4] = [
 ];
 const INITIALIZE_RECEIVER_CAPABILITY: &str = "initialize-receiver-v1";
 const NATIVE_GIT_CAPABILITY: &str = "native-git-pack-v1";
+const ADAPTIVE_METADATA_CAPABILITY: &str = "adaptive-commit-metadata-v1";
+const METADATA_PROBE_BATCH_SIZE: usize = 128;
 const NEGOTIATE_OBJECT_HASH: &str = "auto";
 const INVENTORY_BATCH_SIZE: usize = 512;
 const MAX_INVENTORY_BATCH_BYTES: usize = INVENTORY_BATCH_SIZE * 192;
@@ -92,6 +98,7 @@ struct TransferProgress<'a> {
     objects: usize,
     total_objects: Option<usize>,
     transferred_bytes: u64,
+    commit_metadata_records: usize,
     started: Instant,
     next_update: Instant,
 }
@@ -106,6 +113,7 @@ impl<'a> TransferProgress<'a> {
             objects: 0,
             total_objects,
             transferred_bytes: 0,
+            commit_metadata_records: 0,
             started,
             next_update: started + Duration::from_secs(1),
         }
@@ -116,6 +124,7 @@ impl<'a> TransferProgress<'a> {
             self.objects += 1;
         }
         self.transferred_bytes = self.transferred_bytes.saturating_add(encoded_bytes as u64);
+        self.commit_metadata_records += usize::from(matches!(record, Record::GitCommitMetadata(_)));
         let now = Instant::now();
         if now >= self.next_update {
             self.report(false);
@@ -134,6 +143,7 @@ impl<'a> TransferProgress<'a> {
             completed_objects = self.objects,
             total_objects = ?self.total_objects,
             transferred_bytes = self.transferred_bytes,
+            commit_metadata_records = self.commit_metadata_records,
             elapsed_seconds = self.started.elapsed().as_secs_f64(),
             complete,
             "Synchronization transfer progress"
@@ -348,6 +358,7 @@ struct PreparedEndpoint {
     pins: Vec<String>,
     publication_leases: Vec<FileLock>,
     packed_git: bool,
+    common_metadata: KnownCommitMetadata,
 }
 
 impl PreparedEndpoint {
@@ -443,6 +454,7 @@ impl PreparedEndpoint {
             publication_leases: Vec::new(),
             transfer,
             packed_git,
+            common_metadata: KnownCommitMetadata::new(),
         })
     }
 
@@ -509,7 +521,7 @@ impl PreparedEndpoint {
             ui,
             &self.root,
             "Sending",
-            Some(
+            self.common_metadata.is_empty().then(|| {
                 inventory
                     .missing(known)
                     .filter(|id| {
@@ -521,8 +533,8 @@ impl PreparedEndpoint {
                                 _ => true,
                             }
                     })
-                    .count(),
-            ),
+                    .count()
+            }),
         );
         let mut emit = |record: Record| {
             let bytes = record.encode()?;
@@ -535,7 +547,7 @@ impl PreparedEndpoint {
         };
         if self.packed_git {
             objects
-                .export_metadata_records(inventory, known, &mut emit)
+                .export_metadata_records(inventory, known, &self.common_metadata, &mut emit)
                 .map_err(failed)?;
         } else {
             for id in inventory.missing(known) {
@@ -597,6 +609,11 @@ impl PreparedEndpoint {
         } else {
             None
         };
+        if !self.common_metadata.is_empty() {
+            quarantine
+                .set_known_commit_metadata(self.common_metadata.clone())
+                .map_err(failed)?;
+        }
         let mut progress = TransferProgress::new(ui, &self.root, "Receiving", None);
         loop {
             match stream.receive()? {
@@ -1051,7 +1068,7 @@ pub(crate) async fn synchronize(
     transport
         .send(&Message::Hello(hello.clone()))
         .map_err(failed)?;
-    let packed_git = match transport.receive().map_err(failed)? {
+    let (packed_git, adaptive_metadata) = match transport.receive().map_err(failed)? {
         Message::HelloReply(reply) => {
             tracing::debug!(
                 object_hash = %reply.object_hash,
@@ -1061,7 +1078,10 @@ pub(crate) async fn synchronize(
                 hello.object_hash.clone_from(&reply.object_hash);
             }
             hello.validate_peer(&reply).map_err(failed)?;
-            use_native_git(&hello, &reply)
+            (
+                use_native_git(&hello, &reply),
+                use_adaptive_metadata(&hello, &reply),
+            )
         }
         Message::Error(error) => {
             return Err(user_error(format!("Peer synchronization failed: {error}")));
@@ -1086,6 +1106,17 @@ pub(crate) async fn synchronize(
     let remote: Advertisement = receive_command(&mut transport, "capture")?;
     remote.validate()?;
     let remote_known = receive_inventory(&mut transport, local.known_cache_limit()?)?;
+    if adaptive_metadata {
+        let manifest = objects(&local.helper, &local.endpoint)?
+            .commit_metadata_inventory(&local.inventory)
+            .map_err(failed)?;
+        local.common_metadata = negotiate_metadata(
+            &mut transport,
+            &manifest,
+            parse_object_hash(&hello.object_hash)?,
+            true,
+        )?;
+    }
     #[cfg(feature = "test-fakes")]
     crate::cli_util::pause_for_test("JJ_TEST_SYNC_AFTER_CAPTURE_PAUSE_DIR");
     let local_applied = match direction {
@@ -1234,6 +1265,7 @@ async fn serve_session(
     }
     stream.send(&Message::HelloReply(reply.clone()))?;
     let packed_git = use_native_git(&request, &reply);
+    let adaptive_metadata = use_adaptive_metadata(&request, &reply);
     let mut local =
         PreparedEndpoint::open(ui, command, &path, request.ignore_working_copy, packed_git).await?;
     reply
@@ -1245,6 +1277,17 @@ async fn serve_session(
     let advertisement = local.advertisement()?;
     send_command(stream, "capture", &advertisement)?;
     send_inventory(stream, &local.inventory, packed_git)?;
+    if adaptive_metadata {
+        let manifest = objects(&local.helper, &local.endpoint)?
+            .commit_metadata_inventory(&local.inventory)
+            .map_err(failed)?;
+        local.common_metadata = negotiate_metadata(
+            stream,
+            &manifest,
+            parse_object_hash(&reply.object_hash)?,
+            false,
+        )?;
+    }
     match request.direction {
         Direction::Receive => {
             local.send_offer(
@@ -1367,6 +1410,12 @@ fn format_hello(
         && std::env::var("JJ_TEST_SYNC_DISABLE_NATIVE_GIT").map_or(true, |disabled| {
             disabled != "all" && !(disabled == "helper" && path.is_empty())
         });
+    let adaptive_metadata = native_git;
+    #[cfg(feature = "test-fakes")]
+    let adaptive_metadata = adaptive_metadata
+        && std::env::var("JJ_TEST_SYNC_DISABLE_METADATA_NEGOTIATION").map_or(true, |disabled| {
+            disabled != "all" && !(disabled == "helper" && path.is_empty())
+        });
     Hello {
         version: PROTOCOL_VERSION,
         direction,
@@ -1380,6 +1429,7 @@ fn format_hello(
             .copied()
             .chain([INITIALIZE_RECEIVER_CAPABILITY])
             .chain(native_git.then_some(NATIVE_GIT_CAPABILITY))
+            .chain(adaptive_metadata.then_some(ADAPTIVE_METADATA_CAPABILITY))
             .map(str::to_owned)
             .collect(),
         required_capabilities: CAPABILITIES.iter().map(|name| (*name).to_owned()).collect(),
@@ -1394,6 +1444,154 @@ fn use_native_git(request: &Hello, reply: &Hello) -> bool {
                 .iter()
                 .any(|capability| capability == NATIVE_GIT_CAPABILITY)
         })
+}
+
+fn use_adaptive_metadata(request: &Hello, reply: &Hello) -> bool {
+    use_native_git(request, reply)
+        && [request, reply].iter().all(|hello| {
+            hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == ADAPTIVE_METADATA_CAPABILITY)
+        })
+}
+
+/// An ordered prefix frontier gives both peers the same requests and bounds
+/// traversal by the locally captured keys, even if peer counts are dishonest.
+struct MetadataProbe {
+    prefix: String,
+    peer_parent_count: usize,
+}
+
+struct MetadataNegotiation<'a> {
+    inventory: &'a MetadataInventory,
+    hash: gix::hash::Kind,
+    pending: VecDeque<MetadataProbe>,
+    known: KnownCommitMetadata,
+    visited: usize,
+    limit: usize,
+}
+
+impl<'a> MetadataNegotiation<'a> {
+    fn new(inventory: &'a MetadataInventory, hash: gix::hash::Kind) -> Self {
+        Self {
+            inventory,
+            hash,
+            pending: VecDeque::from([MetadataProbe {
+                prefix: String::new(),
+                peer_parent_count: usize::MAX,
+            }]),
+            known: KnownCommitMetadata::new(),
+            visited: 0,
+            limit: inventory
+                .len()
+                .saturating_mul(hash.len_in_bytes() * 2)
+                .saturating_mul(16)
+                .saturating_add(1),
+        }
+    }
+
+    fn batch(&mut self) -> Result<Vec<MetadataProbe>, CommandError> {
+        let count = self.pending.len().min(METADATA_PROBE_BATCH_SIZE);
+        self.visited = self
+            .visited
+            .checked_add(count)
+            .ok_or_else(|| user_error("Commit metadata negotiation exceeded its probe limit"))?;
+        if self.visited > self.limit {
+            return Err(user_error(
+                "Commit metadata negotiation exceeded its probe limit",
+            ));
+        }
+        Ok(self.pending.drain(..count).collect())
+    }
+
+    fn summaries(&self, probes: &[MetadataProbe]) -> Result<Vec<MetadataSummary>, CommandError> {
+        probes
+            .iter()
+            .map(|probe| self.inventory.summarize(&probe.prefix).map_err(failed))
+            .collect()
+    }
+
+    fn accept(
+        &mut self,
+        probes: &[MetadataProbe],
+        local: &[MetadataSummary],
+        peer: &[MetadataSummary],
+    ) -> Result<(), CommandError> {
+        if peer.len() != probes.len() || peer.len() > METADATA_PROBE_BATCH_SIZE {
+            return Err(user_error("Invalid commit metadata probe batch size"));
+        }
+        // Apart from the initial root, requests contain complete ordered sibling
+        // groups. Child counts must partition their advertised parent count.
+        if !probes[0].prefix.is_empty() {
+            for (siblings, summaries) in probes.chunks(16).zip(peer.chunks(16)) {
+                let count = summaries
+                    .iter()
+                    .try_fold(0usize, |sum, summary| sum.checked_add(summary.count));
+                if siblings.len() != 16 || count != Some(siblings[0].peer_parent_count) {
+                    return Err(user_error("Inconsistent commit metadata subtree counts"));
+                }
+            }
+        }
+        for ((probe, local), peer) in probes.iter().zip(local).zip(peer) {
+            peer.validate(self.hash).map_err(failed)?;
+            let capacity =
+                16usize.saturating_pow((self.hash.len_in_bytes() * 2 - probe.prefix.len()) as u32);
+            if peer.prefix != probe.prefix
+                || peer.count > probe.peer_parent_count
+                || peer.count > capacity
+            {
+                return Err(user_error("Noncanonical commit metadata probe sequence"));
+            }
+            if local.count == 0 || peer.count == 0 {
+                continue;
+            }
+            if local.count == peer.count && local.digest == peer.digest {
+                self.inventory
+                    .append_matching(&probe.prefix, &mut self.known)
+                    .map_err(failed)?;
+            } else if (local.count > 1 || peer.count > 1)
+                && probe.prefix.len() < self.hash.len_in_bytes() * 2
+            {
+                for digit in b"0123456789abcdef" {
+                    self.pending.push_back(MetadataProbe {
+                        prefix: format!("{}{}", probe.prefix, char::from(*digit)),
+                        peer_parent_count: peer.count,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn negotiate_metadata(
+    stream: &mut impl Stream,
+    inventory: &MetadataInventory,
+    hash: gix::hash::Kind,
+    client: bool,
+) -> Result<KnownCommitMetadata, CommandError> {
+    let mut negotiation = MetadataNegotiation::new(inventory, hash);
+    while !negotiation.pending.is_empty() {
+        let probes = negotiation.batch()?;
+        let local = negotiation.summaries(&probes)?;
+        let peer = if client {
+            send_command(stream, "metadata-probe", &local)?;
+            receive_command::<Vec<MetadataSummary>>(stream, "metadata-reply")?
+        } else {
+            receive_command::<Vec<MetadataSummary>>(stream, "metadata-probe")?
+        };
+        negotiation.accept(&probes, &local, &peer)?;
+        if !client {
+            send_command(stream, "metadata-reply", &local)?;
+        }
+    }
+    tracing::debug!(
+        matching_commits = negotiation.known.len(),
+        probes = negotiation.visited,
+        "Commit metadata negotiation completed"
+    );
+    Ok(negotiation.known)
 }
 
 /// An invalid marker is an existing broken repository, never an init request.
@@ -1620,6 +1818,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_negotiation_keeps_common_sidecars_and_excludes_changed_identities() {
+        for hash in [gix::hash::Kind::Sha1, gix::hash::Kind::Sha256] {
+            let mut source = MetadataInventory::new(hash);
+            let mut peer = MetadataInventory::new(hash);
+            let mut expected = KnownCommitMetadata::new();
+            for index in 0..64u8 {
+                let id = gix::ObjectId::from_bytes_or_panic(&vec![index; hash.len_in_bytes()]);
+                source.insert(id, [index; 32]).unwrap();
+                if index == 17 {
+                    peer.insert(id, [255; 32]).unwrap();
+                } else {
+                    peer.insert(id, [index; 32]).unwrap();
+                    expected.insert(id, [index; 32]);
+                }
+            }
+            peer.insert(
+                gix::ObjectId::from_bytes_or_panic(&vec![255; hash.len_in_bytes()]),
+                [255; 32],
+            )
+            .unwrap();
+            let mut client = MetadataNegotiation::new(&source, hash);
+            let mut server = MetadataNegotiation::new(&peer, hash);
+            while !client.pending.is_empty() {
+                let client_probes = client.batch().unwrap();
+                let server_probes = server.batch().unwrap();
+                assert_eq!(
+                    client_probes
+                        .iter()
+                        .map(|probe| &probe.prefix)
+                        .collect::<Vec<_>>(),
+                    server_probes
+                        .iter()
+                        .map(|probe| &probe.prefix)
+                        .collect::<Vec<_>>(),
+                );
+                let left = client.summaries(&client_probes).unwrap();
+                let right = server.summaries(&server_probes).unwrap();
+                client.accept(&client_probes, &left, &right).unwrap();
+                server.accept(&server_probes, &right, &left).unwrap();
+            }
+            assert!(server.pending.is_empty());
+            assert_eq!(client.known, expected);
+            assert_eq!(server.known, expected);
+            assert!(client.visited < source.len() * 2);
+        }
+    }
+
+    #[test]
+    fn metadata_negotiation_never_descends_an_empty_local_inventory() {
+        let inventory = MetadataInventory::new(gix::hash::Kind::Sha1);
+        let mut negotiation = MetadataNegotiation::new(&inventory, gix::hash::Kind::Sha1);
+        let probes = negotiation.batch().unwrap();
+        let local = negotiation.summaries(&probes).unwrap();
+        let peer = [MetadataSummary {
+            prefix: String::new(),
+            count: usize::MAX,
+            digest: "00".repeat(32),
+        }];
+        negotiation.accept(&probes, &local, &peer).unwrap();
+        assert!(negotiation.pending.is_empty());
+        assert!(negotiation.known.is_empty());
+        assert_eq!(negotiation.visited, 1);
+    }
+
+    #[test]
+    fn metadata_negotiation_rejects_noncanonical_batches_and_counts() {
+        let hash = gix::hash::Kind::Sha1;
+        let mut inventory = MetadataInventory::new(hash);
+        inventory
+            .insert(gix::ObjectId::from_bytes_or_panic(&[1; 20]), [1; 32])
+            .unwrap();
+        inventory
+            .insert(gix::ObjectId::from_bytes_or_panic(&[2; 20]), [2; 32])
+            .unwrap();
+        for change in 0..4 {
+            let mut negotiation = MetadataNegotiation::new(&inventory, hash);
+            let probes = negotiation.batch().unwrap();
+            let local = negotiation.summaries(&probes).unwrap();
+            let mut peer = local.clone();
+            match change {
+                0 => peer.clear(),
+                1 => peer.push(peer[0].clone()),
+                2 => peer[0].prefix = "0".to_owned(),
+                3 => peer[0].digest = "G".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(negotiation.accept(&probes, &local, &peer).is_err());
+        }
+        let mut negotiation = MetadataNegotiation::new(&inventory, hash);
+        let probes = negotiation.batch().unwrap();
+        let local = negotiation.summaries(&probes).unwrap();
+        let mut peer = local.clone();
+        peer[0].digest = "00".repeat(32);
+        peer[0].count = usize::MAX;
+        negotiation.accept(&probes, &local, &peer).unwrap();
+        let probes = negotiation.batch().unwrap();
+        let local = negotiation.summaries(&probes).unwrap();
+        let mut peer = local.clone();
+        peer[0].count = usize::MAX;
+        peer[1].count = 1;
+        assert!(negotiation.accept(&probes, &local, &peer).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adaptive_metadata_requires_native_git_and_both_optional_capabilities() {
+        let mut hello = format_hello(Direction::Send, vec![1], false, "sha1", Path::new("git"));
+        hello.capabilities.extend([
+            NATIVE_GIT_CAPABILITY.to_owned(),
+            ADAPTIVE_METADATA_CAPABILITY.to_owned(),
+        ]);
+        assert!(use_adaptive_metadata(&hello, &hello));
+        assert!(
+            !hello
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == ADAPTIVE_METADATA_CAPABILITY)
+        );
+        for removed in [NATIVE_GIT_CAPABILITY, ADAPTIVE_METADATA_CAPABILITY] {
+            let mut old = hello.clone();
+            old.capabilities.retain(|capability| capability != removed);
+            assert!(!use_adaptive_metadata(&hello, &old));
+            assert!(!use_adaptive_metadata(&old, &hello));
+        }
+    }
+
+    #[test]
     fn new_receiver_rejects_incompatible_negotiation_before_initialization() {
         let valid = format_hello(
             Direction::Send,
@@ -1818,7 +2143,14 @@ mod tests {
 
     #[test]
     fn phase_controls_bound_malformed_acknowledgments_before_deserialization() {
-        for phase in ["ready", "apply", "result", "complete"] {
+        for phase in [
+            "ready",
+            "apply",
+            "result",
+            "complete",
+            "metadata-probe",
+            "metadata-reply",
+        ] {
             let mut output = Session::new(io::empty(), Vec::new());
             Stream::send(
                 &mut output,

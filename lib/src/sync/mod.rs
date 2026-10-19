@@ -18,6 +18,8 @@ pub mod anchor;
 pub mod endpoint;
 pub mod gc;
 #[cfg(feature = "git")]
+pub mod metadata;
+#[cfg(feature = "git")]
 mod metadata_limits;
 pub mod normalize;
 #[cfg(feature = "git")]
