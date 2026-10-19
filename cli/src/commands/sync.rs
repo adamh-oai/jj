@@ -26,10 +26,12 @@ use crate::ui::Ui;
 /// Exchange repository data and operation history with another jj repository
 ///
 /// The peer is a workspace path or an SSH URL such as
-/// ssh://user@host/path/to/repository. A missing destination is initialized as
-/// a colocated Git repository before synchronization. To receive into a new
+/// ssh://user@host/home/user/repository. SSH URL paths are absolute on the
+/// remote machine. A missing destination is initialized as a colocated Git
+/// repository before synchronization. To receive into a new
 /// local destination, select it with -R; this also works with --bidi. At least
-/// one endpoint must already contain a repository.
+/// one endpoint must already contain a repository. The destination's parent
+/// directory must already exist.
 ///
 /// Select exactly one direction. Both endpoints snapshot their selected
 /// working copies by default; use

@@ -1263,7 +1263,23 @@ fn configure_fake_sync_ssh(env: &mut TestEnvironment) -> PathBuf {
     let bin = env.env_root().join("fake-bin");
     fs::create_dir(&bin).unwrap();
     let ssh = bin.join("ssh");
-    fs::write(&ssh, b"#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$JJ_SYNC_SSH_ARGUMENTS\"\nexec \"$JJ_SYNC_REAL_JJ\" util sync-server\n").unwrap();
+    fs::write(
+        &ssh,
+        indoc::indoc! {r#"
+            #!/bin/sh
+            printf '%s\n' "$@" > "$JJ_SYNC_SSH_ARGUMENTS"
+            if [ -n "$JJ_SYNC_SSH_DIAGNOSTIC" ]; then
+                printf '%s\n' "$JJ_SYNC_SSH_DIAGNOSTIC" >&2
+            fi
+            while [ "$#" -gt 1 ]; do shift; done
+            case "$1" in
+                'jj util sync-server') exec "$JJ_SYNC_REAL_JJ" util sync-server ;;
+                'jj --debug util sync-server') exec "$JJ_SYNC_REAL_JJ" --debug util sync-server ;;
+                *) exit 1 ;;
+            esac
+        "#},
+    )
+    .unwrap();
     fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
     let arguments = env.env_root().join("ssh-arguments");
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
@@ -1288,6 +1304,95 @@ fn ssh_sync_url(peer: &TestWorkDir<'_>) -> String {
     .to_string()
     .replace("%2F", "/");
     format!("ssh://user@example.com:2222{encoded}")
+}
+
+#[cfg(unix)]
+#[test_case(false; "ordinary_failure")]
+#[test_case(true; "debug_failure")]
+fn test_sync_ssh_init_failure_reports_destination_and_helper_stderr(debug: bool) {
+    let mut env = TestEnvironment::default();
+    let arguments = configure_fake_sync_ssh(&mut env);
+    env.add_env_var("JJ_SYNC_SSH_DIAGNOSTIC", "SSH helper diagnostic");
+    let source = init_repo(&env, "source");
+    let source_op = source.current_operation_id();
+    let receiver = env.work_dir("missing-parent/peer");
+    let url = ssh_sync_url(&receiver);
+    let mut args = vec!["sync", "--send", &url];
+    if debug {
+        args.insert(0, "--debug");
+    }
+    let output = source.run_jj(args);
+    assert!(!output.status.success());
+    let stderr = output.stderr.raw();
+    assert!(stderr.contains("Peer synchronization failed"), "{stderr}");
+    assert!(stderr.contains("Failed to create workspace at"), "{stderr}");
+    assert!(
+        stderr.contains(receiver.root().to_str().unwrap()),
+        "{stderr}"
+    );
+    assert!(stderr.contains("SSH helper diagnostic"), "{stderr}");
+    if debug {
+        assert!(
+            stderr.contains("Starting repository synchronization"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("Opening peer synchronization repository"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("Initializing synchronization destination"),
+            "{stderr}"
+        );
+    }
+    assert_eq!(source.current_operation_id(), source_op);
+    assert!(!env.env_root().join("missing-parent").exists());
+    assert_eq!(
+        fs::read_to_string(arguments)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+        if debug {
+            "jj --debug util sync-server"
+        } else {
+            "jj util sync-server"
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test_case(false; "local_helper")]
+#[test_case(true; "ssh_helper")]
+fn test_sync_debug_reports_helper_phases(ssh: bool) {
+    let mut env = TestEnvironment::default();
+    if ssh {
+        configure_fake_sync_ssh(&mut env);
+    }
+    let source = init_repo(&env, "source");
+    describe_and_bookmark(&source, "source");
+    let receiver = env.work_dir("receiver");
+    let peer = if ssh {
+        ssh_sync_url(&receiver)
+    } else {
+        receiver.root().to_str().unwrap().to_owned()
+    };
+    let output = source
+        .run_jj(["--debug", "sync", "--send", &peer])
+        .success();
+    let stderr = output.stderr.raw();
+    for phase in [
+        "Starting repository synchronization",
+        "Opening peer synchronization repository",
+        "Initializing synchronization destination",
+        "Peer accepted synchronization handshake",
+        "Sending synchronization objects",
+        "Receiving synchronization objects",
+        "Applying synchronized history",
+    ] {
+        assert!(stderr.contains(phase), "missing {phase}: {stderr}");
+    }
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
 }
 
 #[cfg(unix)]

@@ -220,6 +220,11 @@ impl PreparedEndpoint {
         root: &Path,
         ignore_working_copy: bool,
     ) -> Result<Self, CommandError> {
+        tracing::debug!(
+            path = %root.display(),
+            ignore_working_copy,
+            "Preparing synchronization endpoint"
+        );
         let transfer = format!("{:032x}", rand::random::<u128>());
         let mut helper = load_helper(ui, command, root, ignore_working_copy).await?;
         jj_lib::git::get_git_backend(helper.repo().store())?;
@@ -329,6 +334,10 @@ impl PreparedEndpoint {
         shared: &SharedEventId,
         known: &BTreeSet<RecordId>,
     ) -> Result<(), CommandError> {
+        tracing::debug!(
+            path = %self.root.display(),
+            "Sending synchronization objects"
+        );
         send_command(
             stream,
             "offer",
@@ -354,6 +363,10 @@ impl PreparedEndpoint {
         expected_peer: &str,
         captured: Option<&Advertisement>,
     ) -> Result<Advertisement, CommandError> {
+        tracing::debug!(
+            path = %self.root.display(),
+            "Receiving synchronization objects"
+        );
         let offered: Advertisement = receive_command(stream, "offer")?;
         offered.validate()?;
         if offered.peer != expected_peer {
@@ -452,6 +465,10 @@ impl PreparedEndpoint {
         selected: &SharedEventId,
         incoming: &Advertisement,
     ) -> Result<Applied, CommandError> {
+        tracing::debug!(
+            path = %self.root.display(),
+            "Applying synchronized history"
+        );
         // Ordinary commands can have advanced the endpoint during the transfer.
         // Refresh its normal workspace helper, then preserve that newer work as
         // a local causal descendant containing the agreed frozen result.
@@ -653,6 +670,13 @@ pub(crate) async fn synchronize(
         }
     };
     let ignore = command.global_args().ignore_working_copy;
+    tracing::debug!(
+        path = %local_root.display(),
+        peer_path = %String::from_utf8_lossy(&peer.repository_path()),
+        ?direction,
+        ignore_working_copy = ignore,
+        "Starting repository synchronization"
+    );
     let local_missing = workspace_is_missing(&local_root)?;
     if local_missing && direction == Direction::Send {
         return Err(user_error(
@@ -691,12 +715,16 @@ pub(crate) async fn synchronize(
         }
     };
     drop(profile);
-    let mut transport = Transport::connect(peer).map_err(failed)?;
+    let mut transport = Transport::connect(peer, command.global_args().debug).map_err(failed)?;
     transport
         .send(&Message::Hello(hello.clone()))
         .map_err(failed)?;
     match transport.receive().map_err(failed)? {
         Message::HelloReply(reply) => {
+            tracing::debug!(
+                object_hash = %reply.object_hash,
+                "Peer accepted synchronization handshake"
+            );
             if local_missing {
                 hello.object_hash.clone_from(&reply.object_hash);
             }
@@ -816,6 +844,11 @@ async fn serve_session(
         return Err(user_error("Expected synchronization negotiation"));
     };
     let path = sync_transport::decode_repository_path(&request.repository_path).map_err(failed)?;
+    tracing::debug!(
+        path = %path.display(),
+        direction = ?request.direction,
+        "Opening peer synchronization repository"
+    );
     let negotiate_hash = request.object_hash == NEGOTIATE_OBJECT_HASH;
     if negotiate_hash
         && (request.direction == Direction::Send
@@ -831,6 +864,11 @@ async fn serve_session(
     if workspace_is_missing(&path)? {
         // Validate formats and capabilities before creating any destination data.
         let object_hash = validate_receiver_request(&request)?;
+        tracing::debug!(
+            path = %path.display(),
+            %object_hash,
+            "Initializing synchronization destination"
+        );
         crate::commands::init_colocated_for_sync(ui, command, &path, object_hash).await?;
     }
     let profile = command.load_workspace_for_sync_profile(ui, &path)?;

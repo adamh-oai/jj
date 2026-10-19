@@ -1206,12 +1206,12 @@ fn test_git_init_bad_wc_path() -> TestResult {
     test_env.add_config("git.colocate = true");
     std::fs::write(test_env.env_root().join("existing-file"), b"")?;
     let output = test_env.run_jj_in(".", ["git", "init", "existing-file"]);
-    insta::assert_snapshot!(output.strip_stderr_last_line(), @"
+    insta::assert_snapshot!(output.normalize_backslash().strip_stderr_last_line(), @r#"
     ------- stderr -------
-    Error: Failed to create workspace
+    Error: Failed to create workspace at "$TEST_ENV/existing-file"
     [EOF]
     [exit status: 1]
-    ");
+    "#);
     Ok(())
 }
 

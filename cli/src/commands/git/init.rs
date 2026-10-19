@@ -195,7 +195,12 @@ pub async fn cmd_git_init(
 fn create_workspace_directory(path: &Path) -> Result<PathBuf, CommandError> {
     file_util::create_or_reuse_dir(path)
         .and_then(|_| dunce::canonicalize(path))
-        .map_err(|e| user_error_with_message("Failed to create workspace", e))
+        .map_err(|e| {
+            user_error_with_message(
+                format!("Failed to create workspace at \"{}\"", path.display()),
+                e,
+            )
+        })
 }
 
 /// Initializes a missing sync receiver with ordinary colocated-init semantics.

@@ -28,6 +28,19 @@ The remote machine needs a compatible `jj` executable on its command search
 path. Local paths and SSH use the same synchronization protocol. Quote paths
 containing spaces as you would for other shell commands.
 
+SSH URL paths are absolute on the remote machine: `ssh://host/code/project`
+selects `/code/project`. For a repository under the remote user's home, use
+its full path, such as `ssh://host/home/user/code/project`. Tildes and shell
+variables in the URL are passed literally.
+
+Use `jj --debug sync ...` to trace endpoint paths, negotiation, and transfer
+phases, including helper diagnostics. Debug logs follow the usual logging
+configuration:
+
+```shell
+jj --debug sync --send 'ssh://host/home/user/code/project'
+```
+
 ## Creating a destination
 
 Sending to a path without a Jujutsu repository initializes a colocated

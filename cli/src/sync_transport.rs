@@ -166,10 +166,13 @@ impl Endpoint {
         }
     }
 
-    fn command(&self, local_executable: &Path, ssh_executable: &OsStr) -> Command {
+    fn command(&self, local_executable: &Path, ssh_executable: &OsStr, debug: bool) -> Command {
         match self {
             Self::Local(_) => {
                 let mut command = Command::new(local_executable);
+                if debug {
+                    command.arg("--debug");
+                }
                 command.args(["util", "sync-server"]);
                 command
             }
@@ -183,10 +186,11 @@ impl Endpoint {
                 }
                 // Only this constant is interpreted by the remote shell. In
                 // particular, the repository path never enters shell syntax.
-                command
-                    .arg("--")
-                    .arg(destination)
-                    .arg("jj util sync-server");
+                command.arg("--").arg(destination).arg(if debug {
+                    "jj --debug util sync-server"
+                } else {
+                    "jj util sync-server"
+                });
                 command
             }
         }
@@ -277,12 +281,17 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    pub(crate) fn connect(endpoint: &Endpoint) -> Result<Self, TransportError> {
+    pub(crate) fn connect(endpoint: &Endpoint, debug: bool) -> Result<Self, TransportError> {
         let executable = std::env::current_exe()?;
-        Self::spawn(endpoint.command(&executable, OsStr::new("ssh")))
+        Self::spawn(endpoint.command(&executable, OsStr::new("ssh"), debug))
     }
 
     fn spawn(mut command: Command) -> Result<Self, TransportError> {
+        tracing::debug!(
+            program = ?command.get_program(),
+            arguments = ?command.get_args().collect::<Vec<_>>(),
+            "Starting synchronization helper"
+        );
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -298,6 +307,7 @@ impl Transport {
             program: command.get_program().to_owned(),
             source,
         })?;
+        tracing::debug!(pid = child.id(), "Synchronization helper started");
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
         let child_stderr = child.stderr.take().unwrap();
@@ -335,8 +345,20 @@ impl Transport {
     }
 
     pub(crate) fn receive(&mut self) -> Result<Message, TransportError> {
-        let result = self.active_session()?.receive();
-        result.map_err(|error| self.protocol_failure(error))
+        match self.active_session()?.receive() {
+            Ok(Message::Error(error)) => {
+                // A framed peer error terminates the session just like a
+                // broken stream. Preserve its stderr before callers return
+                // early and drop the transport, including during negotiation.
+                self.cancel();
+                Ok(Message::Error(format!(
+                    "{error}{}",
+                    self.stderr_diagnostic()
+                )))
+            }
+            Ok(message) => Ok(message),
+            Err(error) => Err(self.protocol_failure(error)),
+        }
     }
 
     /// Closes the protocol streams, waits for the helper, and checks its status.
@@ -450,6 +472,10 @@ fn drain_stderr(
             Ok(0) => return Ok(()),
             Ok(length) => {
                 capture.lock().unwrap().append(&buffer[..length]);
+                tracing::debug!(
+                    helper_stderr = %String::from_utf8_lossy(&buffer[..length]),
+                    "Synchronization helper stderr"
+                );
                 if stop.load(Ordering::Acquire) {
                     drained_after_stop += length;
                     if drained_after_stop >= MAX_STDERR_BYTES {
@@ -623,7 +649,7 @@ mod tests {
                 decode_repository_path(&endpoint.repository_path()).unwrap(),
                 *path
             );
-            let command = endpoint.command(Path::new("my jj"), OsStr::new("ssh"));
+            let command = endpoint.command(Path::new("my jj"), OsStr::new("ssh"), false);
             assert_eq!(command.get_program(), "my jj");
             assert_eq!(
                 command.get_args().collect::<Vec<_>>(),
@@ -639,7 +665,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(endpoint.repository_path(), b"/a space/';$(literal)/-repo#?");
-        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"));
+        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), false);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [
@@ -656,10 +682,39 @@ mod tests {
     #[test]
     fn ssh_ipv6_and_default_port() {
         let endpoint = Endpoint::parse(OsStr::new("ssh://person@[::1]/repo")).unwrap();
-        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"));
+        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), false);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["-T", "--", "person@::1", "jj util sync-server"]
+        );
+    }
+
+    #[test]
+    fn debug_logging_is_enabled_for_local_and_ssh_helpers() {
+        let endpoint = Endpoint::parse(OsStr::new("local-repo")).unwrap();
+        let command = endpoint.command(Path::new("my jj"), OsStr::new("ssh"), true);
+        assert_eq!(command.get_program(), "my jj");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--debug", "util", "sync-server"]
+        );
+
+        let endpoint = Endpoint::parse(OsStr::new(
+            "ssh://person@example.org:2202/a%20space/'%3B%24(literal)/-repo%23%3F",
+        ))
+        .unwrap();
+        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), true);
+        assert_eq!(command.get_program(), "ssh");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "-T",
+                "-p",
+                "2202",
+                "--",
+                "person@example.org",
+                "jj --debug util sync-server"
+            ]
         );
     }
 
@@ -729,6 +784,30 @@ mod tests {
         assert!(error.contains("helper unavailable"), "{error}");
         assert!(error.contains("last 64 KiB"), "{error}");
         assert!(transport.child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn framed_peer_errors_preserve_stderr_and_cancel_the_helper() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo 'peer initialization diagnostic' >&2; exec cat"]);
+        let mut transport = Transport::spawn(command).unwrap();
+        // The helper echoes the frame but remains blocked on stdin. Receiving
+        // a terminal error must cancel it without waiting for pipe EOF.
+        transport
+            .send(&Message::Error("peer rejected synchronization".to_owned()))
+            .unwrap();
+        let Message::Error(error) = transport.receive().unwrap() else {
+            panic!("expected a framed peer error");
+        };
+        assert!(error.contains("peer rejected synchronization"), "{error}");
+        assert!(error.contains("peer initialization diagnostic"), "{error}");
+        assert!(error.contains("Helper stderr:"), "{error}");
+        assert!(transport.finished);
+        assert!(transport.child.try_wait().unwrap().is_some());
+        assert!(transport.stderr_thread.is_none());
+        assert!(transport.receive().is_err());
+        transport.cancel();
     }
 
     #[cfg(unix)]
