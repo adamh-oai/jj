@@ -1380,7 +1380,7 @@ fn test_sync_debug_reports_helper_phases(ssh: bool) {
     let output = source
         .run_jj(["--debug", "sync", "--send", &peer])
         .success();
-    let stderr = output.stderr.raw();
+    let stderr = anstream::adapter::strip_str(output.stderr.raw()).to_string();
     for phase in [
         "Starting repository synchronization",
         "Opening peer synchronization repository",
