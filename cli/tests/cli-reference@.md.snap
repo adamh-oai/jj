@@ -3533,11 +3533,11 @@ Note: You can use `jj diff --summary -r <rev>` to see the changed files for a sp
 
 Exchange repository data and operation history with another jj repository
 
-The peer is a workspace path or an SSH URL such as ssh://user@host/path/to/repository. A missing destination is initialized as a colocated Git repository before synchronization. To receive into a new local destination, select it with -R; this also works with --bidi. At least one endpoint must already contain a repository.
+The peer is a workspace path or an SSH URL such as ssh://user@host/home/user/repository. SSH URL paths are absolute on the remote machine. A missing destination is initialized as a colocated Git repository before synchronization. To receive into a new local destination, select it with -R; this also works with --bidi. At least one endpoint must already contain a repository. The destination's parent directory must already exist.
 
 Select exactly one direction. Both endpoints snapshot their selected working copies by default; use --ignore-working-copy to skip snapshots and checkout updates at both ends. Workspace names, checkout pointers, and local Git observations stay local.
 
-The first use enables a repository format that older jj versions reject. Stop other repository processes before that first transition. An already running old process is not excluded by the new format marker.
+The first use enables a repository format that older jj versions reject. This transition waits for other commands using updated jj versions to finish. Already-running older binaries do not participate in the lock and must finish before the first sync.
 
 **Usage:** `jj sync <--receive|--send|--bidi> <PEER>`
 
