@@ -21,6 +21,8 @@ use std::io::Read;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -70,6 +72,10 @@ use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::progress::ProgressWriter;
 #[cfg(unix)]
+use crate::sync_process::ProcessTransferOptions;
+#[cfg(unix)]
+use crate::sync_process::ProgressCallback;
+#[cfg(unix)]
 use crate::sync_rsync_transport::TransferMode;
 use crate::sync_transport;
 use crate::sync_transport::Transport;
@@ -95,6 +101,35 @@ const MAX_PHASE_CONTROL_BYTES: usize = 64 * 1024;
 // Known IDs only avoid retransmission. Bound this peer-controlled cache and
 // resend anything omitted from it, so large repositories remain supported.
 const MAX_KNOWN_RECORD_IDS: usize = 65_536;
+
+#[derive(Clone, Copy)]
+struct SyncProgress {
+    label: &'static str,
+}
+
+impl SyncProgress {
+    fn phase(self, ui: &Ui, message: impl std::fmt::Display) -> io::Result<()> {
+        // Unlike the delayed terminal counter, phase changes are also useful
+        // before a blocking step and when stderr is redirected.
+        writeln!(ui.status(), "{} {message}...", self.label)
+    }
+
+    #[cfg(unix)]
+    fn transfer(self, ui: &Ui, action: &'static str) -> Option<Box<ProgressCallback<'static>>> {
+        let writer = Mutex::new(ProgressWriter::new(ui, self.label)?);
+        Some(Box::new(move |sent_bytes, received_bytes| {
+            if let Ok(mut writer) = writer.try_lock() {
+                writer
+                    .display(&format!(
+                        "{action}: {:.1} MiB sent, {:.1} MiB received",
+                        sent_bytes as f64 / (1024.0 * 1024.0),
+                        received_bytes as f64 / (1024.0 * 1024.0),
+                    ))
+                    .ok();
+            }
+        }))
+    }
+}
 
 struct TransferProgress<'a> {
     root: &'a Path,
@@ -179,7 +214,7 @@ trait Stream {
         _git: &Path,
         _repository: &Path,
         _sending: bool,
-        _max_received_bytes: u64,
+        _options: ProcessTransferOptions<'_>,
     ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         Err(user_error("This stream cannot transfer native Git data"))
     }
@@ -191,7 +226,7 @@ trait Stream {
         _directory: &Path,
         _basis: Option<&Path>,
         _mode: TransferMode<'_>,
-        _max_received_bytes: u64,
+        _options: ProcessTransferOptions<'_>,
     ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         Err(user_error(
             "This stream cannot transfer immutable history files",
@@ -216,7 +251,7 @@ impl Stream for Transport {
         git: &Path,
         repository: &Path,
         sending: bool,
-        max_received_bytes: u64,
+        options: ProcessTransferOptions<'_>,
     ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         use crate::sync_git_transport::GitAction;
         let action = if sending {
@@ -225,14 +260,7 @@ impl Stream for Transport {
             GitAction::Fetch
         };
         let (reader, writer) = self.framed_io_mut().map_err(failed)?;
-        crate::sync_git_transport::run_client(
-            git,
-            repository,
-            action,
-            max_received_bytes,
-            reader,
-            writer,
-        )
+        crate::sync_git_transport::run_client(git, repository, action, options, reader, writer)
     }
 
     #[cfg(unix)]
@@ -242,18 +270,10 @@ impl Stream for Transport {
         directory: &Path,
         basis: Option<&Path>,
         mode: TransferMode<'_>,
-        max_received_bytes: u64,
+        options: ProcessTransferOptions<'_>,
     ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         let (reader, writer) = self.framed_io_mut().map_err(failed)?;
-        crate::sync_rsync_transport::run(
-            rsync,
-            directory,
-            basis,
-            mode,
-            max_received_bytes,
-            reader,
-            writer,
-        )
+        crate::sync_rsync_transport::run(rsync, directory, basis, mode, options, reader, writer)
     }
 }
 
@@ -274,7 +294,7 @@ impl<R: Read + Send, W: io::Write> Stream for Session<R, W> {
         git: &Path,
         repository: &Path,
         sending: bool,
-        max_received_bytes: u64,
+        options: ProcessTransferOptions<'_>,
     ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         use crate::sync_git_transport::GitService;
         let service = if sending {
@@ -283,14 +303,7 @@ impl<R: Read + Send, W: io::Write> Stream for Session<R, W> {
             GitService::ReceivePack
         };
         let (reader, writer) = self.split_mut();
-        crate::sync_git_transport::run_server(
-            git,
-            repository,
-            service,
-            max_received_bytes,
-            reader,
-            writer,
-        )
+        crate::sync_git_transport::run_server(git, repository, service, options, reader, writer)
     }
 
     #[cfg(unix)]
@@ -300,18 +313,10 @@ impl<R: Read + Send, W: io::Write> Stream for Session<R, W> {
         directory: &Path,
         basis: Option<&Path>,
         mode: TransferMode<'_>,
-        max_received_bytes: u64,
+        options: ProcessTransferOptions<'_>,
     ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         let (reader, writer) = self.split_mut();
-        crate::sync_rsync_transport::run(
-            rsync,
-            directory,
-            basis,
-            mode,
-            max_received_bytes,
-            reader,
-            writer,
-        )
+        crate::sync_rsync_transport::run(rsync, directory, basis, mode, options, reader, writer)
     }
 }
 
@@ -414,6 +419,7 @@ struct PreparedEndpoint {
     capture: Capture,
     inventory: Inventory,
     root: PathBuf,
+    progress: SyncProgress,
     ignore_working_copy: bool,
     transfer: String,
     pins: Vec<String>,
@@ -433,12 +439,14 @@ impl PreparedEndpoint {
         ignore_working_copy: bool,
         packed_git: bool,
         rsync_immutable: bool,
+        progress: SyncProgress,
     ) -> Result<Self, CommandError> {
         tracing::debug!(
             path = %root.display(),
             ignore_working_copy,
             "Preparing synchronization endpoint"
         );
+        progress.phase(ui, "Preparing repository")?;
         let transfer = format!("{:032x}", rand::random::<u128>());
         let mut helper = load_helper(ui, command, root, ignore_working_copy).await?;
         jj_lib::git::get_git_backend(helper.repo().store())?;
@@ -486,6 +494,7 @@ impl PreparedEndpoint {
                     .await?;
             }
         }
+        progress.phase(ui, "Reading operation history")?;
         endpoint
             .recover_published(helper.repo())
             .await
@@ -501,6 +510,7 @@ impl PreparedEndpoint {
             &transfer,
         )
         .await?;
+        progress.phase(ui, "Collecting history objects")?;
         let inventory = collect_inventory(
             &helper,
             &endpoint,
@@ -511,6 +521,7 @@ impl PreparedEndpoint {
         let pins = vec![transfer.clone()];
         #[cfg(unix)]
         let (pins, immutable_basis) = if rsync_immutable {
+            progress.phase(ui, "Preparing history comparison")?;
             let mut pins = pins;
             let key = format!("{transfer}-basis");
             let (raw_heads, shared_heads) = endpoint.pin_retained(&key).map_err(failed)?;
@@ -529,6 +540,7 @@ impl PreparedEndpoint {
             capture,
             inventory,
             root,
+            progress,
             ignore_working_copy,
             pins,
             publication_leases: Vec::new(),
@@ -584,6 +596,7 @@ impl PreparedEndpoint {
             "offer",
             &self.advertise_inventory(inventory, shared)?,
         )?;
+        self.progress.phase(ui, "Preparing objects to send")?;
         let objects = objects(&self.helper, &self.endpoint)?;
         #[cfg(unix)]
         let git_repository = (self.packed_git
@@ -609,6 +622,14 @@ impl PreparedEndpoint {
                 self.transfer_immutable(ui, stream, files.path(), None, mode, u64::MAX)?;
             }
         }
+        self.progress.phase(
+            ui,
+            if self.rsync_immutable {
+                "Sending commit metadata"
+            } else {
+                "Sending history objects"
+            },
+        )?;
         let mut progress = TransferProgress::new(
             ui,
             &self.root,
@@ -685,6 +706,7 @@ impl PreparedEndpoint {
         if let Some(captured) = captured {
             check_captured_offer(&offered, captured)?;
         }
+        self.progress.phase(ui, "Preparing to receive objects")?;
         let objects = objects(&self.helper, &self.endpoint)?;
         let mut quarantine = Quarantine::with_limits(
             &self.helper.repo_path().join("sync"),
@@ -756,6 +778,14 @@ impl PreparedEndpoint {
                 planned_bytes = plan.data_bytes(),
                 "Immutable history file transfer planned"
             );
+            self.progress.phase(
+                ui,
+                format_args!(
+                    "Receiving {} history files ({:.1} MiB)",
+                    plan.len(),
+                    plan.data_bytes() as f64 / (1024.0 * 1024.0)
+                ),
+            )?;
             self.transfer_immutable(
                 ui,
                 stream,
@@ -780,6 +810,14 @@ impl PreparedEndpoint {
                 "Immutable history files staged"
             );
         }
+        self.progress.phase(
+            ui,
+            if self.rsync_immutable {
+                "Receiving commit metadata"
+            } else {
+                "Receiving history objects"
+            },
+        )?;
         let mut progress = TransferProgress::new(ui, &self.root, "Receiving", None);
         loop {
             match stream.receive()? {
@@ -819,6 +857,7 @@ impl PreparedEndpoint {
             path = %self.root.display(),
             "Validating received synchronization history"
         );
+        self.progress.phase(ui, "Validating received history")?;
         let inventory = quarantine
             .validate(&objects, &offered.raw_heads()?, &offered.shared_heads()?)
             .map_err(failed)?;
@@ -831,6 +870,7 @@ impl PreparedEndpoint {
             path = %self.root.display(),
             "Installing synchronized objects"
         );
+        self.progress.phase(ui, "Installing received objects")?;
         self.endpoint
             .install_and_retain(self.helper.repo(), &quarantine, &inventory, &offered.peer)
             .map_err(failed)?;
@@ -854,19 +894,36 @@ impl PreparedEndpoint {
     ) -> Result<(), CommandError> {
         let sending = matches!(mode, TransferMode::SendPlan | TransferMode::Send);
         let planning = matches!(mode, TransferMode::Plan { .. } | TransferMode::SendPlan);
+        if planning {
+            self.progress.phase(ui, "Comparing operation history")?;
+        } else if sending {
+            self.progress.phase(ui, "Sending operations and views")?;
+        }
         tracing::debug!(
             path = %self.root.display(),
             sending,
             planning,
             "Transferring immutable history files with rsync"
         );
+        let progress = self.progress.transfer(
+            ui,
+            if planning {
+                "Comparing history"
+            } else {
+                "Transferring history"
+            },
+        );
         let report = stream.transfer_immutable(
             Path::new("rsync"),
             directory,
             basis,
             mode,
-            max_received_bytes,
+            ProcessTransferOptions {
+                max_received_bytes,
+                progress: progress.as_deref(),
+            },
         )?;
+        drop(progress);
         tracing::debug!(
             path = %self.root.display(),
             sending,
@@ -890,6 +947,14 @@ impl PreparedEndpoint {
         sending: bool,
         receive_budget: u64,
     ) -> Result<(), CommandError> {
+        self.progress.phase(
+            ui,
+            if sending {
+                "Sending Git objects"
+            } else {
+                "Receiving Git objects"
+            },
+        )?;
         tracing::debug!(
             path = %self.root.display(),
             sending,
@@ -904,12 +969,16 @@ impl PreparedEndpoint {
         } else {
             receive_budget.saturating_add(16 * 1024 * 1024)
         };
+        let progress = self.progress.transfer(ui, "Transferring Git objects");
         let report = stream
             .transfer_git(
                 backend.git_executable_path(),
                 repository,
                 sending,
-                max_received_bytes,
+                ProcessTransferOptions {
+                    max_received_bytes,
+                    progress: progress.as_deref(),
+                },
             )
             .map_err(|error| {
                 if command_error_message(&error).contains("exceeds maximum allowed size") {
@@ -921,6 +990,7 @@ impl PreparedEndpoint {
                     error
                 }
             })?;
+        drop(progress);
         tracing::debug!(
             path = %self.root.display(),
             sending,
@@ -973,7 +1043,12 @@ impl PreparedEndpoint {
         Ok(limits)
     }
 
-    async fn select(&self, incoming: &Advertisement) -> Result<SharedEventId, CommandError> {
+    async fn select(
+        &self,
+        ui: &Ui,
+        incoming: &Advertisement,
+    ) -> Result<SharedEventId, CommandError> {
+        self.progress.phase(ui, "Merging repository views")?;
         self.endpoint
             .reconcile(
                 self.helper.repo(),
@@ -984,7 +1059,13 @@ impl PreparedEndpoint {
             .map_err(failed)
     }
 
-    fn selected_inventory(&self, selected: &SharedEventId) -> Result<Inventory, CommandError> {
+    fn selected_inventory(
+        &self,
+        ui: &Ui,
+        selected: &SharedEventId,
+    ) -> Result<Inventory, CommandError> {
+        self.progress
+            .phase(ui, "Collecting merged history objects")?;
         collect_inventory(
             &self.helper,
             &self.endpoint,
@@ -1001,6 +1082,7 @@ impl PreparedEndpoint {
         selected: &SharedEventId,
         incoming: &Advertisement,
     ) -> Result<Applied, CommandError> {
+        self.progress.phase(ui, "Applying synchronized history")?;
         tracing::debug!(
             path = %self.root.display(),
             "Applying synchronized history"
@@ -1213,6 +1295,8 @@ pub(crate) async fn synchronize(
     direction: Direction,
 ) -> Result<(), CommandError> {
     check_command_options(command)?;
+    let progress = SyncProgress { label: "Local:" };
+    progress.phase(ui, "Opening repository")?;
     let local_root = match command.workspace_loader() {
         Ok(loader) => loader.workspace_root().to_owned(),
         Err(err) => {
@@ -1274,7 +1358,9 @@ pub(crate) async fn synchronize(
         }
     };
     drop(profile);
-    let mut transport = Transport::connect(peer, command.global_args().debug).map_err(failed)?;
+    writeln!(ui.status(), "Connecting to peer...")?;
+    let mut transport =
+        Transport::connect(peer, command.global_args().debug, ui).map_err(failed)?;
     transport
         .send(&Message::Hello(hello.clone()))
         .map_err(failed)?;
@@ -1305,6 +1391,7 @@ pub(crate) async fn synchronize(
             }
         };
     if local_missing {
+        progress.phase(ui, "Initializing repository")?;
         let object_hash = parse_object_hash(&hello.object_hash)?;
         crate::commands::init_colocated_for_sync(ui, command, &local_root, object_hash).await?;
     }
@@ -1315,6 +1402,7 @@ pub(crate) async fn synchronize(
         ignore,
         packed_git,
         rsync_immutable,
+        progress,
     )
     .await?;
     hello
@@ -1333,6 +1421,7 @@ pub(crate) async fn synchronize(
         receive_inventory(&mut transport, local.known_cache_limit()?)?
     };
     if adaptive_metadata {
+        local.progress.phase(ui, "Comparing commit metadata")?;
         let manifest = objects(&local.helper, &local.endpoint)?
             .commit_metadata_inventory(&local.inventory)
             .map_err(failed)?;
@@ -1348,9 +1437,9 @@ pub(crate) async fn synchronize(
     let local_applied = match direction {
         Direction::Receive | Direction::Bidirectional => {
             let incoming = local.receive_offer(ui, &mut transport, &remote.peer, Some(&remote))?;
-            let selected = local.select(&incoming).await?;
+            let selected = local.select(ui, &incoming).await?;
             if direction == Direction::Bidirectional {
-                let inventory = local.selected_inventory(&selected)?;
+                let inventory = local.selected_inventory(ui, &selected)?;
                 local.send_offer(ui, &mut transport, &inventory, &selected, &remote_known)?;
                 let ready: String = receive_command(&mut transport, "ready")?;
                 if ready != selected.hex() {
@@ -1383,6 +1472,10 @@ pub(crate) async fn synchronize(
                 &local.inventory,
                 &local.capture.current_shared,
                 &remote_known,
+            )?;
+            writeln!(
+                ui.status(),
+                "Waiting for peer to apply synchronized history..."
             )?;
             let applied: Applied = receive_command(&mut transport, "result").map_err(|err| {
                 err.hinted(
@@ -1443,6 +1536,7 @@ async fn serve_session(
     command: &CommandHelper,
     stream: &mut impl Stream,
 ) -> Result<(), CommandError> {
+    let progress = SyncProgress { label: "Peer:" };
     let Message::Hello(request) = stream.receive()? else {
         return Err(user_error("Expected synchronization negotiation"));
     };
@@ -1472,6 +1566,7 @@ async fn serve_session(
             %object_hash,
             "Initializing synchronization destination"
         );
+        progress.phase(ui, "Initializing repository")?;
         crate::commands::init_colocated_for_sync(ui, command, &path, object_hash).await?;
     }
     let profile = command.load_workspace_for_sync_profile(ui, &path)?;
@@ -1500,6 +1595,7 @@ async fn serve_session(
         request.ignore_working_copy,
         packed_git,
         rsync_immutable,
+        progress,
     )
     .await?;
     reply
@@ -1518,6 +1614,7 @@ async fn serve_session(
         send_inventory(stream, &local.inventory, packed_git)?;
     }
     if adaptive_metadata {
+        local.progress.phase(ui, "Comparing commit metadata")?;
         let manifest = objects(&local.helper, &local.endpoint)?
             .commit_metadata_inventory(&local.inventory)
             .map_err(failed)?;
@@ -1540,7 +1637,7 @@ async fn serve_session(
         }
         Direction::Send => {
             let incoming = local.receive_offer(ui, stream, &peer.peer, Some(&peer))?;
-            let selected = local.select(&incoming).await?;
+            let selected = local.select(ui, &incoming).await?;
             let applied = local.apply(ui, command, &selected, &incoming).await?;
             send_command(stream, "result", &applied)?;
         }

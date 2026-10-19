@@ -35,6 +35,7 @@ use crate::command_error::user_error_with_message;
 use crate::sync_process::ProcessChild;
 use crate::sync_process::ProcessError;
 use crate::sync_process::ProcessInput;
+use crate::sync_process::ProcessTransferOptions;
 use crate::sync_process::ProcessTransferReport;
 use crate::sync_process::accept_bridge;
 use crate::sync_process::kill_child;
@@ -95,22 +96,14 @@ pub(crate) fn run<R: Read + Send, W: Write>(
     directory: &Path,
     basis: Option<&Path>,
     mode: TransferMode<'_>,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<ProcessTransferReport, CommandError> {
     if mode.is_sender() {
-        run_sender(rsync, directory, mode, max_received_bytes, reader, writer)
+        run_sender(rsync, directory, mode, options, reader, writer)
     } else {
-        run_receiver(
-            rsync,
-            directory,
-            basis,
-            mode,
-            max_received_bytes,
-            reader,
-            writer,
-        )
+        run_receiver(rsync, directory, basis, mode, options, reader, writer)
     }
     .map_err(failed)
 }
@@ -120,7 +113,7 @@ fn run_receiver<R: Read + Send, W: Write>(
     directory: &Path,
     basis: Option<&Path>,
     mode: TransferMode<'_>,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<ProcessTransferReport, ProcessError> {
@@ -183,7 +176,7 @@ fn run_receiver<R: Read + Send, W: Write>(
         input,
         &process,
         Some(cancel_socket),
-        max_received_bytes,
+        options,
     );
     let captured = capture.map(|thread| {
         thread
@@ -230,7 +223,7 @@ fn run_sender<R: Read + Send, W: Write>(
     rsync: &Path,
     directory: &Path,
     mode: TransferMode<'_>,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<ProcessTransferReport, ProcessError> {
@@ -244,15 +237,7 @@ fn run_sender<R: Read + Send, W: Write>(
             child.stdout.take().unwrap(),
         )
     };
-    let counts = match relay(
-        reader,
-        writer,
-        output,
-        input,
-        &process,
-        None,
-        max_received_bytes,
-    ) {
+    let counts = match relay(reader, writer, output, input, &process, None, options) {
         Ok(counts) => counts,
         Err(error) => return Err(process.abort(error)),
     };
@@ -453,7 +438,10 @@ mod tests {
                 rsync,
                 directory.path(),
                 TransferMode::SendPlan,
-                budget,
+                ProcessTransferOptions {
+                    max_received_bytes: budget,
+                    progress: None,
+                },
                 &mut reader,
                 &mut writer,
             )

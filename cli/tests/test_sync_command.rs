@@ -1388,6 +1388,8 @@ fn configure_fake_sync_ssh(env: &mut TestEnvironment) -> PathBuf {
             case "$1" in
                 'jj util sync-server') exec "$JJ_SYNC_REAL_JJ" util sync-server ;;
                 'jj --debug util sync-server') exec "$JJ_SYNC_REAL_JJ" --debug util sync-server ;;
+                'jj --quiet util sync-server') exec "$JJ_SYNC_REAL_JJ" --quiet util sync-server ;;
+                'jj --debug --quiet util sync-server') exec "$JJ_SYNC_REAL_JJ" --debug --quiet util sync-server ;;
                 *) exit 1 ;;
             esac
         "#},
@@ -1970,6 +1972,134 @@ fn test_sync_ssh_init_failure_reports_destination_and_helper_stderr(debug: bool)
             "jj util sync-server"
         },
     );
+}
+
+#[cfg(unix)]
+#[test_case("--send", false; "local_send")]
+#[test_case("--receive", false; "local_receive")]
+#[test_case("--send", true; "ssh_send")]
+#[test_case("--receive", true; "ssh_receive")]
+fn test_sync_reports_phase_progress_without_debug(direction: &str, ssh: bool) {
+    let mut env = TestEnvironment::default();
+    // Disabling interactive indicators must not hide phase descriptions in
+    // redirected output or prevent the helper's messages from arriving.
+    env.add_config("ui.progress-indicator = false\n");
+    if ssh {
+        configure_fake_sync_ssh(&mut env);
+    }
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    describe_and_bookmark(&left, "left");
+    describe_and_bookmark(&right, "right");
+    let peer = if ssh {
+        ssh_sync_url(&right)
+    } else {
+        right.root().to_str().unwrap().to_owned()
+    };
+
+    let output = left.run_jj(["sync", direction, &peer]).success();
+    assert!(output.stdout.raw().is_empty(), "{}", output.stdout.raw());
+    let stderr = output.stderr.raw();
+    for endpoint in ["Local", "Peer"] {
+        for phase in [
+            "Preparing repository",
+            "Reading operation history",
+            "Collecting history objects",
+        ] {
+            assert!(
+                stderr.contains(&format!("{endpoint}: {phase}")),
+                "missing {endpoint} phase {phase}: {stderr}"
+            );
+        }
+    }
+    let (sender, receiver) = if direction == "--send" {
+        ("Local", "Peer")
+    } else {
+        ("Peer", "Local")
+    };
+    assert!(
+        stderr.contains(&format!("{sender}: Sending Git objects")),
+        "{stderr}"
+    );
+    for phase in [
+        "Receiving Git objects",
+        "Validating received history",
+        "Installing received objects",
+        "Applying synchronized history",
+    ] {
+        assert!(
+            stderr.contains(&format!("{receiver}: {phase}")),
+            "missing receiver phase {phase}: {stderr}"
+        );
+    }
+    assert!(stderr.contains("Synchronization complete."), "{stderr}");
+    assert!(!stderr.contains('\r'), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'), "{stderr}");
+    let receiver = if direction == "--send" { &right } else { &left };
+    assert_eq!(
+        bookmarks(receiver),
+        BTreeSet::from(["left".to_owned(), "right".to_owned()])
+    );
+}
+
+#[cfg(unix)]
+#[test_case(false, false; "local_flag")]
+#[test_case(true, false; "local_config")]
+#[test_case(false, true; "ssh_flag")]
+#[test_case(true, true; "ssh_config")]
+fn test_sync_quiet_suppresses_phase_progress_on_both_endpoints(config: bool, ssh: bool) {
+    let mut env = TestEnvironment::default();
+    let arguments = ssh.then(|| configure_fake_sync_ssh(&mut env));
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    describe_and_bookmark(&left, "left");
+    describe_and_bookmark(&right, "right");
+    let peer = if ssh {
+        ssh_sync_url(&right)
+    } else {
+        right.root().to_str().unwrap().to_owned()
+    };
+    // A command-line config override is not inherited by the helper. This
+    // checks propagation of effective quiet, rather than only the parsed flag.
+    let quiet = if config {
+        "--config=ui.quiet=true"
+    } else {
+        "--quiet"
+    };
+    let output = left.run_jj([quiet, "sync", "--send", &peer]).success();
+    assert!(output.stdout.raw().is_empty(), "{}", output.stdout.raw());
+    assert!(output.stderr.raw().is_empty(), "{}", output.stderr.raw());
+    assert_eq!(
+        bookmarks(&right),
+        BTreeSet::from(["left".to_owned(), "right".to_owned()])
+    );
+    if let Some(arguments) = arguments {
+        assert_eq!(
+            fs::read_to_string(arguments)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+            "jj --quiet util sync-server",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_sync_quiet_preserves_peer_diagnostics_without_repeating_them() {
+    let mut env = TestEnvironment::default();
+    configure_fake_sync_ssh(&mut env);
+    env.add_env_var("JJ_SYNC_SSH_DIAGNOSTIC", "SSH connection warning");
+    let source = init_repo(&env, "source");
+    let receiver = init_repo(&env, "receiver");
+    describe_and_bookmark(&source, "source");
+    let output = source
+        .run_jj(["--quiet", "sync", "--send", &ssh_sync_url(&receiver)])
+        .success();
+    assert!(output.stdout.raw().is_empty(), "{}", output.stdout.raw());
+    assert_eq!(output.stderr.raw(), "SSH connection warning\n");
+    assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
 }
 
 #[cfg(unix)]

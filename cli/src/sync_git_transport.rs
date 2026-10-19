@@ -35,6 +35,7 @@ use crate::command_error::user_error_with_message;
 use crate::sync_process::ProcessChild;
 use crate::sync_process::ProcessError;
 use crate::sync_process::ProcessInput;
+use crate::sync_process::ProcessTransferOptions;
 use crate::sync_process::ProcessTransferReport;
 use crate::sync_process::accept_bridge;
 use crate::sync_process::relay;
@@ -80,18 +81,18 @@ pub(crate) fn run_client<R: Read + Send, W: Write>(
     git: &Path,
     repository: &Path,
     action: GitAction,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<ProcessTransferReport, CommandError> {
-    run_client_inner(git, repository, action, max_received_bytes, reader, writer).map_err(failed)
+    run_client_inner(git, repository, action, options, reader, writer).map_err(failed)
 }
 
 fn run_client_inner<R: Read + Send, W: Write>(
     git: &Path,
     repository: &Path,
     action: GitAction,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<ProcessTransferReport, ProcessError> {
@@ -115,7 +116,7 @@ fn run_client_inner<R: Read + Send, W: Write>(
                 "-c",
                 "push.negotiate=false",
                 "push",
-                "--progress",
+                "--quiet",
                 "--porcelain",
                 "--atomic",
                 "--no-verify",
@@ -152,7 +153,7 @@ fn run_client_inner<R: Read + Send, W: Write>(
         input,
         &process,
         Some(cancel_socket),
-        max_received_bytes,
+        options,
     ) {
         Ok(counts) => counts,
         Err(error) => return Err(process.abort(error)),
@@ -165,10 +166,9 @@ fn configure_fetch(command: &mut Command) {
         "-c",
         "fetch.unpackLimit=0",
         "fetch",
-        // Hide successful ref updates, while forced progress still enables
-        // upload-pack progress. Git errors and failure status remain visible.
+        // jj displays its own phases and byte counters. Keep Git warnings and
+        // errors without successful ref updates or buffered native progress.
         "--quiet",
-        "--progress",
         "--no-tags",
         "--no-recurse-submodules",
         "--no-auto-maintenance",
@@ -183,18 +183,18 @@ pub(crate) fn run_server<R: Read + Send, W: Write>(
     git: &Path,
     repository: &Path,
     service: GitService,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<ProcessTransferReport, CommandError> {
-    run_server_inner(git, repository, service, max_received_bytes, reader, writer).map_err(failed)
+    run_server_inner(git, repository, service, options, reader, writer).map_err(failed)
 }
 
 fn run_server_inner<R: Read + Send, W: Write>(
     git: &Path,
     repository: &Path,
     service: GitService,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
     reader: &mut R,
     writer: &mut W,
 ) -> Result<ProcessTransferReport, ProcessError> {
@@ -219,15 +219,7 @@ fn run_server_inner<R: Read + Send, W: Write>(
             child.stdout.take().unwrap(),
         )
     };
-    let counts = match relay(
-        reader,
-        writer,
-        output,
-        input,
-        &process,
-        None,
-        max_received_bytes,
-    ) {
+    let counts = match relay(reader, writer, output, input, &process, None, options) {
         Ok(counts) => counts,
         Err(error) => return Err(process.abort(error)),
     };
@@ -308,7 +300,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quiet_fetch_keeps_remote_progress_and_actionable_ref_errors() {
+    fn quiet_fetch_hides_native_progress_and_preserves_actionable_ref_errors() {
         let directory = tempfile::tempdir().unwrap();
         let bare = |path: &Path| {
             gix::ThreadSafeRepository::init_opts(
@@ -364,8 +356,8 @@ mod tests {
         };
         let report = fetch().finish((0, 0)).unwrap();
         assert!(
-            report.stderr.contains("Counting objects:"),
-            "forced remote progress was lost: {}",
+            report.stderr.is_empty(),
+            "native output duplicates jj's own progress: {}",
             report.stderr
         );
         assert!(!report.stderr.contains("[new ref]"), "{}", report.stderr);

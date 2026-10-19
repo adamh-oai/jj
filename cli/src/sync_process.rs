@@ -46,6 +46,16 @@ const MAX_TERMINAL_ERROR_BYTES: usize = 2048;
 const BRIDGE_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_LENGTH: usize = 32;
 
+/// Reports cumulative bytes without jj's fixed-size outer frame headers.
+/// Calls are serialized across the two transfer directions.
+pub(crate) type ProgressCallback<'a> = dyn Fn(u64, u64) + Sync + 'a;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProcessTransferOptions<'a> {
+    pub(crate) max_received_bytes: u64,
+    pub(crate) progress: Option<&'a ProgressCallback<'a>>,
+}
+
 /// Protocol bytes exclude jj's fixed-size outer frame headers.
 #[derive(Debug)]
 pub(crate) struct ProcessTransferReport {
@@ -164,12 +174,24 @@ pub(crate) fn relay<R: Read + Send, W: Write, O: Read>(
     mut input: ProcessInput,
     process: &ProcessChild,
     cancel_socket: Option<UnixStream>,
-    max_received_bytes: u64,
+    options: ProcessTransferOptions<'_>,
 ) -> Result<(u64, u64), ProcessError> {
+    let progress_counts = Mutex::new((0u64, 0u64));
+    let report_progress = |sent: u64, received: u64| {
+        if let Some(progress) = options.progress {
+            // Keep updates and notification under one lock so concurrent
+            // reads and writes never report older directional counters.
+            let mut counts = progress_counts.lock().unwrap();
+            counts.0 += sent;
+            counts.1 += received;
+            progress(counts.0, counts.1);
+        }
+    };
     thread::scope(|scope| {
         let child = process.child.clone();
         let incoming_failure = Arc::new(Mutex::new(None::<String>));
         let failure_writer = incoming_failure.clone();
+        let report_progress = &report_progress;
         let incoming = scope.spawn(move || {
             let mut stream = Session::new(reader, io::sink());
             let result = (|| {
@@ -182,7 +204,7 @@ pub(crate) fn relay<R: Read + Send, W: Write, O: Read>(
                             total = total.checked_add(bytes.len() as u64).ok_or_else(|| {
                                 io::Error::other("synchronization subprocess byte count overflow")
                             })?;
-                            if total > max_received_bytes {
+                            if total > options.max_received_bytes {
                                 return Err(io::Error::other(
                                     "synchronization subprocess transfer exceeds the local \
                                      sync.max-quarantine-bytes budget",
@@ -190,6 +212,7 @@ pub(crate) fn relay<R: Read + Send, W: Write, O: Read>(
                                 .into());
                             }
                             input.write_all(&bytes)?;
+                            report_progress(0, bytes.len() as u64);
                         }
                         Message::Done(bytes) if bytes.is_empty() => {
                             input.finish()?;
@@ -241,6 +264,7 @@ pub(crate) fn relay<R: Read + Send, W: Write, O: Read>(
                 total = total.checked_add(length as u64).ok_or_else(|| {
                     io::Error::other("synchronization subprocess byte count overflow")
                 })?;
+                report_progress(length as u64, 0);
             }
         })();
         if let Err(err) = &outgoing {
@@ -693,7 +717,10 @@ mod tests {
             input,
             &process,
             None,
-            u64::MAX,
+            ProcessTransferOptions {
+                max_received_bytes: u64::MAX,
+                progress: None,
+            },
         )
         .unwrap();
         let report = process.finish(counts).unwrap();
@@ -709,6 +736,49 @@ mod tests {
             }
         }
         assert_eq!(body, b"bounded Git protocol bytes");
+    }
+
+    #[test]
+    fn duplex_progress_is_monotonic_and_matches_transferred_bytes() {
+        let process = cat_process();
+        let (input, output) = pipe_ends(&process);
+        let mut reader = framed(&[
+            Message::Record(vec![b'a'; CHUNK_SIZE]),
+            Message::Record(vec![b'b'; CHUNK_SIZE]),
+            Message::Record(b"last chunk".to_vec()),
+            Message::Done(Vec::new()),
+        ]);
+        let mut writer = Vec::new();
+        let samples = Mutex::new(Vec::new());
+        let progress = |sent, received| samples.lock().unwrap().push((sent, received));
+        let counts = relay(
+            &mut reader,
+            &mut writer,
+            output,
+            input,
+            &process,
+            None,
+            ProcessTransferOptions {
+                max_received_bytes: u64::MAX,
+                progress: Some(&progress),
+            },
+        )
+        .unwrap();
+        process.finish(counts).unwrap();
+        let samples = samples.into_inner().unwrap();
+        assert!(
+            samples.len() > 3,
+            "expected progress throughout both directions"
+        );
+        assert_eq!(
+            counts,
+            ((CHUNK_SIZE * 2 + 10) as u64, (CHUNK_SIZE * 2 + 10) as u64)
+        );
+        assert_eq!(samples.last(), Some(&counts));
+        for pair in samples.windows(2) {
+            assert!(pair[0].0 <= pair[1].0, "sent count regressed: {pair:?}");
+            assert!(pair[0].1 <= pair[1].1, "received count regressed: {pair:?}");
+        }
     }
 
     #[test]
@@ -750,7 +820,10 @@ mod tests {
                 input,
                 &process,
                 None,
-                budget,
+                ProcessTransferOptions {
+                    max_received_bytes: budget,
+                    progress: None,
+                },
             )
             .unwrap_err();
             assert!(
