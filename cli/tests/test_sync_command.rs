@@ -1967,9 +1967,9 @@ fn test_sync_ssh_init_failure_reports_destination_and_helper_stderr(debug: bool)
             .last()
             .unwrap(),
         if debug {
-            "jj --debug util sync-server"
+            "jj --debug --quiet util sync-server"
         } else {
-            "jj util sync-server"
+            "jj --quiet util sync-server"
         },
     );
 }
@@ -1981,8 +1981,8 @@ fn test_sync_ssh_init_failure_reports_destination_and_helper_stderr(debug: bool)
 #[test_case("--receive", true; "ssh_receive")]
 fn test_sync_reports_phase_progress_without_debug(direction: &str, ssh: bool) {
     let mut env = TestEnvironment::default();
-    // Disabling interactive indicators must not hide phase descriptions in
-    // redirected output or prevent the helper's messages from arriving.
+    // Disabling interactive indicators must not hide local phase descriptions
+    // in redirected output. Routine helper output is always suppressed.
     env.add_config("ui.progress-indicator = false\n");
     if ssh {
         configure_fake_sync_ssh(&mut env);
@@ -2000,39 +2000,38 @@ fn test_sync_reports_phase_progress_without_debug(direction: &str, ssh: bool) {
     let output = left.run_jj(["sync", direction, &peer]).success();
     assert!(output.stdout.raw().is_empty(), "{}", output.stdout.raw());
     let stderr = output.stderr.raw();
-    for endpoint in ["Local", "Peer"] {
+    for phase in [
+        "Preparing repository",
+        "Reading operation history",
+        "Collecting history objects",
+    ] {
+        assert!(
+            stderr.contains(&format!("Local: {phase}")),
+            "missing local phase {phase}: {stderr}"
+        );
+    }
+    if direction == "--send" {
+        assert!(stderr.contains("Local: Sending Git objects"), "{stderr}");
+        assert!(
+            stderr.contains("Waiting for peer to apply synchronized history"),
+            "{stderr}"
+        );
+    } else {
         for phase in [
-            "Preparing repository",
-            "Reading operation history",
-            "Collecting history objects",
+            "Receiving Git objects",
+            "Validating received history",
+            "Installing received objects",
+            "Applying synchronized history",
         ] {
             assert!(
-                stderr.contains(&format!("{endpoint}: {phase}")),
-                "missing {endpoint} phase {phase}: {stderr}"
+                stderr.contains(&format!("Local: {phase}")),
+                "missing local receiver phase {phase}: {stderr}"
             );
         }
     }
-    let (sender, receiver) = if direction == "--send" {
-        ("Local", "Peer")
-    } else {
-        ("Peer", "Local")
-    };
-    assert!(
-        stderr.contains(&format!("{sender}: Sending Git objects")),
-        "{stderr}"
-    );
-    for phase in [
-        "Receiving Git objects",
-        "Validating received history",
-        "Installing received objects",
-        "Applying synchronized history",
-    ] {
-        assert!(
-            stderr.contains(&format!("{receiver}: {phase}")),
-            "missing receiver phase {phase}: {stderr}"
-        );
-    }
     assert!(stderr.contains("Synchronization complete."), "{stderr}");
+    assert!(!stderr.contains("Peer:"), "{stderr}");
+    assert!(!stderr.contains("Helper stderr"), "{stderr}");
     assert!(!stderr.contains('\r'), "{stderr}");
     assert!(!stderr.contains('\u{1b}'), "{stderr}");
     let receiver = if direction == "--send" { &right } else { &left };
@@ -2059,8 +2058,8 @@ fn test_sync_quiet_suppresses_phase_progress_on_both_endpoints(config: bool, ssh
     } else {
         right.root().to_str().unwrap().to_owned()
     };
-    // A command-line config override is not inherited by the helper. This
-    // checks propagation of effective quiet, rather than only the parsed flag.
+    // A command-line config override is not inherited by the helper. Local
+    // progress follows the effective setting; the helper is always quiet.
     let quiet = if config {
         "--config=ui.quiet=true"
     } else {
@@ -2086,19 +2085,28 @@ fn test_sync_quiet_suppresses_phase_progress_on_both_endpoints(config: bool, ssh
 }
 
 #[cfg(unix)]
-#[test]
-fn test_sync_quiet_preserves_peer_diagnostics_without_repeating_them() {
+#[test_case(false; "ordinary_output")]
+#[test_case(true; "quiet_output")]
+fn test_sync_suppresses_successful_helper_diagnostics(quiet: bool) {
     let mut env = TestEnvironment::default();
     configure_fake_sync_ssh(&mut env);
     env.add_env_var("JJ_SYNC_SSH_DIAGNOSTIC", "SSH connection warning");
     let source = init_repo(&env, "source");
     let receiver = init_repo(&env, "receiver");
     describe_and_bookmark(&source, "source");
-    let output = source
-        .run_jj(["--quiet", "sync", "--send", &ssh_sync_url(&receiver)])
-        .success();
+    let url = ssh_sync_url(&receiver);
+    let mut args = vec!["sync", "--send", &url];
+    if quiet {
+        args.insert(0, "--quiet");
+    }
+    let output = source.run_jj(args).success();
     assert!(output.stdout.raw().is_empty(), "{}", output.stdout.raw());
-    assert_eq!(output.stderr.raw(), "SSH connection warning\n");
+    let stderr = output.stderr.raw();
+    assert!(!stderr.contains("SSH connection warning"), "{stderr}");
+    assert!(!stderr.contains("Helper stderr"), "{stderr}");
+    if quiet {
+        assert!(stderr.is_empty(), "{stderr}");
+    }
     assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
 }
 
@@ -2170,7 +2178,7 @@ fn test_sync_ssh_paths_are_protocol_data() {
             "2222",
             "--",
             "user@example.com",
-            "jj util sync-server"
+            "jj --quiet util sync-server"
         ]
     );
     assert!(!left.root().join("escaped").exists());
@@ -2187,7 +2195,16 @@ fn test_sync_initializes_missing_ssh_peer(direction: &str) {
     let source_op = source.current_operation_id();
     let receiver = env.work_dir("peer ' ; $(touch escaped)");
     let url = ssh_sync_url(&receiver);
-    source.run_jj(["sync", direction, &url]).success();
+    let output = source.run_jj(["sync", direction, &url]).success();
+    let stderr = output.stderr.raw();
+    assert!(!stderr.contains("Initialized repo"), "{stderr}");
+    assert!(!stderr.contains("Peer:"), "{stderr}");
+    assert!(!stderr.contains("Helper stderr"), "{stderr}");
+    assert_eq!(
+        stderr.matches("Synchronization complete.").count(),
+        1,
+        "{stderr}"
+    );
     assert!(receiver.root().join(".git").is_dir());
     assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
     assert_imported_history(&source, &receiver, &source_op);
@@ -2203,7 +2220,7 @@ fn test_sync_initializes_missing_ssh_peer(direction: &str) {
             "2222",
             "--",
             "user@example.com",
-            "jj util sync-server"
+            "jj --quiet util sync-server"
         ]
     );
     assert!(!source.root().join("escaped").exists());

@@ -468,22 +468,6 @@ impl Ui {
         }
     }
 
-    /// Owned stderr stream that can be moved to a background thread.
-    pub(crate) fn stderr_writer(&self) -> io::Result<Box<dyn Write + Send>> {
-        match &self.output {
-            UiOutput::Terminal { .. } => Ok(Box::new(io::stderr())),
-            UiOutput::Paged { child_stdin, .. } => Ok(Box::new(std::fs::File::from(
-                duplicate_child_stdin(child_stdin)?,
-            ))),
-            UiOutput::BuiltinPaged { err_wr, .. } => Ok(Box::new(err_wr.try_clone()?)),
-            UiOutput::Null => Ok(Box::new(io::sink())),
-        }
-    }
-
-    pub(crate) fn is_quiet(&self) -> bool {
-        self.quiet
-    }
-
     /// Whether continuous feedback should be displayed for long-running
     /// operations
     pub fn use_progress_indicator(&self) -> bool {

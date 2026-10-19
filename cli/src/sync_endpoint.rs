@@ -1359,8 +1359,7 @@ pub(crate) async fn synchronize(
     };
     drop(profile);
     writeln!(ui.status(), "Connecting to peer...")?;
-    let mut transport =
-        Transport::connect(peer, command.global_args().debug, ui).map_err(failed)?;
+    let mut transport = Transport::connect(peer, command.global_args().debug).map_err(failed)?;
     transport
         .send(&Message::Hello(hello.clone()))
         .map_err(failed)?;
@@ -1413,6 +1412,7 @@ pub(crate) async fn synchronize(
     if !rsync_immutable {
         send_inventory(&mut transport, &local.inventory, packed_git)?;
     }
+    writeln!(ui.status(), "Waiting for peer to prepare history...")?;
     let remote: Advertisement = receive_command(&mut transport, "capture")?;
     remote.validate()?;
     let remote_known = if rsync_immutable {
@@ -1441,6 +1441,10 @@ pub(crate) async fn synchronize(
             if direction == Direction::Bidirectional {
                 let inventory = local.selected_inventory(ui, &selected)?;
                 local.send_offer(ui, &mut transport, &inventory, &selected, &remote_known)?;
+                writeln!(
+                    ui.status(),
+                    "Waiting for peer to validate received history..."
+                )?;
                 let ready: String = receive_command(&mut transport, "ready")?;
                 if ready != selected.hex() {
                     return Err(user_error("Peer changed the selected shared result"));
@@ -1448,6 +1452,10 @@ pub(crate) async fn synchronize(
             }
             let applied = local.apply(ui, command, &selected, &incoming).await?;
             if direction == Direction::Bidirectional {
+                writeln!(
+                    ui.status(),
+                    "Waiting for peer to apply synchronized history..."
+                )?;
                 let remote_result = (|| {
                     send_command(&mut transport, "apply", &selected.hex())?;
                     receive_command::<Applied>(&mut transport, "result")
@@ -1497,10 +1505,7 @@ pub(crate) async fn synchronize(
             ));
         }
     }
-    let peer_diagnostics = transport.finish().map_err(failed)?;
-    if !peer_diagnostics.is_empty() {
-        writeln!(ui.stderr(), "{peer_diagnostics}")?;
-    }
+    transport.finish().map_err(failed)?;
     writeln!(ui.status(), "Synchronization complete.")?;
     Ok(())
 }

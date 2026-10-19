@@ -19,7 +19,6 @@ use std::ffi::OsString;
 use std::io;
 use std::io::BufReader;
 use std::io::Read as _;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -41,8 +40,6 @@ use jj_lib::sync::protocol::Message;
 use jj_lib::sync::protocol::ProtocolError;
 use jj_lib::sync::protocol::Session;
 use thiserror::Error;
-
-use crate::ui::Ui;
 
 const MAX_STDERR_BYTES: usize = 64 * 1024;
 
@@ -169,23 +166,14 @@ impl Endpoint {
         }
     }
 
-    fn command(
-        &self,
-        local_executable: &Path,
-        ssh_executable: &OsStr,
-        debug: bool,
-        quiet: bool,
-    ) -> Command {
+    fn command(&self, local_executable: &Path, ssh_executable: &OsStr, debug: bool) -> Command {
         match self {
             Self::Local(_) => {
                 let mut command = Command::new(local_executable);
                 if debug {
                     command.arg("--debug");
                 }
-                if quiet {
-                    command.arg("--quiet");
-                }
-                command.args(["util", "sync-server"]);
+                command.args(["--quiet", "util", "sync-server"]);
                 command
             }
             Self::Ssh {
@@ -198,15 +186,10 @@ impl Endpoint {
                 }
                 // Only this constant is interpreted by the remote shell. In
                 // particular, the repository path never enters shell syntax.
-                command
-                    .arg("--")
-                    .arg(destination)
-                    .arg(match (debug, quiet) {
-                        (false, false) => "jj util sync-server",
-                        (true, false) => "jj --debug util sync-server",
-                        (false, true) => "jj --quiet util sync-server",
-                        (true, true) => "jj --debug --quiet util sync-server",
-                    });
+                command.arg("--").arg(destination).arg(match debug {
+                    false => "jj --quiet util sync-server",
+                    true => "jj --debug --quiet util sync-server",
+                });
                 command
             }
         }
@@ -293,31 +276,16 @@ pub(crate) struct Transport {
     stderr: Arc<Mutex<StderrCapture>>,
     stderr_stop: Arc<AtomicBool>,
     stderr_thread: Option<JoinHandle<io::Result<()>>>,
-    stderr_streamed: bool,
     finished: bool,
 }
 
 impl Transport {
-    pub(crate) fn connect(
-        endpoint: &Endpoint,
-        debug: bool,
-        ui: &Ui,
-    ) -> Result<Self, TransportError> {
+    pub(crate) fn connect(endpoint: &Endpoint, debug: bool) -> Result<Self, TransportError> {
         let executable = std::env::current_exe()?;
-        Self::spawn(
-            endpoint.command(&executable, OsStr::new("ssh"), debug, ui.is_quiet()),
-            Some(ui.stderr_writer()?),
-            ui.use_progress_indicator(),
-            debug,
-        )
+        Self::spawn(endpoint.command(&executable, OsStr::new("ssh"), debug))
     }
 
-    fn spawn(
-        mut command: Command,
-        stderr_output: Option<Box<dyn Write + Send>>,
-        clear_progress: bool,
-        debug: bool,
-    ) -> Result<Self, TransportError> {
+    fn spawn(mut command: Command) -> Result<Self, TransportError> {
         tracing::debug!(
             program = ?command.get_program(),
             arguments = ?command.get_args().collect::<Vec<_>>(),
@@ -350,19 +318,9 @@ impl Transport {
         let stderr_stop = Arc::new(AtomicBool::new(false));
         let stderr_writer = stderr.clone();
         let stderr_reader_stop = stderr_stop.clone();
-        let stderr_streamed = stderr_output.is_some() || debug;
         let stderr_thread = thread::Builder::new()
             .name("jj-sync-stderr".to_owned())
-            .spawn(move || {
-                drain_stderr(
-                    child_stderr,
-                    &stderr_writer,
-                    &stderr_reader_stop,
-                    stderr_output,
-                    clear_progress,
-                    debug,
-                )
-            });
+            .spawn(move || drain_stderr(child_stderr, &stderr_writer, &stderr_reader_stop));
         let stderr_thread = match stderr_thread {
             Ok(thread) => thread,
             Err(err) => {
@@ -376,7 +334,6 @@ impl Transport {
             stderr,
             stderr_stop,
             stderr_thread: Some(stderr_thread),
-            stderr_streamed,
             finished: false,
         })
     }
@@ -412,9 +369,9 @@ impl Transport {
     }
 
     /// Closes the protocol streams, waits for the helper, and checks its status.
-    /// Returns bounded helper diagnostics if they weren't already streamed.
+    /// Includes bounded helper diagnostics only if the helper failed.
     /// The command must consume its final response before calling this method.
-    pub(crate) fn finish(mut self) -> Result<String, TransportError> {
+    pub(crate) fn finish(mut self) -> Result<(), TransportError> {
         drop(self.session.take());
         let status = self.child.wait()?;
         if !status.success() {
@@ -424,15 +381,13 @@ impl Transport {
         }
         self.finished = true;
         self.join_stderr()?;
-        let diagnostic = self.stderr_diagnostic();
         if status.success() {
-            Ok(if self.stderr_streamed {
-                String::new()
-            } else {
-                diagnostic
-            })
+            Ok(())
         } else {
-            Err(TransportError::HelperFailed { status, diagnostic })
+            Err(TransportError::HelperFailed {
+                status,
+                diagnostic: self.stderr_diagnostic(),
+            })
         }
     }
 
@@ -513,19 +468,15 @@ impl Transport {
 
 /// Drains stderr concurrently without waiting forever for inherited descriptors.
 /// After shutdown, collect the available bounded tail and close our pipe even
-/// if a helper descendant continues writing or never closes its copy. Displaying
-/// output can block on the UI destination, as with other command output.
+/// if a helper descendant continues writing or never closes its copy. Keep the
+/// captured tail for failures; ordinary helper output is not user-facing.
 fn drain_stderr(
     mut stderr: ChildStderr,
     capture: &Mutex<StderrCapture>,
     stop: &AtomicBool,
-    mut output: Option<Box<dyn Write + Send>>,
-    clear_progress: bool,
-    debug: bool,
 ) -> io::Result<()> {
     let mut buffer = [0; 8192];
     let mut drained_after_stop = 0;
-    let mut at_line_start = true;
     loop {
         match read_stderr(&mut stderr, &mut buffer) {
             Ok(0) => return Ok(()),
@@ -537,22 +488,6 @@ fn drain_stderr(
                     helper_stderr = %String::from_utf8_lossy(&buffer[..length]),
                     "Synchronization helper stderr"
                 );
-                if let Some(output) = &mut output
-                    && !debug
-                {
-                    // Display progress immediately. Failure to display it must
-                    // not interrupt the protocol or stop draining diagnostics.
-                    let _display_result = if clear_progress && at_line_start {
-                        // Write the clear sequence and message together so a
-                        // local transfer counter cannot appear between them.
-                        let display = [b"\r\x1b[2K".as_slice(), &buffer[..length]].concat();
-                        output.write_all(&display)
-                    } else {
-                        output.write_all(&buffer[..length])
-                    }
-                    .and_then(|()| output.flush());
-                }
-                at_line_start = buffer[length - 1] == b'\n';
                 if stop.load(Ordering::Acquire) {
                     drained_after_stop += length;
                     if drained_after_stop >= MAX_STDERR_BYTES {
@@ -701,23 +636,6 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    struct ChannelWriter(std::sync::mpsc::Sender<Vec<u8>>);
-
-    #[cfg(unix)]
-    impl Write for ChannelWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0
-                .send(bytes.to_vec())
-                .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[cfg(unix)]
     struct ProcessGroupCleanup(u32);
 
     #[cfg(unix)]
@@ -743,11 +661,11 @@ mod tests {
                 decode_repository_path(&endpoint.repository_path()).unwrap(),
                 *path
             );
-            let command = endpoint.command(Path::new("my jj"), OsStr::new("ssh"), false, false);
+            let command = endpoint.command(Path::new("my jj"), OsStr::new("ssh"), false);
             assert_eq!(command.get_program(), "my jj");
             assert_eq!(
                 command.get_args().collect::<Vec<_>>(),
-                ["util", "sync-server"]
+                ["--quiet", "util", "sync-server"]
             );
         }
     }
@@ -759,7 +677,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(endpoint.repository_path(), b"/a space/';$(literal)/-repo#?");
-        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), false, false);
+        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), false);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [
@@ -768,7 +686,7 @@ mod tests {
                 "2202",
                 "--",
                 "person@example.org",
-                "jj util sync-server"
+                "jj --quiet util sync-server"
             ]
         );
     }
@@ -776,28 +694,28 @@ mod tests {
     #[test]
     fn ssh_ipv6_and_default_port() {
         let endpoint = Endpoint::parse(OsStr::new("ssh://person@[::1]/repo")).unwrap();
-        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), false, false);
+        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), false);
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["-T", "--", "person@::1", "jj util sync-server"]
+            ["-T", "--", "person@::1", "jj --quiet util sync-server"]
         );
     }
 
     #[test]
     fn debug_logging_is_enabled_for_local_and_ssh_helpers() {
         let endpoint = Endpoint::parse(OsStr::new("local-repo")).unwrap();
-        let command = endpoint.command(Path::new("my jj"), OsStr::new("ssh"), true, false);
+        let command = endpoint.command(Path::new("my jj"), OsStr::new("ssh"), true);
         assert_eq!(command.get_program(), "my jj");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["--debug", "util", "sync-server"]
+            ["--debug", "--quiet", "util", "sync-server"]
         );
 
         let endpoint = Endpoint::parse(OsStr::new(
             "ssh://person@example.org:2202/a%20space/'%3B%24(literal)/-repo%23%3F",
         ))
         .unwrap();
-        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), true, false);
+        let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), true);
         assert_eq!(command.get_program(), "ssh");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
@@ -807,16 +725,16 @@ mod tests {
                 "2202",
                 "--",
                 "person@example.org",
-                "jj --debug util sync-server"
+                "jj --debug --quiet util sync-server"
             ]
         );
     }
 
     #[test]
-    fn quiet_is_propagated_to_local_and_ssh_helpers() {
+    fn helpers_always_run_quietly() {
         for debug in [false, true] {
             let endpoint = Endpoint::parse(OsStr::new("local-repo")).unwrap();
-            let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), debug, true);
+            let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), debug);
             let expected = if debug {
                 vec!["--debug", "--quiet", "util", "sync-server"]
             } else {
@@ -825,7 +743,7 @@ mod tests {
             assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
 
             let endpoint = Endpoint::parse(OsStr::new("ssh://example.org/repo")).unwrap();
-            let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), debug, true);
+            let command = endpoint.command(Path::new("jj"), OsStr::new("ssh"), debug);
             let remote_command = if debug {
                 "jj --debug --quiet util sync-server"
             } else {
@@ -899,8 +817,7 @@ mod tests {
             "i=0; while [ $i -lt 10000 ]; do echo diagnostic >&2; i=$((i+1)); done; echo 'helper \
              unavailable' >&2; exit 127",
         ]);
-        let mut transport =
-            Transport::spawn(command, Some(Box::new(io::sink())), false, false).unwrap();
+        let mut transport = Transport::spawn(command).unwrap();
         let error = transport.receive().unwrap_err().to_string();
         assert!(error.contains("helper unavailable"), "{error}");
         assert!(error.contains("last 64 KiB"), "{error}");
@@ -912,7 +829,7 @@ mod tests {
     fn framed_peer_errors_preserve_stderr_and_cancel_the_helper() {
         let mut command = Command::new("sh");
         command.args(["-c", "echo 'peer initialization diagnostic' >&2; exec cat"]);
-        let mut transport = Transport::spawn(command, None, false, false).unwrap();
+        let mut transport = Transport::spawn(command).unwrap();
         // The helper echoes the frame but remains blocked on stdin. Receiving
         // a terminal error must cancel it without waiting for pipe EOF.
         transport
@@ -936,7 +853,7 @@ mod tests {
     fn cancellation_reaps_the_helper() {
         let mut command = Command::new("sh");
         command.args(["-c", "exec sleep 30"]);
-        let mut transport = Transport::spawn(command, None, false, false).unwrap();
+        let mut transport = Transport::spawn(command).unwrap();
         transport.cancel();
         assert!(transport.child.try_wait().unwrap().is_some());
         assert!(transport.stderr_thread.is_none());
@@ -947,7 +864,7 @@ mod tests {
     fn cancellation_closes_pipes_inherited_by_helper_descendants() {
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 30 & printf ready; wait"]);
-        let mut transport = Transport::spawn(command, None, false, false).unwrap();
+        let mut transport = Transport::spawn(command).unwrap();
         let (mut reader, writer) = transport.session.take().unwrap().into_inner();
         let mut ready = [0; 5];
         reader.read_exact(&mut ready).unwrap();
@@ -964,7 +881,7 @@ mod tests {
     fn missing_helper_reports_the_executable() {
         let directory = tempfile::tempdir().unwrap();
         let command = Command::new(directory.path().join("missing-jj-sync-helper"));
-        let error = match Transport::spawn(command, None, false, false) {
+        let error = match Transport::spawn(command) {
             Ok(_) => panic!("started a nonexistent helper"),
             Err(error) => error.to_string(),
         };
@@ -973,98 +890,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn helper_progress_is_displayed_before_it_finishes_without_replay() {
-        use std::sync::mpsc;
-
-        let (sender, receiver) = mpsc::channel();
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            "printf 'Peer: Reading operation history...\\n' >&2; IFS= read -r ready",
-        ]);
-        let mut transport =
-            Transport::spawn(command, Some(Box::new(ChannelWriter(sender))), false, false).unwrap();
-        let progress = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("helper progress was buffered until completion");
-        assert_eq!(progress, b"Peer: Reading operation history...\n");
-        assert!(transport.child.try_wait().unwrap().is_none());
-        // The helper only exits when explicitly released after its progress was
-        // observed, so this checks live delivery without relying on a sleep.
-        transport
-            .framed_io_mut()
-            .unwrap()
-            .1
-            .write_all(b"\n")
-            .unwrap();
-        assert!(transport.finish().unwrap().is_empty());
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fragmented_helper_lines_are_not_erased_by_progress_clearing() {
-        use std::sync::mpsc;
-
-        let (sender, receiver) = mpsc::channel();
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            "printf 'Peer: Reading' >&2; IFS= read -r ready; printf ' operation history...\\n' \
-             >&2; IFS= read -r ready; printf 'Peer: Applying history...\\n' >&2; IFS= read -r \
-             ready",
-        ]);
-        let mut transport =
-            Transport::spawn(command, Some(Box::new(ChannelWriter(sender))), true, false).unwrap();
-        for expected in [
-            b"\r\x1b[2KPeer: Reading".as_slice(),
-            b" operation history...\n",
-            b"\r\x1b[2KPeer: Applying history...\n",
-        ] {
-            let displayed = receiver
-                .recv_timeout(Duration::from_secs(5))
-                .expect("helper progress was buffered until completion");
-            assert_eq!(displayed, expected);
-            transport
-                .framed_io_mut()
-                .unwrap()
-                .1
-                .write_all(b"\n")
-                .unwrap();
-        }
-        assert!(transport.finish().unwrap().is_empty());
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn finish_reports_status_and_successful_diagnostics() {
+    fn finish_suppresses_successful_diagnostics_and_reports_failures() {
         use std::os::fd::AsRawFd as _;
         use std::time::Instant;
 
         let mut command = Command::new("sh");
         command.args(["-c", "exit 0"]);
-        assert!(
-            Transport::spawn(command, None, false, false)
-                .unwrap()
-                .finish()
-                .unwrap()
-                .is_empty()
-        );
+        Transport::spawn(command).unwrap().finish().unwrap();
         let mut command = Command::new("sh");
         command.args(["-c", "echo 'peer snapshot warning' >&2; exit 0"]);
-        let diagnostic = Transport::spawn(command, None, false, false)
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(diagnostic.contains("peer snapshot warning"), "{diagnostic}");
+        Transport::spawn(command).unwrap().finish().unwrap();
 
         let mut command = Command::new("sh");
         command.args([
             "-c",
             "sleep 30 & echo 'helper cannot open repository' >&2; exit 2",
         ]);
-        let mut transport = Transport::spawn(command, None, false, false).unwrap();
+        let mut transport = Transport::spawn(command).unwrap();
         let _cleanup = ProcessGroupCleanup(transport.child.id());
         // Retain stdout to prove the failed helper's child is terminated:
         // that child holds the only remaining writer after the shell exits.
@@ -1098,11 +940,10 @@ mod tests {
 
         let mut command = Command::new("sh");
         command.args(["-c", "sleep 30 & echo 'helper completed' >&2; exit 0"]);
-        let transport = Transport::spawn(command, None, false, false).unwrap();
+        let transport = Transport::spawn(command).unwrap();
         let _cleanup = ProcessGroupCleanup(transport.child.id());
         let start = Instant::now();
-        let diagnostic = transport.finish().unwrap();
-        assert!(diagnostic.contains("helper completed"), "{diagnostic}");
+        transport.finish().unwrap();
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "finish waited for the descendant to close stderr"

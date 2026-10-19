@@ -33,14 +33,14 @@ selects `/code/project`. For a repository under the remote user's home, use
 its full path, such as `ssh://host/home/user/code/project`. Tildes and shell
 variables in the URL are passed literally.
 
-Synchronization describes its current phase on stderr, with `Local:` and
-`Peer:` identifying the endpoint doing the work. These messages cover history
-collection, comparison, transfer, validation, and integration, and appear even
-when output is redirected. Messages from the peer are displayed as they arrive.
-Interactive terminals also show transfer counters. Set
+Synchronization describes its current local phase and waits for the peer on
+stderr. These messages cover history collection, comparison, transfer,
+validation, and integration, and appear even when output is redirected.
+Routine helper output is suppressed; helper diagnostics are included when
+synchronization fails. Interactive terminals also show transfer counters. Set
 `ui.progress-indicator = false` to disable those interactive updates while
 keeping phase descriptions. Use `--quiet` or `ui.quiet = true` to suppress
-status messages at both endpoints; warnings and errors remain visible.
+status messages; errors remain visible.
 
 Use `jj --debug sync ...` to trace endpoint paths, negotiation, and transfer
 phases, including helper diagnostics. Debug logs follow the usual logging
