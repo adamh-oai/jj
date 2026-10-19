@@ -175,7 +175,7 @@ trait Stream {
         _repository: &Path,
         _sending: bool,
         _max_received_bytes: u64,
-    ) -> Result<crate::sync_git_transport::GitTransferReport, CommandError> {
+    ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         Err(user_error("This stream cannot transfer native Git data"))
     }
 }
@@ -198,7 +198,7 @@ impl Stream for Transport {
         repository: &Path,
         sending: bool,
         max_received_bytes: u64,
-    ) -> Result<crate::sync_git_transport::GitTransferReport, CommandError> {
+    ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         use crate::sync_git_transport::GitAction;
         let action = if sending {
             GitAction::Push
@@ -235,7 +235,7 @@ impl<R: Read + Send, W: io::Write> Stream for Session<R, W> {
         repository: &Path,
         sending: bool,
         max_received_bytes: u64,
-    ) -> Result<crate::sync_git_transport::GitTransferReport, CommandError> {
+    ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         use crate::sync_git_transport::GitService;
         let service = if sending {
             GitService::UploadPack
