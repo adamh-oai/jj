@@ -39,6 +39,8 @@ use jj_lib::sync::endpoint::EndpointError;
 use jj_lib::sync::metadata::KnownCommitMetadata;
 use jj_lib::sync::metadata::MetadataInventory;
 use jj_lib::sync::metadata::MetadataSummary;
+#[cfg(unix)]
+use jj_lib::sync::objects::ImmutableFiles;
 use jj_lib::sync::objects::Inventory;
 use jj_lib::sync::objects::Quarantine;
 use jj_lib::sync::objects::QuarantineLimits;
@@ -67,6 +69,8 @@ use crate::command_error::CommandError;
 use crate::command_error::user_error;
 use crate::command_error::user_error_with_message;
 use crate::progress::ProgressWriter;
+#[cfg(unix)]
+use crate::sync_rsync_transport::TransferMode;
 use crate::sync_transport;
 use crate::sync_transport::Transport;
 use crate::ui::Ui;
@@ -80,6 +84,7 @@ const CAPABILITIES: [&str; 4] = [
 const INITIALIZE_RECEIVER_CAPABILITY: &str = "initialize-receiver-v1";
 const NATIVE_GIT_CAPABILITY: &str = "native-git-pack-v1";
 const ADAPTIVE_METADATA_CAPABILITY: &str = "adaptive-commit-metadata-v1";
+const RSYNC_IMMUTABLE_CAPABILITY: &str = "rsync-immutable-v1";
 const METADATA_PROBE_BATCH_SIZE: usize = 128;
 const NEGOTIATE_OBJECT_HASH: &str = "auto";
 const INVENTORY_BATCH_SIZE: usize = 512;
@@ -178,6 +183,20 @@ trait Stream {
     ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
         Err(user_error("This stream cannot transfer native Git data"))
     }
+
+    #[cfg(unix)]
+    fn transfer_immutable(
+        &mut self,
+        _rsync: &Path,
+        _directory: &Path,
+        _basis: Option<&Path>,
+        _mode: TransferMode<'_>,
+        _max_received_bytes: u64,
+    ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
+        Err(user_error(
+            "This stream cannot transfer immutable history files",
+        ))
+    }
 }
 
 impl Stream for Transport {
@@ -215,6 +234,27 @@ impl Stream for Transport {
             writer,
         )
     }
+
+    #[cfg(unix)]
+    fn transfer_immutable(
+        &mut self,
+        rsync: &Path,
+        directory: &Path,
+        basis: Option<&Path>,
+        mode: TransferMode<'_>,
+        max_received_bytes: u64,
+    ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
+        let (reader, writer) = self.framed_io_mut().map_err(failed)?;
+        crate::sync_rsync_transport::run(
+            rsync,
+            directory,
+            basis,
+            mode,
+            max_received_bytes,
+            reader,
+            writer,
+        )
+    }
 }
 
 impl<R: Read + Send, W: io::Write> Stream for Session<R, W> {
@@ -247,6 +287,27 @@ impl<R: Read + Send, W: io::Write> Stream for Session<R, W> {
             git,
             repository,
             service,
+            max_received_bytes,
+            reader,
+            writer,
+        )
+    }
+
+    #[cfg(unix)]
+    fn transfer_immutable(
+        &mut self,
+        rsync: &Path,
+        directory: &Path,
+        basis: Option<&Path>,
+        mode: TransferMode<'_>,
+        max_received_bytes: u64,
+    ) -> Result<crate::sync_process::ProcessTransferReport, CommandError> {
+        let (reader, writer) = self.split_mut();
+        crate::sync_rsync_transport::run(
+            rsync,
+            directory,
+            basis,
+            mode,
             max_received_bytes,
             reader,
             writer,
@@ -358,6 +419,9 @@ struct PreparedEndpoint {
     pins: Vec<String>,
     publication_leases: Vec<FileLock>,
     packed_git: bool,
+    rsync_immutable: bool,
+    #[cfg(unix)]
+    immutable_basis: Option<ImmutableFiles>,
     common_metadata: KnownCommitMetadata,
 }
 
@@ -368,6 +432,7 @@ impl PreparedEndpoint {
         root: &Path,
         ignore_working_copy: bool,
         packed_git: bool,
+        rsync_immutable: bool,
     ) -> Result<Self, CommandError> {
         tracing::debug!(
             path = %root.display(),
@@ -443,6 +508,21 @@ impl PreparedEndpoint {
             &capture.shared_heads,
             packed_git,
         )?;
+        let pins = vec![transfer.clone()];
+        #[cfg(unix)]
+        let (pins, immutable_basis) = if rsync_immutable {
+            let mut pins = pins;
+            let key = format!("{transfer}-basis");
+            let (raw_heads, shared_heads) = endpoint.pin_retained(&key).map_err(failed)?;
+            pins.push(key);
+            let retained = collect_inventory(&helper, &endpoint, &raw_heads, &shared_heads, true)?;
+            let basis = objects(&helper, &endpoint)?
+                .prepare_immutable_files(&helper.repo_path().join("sync"), &retained)
+                .map_err(failed)?;
+            (pins, Some(basis))
+        } else {
+            (pins, None)
+        };
         Ok(Self {
             helper,
             endpoint,
@@ -450,10 +530,13 @@ impl PreparedEndpoint {
             inventory,
             root,
             ignore_working_copy,
-            pins: vec![transfer.clone()],
+            pins,
             publication_leases: Vec::new(),
             transfer,
             packed_git,
+            rsync_immutable,
+            #[cfg(unix)]
+            immutable_basis,
             common_metadata: KnownCommitMetadata::new(),
         })
     }
@@ -517,6 +600,15 @@ impl PreparedEndpoint {
             .map_err(failed)
         })
         .transpose()?;
+        #[cfg(unix)]
+        if self.rsync_immutable {
+            let files = objects
+                .prepare_immutable_files(&self.helper.repo_path().join("sync"), inventory)
+                .map_err(failed)?;
+            for mode in [TransferMode::SendPlan, TransferMode::Send] {
+                self.transfer_immutable(ui, stream, files.path(), None, mode, u64::MAX)?;
+            }
+        }
         let mut progress = TransferProgress::new(
             ui,
             &self.root,
@@ -525,18 +617,22 @@ impl PreparedEndpoint {
                 inventory
                     .missing(known)
                     .filter(|id| {
-                        !self.packed_git
-                            || match id {
-                                RecordId::Git(id) => inventory.git_commits.contains(
-                                    &jj_lib::backend::CommitId::from_bytes(id.as_bytes()),
-                                ),
-                                _ => true,
-                            }
+                        (!self.rsync_immutable || matches!(id, RecordId::Git(_)))
+                            && (!self.packed_git
+                                || match id {
+                                    RecordId::Git(id) => inventory.git_commits.contains(
+                                        &jj_lib::backend::CommitId::from_bytes(id.as_bytes()),
+                                    ),
+                                    _ => true,
+                                })
                     })
                     .count()
             }),
         );
         let mut emit = |record: Record| {
+            if self.rsync_immutable && !matches!(record, Record::GitCommitMetadata(_)) {
+                return Ok(());
+            }
             let bytes = record.encode()?;
             let encoded_bytes = bytes.len();
             stream
@@ -545,7 +641,11 @@ impl PreparedEndpoint {
             progress.record(&record, encoded_bytes);
             Ok(())
         };
-        if self.packed_git {
+        if self.rsync_immutable {
+            objects
+                .export_commit_metadata_records(inventory, &self.common_metadata, &mut emit)
+                .map_err(failed)?;
+        } else if self.packed_git {
             objects
                 .export_metadata_records(inventory, known, &self.common_metadata, &mut emit)
                 .map_err(failed)?;
@@ -614,11 +714,82 @@ impl PreparedEndpoint {
                 .set_known_commit_metadata(self.common_metadata.clone())
                 .map_err(failed)?;
         }
+        #[cfg(unix)]
+        if self.rsync_immutable {
+            let parent = self.helper.repo_path().join("sync");
+            let basis = self
+                .immutable_basis
+                .as_ref()
+                .expect("rsync comparison snapshot was prepared");
+            let incoming = tempfile::Builder::new()
+                .prefix("jj-sync-immutable-incoming-")
+                .tempdir_in(&parent)?;
+            let listing = tempfile::NamedTempFile::new_in(&parent)?;
+            let limits = self.quarantine_limits()?;
+            // File lists describe existing history too. Bound their overhead
+            // separately; actual incoming payloads are checked before install.
+            let allowance = 16 * 1024 * 1024;
+            self.transfer_immutable(
+                ui,
+                stream,
+                incoming.path(),
+                Some(basis.path()),
+                TransferMode::Plan {
+                    output: listing.path(),
+                    max_bytes: (limits.max_records as u64)
+                        .saturating_mul(256)
+                        .saturating_add(16 * 1024)
+                        .min(quarantine.remaining_packed_bytes()),
+                },
+                quarantine
+                    .remaining_packed_bytes()
+                    .saturating_add(allowance),
+            )?;
+            let plan = quarantine
+                .plan_immutable_files(listing.path())
+                .map_err(failed)?;
+            let mut files_from = tempfile::NamedTempFile::new_in(&parent)?;
+            plan.write_paths(files_from.as_file_mut()).map_err(failed)?;
+            tracing::debug!(
+                path = %self.root.display(),
+                planned_files = plan.len(),
+                planned_bytes = plan.data_bytes(),
+                "Immutable history file transfer planned"
+            );
+            self.transfer_immutable(
+                ui,
+                stream,
+                incoming.path(),
+                Some(basis.path()),
+                TransferMode::Receive {
+                    files_from: files_from.path(),
+                    max_file_size: plan.max_file_size(),
+                },
+                // The reserved budget includes per-file allocation overhead,
+                // which also covers large lists of tiny requested objects.
+                quarantine
+                    .remaining_packed_bytes()
+                    .saturating_add(allowance),
+            )?;
+            let copied_files = quarantine
+                .stage_immutable_files(&objects, incoming.path(), &plan)
+                .map_err(failed)?;
+            tracing::debug!(
+                path = %self.root.display(),
+                copied_files,
+                "Immutable history files staged"
+            );
+        }
         let mut progress = TransferProgress::new(ui, &self.root, "Receiving", None);
         loop {
             match stream.receive()? {
                 Message::Record(bytes) => {
                     let record = Record::decode(&bytes).map_err(failed)?;
+                    if self.rsync_immutable && !matches!(record, Record::GitCommitMetadata(_)) {
+                        return Err(user_error(
+                            "Unexpected object record after immutable history file transfer",
+                        ));
+                    }
                     quarantine.stage(&objects, &record).map_err(failed)?;
                     progress.record(&record, bytes.len());
                 }
@@ -669,6 +840,45 @@ impl PreparedEndpoint {
             "Synchronized objects installed"
         );
         Ok(offered)
+    }
+
+    #[cfg(unix)]
+    fn transfer_immutable(
+        &self,
+        ui: &Ui,
+        stream: &mut impl Stream,
+        directory: &Path,
+        basis: Option<&Path>,
+        mode: TransferMode<'_>,
+        max_received_bytes: u64,
+    ) -> Result<(), CommandError> {
+        let sending = matches!(mode, TransferMode::SendPlan | TransferMode::Send);
+        let planning = matches!(mode, TransferMode::Plan { .. } | TransferMode::SendPlan);
+        tracing::debug!(
+            path = %self.root.display(),
+            sending,
+            planning,
+            "Transferring immutable history files with rsync"
+        );
+        let report = stream.transfer_immutable(
+            Path::new("rsync"),
+            directory,
+            basis,
+            mode,
+            max_received_bytes,
+        )?;
+        tracing::debug!(
+            path = %self.root.display(),
+            sending,
+            planning,
+            sent_bytes = report.sent_bytes,
+            received_bytes = report.received_bytes,
+            "Immutable history file transfer completed"
+        );
+        if !report.stderr.is_empty() {
+            writeln!(ui.stderr(), "{}", report.stderr)?;
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -1068,44 +1278,60 @@ pub(crate) async fn synchronize(
     transport
         .send(&Message::Hello(hello.clone()))
         .map_err(failed)?;
-    let (packed_git, adaptive_metadata) = match transport.receive().map_err(failed)? {
-        Message::HelloReply(reply) => {
-            tracing::debug!(
-                object_hash = %reply.object_hash,
-                "Peer accepted synchronization handshake"
-            );
-            if local_missing {
-                hello.object_hash.clone_from(&reply.object_hash);
+    let (packed_git, adaptive_metadata, rsync_immutable) =
+        match transport.receive().map_err(failed)? {
+            Message::HelloReply(reply) => {
+                tracing::debug!(
+                    object_hash = %reply.object_hash,
+                    "Peer accepted synchronization handshake"
+                );
+                if local_missing {
+                    hello.object_hash.clone_from(&reply.object_hash);
+                }
+                hello.validate_peer(&reply).map_err(failed)?;
+                (
+                    use_native_git(&hello, &reply),
+                    use_adaptive_metadata(&hello, &reply),
+                    use_rsync_immutable(&hello, &reply),
+                )
             }
-            hello.validate_peer(&reply).map_err(failed)?;
-            (
-                use_native_git(&hello, &reply),
-                use_adaptive_metadata(&hello, &reply),
-            )
-        }
-        Message::Error(error) => {
-            return Err(user_error(format!("Peer synchronization failed: {error}")));
-        }
-        _ => {
-            return Err(user_error(
-                "Peer did not negotiate a synchronization session",
-            ));
-        }
-    };
+            Message::Error(error) => {
+                return Err(user_error(format!("Peer synchronization failed: {error}")));
+            }
+            _ => {
+                return Err(user_error(
+                    "Peer did not negotiate a synchronization session",
+                ));
+            }
+        };
     if local_missing {
         let object_hash = parse_object_hash(&hello.object_hash)?;
         crate::commands::init_colocated_for_sync(ui, command, &local_root, object_hash).await?;
     }
-    let mut local = PreparedEndpoint::open(ui, command, &local_root, ignore, packed_git).await?;
+    let mut local = PreparedEndpoint::open(
+        ui,
+        command,
+        &local_root,
+        ignore,
+        packed_git,
+        rsync_immutable,
+    )
+    .await?;
     hello
         .validate_peer(&local.hello(direction, peer.repository_path())?)
         .map_err(failed)?;
     let local_advertisement = local.advertisement()?;
     send_command(&mut transport, "capture", &local_advertisement)?;
-    send_inventory(&mut transport, &local.inventory, packed_git)?;
+    if !rsync_immutable {
+        send_inventory(&mut transport, &local.inventory, packed_git)?;
+    }
     let remote: Advertisement = receive_command(&mut transport, "capture")?;
     remote.validate()?;
-    let remote_known = receive_inventory(&mut transport, local.known_cache_limit()?)?;
+    let remote_known = if rsync_immutable {
+        BTreeSet::new()
+    } else {
+        receive_inventory(&mut transport, local.known_cache_limit()?)?
+    };
     if adaptive_metadata {
         let manifest = objects(&local.helper, &local.endpoint)?
             .commit_metadata_inventory(&local.inventory)
@@ -1266,17 +1492,31 @@ async fn serve_session(
     stream.send(&Message::HelloReply(reply.clone()))?;
     let packed_git = use_native_git(&request, &reply);
     let adaptive_metadata = use_adaptive_metadata(&request, &reply);
-    let mut local =
-        PreparedEndpoint::open(ui, command, &path, request.ignore_working_copy, packed_git).await?;
+    let rsync_immutable = use_rsync_immutable(&request, &reply);
+    let mut local = PreparedEndpoint::open(
+        ui,
+        command,
+        &path,
+        request.ignore_working_copy,
+        packed_git,
+        rsync_immutable,
+    )
+    .await?;
     reply
         .validate_peer(&local.hello(request.direction, Vec::new())?)
         .map_err(failed)?;
     let peer: Advertisement = receive_command(stream, "capture")?;
     peer.validate()?;
-    let peer_known = receive_inventory(stream, local.known_cache_limit()?)?;
+    let peer_known = if rsync_immutable {
+        BTreeSet::new()
+    } else {
+        receive_inventory(stream, local.known_cache_limit()?)?
+    };
     let advertisement = local.advertisement()?;
     send_command(stream, "capture", &advertisement)?;
-    send_inventory(stream, &local.inventory, packed_git)?;
+    if !rsync_immutable {
+        send_inventory(stream, &local.inventory, packed_git)?;
+    }
     if adaptive_metadata {
         let manifest = objects(&local.helper, &local.endpoint)?
             .commit_metadata_inventory(&local.inventory)
@@ -1416,6 +1656,15 @@ fn format_hello(
         && std::env::var("JJ_TEST_SYNC_DISABLE_METADATA_NEGOTIATION").map_or(true, |disabled| {
             disabled != "all" && !(disabled == "helper" && path.is_empty())
         });
+    #[cfg(unix)]
+    let rsync_immutable = native_git && crate::sync_rsync_transport::available(Path::new("rsync"));
+    #[cfg(not(unix))]
+    let rsync_immutable = false;
+    #[cfg(feature = "test-fakes")]
+    let rsync_immutable = rsync_immutable
+        && std::env::var("JJ_TEST_SYNC_DISABLE_RSYNC").map_or(true, |disabled| {
+            disabled != "all" && !(disabled == "helper" && path.is_empty())
+        });
     Hello {
         version: PROTOCOL_VERSION,
         direction,
@@ -1430,6 +1679,7 @@ fn format_hello(
             .chain([INITIALIZE_RECEIVER_CAPABILITY])
             .chain(native_git.then_some(NATIVE_GIT_CAPABILITY))
             .chain(adaptive_metadata.then_some(ADAPTIVE_METADATA_CAPABILITY))
+            .chain(rsync_immutable.then_some(RSYNC_IMMUTABLE_CAPABILITY))
             .map(str::to_owned)
             .collect(),
         required_capabilities: CAPABILITIES.iter().map(|name| (*name).to_owned()).collect(),
@@ -1453,6 +1703,16 @@ fn use_adaptive_metadata(request: &Hello, reply: &Hello) -> bool {
                 .capabilities
                 .iter()
                 .any(|capability| capability == ADAPTIVE_METADATA_CAPABILITY)
+        })
+}
+
+fn use_rsync_immutable(request: &Hello, reply: &Hello) -> bool {
+    use_native_git(request, reply)
+        && [request, reply].iter().all(|hello| {
+            hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == RSYNC_IMMUTABLE_CAPABILITY)
         })
 }
 
@@ -1941,6 +2201,30 @@ mod tests {
             old.capabilities.retain(|capability| capability != removed);
             assert!(!use_adaptive_metadata(&hello, &old));
             assert!(!use_adaptive_metadata(&old, &hello));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_files_require_native_git_and_both_optional_capabilities() {
+        let mut hello = format_hello(Direction::Send, vec![1], false, "sha1", Path::new("git"));
+        for capability in [NATIVE_GIT_CAPABILITY, RSYNC_IMMUTABLE_CAPABILITY] {
+            if !hello.capabilities.iter().any(|value| value == capability) {
+                hello.capabilities.push(capability.to_owned());
+            }
+        }
+        assert!(use_rsync_immutable(&hello, &hello));
+        assert!(
+            !hello
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == RSYNC_IMMUTABLE_CAPABILITY)
+        );
+        for removed in [NATIVE_GIT_CAPABILITY, RSYNC_IMMUTABLE_CAPABILITY] {
+            let mut old = hello.clone();
+            old.capabilities.retain(|capability| capability != removed);
+            assert!(!use_rsync_immutable(&hello, &old));
+            assert!(!use_rsync_immutable(&old, &hello));
         }
     }
 

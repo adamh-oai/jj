@@ -23,6 +23,8 @@ mod markdown_help;
 mod snapshot;
 #[cfg(all(feature = "git", unix))]
 mod sync_git_bridge;
+#[cfg(all(feature = "git", unix))]
+mod sync_rsync_bridge;
 #[cfg(feature = "git")]
 mod sync_server;
 
@@ -70,6 +72,9 @@ pub(crate) enum UtilCommand {
     #[cfg(all(feature = "git", unix))]
     #[command(hide = true)]
     SyncGitBridge(sync_git_bridge::SyncGitBridgeArgs),
+    #[cfg(all(feature = "git", unix))]
+    #[command(hide = true)]
+    SyncRsyncBridge(sync_rsync_bridge::SyncRsyncBridgeArgs),
 }
 
 #[instrument(skip_all)]
@@ -92,5 +97,7 @@ pub(crate) async fn cmd_util(
         UtilCommand::SyncServer(args) => sync_server::cmd_sync_server(ui, command, args).await,
         #[cfg(all(feature = "git", unix))]
         UtilCommand::SyncGitBridge(args) => sync_git_bridge::cmd_sync_git_bridge(args),
+        #[cfg(all(feature = "git", unix))]
+        UtilCommand::SyncRsyncBridge(args) => sync_rsync_bridge::cmd_sync_rsync_bridge(args),
     }
 }

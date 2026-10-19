@@ -1611,6 +1611,158 @@ fn test_sync_native_git_preserves_packed_history_on_repeat(direction: &str, ssh:
 }
 
 #[cfg(unix)]
+fn rsync_is_available() -> bool {
+    let Ok(output) = std::process::Command::new("rsync")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.rsplit_once("protocol version"))
+            .and_then(|(_, protocol)| protocol.trim().parse::<u32>().ok())
+            .is_some_and(|protocol| protocol >= 31)
+}
+
+#[cfg(unix)]
+#[test_case("--send", false; "local_send")]
+#[test_case("--receive", false; "local_receive")]
+#[test_case("--bidi", false; "local_bidirectional")]
+#[test_case("--send", true; "ssh_send")]
+#[test_case("--receive", true; "ssh_receive")]
+#[test_case("--bidi", true; "ssh_bidirectional")]
+fn test_sync_rsync_immutable_history_is_additive_and_preserves_undo(direction: &str, ssh: bool) {
+    if !rsync_is_available() {
+        return;
+    }
+    let mut env = TestEnvironment::default();
+    // A one-entry legacy ID cache must not force immutable files to be resent.
+    env.add_env_var("JJ_TEST_SYNC_KNOWN_RECORD_IDS", "1");
+    if ssh {
+        configure_fake_sync_ssh(&mut env);
+    }
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    let (source, receiver) = if direction == "--receive" {
+        (&right, &left)
+    } else {
+        (&left, &right)
+    };
+    for index in 0..16 {
+        source
+            .run_jj(["new", "-m", &format!("retained operation {index}")])
+            .success();
+    }
+    describe_and_bookmark(source, "source");
+    describe_and_bookmark(receiver, "receiver");
+    let original_operation = source.current_operation_id();
+    let peer = if ssh {
+        ssh_sync_url(&right)
+    } else {
+        right.root().to_str().unwrap().to_owned()
+    };
+    let first = left.run_jj(["--debug", "sync", direction, &peer]).success();
+    let stderr = anstream::adapter::strip_str(first.stderr.raw()).to_string();
+    assert!(
+        stderr.contains("Transferring immutable history files with rsync"),
+        "{stderr}"
+    );
+    assert_imported_history(source, receiver, &original_operation);
+
+    // The first repeat can exchange receiver-local integration operations that
+    // were created after the original bidirectional capture. They are history,
+    // even though neither repository needs another integration operation.
+    left.run_jj(["sync", direction, &peer]).success();
+    let before_left = left.current_operation_id();
+    let before_right = right.current_operation_id();
+    let repeated = left.run_jj(["--debug", "sync", direction, &peer]).success();
+    let stderr = anstream::adapter::strip_str(repeated.stderr.raw()).to_string();
+    let counts = regex::Regex::new(r"copied_files=(\d+)").unwrap();
+    let copied: Vec<usize> = counts
+        .captures_iter(&stderr)
+        .map(|captures| captures[1].parse().unwrap())
+        .collect();
+    assert!(!copied.is_empty(), "{stderr}");
+    assert!(copied.iter().all(|count| *count == 0), "{stderr}");
+    assert_eq!(left.current_operation_id(), before_left);
+    assert_eq!(right.current_operation_id(), before_right);
+
+    receiver.write_file("remote.txt", "a small edit after the initial transfer\n");
+    receiver.run_jj(["describe", "-m", "remote edit"]).success();
+    receiver.run_jj(["bookmark", "create", "remote"]).success();
+    let remote_commit = revision_id(receiver, "remote");
+    let remote_operation = receiver.current_operation_id();
+    let reverse = match direction {
+        "--send" => "--receive",
+        "--receive" => "--send",
+        _ => "--bidi",
+    };
+    let received = left.run_jj(["--debug", "sync", reverse, &peer]).success();
+    let stderr = anstream::adapter::strip_str(received.stderr.raw()).to_string();
+    // Helper diagnostics appear both in live debug tracing and again in its
+    // final stderr. Bound each receiving phase instead of counting it twice.
+    let largest_transfer = counts
+        .captures_iter(&stderr)
+        .map(|captures| captures[1].parse::<usize>().unwrap())
+        .max()
+        .expect("debug output must report copied immutable files");
+    assert!(largest_transfer > 0 && largest_transfer < 32, "{stderr}");
+    assert_eq!(revision_id(source, "remote"), remote_commit);
+    assert_imported_history(receiver, source, &remote_operation);
+    assert!(!source.root().join("remote.txt").exists());
+    source.run_jj(["undo"]).success();
+    assert!(!bookmarks(source).contains("remote"));
+    left.run_jj(["sync", reverse, &peer]).success();
+    assert!(!bookmarks(source).contains("remote"));
+    assert_imported_history(receiver, source, &remote_operation);
+}
+
+#[cfg(unix)]
+#[test_case("helper"; "older_peer")]
+#[test_case("all"; "disabled")]
+#[test_case("missing"; "missing_executable")]
+fn test_sync_rsync_fallback_preserves_history(disabled: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut env = TestEnvironment::default();
+    configure_fake_sync_ssh(&mut env);
+    if disabled == "missing" {
+        let rsync = env.env_root().join("fake-bin/rsync");
+        fs::write(&rsync, "#!/bin/sh\nexit 127\n").unwrap();
+        fs::set_permissions(&rsync, fs::Permissions::from_mode(0o700)).unwrap();
+    } else {
+        env.add_env_var("JJ_TEST_SYNC_DISABLE_RSYNC", disabled);
+    }
+    let source = init_repo(&env, "source");
+    let receiver = init_repo(&env, "receiver");
+    describe_and_bookmark(&source, "source");
+    describe_and_bookmark(&receiver, "receiver");
+    let source_operation = source.current_operation_id();
+    let peer = ssh_sync_url(&receiver);
+    let output = source
+        .run_jj(["--debug", "sync", "--send", &peer])
+        .success();
+    let stderr = anstream::adapter::strip_str(output.stderr.raw()).to_string();
+    assert!(stderr.contains("Transferring Git objects with native Git"));
+    assert!(
+        !stderr.contains("Transferring immutable history files with rsync"),
+        "{stderr}"
+    );
+    assert_imported_history(&source, &receiver, &source_operation);
+    receiver.run_jj(["undo"]).success();
+    source.run_jj(["sync", "--send", &peer]).success();
+    assert_eq!(
+        bookmarks(&receiver),
+        BTreeSet::from(["receiver".to_owned()])
+    );
+}
+
+#[cfg(unix)]
 #[test_case(false; "adaptive_metadata")]
 #[test_case(true; "older_native_peer")]
 fn test_sync_remote_edit_transfers_only_changed_commit_metadata(old_peer: bool) {

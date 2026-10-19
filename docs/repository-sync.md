@@ -70,11 +70,32 @@ change ID, predecessors, or legacy conflict data match. Installation still
 checks current local metadata under its writer lock before accepting incoming
 data. Older packed-transfer peers continue to send every commit's metadata.
 
-Operations, views, and shared events use a separate inventory of their IDs,
-followed by only the records missing from the receiver's known-ID cache. This
-makes their payload transfer incremental, but collecting and exchanging that
-inventory still walks the retained history. Complete dependency validation also
-walks the history before objects are retained and the integration is published.
+When both Unix endpoints support immutable file transfers and have `rsync` 3.1
+or newer available, original operations, views, and shared events travel as
+immutable files. The sender prepares a temporary tree containing exactly the
+captured history. The receiver prepares a read-only comparison snapshot of its
+pinned retained history, including operations imported by earlier exchanges.
+Rsync first lists missing files without copying their contents. The receiver
+checks their names, sizes, count, and total disk budget before requesting them.
+Rsync then copies only those files into a private incoming directory, with
+compression enabled. Original content identities are checked after copying.
+The transfer adds objects; it does not propagate deletions or copy mutable
+operation heads, synchronization tracking, repository settings, or workspaces.
+Both local paths and SSH carry rsync's protocol over the existing synchronization
+connection, without another SSH connection.
+
+Received files are validated under their original content identities and retained
+before the receiver merges shared state and publishes its local integration
+operation. Per-commit metadata still uses its separate negotiation and writer
+lock; Git objects still use Git's packed transfer.
+
+Peers without this optional capability, including those without `rsync`, retain
+the previous ID-inventory and missing-record transfer. That path's bounded
+known-ID cache can cause omitted records to be transferred again. Rsync file
+lists and local history collection still examine existing history, so a small
+change transfers only missing file payloads without making total synchronization
+time proportional only to the change. Complete dependency validation also walks
+the history before objects are retained and the integration is published.
 
 Older peers and endpoints without native Git support continue to use the
 existing object-record transfer. That path expands each object it sends, so
@@ -212,5 +233,15 @@ metadata record, including nested fields, before that record is decoded.
 Operators can raise these limits for larger transfers. The sender cannot
 override the receiver's settings.
 
-The bounded cache of known object IDs only avoids retransmission. IDs omitted
-from that cache are transferred again; its size does not limit repository size.
+The immutable-file transport checks the planned uncompressed payload and file
+count against local staging limits before copying files, including space for
+canonical installation. It permits at most 16 MiB of file-list and protocol
+overhead beyond the relevant payload budget. Copied files must match the plan
+and pass dependency validation before installation. Very large file lists can
+require a larger payload budget even when little new file content is transferred.
+Rsync checks declared file sizes before decompression; Jujutsu checks actual
+sizes after copying. Hard disk bounds during decompression require an
+operating-system storage quota, as with Git's native transfer.
+The older transport's bounded cache
+of known object IDs only avoids retransmission: IDs omitted from that cache are
+transferred again, and its size does not limit repository size.

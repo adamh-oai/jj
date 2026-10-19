@@ -45,6 +45,12 @@ pub struct AnchorStore {
 }
 
 impl AnchorStore {
+    /// Directory containing the original immutable event files.
+    #[cfg(unix)]
+    pub(super) fn directory(&self) -> &Path {
+        &self.path
+    }
+
     /// Selects an existing store without creating missing directories.
     pub fn load(repo_path: &Path) -> Self {
         Self {

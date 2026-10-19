@@ -22,6 +22,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
+use std::io::BufRead as _;
 use std::io::Read as _;
 use std::io::Seek as _;
 use std::io::Write as _;
@@ -411,6 +413,60 @@ impl Inventory {
     }
 }
 
+/// Missing immutable files selected by a frozen rsync dry run.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct ImmutableFilePlan {
+    files: BTreeMap<RecordId, u64>,
+    data_bytes: u64,
+}
+
+#[cfg(unix)]
+impl ImmutableFilePlan {
+    /// Number of missing files, excluding directories.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Whether all captured files already exist in the comparison basis.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Uncompressed payload size, independent of rsync's compression.
+    pub fn data_bytes(&self) -> u64 {
+        self.data_bytes
+    }
+
+    /// Largest allowed individual file for the selected transfer.
+    pub fn max_file_size(&self) -> u64 {
+        self.files.values().copied().max().unwrap_or(0)
+    }
+
+    /// Writes the receiver's NUL-delimited rsync selection.
+    pub fn write_paths(&self, writer: &mut impl std::io::Write) -> SyncResult<()> {
+        for id in self.files.keys() {
+            let (directory, hex) = immutable_file_name(id)?;
+            write!(writer, "{directory}/{hex}\0")?;
+        }
+        Ok(())
+    }
+}
+
+/// A private directory used for additive immutable-file transfer.
+#[cfg(unix)]
+pub struct ImmutableFiles {
+    directory: TempDir,
+}
+
+#[cfg(unix)]
+impl ImmutableFiles {
+    /// Root containing operation, view, and shared-event subdirectories.
+    pub fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
 /// Read-only immutable-object access for one repository.
 pub struct RepositoryObjects<'a> {
     operations: &'a SimpleOpStore,
@@ -420,6 +476,54 @@ pub struct RepositoryObjects<'a> {
 }
 
 impl<'a> RepositoryObjects<'a> {
+    /// Hard-links exactly the captured immutable history into a private tree.
+    /// The caller keeps the captured roots pinned while this tree is used.
+    #[cfg(unix)]
+    pub fn prepare_immutable_files(
+        &self,
+        parent: &Path,
+        inventory: &Inventory,
+    ) -> SyncResult<ImmutableFiles> {
+        let directory = tempfile::Builder::new()
+            .prefix("jj-sync-outgoing-")
+            .tempdir_in(parent)?;
+        for name in ["operations", "views", "events"] {
+            fs::create_dir(directory.path().join(name))?;
+        }
+        for id in &inventory.records {
+            let (name, hex) = match id {
+                RecordId::Operation(id) => ("operations", id.hex()),
+                RecordId::View(id) => ("views", id.hex()),
+                RecordId::SharedEvent(id) => ("events", id.hex()),
+                RecordId::Git(_) => continue,
+            };
+            let original = match id {
+                RecordId::Operation(_) | RecordId::View(_) => {
+                    self.operations.store_path().join(name).join(&hex)
+                }
+                RecordId::SharedEvent(_) => self.anchors.directory().join(&hex),
+                RecordId::Git(_) => unreachable!(),
+            };
+            if !fs::symlink_metadata(&original)?.file_type().is_file() {
+                return Err(invalid("immutable source object is not a regular file"));
+            }
+            let destination = directory.path().join(name).join(hex);
+            match fs::hard_link(&original, &destination) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::CrossesDevices | std::io::ErrorKind::Unsupported
+                    ) =>
+                {
+                    fs::copy(&original, &destination)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(ImmutableFiles { directory })
+    }
+
     /// Captures immutable metadata without retaining the writer lock.
     pub fn new(
         operations: &'a SimpleOpStore,
@@ -526,29 +630,42 @@ impl<'a> RepositoryObjects<'a> {
         mut emit: impl FnMut(Record) -> SyncResult<()>,
     ) -> SyncResult<()> {
         for id in inventory.missing(known) {
-            match id {
-                RecordId::Git(id)
-                    if inventory
-                        .git_commits
-                        .contains(&CommitId::from_bytes(id.as_bytes())) =>
-                {
-                    let metadata = self
-                        .backend
-                        .export_commit_metadata_with_metadata(id, Some(&self.metadata))?;
-                    let digest = fingerprint(&metadata);
-                    self.backend
-                        .validate_commit_metadata_snapshot(&metadata, &self.metadata)?;
-                    let record = Record::GitCommitMetadata(metadata);
-                    self.validate_record(&record)?;
-                    // Recheck the exact bytes against this export snapshot. A
-                    // newer metadata head must not be omitted using an older
-                    // negotiation result.
-                    if known_metadata.get(id) != Some(&digest) {
-                        emit(record)?;
-                    }
-                }
-                RecordId::Git(_) => {}
-                _ => emit(self.export_record(id)?)?,
+            if !matches!(id, RecordId::Git(_)) {
+                emit(self.export_record(id)?)?;
+            }
+        }
+        self.export_commit_metadata_records(inventory, known_metadata, emit)
+    }
+
+    /// Exports only commit metadata when immutable history uses file copying.
+    pub fn export_commit_metadata_records(
+        &self,
+        inventory: &Inventory,
+        known_metadata: &KnownCommitMetadata,
+        mut emit: impl FnMut(Record) -> SyncResult<()>,
+    ) -> SyncResult<()> {
+        for id in &inventory.records {
+            let RecordId::Git(id) = id else {
+                continue;
+            };
+            if !inventory
+                .git_commits
+                .contains(&CommitId::from_bytes(id.as_bytes()))
+            {
+                continue;
+            }
+            let metadata = self
+                .backend
+                .export_commit_metadata_with_metadata(id, Some(&self.metadata))?;
+            let digest = fingerprint(&metadata);
+            self.backend
+                .validate_commit_metadata_snapshot(&metadata, &self.metadata)?;
+            let record = Record::GitCommitMetadata(metadata);
+            self.validate_record(&record)?;
+            // Recheck against this export snapshot: a newer metadata head must
+            // not be omitted using an older negotiation result.
+            if known_metadata.get(id) != Some(&digest) {
+                emit(record)?;
             }
         }
         Ok(())
@@ -671,6 +788,7 @@ pub struct Quarantine {
     directory: TempDir,
     root_commit_id: CommitId,
     staged: BTreeSet<RecordId>,
+    file_records: BTreeSet<RecordId>,
     streams: BTreeMap<gix::ObjectId, PendingStream>,
     limits: QuarantineLimits,
     reserved_bytes: u64,
@@ -707,6 +825,7 @@ impl Quarantine {
                 .tempdir_in(parent)?,
             root_commit_id,
             staged: BTreeSet::new(),
+            file_records: BTreeSet::new(),
             streams: BTreeMap::new(),
             limits,
             reserved_bytes: 0,
@@ -794,6 +913,132 @@ impl Quarantine {
         self.limits
             .max_staged_bytes
             .saturating_sub(self.reserved_bytes)
+    }
+
+    /// Checks the missing-file plan before rsync writes any object payloads.
+    /// Both the source files and receiver comparison basis remain frozen.
+    #[cfg(unix)]
+    pub fn plan_immutable_files(&self, listing: &Path) -> SyncResult<ImmutableFilePlan> {
+        let mut plan = ImmutableFilePlan::default();
+        let mut reader = std::io::BufReader::new(fs::File::open(listing)?);
+        let mut allocation = 0u64;
+        let mut directories = BTreeSet::new();
+        loop {
+            let mut line = Vec::new();
+            if reader.by_ref().take(513).read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.len() > 512 || line.last() != Some(&b'\n') {
+                return Err(invalid("invalid immutable-file plan line length"));
+            }
+            let line = std::str::from_utf8(&line[..line.len() - 1])
+                .map_err(|_| invalid("invalid immutable-file plan encoding"))?;
+            let (length, path) = line
+                .split_once(' ')
+                .ok_or_else(|| invalid("invalid immutable-file plan entry"))?;
+            let length = length
+                .parse::<u64>()
+                .map_err(|_| invalid("invalid immutable-file plan size"))?;
+            if matches!(path, "./" | "." | "operations/" | "views/" | "events/") {
+                continue;
+            }
+            let (directory, hex) = path
+                .split_once('/')
+                .ok_or_else(|| invalid("invalid immutable-file plan path"))?;
+            let id = immutable_file_id(directory, hex)?;
+            if length > MAX_RECORD_SIZE as u64 {
+                return Err(invalid("immutable history object exceeds size limit"));
+            }
+            if self.reserved_records.saturating_add(plan.len()) >= self.limits.max_records {
+                return Err(invalid("immutable-file plan exceeds sync.max-records"));
+            }
+            if plan.files.insert(id, length).is_some() {
+                return Err(invalid("duplicate immutable-file plan entry"));
+            }
+            if directories.insert(directory.to_owned()) {
+                allocation = allocation
+                    .checked_add(FILE_OVERHEAD)
+                    .ok_or_else(|| invalid("immutable-file plan allocation overflow"))?;
+            }
+            plan.data_bytes = plan
+                .data_bytes
+                .checked_add(length)
+                .ok_or_else(|| invalid("immutable-file plan size overflow"))?;
+            allocation = allocation
+                .checked_add(length)
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        FILE_OVERHEAD + (MAX_ENCODED_RECORD_SIZE - MAX_RECORD_SIZE) as u64,
+                    )
+                })
+                .ok_or_else(|| invalid("immutable-file plan allocation overflow"))?;
+            if self.reserved_bytes.saturating_add(allocation) > self.limits.max_staged_bytes {
+                return Err(invalid(
+                    "immutable-file plan exceeds sync.max-quarantine-bytes",
+                ));
+            }
+        }
+        // Immutable installation may need another copy in the canonical store.
+        self.limits
+            .check_space(self.directory.path(), allocation.saturating_mul(2))?;
+        Ok(plan)
+    }
+
+    /// Validates incoming immutable files and adopts them without another copy.
+    /// The source tree is private and its receiving process has already exited.
+    #[cfg(unix)]
+    pub fn stage_immutable_files(
+        &mut self,
+        receiver: &RepositoryObjects<'_>,
+        directory: &Path,
+        plan: &ImmutableFilePlan,
+    ) -> SyncResult<usize> {
+        self.check_receiver(receiver)?;
+        let mut count = 0;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .filter(|name| matches!(*name, "operations" | "views" | "events"))
+                .ok_or_else(|| invalid("unexpected immutable history directory"))?;
+            if !entry.file_type()?.is_dir() {
+                return Err(invalid("immutable history entry is not a directory"));
+            }
+            for object in fs::read_dir(entry.path())? {
+                let object = object?;
+                if !object.file_type()?.is_file() {
+                    return Err(invalid("immutable history object is not a regular file"));
+                }
+                let filename = object.file_name();
+                let hex = filename
+                    .to_str()
+                    .ok_or_else(|| invalid("invalid immutable history object filename"))?;
+                let id = immutable_file_id(name, hex)?;
+                let expected = plan
+                    .files
+                    .get(&id)
+                    .ok_or_else(|| invalid("immutable file was not requested by the receiver"))?;
+                if object.metadata()?.len() != *expected {
+                    return Err(invalid("immutable file size changed after preflight"));
+                }
+                let record = read_immutable_file(&id, &object.path())?;
+                if self.staged.contains(&id) {
+                    return Err(invalid("immutable history object was supplied twice"));
+                }
+                self.reserve(record_size(&record)?.saturating_add(FILE_OVERHEAD))?;
+                preflight_metadata(&record, self.limits.max_dependencies)?;
+                receiver.validate_record(&record)?;
+                fs::rename(object.path(), self.directory.path().join(id.filename()))?;
+                self.file_records.insert(id.clone());
+                self.staged.insert(id);
+                count += 1;
+            }
+        }
+        if count != plan.len() {
+            return Err(invalid("immutable transfer omitted a requested file"));
+        }
+        Ok(count)
     }
 
     /// Validates one bounded record against the receiver before saving it to disk.
@@ -948,6 +1193,9 @@ impl Quarantine {
 
     /// Reads one staged record, bounding allocation before decoding any payload.
     pub fn read_record(&self, id: &RecordId) -> SyncResult<Record> {
+        if self.file_records.contains(id) {
+            return read_immutable_file(id, &self.directory.path().join(id.filename()));
+        }
         let mut bytes = Vec::new();
         fs::File::open(self.directory.path().join(id.filename()))?
             .take((MAX_ENCODED_RECORD_SIZE + 1) as u64)
@@ -1124,6 +1372,50 @@ impl Quarantine {
 
     fn body_path(&self, id: &gix::ObjectId) -> std::path::PathBuf {
         self.directory.path().join(format!("body-{id}"))
+    }
+}
+
+#[cfg(unix)]
+fn immutable_file_name(id: &RecordId) -> SyncResult<(&'static str, String)> {
+    match id {
+        RecordId::Operation(id) => Ok(("operations", id.hex())),
+        RecordId::View(id) => Ok(("views", id.hex())),
+        RecordId::SharedEvent(id) => Ok(("events", id.hex())),
+        RecordId::Git(_) => Err(invalid("Git object in immutable-file plan")),
+    }
+}
+
+#[cfg(unix)]
+fn immutable_file_id(directory: &str, hex: &str) -> SyncResult<RecordId> {
+    if hex.len() != 128
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid("invalid immutable history object filename"));
+    }
+    match directory {
+        "operations" => OperationId::try_from_hex(hex).map(RecordId::Operation),
+        "views" => ViewId::try_from_hex(hex).map(RecordId::View),
+        "events" => SharedEventId::try_from_hex(hex).map(RecordId::SharedEvent),
+        _ => None,
+    }
+    .ok_or_else(|| invalid("invalid immutable history object path"))
+}
+
+fn read_immutable_file(id: &RecordId, path: &Path) -> SyncResult<Record> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((MAX_RECORD_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_RECORD_SIZE {
+        return Err(invalid("immutable history object exceeds size limit"));
+    }
+    match id {
+        RecordId::Operation(id) => Ok(Record::Operation(id.clone(), bytes)),
+        RecordId::View(id) => Ok(Record::View(id.clone(), bytes)),
+        RecordId::SharedEvent(id) => Ok(Record::SharedEvent(id.clone(), bytes)),
+        RecordId::Git(_) => Err(invalid("Git object received as an immutable history file")),
     }
 }
 
@@ -2067,6 +2359,273 @@ mod tests {
             }
             self.operations.write_operation(&op).block_on().unwrap()
         }
+    }
+
+    #[cfg(unix)]
+    fn plan_for_files(quarantine: &Quarantine, directory: &Path) -> SyncResult<ImmutableFilePlan> {
+        let mut listing = NamedTempFile::new_in(directory.parent().unwrap())?;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            for object in fs::read_dir(entry.path())? {
+                let object = object?;
+                writeln!(
+                    listing,
+                    "{} {}/{}",
+                    object.metadata()?.len(),
+                    entry.file_name().to_string_lossy(),
+                    object.file_name().to_string_lossy()
+                )?;
+            }
+        }
+        quarantine.plan_immutable_files(listing.path())
+    }
+
+    #[cfg(unix)]
+    #[test_case(gix::hash::Kind::Sha1; "sha1")]
+    #[test_case(gix::hash::Kind::Sha256; "sha256")]
+    fn immutable_files_keep_exact_history_and_install_its_closure(
+        kind: gix::hash::Kind,
+    ) -> TestResult {
+        let source = Fixture::new(kind);
+        let destination = Fixture::new(kind);
+        let tree = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(tree.id, &[], &[], "captured commit");
+        let head = source.operation(commit.id, None, "captured operation");
+        let operation_path = source
+            .operations
+            .store_path()
+            .join("operations")
+            .join(head.hex());
+        let mut original = source.operations.export_operation(&head)?;
+        // A valid historical protobuf encoding must survive without re-encoding.
+        original.extend_from_slice(&[0xf8, 0x07, 0x01]);
+        fs::write(&operation_path, &original)?;
+        let operation = source.operations.read_operation(&head).block_on()?;
+        let view = source.operations.read_view(&operation.view_id).block_on()?;
+        let shared = source.anchors.write(&SharedEvent::new(
+            vec![],
+            SharedView::from_view(&view),
+            Some(head.clone()),
+        ))?;
+        let objects = source.objects();
+        let inventory =
+            objects.inventory(std::slice::from_ref(&head), std::slice::from_ref(&shared))?;
+        // The file tree must follow the capture, not include later operations.
+        let later = source.operation(commit.id, None, "later local operation");
+        let files = objects.prepare_immutable_files(source.directory.path(), &inventory)?;
+        assert_eq!(
+            fs::read(files.path().join("operations").join(head.hex()))?,
+            original
+        );
+        assert!(!files.path().join("operations").join(later.hex()).exists());
+        assert_eq!(fs::read_dir(files.path())?.count(), 3);
+
+        let receiver = destination.objects();
+        let mut quarantine = Quarantine::new(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+        )?;
+        let plan = plan_for_files(&quarantine, files.path())?;
+        assert_eq!(plan.len(), 3);
+        let copied = quarantine.stage_immutable_files(&receiver, files.path(), &plan)?;
+        assert_eq!(copied, 3);
+        for id in &inventory.records {
+            if matches!(id, RecordId::Git(_)) {
+                quarantine.stage(&receiver, &objects.export_record(id)?)?;
+            }
+        }
+        assert!(destination.operations.export_operation(&head).is_err());
+        let verified = quarantine.validate(
+            &receiver,
+            std::slice::from_ref(&head),
+            std::slice::from_ref(&shared),
+        )?;
+        assert_eq!(verified, inventory);
+        quarantine.install(&receiver, &verified)?;
+        assert_eq!(destination.operations.export_operation(&head)?, original);
+        assert_eq!(destination.backend.export_object(&commit.id)?, commit);
+        assert_eq!(
+            destination.anchors.read(&shared)?,
+            source.anchors.read(&shared)?
+        );
+        assert_eq!(fs::read(operation_path)?, original);
+        assert!(!destination.directory.path().join("op_heads").exists());
+        let orphan = destination.operation(commit.id, None, "unretained operation");
+        let basis = receiver.prepare_immutable_files(destination.directory.path(), &verified)?;
+        assert_eq!(
+            fs::read(basis.path().join("operations").join(head.hex()))?,
+            original
+        );
+        assert!(!basis.path().join("operations").join(orphan.hex()).exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test_case("unknown-directory")]
+    #[test_case("directory-link")]
+    #[test_case("object-link")]
+    #[test_case("object-directory")]
+    #[test_case("bad-name")]
+    #[test_case("bad-content")]
+    #[test_case("oversized")]
+    fn immutable_file_staging_rejects_invalid_trees(case: &str) -> TestResult {
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let incoming = new_temp_dir();
+        let views = incoming.path().join("views");
+        let outside = new_temp_dir();
+        let object = views.join("1".repeat(128));
+        if case == "directory-link" {
+            std::os::unix::fs::symlink(outside.path(), views)?;
+        } else {
+            fs::create_dir(&views)?;
+            match case {
+                "unknown-directory" => fs::create_dir(incoming.path().join("op_heads"))?,
+                "object-link" => {
+                    fs::write(outside.path().join("object"), b"original")?;
+                    std::os::unix::fs::symlink(outside.path().join("object"), object)?;
+                }
+                "object-directory" => fs::create_dir(object)?,
+                "bad-name" => fs::write(views.join("not-an-object"), b"invalid")?,
+                "bad-content" => fs::write(object, b"invalid")?,
+                "oversized" => fs::File::create(object)?.set_len(MAX_RECORD_SIZE as u64 + 1)?,
+                _ => unreachable!(),
+            }
+        }
+        let mut quarantine = Quarantine::new(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+        )?;
+        let mut plan = ImmutableFilePlan::default();
+        plan.files.insert(
+            RecordId::View(ViewId::try_from_hex("1".repeat(128)).unwrap()),
+            if case == "oversized" {
+                MAX_RECORD_SIZE as u64
+            } else {
+                7
+            },
+        );
+        assert!(
+            quarantine
+                .stage_immutable_files(&destination.objects(), incoming.path(), &plan)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(destination.operations.store_path().join("views"))?.count(),
+            0
+        );
+        if case == "object-link" {
+            assert_eq!(fs::read(outside.path().join("object"))?, b"original");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn immutable_file_staging_obeys_local_budgets() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let tree = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(tree.id, &[], &[], "commit");
+        let head = source.operation(commit.id, None, "operation");
+        let objects = source.objects();
+        let inventory = objects.inventory_packed(std::slice::from_ref(&head), &[])?;
+        let files = objects.prepare_immutable_files(source.directory.path(), &inventory)?;
+        let mut limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        limits.max_staged_bytes = FILE_OVERHEAD;
+        let quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        assert!(
+            plan_for_files(&quarantine, files.path())
+                .unwrap_err()
+                .to_string()
+                .contains("sync.max-quarantine-bytes")
+        );
+        assert!(destination.operations.export_operation(&head).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test_case("truncated")]
+    #[test_case("too-long")]
+    #[test_case("unknown-directory")]
+    #[test_case("traversal")]
+    #[test_case("oversized")]
+    #[test_case("duplicate")]
+    #[test_case("too-many")]
+    fn immutable_file_preflight_rejects_invalid_plans(case: &str) -> TestResult {
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let mut limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        let valid = format!("1 views/{}\n", "1".repeat(128));
+        let listing = match case {
+            "truncated" => valid.trim_end().to_owned(),
+            "too-long" => format!("{}\n", "1".repeat(1024)),
+            "unknown-directory" => format!("1 op_heads/{}\n", "1".repeat(128)),
+            "traversal" => format!("1 views/../{}\n", "1".repeat(128)),
+            "oversized" => format!("{} views/{}\n", MAX_RECORD_SIZE + 1, "1".repeat(128)),
+            "duplicate" => valid.repeat(2),
+            "too-many" => {
+                limits.max_records = 1;
+                format!("{valid}1 views/{}\n", "2".repeat(128))
+            }
+            _ => unreachable!(),
+        };
+        let file = NamedTempFile::new_in(destination.directory.path())?;
+        fs::write(file.path(), listing)?;
+        let quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        assert!(quarantine.plan_immutable_files(file.path()).is_err());
+        assert!(quarantine.staged.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test_case("missing")]
+    #[test_case("changed-size")]
+    #[test_case("changed-content")]
+    fn immutable_file_staging_rechecks_the_frozen_plan(case: &str) -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let tree = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(tree.id, &[], &[], "commit");
+        let head = source.operation(commit.id, None, "operation");
+        let objects = source.objects();
+        let inventory = objects.inventory_packed(std::slice::from_ref(&head), &[])?;
+        let files = objects.prepare_immutable_files(source.directory.path(), &inventory)?;
+        let mut quarantine = Quarantine::new(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+        )?;
+        let plan = plan_for_files(&quarantine, files.path())?;
+        let path = files.path().join("operations").join(head.hex());
+        match case {
+            "missing" => fs::remove_file(path)?,
+            "changed-size" => fs::write(path, b"changed")?,
+            "changed-content" => {
+                let mut bytes = fs::read(&path)?;
+                // This field still has its planned length, but no longer has
+                // the content authenticated by the advertised operation ID.
+                let offset = bytes
+                    .windows(9)
+                    .position(|bytes| bytes == b"operation")
+                    .unwrap();
+                bytes[offset] = b'X';
+                fs::write(path, bytes)?;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            quarantine
+                .stage_immutable_files(&destination.objects(), files.path(), &plan)
+                .is_err()
+        );
+        assert!(destination.operations.export_operation(&head).is_err());
+        Ok(())
     }
 
     fn fetch_test_pack(

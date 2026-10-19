@@ -318,6 +318,31 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Pins all retained history for a frozen receiver comparison basis.
+    /// This includes imported native operations outside the current causal tip.
+    pub fn pin_retained(
+        &self,
+        transfer: &str,
+    ) -> EndpointResult<(Vec<OperationId>, Vec<SharedEventId>)> {
+        let mut locked = self.state.lock()?;
+        let retained = locked.state().gc_roots();
+        let raw = retained
+            .raw_operations
+            .iter()
+            .map(|id| parse_raw_id(id))
+            .collect::<EndpointResult<Vec<_>>>()?;
+        let shared = retained
+            .shared_events
+            .iter()
+            .map(|id| parse_shared_id(id))
+            .collect::<EndpointResult<Vec<_>>>()?;
+        locked
+            .state_mut()
+            .pin_transfer(transfer.to_owned(), roots(&raw, &shared))?;
+        locked.save()?;
+        Ok((raw, shared))
+    }
+
     /// Releases a finished transfer's temporary roots after acknowledgment/retention.
     pub fn release_transfer(&self, transfer: &str) -> EndpointResult<()> {
         let mut locked = self.state.lock()?;

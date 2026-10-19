@@ -41,6 +41,8 @@ pub(crate) mod sync_endpoint;
 pub(crate) mod sync_git_transport;
 #[cfg(all(feature = "git", unix))]
 pub(crate) mod sync_process;
+#[cfg(all(feature = "git", unix))]
+pub(crate) mod sync_rsync_transport;
 pub(crate) mod sync_transport;
 pub mod template_builder;
 pub mod templater;
