@@ -18,6 +18,7 @@
 //! Callers protect advertised source roots while exporting, and hold the
 //! receiver's sync/GC lock while installing and pinning a validated closure.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
@@ -34,11 +35,14 @@ use super::SyncError;
 use super::SyncResult;
 use super::anchor::AnchorStore;
 use super::normalize::INTEGRATION_ANCHOR_ATTRIBUTE;
+use super::packed::GitPackReader;
+use super::packed::GitPackRepository;
 use super::shared::SharedEventId;
 use crate::backend::Backend as _;
 use crate::backend::CommitId;
 use crate::backend::TreeId;
 use crate::git_backend::GitBackend;
+use crate::git_backend::GitCommitMetadata;
 use crate::git_backend::GitObjectHeader;
 use crate::git_backend::GitObjectRecord;
 use crate::object_id::ObjectId as _;
@@ -58,7 +62,8 @@ const FILE_OVERHEAD: u64 = 4096;
 /// Receiver-controlled staging and validation budgets, independent of frame size.
 #[derive(Clone, Debug)]
 pub struct QuarantineLimits {
-    /// Total reserved body, metadata, and per-file allocation overhead.
+    /// Physical staging bytes, including metadata and per-file allocation overhead.
+    /// Raw transfers stage uncompressed bodies; native transfers retain packs.
     pub max_staged_bytes: u64,
     /// Maximum staging reservations or distinct validated records.
     pub max_records: usize,
@@ -82,7 +87,7 @@ impl QuarantineLimits {
         })
     }
 
-    fn check_space(&self, directory: &Path, additional: u64) -> SyncResult<()> {
+    pub(super) fn check_space(&self, directory: &Path, additional: u64) -> SyncResult<()> {
         if available_space(directory)?.saturating_sub(self.min_free_bytes) < additional {
             return Err(invalid(
                 "insufficient free space for synchronization; free disk space or adjust the local \
@@ -160,6 +165,8 @@ pub enum Record {
     SharedEvent(SharedEventId, Vec<u8>),
     /// Exact Git object bytes and the exact per-commit jj metadata entry.
     Git(GitObjectRecord),
+    /// Exact jj commit interpretation; its physical body travels in a native pack.
+    GitCommitMetadata(GitCommitMetadata),
     /// Announces an arbitrarily large physical object, followed by body chunks.
     GitHeader(GitObjectHeader),
     /// Contiguous body data for a previously announced physical object.
@@ -183,6 +190,7 @@ impl Record {
             Self::View(id, _) => RecordId::View(id.clone()),
             Self::SharedEvent(id, _) => RecordId::SharedEvent(id.clone()),
             Self::Git(record) => RecordId::Git(record.id),
+            Self::GitCommitMetadata(metadata) => RecordId::Git(metadata.id),
             Self::GitHeader(header) => RecordId::Git(header.id),
             Self::GitChunk { id, .. } | Self::GitEnd(id) => RecordId::Git(*id),
         }
@@ -204,7 +212,7 @@ impl Record {
         let id_length = bytes[2] as usize;
         if !(match kind {
             1..=3 => id_length == 64,
-            4..=10 => matches!(id_length, 20 | 32),
+            4..=11 => matches!(id_length, 20 | 32),
             _ => false,
         }) {
             return Err(invalid("invalid object record kind or identity length"));
@@ -261,6 +269,12 @@ impl Record {
                 })
             }
             10 if data.is_empty() && extras.is_none() => Ok(Self::GitEnd(git_id(id)?)),
+            11 if data.is_empty() && extras.is_some() => {
+                Ok(Self::GitCommitMetadata(GitCommitMetadata {
+                    id: git_id(id)?,
+                    extras: extras.unwrap(),
+                }))
+            }
             _ => Err(invalid("only Git commits can carry jj metadata")),
         }
     }
@@ -295,6 +309,7 @@ impl Record {
             Self::View(id, _) => id.as_bytes(),
             Self::SharedEvent(id, _) => id.as_bytes(),
             Self::Git(record) => record.id.as_bytes(),
+            Self::GitCommitMetadata(metadata) => metadata.id.as_bytes(),
             _ => unreachable!(),
         };
         if (kind <= 3 && id.len() != 64) || (kind > 3 && !matches!(id.len(), 20 | 32)) {
@@ -308,6 +323,7 @@ impl Record {
             Self::Operation(_, bytes) => (1, bytes, None),
             Self::View(_, bytes) => (2, bytes, None),
             Self::SharedEvent(_, bytes) => (3, bytes, None),
+            Self::GitCommitMetadata(metadata) => (11, &[], Some(&metadata.extras)),
             Self::Git(record) => (
                 match record.kind {
                     gix::objs::Kind::Commit => 4,
@@ -469,6 +485,70 @@ impl<'a> RepositoryObjects<'a> {
         }
     }
 
+    /// Emits jj records and mandatory per-commit sidecars for a native Git transfer.
+    /// Knowing the Git object does not authenticate its sender's jj interpretation.
+    pub fn export_metadata_records(
+        &self,
+        inventory: &Inventory,
+        known: &BTreeSet<RecordId>,
+        mut emit: impl FnMut(Record) -> SyncResult<()>,
+    ) -> SyncResult<()> {
+        for id in inventory.missing(known) {
+            match id {
+                RecordId::Git(id)
+                    if inventory
+                        .git_commits
+                        .contains(&CommitId::from_bytes(id.as_bytes())) =>
+                {
+                    let record =
+                        Record::GitCommitMetadata(self.backend.export_commit_metadata(id)?);
+                    self.validate_record(&record)?;
+                    emit(record)?;
+                }
+                RecordId::Git(_) => {}
+                _ => emit(self.export_record(id)?)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Walks Git dependencies through headers and native batch reads, never blob bodies.
+    pub fn inventory_packed(
+        &self,
+        raw_heads: &[OperationId],
+        shared_heads: &[SharedEventId],
+    ) -> SyncResult<Inventory> {
+        self.inventory_packed_with_git_roots(raw_heads, shared_heads, &[])
+    }
+
+    /// Includes explicit physical roots in a native packed dependency inventory.
+    pub fn inventory_packed_with_git_roots(
+        &self,
+        raw_heads: &[OperationId],
+        shared_heads: &[SharedEventId],
+        git_roots: &[gix::ObjectId],
+    ) -> SyncResult<Inventory> {
+        let reader = RefCell::new(GitPackReader::new(
+            self.backend.git_executable_path().as_os_str(),
+            self.backend.git_repo_path(),
+        )?);
+        build_inventory(
+            self,
+            raw_heads,
+            shared_heads,
+            git_roots,
+            None,
+            |id| match id {
+                RecordId::Git(id) => Ok(Record::GitCommitMetadata(
+                    self.backend.export_commit_metadata(id)?,
+                )),
+                _ => self.export_record(id),
+            },
+            |_, _| Err(invalid("packed inventory cannot stream raw Git records")),
+            Some(&reader),
+        )
+    }
+
     /// Validates all roots and dependencies, including records a peer already knows.
     pub fn inventory(
         &self,
@@ -497,6 +577,7 @@ impl<'a> RepositoryObjects<'a> {
                     .export_object_stream(header, to)
                     .map_err(Into::into)
             },
+            None,
         )
     }
 
@@ -514,6 +595,9 @@ impl<'a> RepositoryObjects<'a> {
                 AnchorStore::decode(id, bytes)?;
             }
             Record::Git(record) => self.backend.validate_object_import(record)?,
+            Record::GitCommitMetadata(metadata) => {
+                self.backend.validate_commit_metadata_encoding(metadata)?
+            }
             Record::GitHeader(header) => {
                 if header.id.kind() != self.backend.git_repo().object_hash()
                     || (header.kind == gix::objs::Kind::Commit) != header.commit_extras.is_some()
@@ -540,6 +624,7 @@ pub struct Quarantine {
     limits: QuarantineLimits,
     reserved_bytes: u64,
     reserved_records: usize,
+    packed: Option<GitPackRepository>,
 }
 
 struct PendingStream {
@@ -574,13 +659,56 @@ impl Quarantine {
             limits,
             reserved_bytes: 0,
             reserved_records: 0,
+            packed: None,
         })
+    }
+
+    /// Attaches the disposable Git receiver after native pack transfer.
+    pub fn set_git_pack_repository(&mut self, repository: GitPackRepository) -> SyncResult<()> {
+        if self.packed.is_some()
+            || !self.streams.is_empty()
+            || self.staged.iter().any(|id| matches!(id, RecordId::Git(_)))
+        {
+            return Err(invalid(
+                "packed Git receiver must be attached before staging Git metadata",
+            ));
+        }
+        if repository.git_repo().object_hash().len_in_bytes()
+            != self.root_commit_id.as_bytes().len()
+        {
+            return Err(invalid(
+                "packed Git receiver uses a different object format",
+            ));
+        }
+        self.packed = Some(repository);
+        Ok(())
+    }
+
+    /// Byte allowance left for native packs after immutable metadata staging.
+    pub fn remaining_packed_bytes(&self) -> u64 {
+        self.limits
+            .max_staged_bytes
+            .saturating_sub(self.reserved_bytes)
     }
 
     /// Validates one bounded record against the receiver before saving it to disk.
     pub fn stage(&mut self, receiver: &RepositoryObjects<'_>, record: &Record) -> SyncResult<()> {
         self.check_receiver(receiver)?;
         record.check_size()?;
+        match (self.packed.is_some(), record) {
+            (false, Record::GitCommitMetadata(_)) => {
+                return Err(invalid("packed commit metadata was not negotiated"));
+            }
+            (
+                true,
+                Record::Git(_) | Record::GitHeader(_) | Record::GitChunk { .. } | Record::GitEnd(_),
+            ) => {
+                return Err(invalid(
+                    "raw Git body received during native packed transfer",
+                ));
+            }
+            _ => {}
+        }
         match record {
             Record::GitHeader(header) => {
                 if self.streams.contains_key(&header.id) || self.staged.contains(&record.id()) {
@@ -689,7 +817,9 @@ impl Quarantine {
     fn save_record(&mut self, record: &Record) -> SyncResult<()> {
         let id = record.id();
         if self.staged.contains(&id) {
-            if matches!(record, Record::Git(_)) && self.read_record(&id)? != *record {
+            if matches!(record, Record::Git(_) | Record::GitCommitMetadata(_))
+                && self.read_record(&id)? != *record
+            {
                 return Err(invalid(
                     "different Git metadata supplied twice for one staged identity",
                 ));
@@ -744,7 +874,13 @@ impl Quarantine {
         if !self.streams.is_empty() {
             return Err(invalid("object transfer has unfinished body streams"));
         }
-        build_inventory(
+        let packed_reader = self
+            .packed
+            .as_ref()
+            .map(|repository| repository.read_objects())
+            .transpose()?
+            .map(RefCell::new);
+        let inventory = build_inventory(
             receiver,
             raw_heads,
             shared_heads,
@@ -753,6 +889,10 @@ impl Quarantine {
             |id| {
                 if self.staged.contains(id) {
                     self.read_record(id)
+                } else if self.packed.is_some() && matches!(id, RecordId::Git(_)) {
+                    Err(invalid(
+                        "native Git transfer omitted mandatory commit metadata",
+                    ))
                 } else {
                     receiver.export_record(id)
                 }
@@ -768,7 +908,17 @@ impl Quarantine {
                         .map_err(Into::into)
                 }
             },
-        )
+            packed_reader.as_ref(),
+        )?;
+        if let Some(packed) = &self.packed {
+            let mut limits = self.limits.clone();
+            limits.max_staged_bytes = limits
+                .max_staged_bytes
+                .checked_sub(self.reserved_bytes)
+                .ok_or_else(|| invalid("metadata exceeds native Git quarantine budget"))?;
+            packed.validate_received(receiver.backend, &inventory, &limits)?;
+        }
+        Ok(inventory)
     }
 
     /// Installs a complete validated closure and its retention refs, without activation.
@@ -787,6 +937,43 @@ impl Quarantine {
         if verified != *inventory {
             return Err(invalid("inventory changed before immutable installation"));
         }
+        let _packed_promotion = self
+            .packed
+            .as_ref()
+            .map(|packed| packed.promote(receiver.backend))
+            .transpose()?;
+        if let Some(packed) = &self.packed {
+            let reader = RefCell::new(packed.read_objects()?);
+            receiver.backend.import_commit_metadata(
+                inventory
+                    .git_commits
+                    .iter()
+                    .map(|id| gix::ObjectId::from_bytes_or_panic(id.as_bytes())),
+                |id| match self
+                    .read_record(&RecordId::Git(id.to_owned()))
+                    .map_err(|err| crate::backend::BackendError::Other(err.into()))?
+                {
+                    Record::GitCommitMetadata(metadata) => Ok(metadata.extras),
+                    _ => Err(crate::backend::BackendError::Other(
+                        "packed commit sidecar is missing".into(),
+                    )),
+                },
+                |id, to| {
+                    reader
+                        .borrow_mut()
+                        .with_object(id, |kind, _, from| {
+                            if kind != gix::objs::Kind::Commit {
+                                return Err(invalid(
+                                    "commit metadata points to a non-commit object",
+                                ));
+                            }
+                            std::io::copy(from, to)?;
+                            Ok(())
+                        })
+                        .map_err(|err| crate::backend::BackendError::Other(err.into()))
+                },
+            )?;
+        }
         for id in inventory.records.intersection(&self.staged) {
             match self.read_record(id)? {
                 Record::Operation(id, bytes) => {
@@ -803,6 +990,7 @@ impl Quarantine {
                     &header,
                     &mut fs::File::open(self.body_path(&header.id))?,
                 )?,
+                Record::GitCommitMetadata(_) => {}
                 Record::GitChunk { .. } | Record::GitEnd(_) => {
                     return Err(invalid(
                         "unfinished streaming record in validated inventory",
@@ -841,6 +1029,7 @@ fn build_inventory(
     limits: Option<(&QuarantineLimits, &Path)>,
     read: impl Fn(&RecordId) -> SyncResult<Record>,
     stream: impl Fn(&GitObjectHeader, &mut dyn std::io::Write) -> SyncResult<()>,
+    packed: Option<&RefCell<GitPackReader>>,
 ) -> SyncResult<Inventory> {
     if limits.is_some_and(|(limits, _)| {
         raw_heads
@@ -906,6 +1095,64 @@ fn build_inventory(
                 "dependency closure exceeds the local sync.max-records budget; increase that \
                  setting",
             ));
+        }
+        if let (RecordId::Git(git_id), Some(reader)) = (&id, packed) {
+            let (kind, size) = reader.borrow().header(git_id)?;
+            if expected.is_some_and(|expected| expected != kind) {
+                return Err(invalid("Git dependency has the wrong object type"));
+            }
+            git_kinds.insert(*git_id, kind);
+            // Native Git has already verified physical hashes. Blob bodies
+            // have no dependencies and never pass through Rust staging.
+            if kind != gix::objs::Kind::Blob {
+                let metadata = if kind == gix::objs::Kind::Commit {
+                    let record = read(&id)?;
+                    if record.id() != id {
+                        return Err(invalid("commit sidecar has the wrong identity"));
+                    }
+                    if let Some((limits, _)) = limits {
+                        preflight_metadata(&record, limits.max_dependencies)?;
+                    }
+                    receiver.validate_record(&record)?;
+                    let Record::GitCommitMetadata(metadata) = record else {
+                        return Err(invalid(
+                            "native Git transfer requires commit metadata sidecars",
+                        ));
+                    };
+                    Some(metadata)
+                } else {
+                    None
+                };
+                let header = GitObjectHeader {
+                    id: *git_id,
+                    kind,
+                    size,
+                    commit_extras: metadata.as_ref().map(|metadata| metadata.extras.clone()),
+                };
+                reader
+                    .borrow_mut()
+                    .with_object(git_id, |actual_kind, actual_size, from| {
+                        if actual_kind != kind || actual_size != size {
+                            return Err(invalid("packed object changed during validation"));
+                        }
+                        if let Some(metadata) = &metadata {
+                            receiver
+                                .backend
+                                .inspect_packed_commit(metadata, from, |from| {
+                                    streamed_dependencies(
+                                        &header,
+                                        from,
+                                        &mut pending,
+                                        &mut inventory,
+                                    )
+                                })
+                        } else {
+                            streamed_dependencies(&header, from, &mut pending, &mut inventory)
+                        }
+                    })?;
+            }
+            inventory.records.insert(id);
+            continue;
         }
         let record = read(&id)?;
         if record.id() != id {
@@ -1053,6 +1300,11 @@ fn build_inventory(
                     .validate_object_stream(&header, body.as_file_mut())?;
                 body.as_file_mut().rewind()?;
                 streamed_dependencies(&header, body.as_file_mut(), &mut pending, &mut inventory)?;
+            }
+            Record::GitCommitMetadata(_) => {
+                return Err(invalid(
+                    "commit metadata sidecar has no native Git object source",
+                ));
             }
             Record::GitChunk { .. } | Record::GitEnd(_) => {
                 return Err(invalid(
@@ -1226,6 +1478,9 @@ fn preflight_metadata(record: &Record, max_fields: usize) -> SyncResult<()> {
                 metadata_limits::check_git_extras(bytes, max_fields)
             })
         }
+        Record::GitCommitMetadata(metadata) => {
+            metadata_limits::check_git_extras(&metadata.extras, max_fields)
+        }
         Record::GitHeader(header) => header.commit_extras.as_deref().map_or(Ok(()), |bytes| {
             metadata_limits::check_git_extras(bytes, max_fields)
         }),
@@ -1309,7 +1564,7 @@ impl<F: FnMut(Record) -> SyncResult<()>> std::io::Write for ChunkWriter<'_, F> {
 
 fn streamed_dependencies(
     header: &GitObjectHeader,
-    from: &mut impl std::io::Read,
+    from: &mut dyn std::io::Read,
     pending: &mut PendingObjects,
     inventory: &mut Inventory,
 ) -> SyncResult<()> {
@@ -1686,6 +1941,337 @@ mod tests {
             }
             self.operations.write_operation(&op).block_on().unwrap()
         }
+    }
+
+    fn fetch_test_pack(
+        source: &GitPackRepository,
+        receiver: &GitPackRepository,
+        backend: &GitBackend,
+    ) {
+        let output = std::process::Command::new(backend.git_executable_path())
+            .arg("--git-dir")
+            .arg(receiver.path())
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "fetch",
+                "--no-tags",
+                "--no-auto-maintenance",
+                "--no-write-fetch-head",
+            ])
+            .arg(source.path())
+            .arg("+refs/jj-sync/export/*:refs/jj-sync/incoming/*")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test_case(gix::hash::Kind::Sha1; "sha1")]
+    #[test_case(gix::hash::Kind::Sha256; "sha256")]
+    fn packed_quarantine_preserves_metadata_predecessors_and_legacy_trees(
+        hash: gix::hash::Kind,
+    ) -> TestResult {
+        let source = Fixture::new(hash);
+        let destination = Fixture::new(hash);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let blob = source.object(gix::objs::Kind::Blob, b"legacy tree body".to_vec(), None);
+        let mut bytes = b"100644 file\0".to_vec();
+        bytes.extend(blob.id.as_bytes());
+        let tree = source.object(gix::objs::Kind::Tree, bytes, None);
+        let predecessor = source.commit(tree.id, &[], &[], "metadata-only predecessor");
+        let physical = source.commit(empty.id, &[], &[], "legacy conflict");
+        let extras = crate::protos::git_store::Commit {
+            change_id: vec![7; 16],
+            predecessors: vec![predecessor.id.as_bytes().to_vec()],
+            uses_tree_conflict_format: true,
+            root_tree: vec![
+                tree.id.as_bytes().to_vec(),
+                empty.id.as_bytes().to_vec(),
+                tree.id.as_bytes().to_vec(),
+            ],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let mut body = physical.data;
+        body.extend(b" with detached tree terms");
+        let commit = source.object(gix::objs::Kind::Commit, body, Some(extras));
+        let head = source.operation(commit.id, None, "packed foreign history");
+        let objects = source.objects();
+        let inventory = objects.inventory_packed(std::slice::from_ref(&head), &[])?;
+        assert_eq!(
+            inventory,
+            objects.inventory(std::slice::from_ref(&head), &[])?
+        );
+        let limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        let sender = GitPackRepository::sender(
+            source.directory.path(),
+            &source.backend,
+            &inventory,
+            &limits,
+        )?;
+        let receiver_inventory = destination.objects().inventory_packed(&[], &[])?;
+        let packed = GitPackRepository::receiver(
+            destination.directory.path(),
+            &destination.backend,
+            &receiver_inventory,
+            &limits,
+        )?;
+        fetch_test_pack(&sender, &packed, &destination.backend);
+        let mut quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        quarantine.set_git_pack_repository(packed)?;
+        // Even claiming every physical object as known cannot omit its jj identity.
+        let known = inventory
+            .records
+            .iter()
+            .filter(|id| matches!(id, RecordId::Git(_)))
+            .cloned()
+            .collect();
+        let mut sidecars = 0;
+        objects.export_metadata_records(&inventory, &known, |record| {
+            assert!(!matches!(
+                record,
+                Record::Git(_) | Record::GitHeader(_) | Record::GitChunk { .. } | Record::GitEnd(_)
+            ));
+            if matches!(record, Record::GitCommitMetadata(_)) {
+                sidecars += 1;
+            }
+            assert_eq!(Record::decode(&record.encode()?)?, record);
+            quarantine.stage(&destination.objects(), &record)
+        })?;
+        assert_eq!(sidecars, inventory.git_commits.len());
+        let validated =
+            quarantine.validate(&destination.objects(), std::slice::from_ref(&head), &[])?;
+        assert_eq!(validated, inventory);
+        quarantine.install(&destination.objects(), &validated)?;
+        assert_eq!(destination.backend.export_object(&commit.id)?, commit);
+        assert_eq!(
+            destination.backend.export_object(&predecessor.id)?,
+            predecessor
+        );
+        assert_eq!(
+            destination.operations.export_operation(&head)?,
+            source.operations.export_operation(&head)?
+        );
+        let blob_hex = blob.id.to_string();
+        let objects_path = destination.backend.git_repo_path().join("objects");
+        assert!(
+            !objects_path
+                .join(&blob_hex[..2])
+                .join(&blob_hex[2..])
+                .exists()
+        );
+        assert!(fs::read_dir(objects_path.join("pack"))?.any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "pack")
+        }));
+        assert!(
+            destination
+                .backend
+                .git_repo()
+                .find_reference(format!("refs/jj/sync/trees/{}", tree.id).as_str())
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn packed_metadata_conflicts_and_missing_sidecars_fail_closed() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(empty.id, &[], &[], "known physical commit");
+        let head = source.operation(commit.id, None, "incoming");
+        let inventory = source
+            .objects()
+            .inventory_packed(std::slice::from_ref(&head), &[])?;
+        let mut existing = commit.clone();
+        let mut extras =
+            crate::protos::git_store::Commit::decode(existing.commit_extras.as_deref().unwrap())?;
+        extras.change_id = vec![9; 16];
+        existing.commit_extras = Some(extras.encode_to_vec());
+        destination.backend.import_object(&existing)?;
+        let limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        let known =
+            destination
+                .objects()
+                .inventory_packed_with_git_roots(&[], &[], &[commit.id])?;
+        let packed = GitPackRepository::receiver(
+            destination.directory.path(),
+            &destination.backend,
+            &known,
+            &limits,
+        )?;
+        let mut quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        quarantine.set_git_pack_repository(packed)?;
+        source
+            .objects()
+            .export_metadata_records(&inventory, &BTreeSet::new(), |record| {
+                if matches!(record, Record::GitCommitMetadata(_)) {
+                    return Ok(());
+                }
+                quarantine.stage(&destination.objects(), &record)
+            })?;
+        assert!(
+            quarantine
+                .validate(&destination.objects(), std::slice::from_ref(&head), &[])
+                .unwrap_err()
+                .to_string()
+                .contains("omitted mandatory commit metadata")
+        );
+        let sidecar = Record::GitCommitMetadata(source.backend.export_commit_metadata(&commit.id)?);
+        quarantine.stage(&destination.objects(), &sidecar)?;
+        assert!(
+            quarantine
+                .validate(&destination.objects(), std::slice::from_ref(&head), &[])
+                .is_err()
+        );
+        assert_eq!(destination.backend.export_object(&commit.id)?, existing);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_quarantine_rejects_unoffered_received_objects() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(empty.id, &[], &[], "offered");
+        let head = source.operation(commit.id, None, "incoming");
+        let extra = source.object(
+            gix::objs::Kind::Blob,
+            b"not in captured history".to_vec(),
+            None,
+        );
+        let inventory = source
+            .objects()
+            .inventory_packed(std::slice::from_ref(&head), &[])?;
+        let limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        let sender = GitPackRepository::sender(
+            source.directory.path(),
+            &source.backend,
+            &inventory,
+            &limits,
+        )?;
+        fs::create_dir_all(sender.path().join("refs/jj-sync/export"))?;
+        fs::write(
+            sender.path().join("refs/jj-sync/export/unoffered"),
+            format!("{}\n", extra.id),
+        )?;
+        let packed = GitPackRepository::receiver(
+            destination.directory.path(),
+            &destination.backend,
+            &Inventory::default(),
+            &limits,
+        )?;
+        fetch_test_pack(&sender, &packed, &destination.backend);
+        let mut quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        quarantine.set_git_pack_repository(packed)?;
+        source
+            .objects()
+            .export_metadata_records(&inventory, &BTreeSet::new(), |record| {
+                quarantine.stage(&destination.objects(), &record)
+            })?;
+        assert!(
+            quarantine
+                .validate(&destination.objects(), std::slice::from_ref(&head), &[])
+                .unwrap_err()
+                .to_string()
+                .contains("outside the offered inventory")
+        );
+        assert!(destination.backend.export_object(&extra.id).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn packed_quarantine_budget_counts_compressed_files_not_blob_bodies() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let blob = source.object(gix::objs::Kind::Blob, vec![b'x'; 4 * 1024 * 1024], None);
+        let mut bytes = b"100644 compressible\0".to_vec();
+        bytes.extend(blob.id.as_bytes());
+        let tree = source.object(gix::objs::Kind::Tree, bytes, None);
+        let commit = source.commit(tree.id, &[], &[], "large compressed blob");
+        let head = source.operation(commit.id, None, "compressed history");
+        let inventory = source
+            .objects()
+            .inventory_packed(std::slice::from_ref(&head), &[])?;
+        // Leave room for Git's administrative files and their allocation
+        // overhead while staying far below the uncompressed blob's size.
+        let limits = tiny_limits(512 * 1024);
+        let sender = GitPackRepository::sender(
+            source.directory.path(),
+            &source.backend,
+            &inventory,
+            &limits,
+        )?;
+        assert!(!sender.path().join("refs/jj-sync/export").exists());
+        let packed = GitPackRepository::receiver(
+            destination.directory.path(),
+            &destination.backend,
+            &Inventory::default(),
+            &limits,
+        )?;
+        fetch_test_pack(&sender, &packed, &destination.backend);
+        let extra_scratch = packed.path().join("extra-scratch");
+        let mut quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits,
+        )?;
+        quarantine.set_git_pack_repository(packed)?;
+        source
+            .objects()
+            .export_metadata_records(&inventory, &BTreeSet::new(), |record| {
+                assert!(!matches!(
+                    record,
+                    Record::Git(_)
+                        | Record::GitHeader(_)
+                        | Record::GitChunk { .. }
+                        | Record::GitEnd(_)
+                ));
+                quarantine.stage(&destination.objects(), &record)
+            })?;
+        // Control files and incoming refs consume the same physical allowance
+        // as object packs, even though they are never promoted to the live ODB.
+        fs::write(&extra_scratch, vec![0; 512 * 1024])?;
+        assert!(
+            quarantine
+                .validate(&destination.objects(), std::slice::from_ref(&head), &[])
+                .unwrap_err()
+                .to_string()
+                .contains("sync.max-quarantine-bytes")
+        );
+        fs::remove_file(extra_scratch)?;
+        let validated =
+            quarantine.validate(&destination.objects(), std::slice::from_ref(&head), &[])?;
+        assert!(fs::read_dir(quarantine.directory.path())?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("body-")
+        }));
+        quarantine.install(&destination.objects(), &validated)?;
+        assert_eq!(destination.backend.export_object(&blob.id)?, blob);
+        Ok(())
     }
 
     #[test_case(gix::hash::Kind::Sha1; "sha1")]

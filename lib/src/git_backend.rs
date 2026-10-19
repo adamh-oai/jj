@@ -192,6 +192,13 @@ pub struct GitObjectHeader {
     pub commit_extras: Option<Vec<u8>>,
 }
 
+/// Exact jj interpretation of a commit whose Git body travels in a native pack.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommitMetadata {
+    pub id: gix::ObjectId,
+    pub extras: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum GitRepoAtWorkdirError {
     #[error("No Git repository found at {path}")]
@@ -447,6 +454,11 @@ impl GitBackend {
         self.base_repo.path()
     }
 
+    /// Configured native Git executable used by repository synchronization.
+    pub fn git_executable_path(&self) -> &Path {
+        Path::new(&self.git_executable)
+    }
+
     fn shallow_root_ids(&self, git_repo: &gix::Repository) -> BackendResult<&[CommitId]> {
         // The list of shallow roots is cached by gix, but it's still expensive
         // to stat file on every read_object() call. Refreshing shallow roots is
@@ -606,6 +618,130 @@ impl GitBackend {
             }
         }
         Ok(header)
+    }
+
+    /// Exports the immutable per-commit entry, independently of its Git body.
+    pub fn export_commit_metadata(&self, id: &gix::oid) -> BackendResult<GitCommitMetadata> {
+        let header = self.export_object_header(id)?;
+        let extras = header.commit_extras.ok_or_else(|| {
+            BackendError::Other("commit metadata requested for a non-commit object".into())
+        })?;
+        Ok(GitCommitMetadata {
+            id: id.to_owned(),
+            extras,
+        })
+    }
+
+    /// Checks the bounded metadata encoding without requiring its packed body yet.
+    pub fn validate_commit_metadata_encoding(
+        &self,
+        metadata: &GitCommitMetadata,
+    ) -> BackendResult<()> {
+        if metadata.id.kind() != self.git_repo().object_hash() {
+            return Err(BackendError::Other(
+                "commit metadata uses the wrong Git object format".into(),
+            ));
+        }
+        validate_object_extras(&metadata.id, &metadata.extras)?;
+        Ok(())
+    }
+
+    /// Inspects a natively verified packed commit and checks its jj identity.
+    /// The body is streamed once, without hashing or copying it into staging again.
+    pub(crate) fn inspect_packed_commit<T, E>(
+        &self,
+        metadata: &GitCommitMetadata,
+        from: &mut dyn io::Read,
+        inspect: impl FnOnce(&mut dyn io::Read) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<BackendError> + From<io::Error>,
+    {
+        self.validate_commit_metadata_encoding(metadata)?;
+        let mut reader = CommitIdentityReader {
+            from,
+            scanner: CommitIdentityScanner::new(metadata.id),
+        };
+        let result = inspect(&mut reader)?;
+        io::copy(&mut reader, &mut io::sink())?;
+        let identity = reader.scanner.finish()?;
+        let (tables, _lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)
+            .map_err(BackendError::from)?;
+        let header = metadata.header();
+        for table in tables {
+            if let Some(existing) = table.get_value(metadata.id.as_bytes()) {
+                identity.validate_existing(&header, existing)?;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Installs sidecars in bounded batches under the ordinary metadata lock.
+    /// All competing heads are checked before merging them. Physical packs must
+    /// already be verified; callers protect them until commit/tree refs are pinned.
+    pub fn import_commit_metadata(
+        &self,
+        ids: impl Iterator<Item = gix::ObjectId> + Clone,
+        mut metadata: impl FnMut(&gix::oid) -> BackendResult<Vec<u8>>,
+        mut body: impl FnMut(&gix::oid, &mut dyn io::Write) -> BackendResult<()>,
+    ) -> BackendResult<()> {
+        let (tables, lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        for id in ids.clone() {
+            let incoming = GitCommitMetadata {
+                id,
+                extras: metadata(&id)?,
+            };
+            self.validate_commit_metadata_encoding(&incoming)?;
+            if tables.iter().any(|table| {
+                table
+                    .get_value(id.as_bytes())
+                    .is_some_and(|existing| existing != incoming.extras.as_slice())
+            }) {
+                let mut writer = CommitIdentityWriter(CommitIdentityScanner::new(id));
+                body(&id, &mut writer)?;
+                let identity = writer.0.finish()?;
+                let header = incoming.header();
+                for table in &tables {
+                    if let Some(existing) = table.get_value(id.as_bytes()) {
+                        identity.validate_existing(&header, existing)?;
+                    }
+                }
+            }
+        }
+        let mut table = self
+            .extra_metadata_store
+            .merge_head_tables_locked(tables, &lock)
+            .map_err(GitBackendError::ReadMetadata)?;
+        let mut mutation = table.start_mutation();
+        let mut bytes = 0usize;
+        let mut count = 0usize;
+        for id in ids {
+            if table.get_value(id.as_bytes()).is_some() {
+                continue;
+            }
+            let extras = metadata(&id)?;
+            validate_object_extras(&id, &extras)?;
+            bytes = bytes.saturating_add(extras.len());
+            mutation.add_entry(id.as_bytes().to_vec(), extras);
+            count += 1;
+            if count >= 512 || bytes >= 64 * 1024 * 1024 {
+                self.save_extra_metadata_table(mutation, &lock)?;
+                table = self.cached_extra_metadata_table()?;
+                mutation = table.start_mutation();
+                bytes = 0;
+                count = 0;
+            }
+        }
+        if count != 0 {
+            self.save_extra_metadata_table(mutation, &lock)?;
+        }
+        Ok(())
     }
 
     /// Streams exact Git bytes from loose or packed storage to the writer.
@@ -1339,6 +1475,45 @@ struct StreamedCommitIdentity {
     change_id: ChangeId,
     physical_tree: TreeId,
     has_tree_conflict: bool,
+}
+
+impl GitCommitMetadata {
+    fn header(&self) -> GitObjectHeader {
+        GitObjectHeader {
+            id: self.id,
+            kind: gix::objs::Kind::Commit,
+            size: 0,
+            commit_extras: Some(self.extras.clone()),
+        }
+    }
+}
+
+struct CommitIdentityReader<'a> {
+    from: &'a mut dyn io::Read,
+    scanner: CommitIdentityScanner,
+}
+
+impl io::Read for CommitIdentityReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let length = self.from.read(bytes)?;
+        self.scanner
+            .update(&bytes[..length])
+            .map_err(io::Error::other)?;
+        Ok(length)
+    }
+}
+
+struct CommitIdentityWriter(CommitIdentityScanner);
+
+impl io::Write for CommitIdentityWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes).map_err(io::Error::other)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl StreamedCommitIdentity {

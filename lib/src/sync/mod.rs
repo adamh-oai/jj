@@ -22,6 +22,8 @@ mod metadata_limits;
 pub mod normalize;
 #[cfg(feature = "git")]
 pub mod objects;
+#[cfg(feature = "git")]
+pub mod packed;
 pub mod protocol;
 pub mod reconcile;
 pub mod shared;
