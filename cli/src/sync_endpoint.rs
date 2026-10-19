@@ -41,6 +41,8 @@ use jj_lib::sync::objects::QuarantineLimits;
 use jj_lib::sync::objects::Record;
 use jj_lib::sync::objects::RecordId;
 use jj_lib::sync::objects::RepositoryObjects;
+#[cfg(unix)]
+use jj_lib::sync::packed::GitPackRepository;
 use jj_lib::sync::protocol::Direction;
 use jj_lib::sync::protocol::Hello;
 use jj_lib::sync::protocol::Message;
@@ -72,6 +74,7 @@ const CAPABILITIES: [&str; 4] = [
     "local-workspaces-v1",
 ];
 const INITIALIZE_RECEIVER_CAPABILITY: &str = "initialize-receiver-v1";
+const NATIVE_GIT_CAPABILITY: &str = "native-git-pack-v1";
 const NEGOTIATE_OBJECT_HASH: &str = "auto";
 const INVENTORY_BATCH_SIZE: usize = 512;
 const MAX_INVENTORY_BATCH_BYTES: usize = INVENTORY_BATCH_SIZE * 192;
@@ -154,6 +157,17 @@ impl<'a> TransferProgress<'a> {
 trait Stream {
     fn send(&mut self, message: &Message) -> Result<(), CommandError>;
     fn receive(&mut self) -> Result<Message, CommandError>;
+
+    #[cfg(unix)]
+    fn transfer_git(
+        &mut self,
+        _git: &Path,
+        _repository: &Path,
+        _sending: bool,
+        _max_received_bytes: u64,
+    ) -> Result<crate::sync_git_transport::GitTransferReport, CommandError> {
+        Err(user_error("This stream cannot transfer native Git data"))
+    }
 }
 
 impl Stream for Transport {
@@ -166,9 +180,34 @@ impl Stream for Transport {
             .map_err(failed)
             .and_then(check_peer_error)
     }
+
+    #[cfg(unix)]
+    fn transfer_git(
+        &mut self,
+        git: &Path,
+        repository: &Path,
+        sending: bool,
+        max_received_bytes: u64,
+    ) -> Result<crate::sync_git_transport::GitTransferReport, CommandError> {
+        use crate::sync_git_transport::GitAction;
+        let action = if sending {
+            GitAction::Push
+        } else {
+            GitAction::Fetch
+        };
+        let (reader, writer) = self.framed_io_mut().map_err(failed)?;
+        crate::sync_git_transport::run_client(
+            git,
+            repository,
+            action,
+            max_received_bytes,
+            reader,
+            writer,
+        )
+    }
 }
 
-impl<R: Read, W: io::Write> Stream for Session<R, W> {
+impl<R: Read + Send, W: io::Write> Stream for Session<R, W> {
     fn send(&mut self, message: &Message) -> Result<(), CommandError> {
         Self::send(self, message).map_err(failed)
     }
@@ -177,6 +216,31 @@ impl<R: Read, W: io::Write> Stream for Session<R, W> {
         Self::receive(self)
             .map_err(failed)
             .and_then(check_peer_error)
+    }
+
+    #[cfg(unix)]
+    fn transfer_git(
+        &mut self,
+        git: &Path,
+        repository: &Path,
+        sending: bool,
+        max_received_bytes: u64,
+    ) -> Result<crate::sync_git_transport::GitTransferReport, CommandError> {
+        use crate::sync_git_transport::GitService;
+        let service = if sending {
+            GitService::UploadPack
+        } else {
+            GitService::ReceivePack
+        };
+        let (reader, writer) = self.split_mut();
+        crate::sync_git_transport::run_server(
+            git,
+            repository,
+            service,
+            max_received_bytes,
+            reader,
+            writer,
+        )
     }
 }
 
@@ -283,6 +347,7 @@ struct PreparedEndpoint {
     transfer: String,
     pins: Vec<String>,
     publication_leases: Vec<FileLock>,
+    packed_git: bool,
 }
 
 impl PreparedEndpoint {
@@ -291,6 +356,7 @@ impl PreparedEndpoint {
         command: &CommandHelper,
         root: &Path,
         ignore_working_copy: bool,
+        packed_git: bool,
     ) -> Result<Self, CommandError> {
         tracing::debug!(
             path = %root.display(),
@@ -364,6 +430,7 @@ impl PreparedEndpoint {
             &endpoint,
             &capture.raw_heads,
             &capture.shared_heads,
+            packed_git,
         )?;
         Ok(Self {
             helper,
@@ -375,6 +442,7 @@ impl PreparedEndpoint {
             pins: vec![transfer.clone()],
             publication_leases: Vec::new(),
             transfer,
+            packed_git,
         })
     }
 
@@ -422,27 +490,67 @@ impl PreparedEndpoint {
             &self.advertise_inventory(inventory, shared)?,
         )?;
         let objects = objects(&self.helper, &self.endpoint)?;
+        #[cfg(unix)]
+        let git_repository = (self.packed_git
+            && (!inventory.git_commits.is_empty()
+                || !inventory.legacy_tree_roots.is_empty()
+                || !inventory.git_roots.is_empty()))
+        .then(|| {
+            GitPackRepository::sender(
+                &self.helper.repo_path().join("sync"),
+                jj_lib::git::get_git_backend(self.helper.repo().store())?,
+                inventory,
+                &self.quarantine_limits()?,
+            )
+            .map_err(failed)
+        })
+        .transpose()?;
         let mut progress = TransferProgress::new(
             ui,
             &self.root,
             "Sending",
-            Some(inventory.missing(known).count()),
+            Some(
+                inventory
+                    .missing(known)
+                    .filter(|id| {
+                        !self.packed_git
+                            || match id {
+                                RecordId::Git(id) => inventory.git_commits.contains(
+                                    &jj_lib::backend::CommitId::from_bytes(id.as_bytes()),
+                                ),
+                                _ => true,
+                            }
+                    })
+                    .count(),
+            ),
         );
-        for id in inventory.missing(known) {
+        let mut emit = |record: Record| {
+            let bytes = record.encode()?;
+            let encoded_bytes = bytes.len();
+            stream
+                .send(&Message::Record(bytes))
+                .map_err(|err| SyncError::InvalidData(command_error_message(&err)))?;
+            progress.record(&record, encoded_bytes);
+            Ok(())
+        };
+        if self.packed_git {
             objects
-                .export_records(id, |record| {
-                    let bytes = record.encode()?;
-                    let encoded_bytes = bytes.len();
-                    stream
-                        .send(&Message::Record(bytes))
-                        .map_err(|err| SyncError::InvalidData(command_error_message(&err)))?;
-                    progress.record(&record, encoded_bytes);
-                    Ok(())
-                })
+                .export_metadata_records(inventory, known, &mut emit)
                 .map_err(failed)?;
+        } else {
+            for id in inventory.missing(known) {
+                objects.export_records(id, &mut emit).map_err(failed)?;
+            }
         }
         stream.send(&Message::Done(Vec::new()))?;
         progress.finish();
+        #[cfg(unix)]
+        if self.packed_git {
+            send_command(stream, "git-pack", &git_repository.is_some())?;
+            if let Some(repository) = git_repository {
+                self.transfer_git(ui, stream, repository.path(), true, u64::MAX)?;
+            }
+        }
         Ok(())
     }
 
@@ -472,6 +580,23 @@ impl PreparedEndpoint {
             self.quarantine_limits()?,
         )
         .map_err(failed)?;
+        #[cfg(unix)]
+        let git_repository_path = if self.packed_git {
+            let repository = GitPackRepository::receiver(
+                &self.helper.repo_path().join("sync"),
+                jj_lib::git::get_git_backend(self.helper.repo().store())?,
+                &self.inventory,
+                &self.quarantine_limits()?,
+            )
+            .map_err(failed)?;
+            let path = repository.path().to_owned();
+            quarantine
+                .set_git_pack_repository(repository)
+                .map_err(failed)?;
+            Some(path)
+        } else {
+            None
+        };
         let mut progress = TransferProgress::new(ui, &self.root, "Receiving", None);
         loop {
             match stream.receive()? {
@@ -489,6 +614,19 @@ impl PreparedEndpoint {
             }
         }
         progress.finish();
+        #[cfg(unix)]
+        if let Some(path) = git_repository_path {
+            let has_git_objects: bool = receive_command(stream, "git-pack")?;
+            if has_git_objects {
+                self.transfer_git(
+                    ui,
+                    stream,
+                    &path,
+                    false,
+                    quarantine.remaining_packed_bytes(),
+                )?;
+            }
+        }
         tracing::debug!(
             path = %self.root.display(),
             "Validating received synchronization history"
@@ -516,12 +654,69 @@ impl PreparedEndpoint {
         Ok(offered)
     }
 
+    #[cfg(unix)]
+    fn transfer_git(
+        &self,
+        ui: &Ui,
+        stream: &mut impl Stream,
+        repository: &Path,
+        sending: bool,
+        receive_budget: u64,
+    ) -> Result<(), CommandError> {
+        tracing::debug!(
+            path = %self.root.display(),
+            sending,
+            "Transferring Git objects with native Git"
+        );
+        let backend = jj_lib::git::get_git_backend(self.helper.repo().store())?;
+        // Git's input-size setting protects receive-pack, while fetch needs
+        // the same bound at the wire. Allow a fixed amount for ref negotiation;
+        // physical pack and metadata budgets are checked again before install.
+        let max_received_bytes = if sending {
+            u64::MAX
+        } else {
+            receive_budget.saturating_add(16 * 1024 * 1024)
+        };
+        let report = stream
+            .transfer_git(
+                backend.git_executable_path(),
+                repository,
+                sending,
+                max_received_bytes,
+            )
+            .map_err(|error| {
+                if command_error_message(&error).contains("exceeds maximum allowed size") {
+                    error.hinted(
+                        "The receiver's sync.max-quarantine-bytes setting limits the incoming Git \
+                         pack.",
+                    )
+                } else {
+                    error
+                }
+            })?;
+        tracing::debug!(
+            path = %self.root.display(),
+            sending,
+            sent_bytes = report.sent_bytes,
+            received_bytes = report.received_bytes,
+            "Native Git object transfer completed"
+        );
+        if !report.stderr.is_empty() {
+            writeln!(ui.stderr(), "{}", report.stderr)?;
+        }
+        Ok(())
+    }
+
     fn known_cache_limit(&self) -> Result<usize, CommandError> {
-        Ok(
-            positive_count_setting(self.helper.settings(), "sync.max-records")?
-                .unwrap_or(MAX_KNOWN_RECORD_IDS)
-                .min(MAX_KNOWN_RECORD_IDS),
-        )
+        let limit = positive_count_setting(self.helper.settings(), "sync.max-records")?
+            .unwrap_or(MAX_KNOWN_RECORD_IDS)
+            .min(MAX_KNOWN_RECORD_IDS);
+        #[cfg(feature = "test-fakes")]
+        let limit = std::env::var("JJ_TEST_SYNC_KNOWN_RECORD_IDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map_or(limit, |value| limit.min(value));
+        Ok(limit)
     }
 
     fn quarantine_limits(&self) -> Result<QuarantineLimits, CommandError> {
@@ -568,6 +763,7 @@ impl PreparedEndpoint {
             &self.endpoint,
             &self.capture.raw_heads,
             std::slice::from_ref(selected),
+            self.packed_git,
         )
     }
 
@@ -746,14 +942,19 @@ fn collect_inventory(
     endpoint: &Endpoint,
     raw_heads: &[OperationId],
     shared_heads: &[SharedEventId],
+    packed_git: bool,
 ) -> Result<Inventory, CommandError> {
     tracing::debug!(
         path = %helper.workspace_root().display(),
         "Collecting synchronization object inventory"
     );
-    let inventory = objects(helper, endpoint)?
-        .inventory(raw_heads, shared_heads)
-        .map_err(failed)?;
+    let objects = objects(helper, endpoint)?;
+    let inventory = if packed_git {
+        objects.inventory_packed(raw_heads, shared_heads)
+    } else {
+        objects.inventory(raw_heads, shared_heads)
+    }
+    .map_err(failed)?;
     tracing::debug!(
         path = %helper.workspace_root().display(),
         objects = inventory.records.len(),
@@ -841,6 +1042,7 @@ pub(crate) async fn synchronize(
                 peer.repository_path(),
                 ignore,
                 NEGOTIATE_OBJECT_HASH,
+                &command.settings().get::<PathBuf>("git.executable-path")?,
             );
             hello
                 .required_capabilities
@@ -853,7 +1055,7 @@ pub(crate) async fn synchronize(
     transport
         .send(&Message::Hello(hello.clone()))
         .map_err(failed)?;
-    match transport.receive().map_err(failed)? {
+    let packed_git = match transport.receive().map_err(failed)? {
         Message::HelloReply(reply) => {
             tracing::debug!(
                 object_hash = %reply.object_hash,
@@ -863,6 +1065,7 @@ pub(crate) async fn synchronize(
                 hello.object_hash.clone_from(&reply.object_hash);
             }
             hello.validate_peer(&reply).map_err(failed)?;
+            use_native_git(&hello, &reply)
         }
         Message::Error(error) => {
             return Err(user_error(format!("Peer synchronization failed: {error}")));
@@ -872,18 +1075,18 @@ pub(crate) async fn synchronize(
                 "Peer did not negotiate a synchronization session",
             ));
         }
-    }
+    };
     if local_missing {
         let object_hash = parse_object_hash(&hello.object_hash)?;
         crate::commands::init_colocated_for_sync(ui, command, &local_root, object_hash).await?;
     }
-    let mut local = PreparedEndpoint::open(ui, command, &local_root, ignore).await?;
+    let mut local = PreparedEndpoint::open(ui, command, &local_root, ignore, packed_git).await?;
     hello
         .validate_peer(&local.hello(direction, peer.repository_path())?)
         .map_err(failed)?;
     let local_advertisement = local.advertisement()?;
     send_command(&mut transport, "capture", &local_advertisement)?;
-    send_inventory(&mut transport, &local.inventory)?;
+    send_inventory(&mut transport, &local.inventory, packed_git)?;
     let remote: Advertisement = receive_command(&mut transport, "capture")?;
     remote.validate()?;
     let remote_known = receive_inventory(&mut transport, local.known_cache_limit()?)?;
@@ -961,11 +1164,23 @@ pub(crate) async fn serve(ui: &Ui, command: &CommandHelper) -> Result<(), Comman
     check_command_options(command)?;
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut session = Session::new(io::BufReader::new(stdin.lock()), stdout.lock());
+    let mut session = Session::new(io::BufReader::new(stdin), stdout);
     let result = serve_session(ui, command, &mut session).await;
     if let Err(error) = &result {
-        let _send_error_result =
-            Session::send(&mut session, &Message::Error(command_error_message(error)));
+        // A failed native phase may already have stopped reading its peer's
+        // input. Keep the final error smaller than a pipe buffer so reporting
+        // it cannot prevent this helper from closing the peer's output pipe.
+        // The normal command error printer retains full diagnostics on stderr.
+        let mut message = command_error_message(error);
+        if message.len() > 2048 {
+            let mut end = 2000;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push_str("\n[Full diagnostics are in helper stderr.]");
+        }
+        let _send_error_result = Session::send(&mut session, &Message::Error(message));
     }
     result
 }
@@ -1022,7 +1237,9 @@ async fn serve_session(
         reply.validate_peer(&request).map_err(failed)?;
     }
     stream.send(&Message::HelloReply(reply.clone()))?;
-    let mut local = PreparedEndpoint::open(ui, command, &path, request.ignore_working_copy).await?;
+    let packed_git = use_native_git(&request, &reply);
+    let mut local =
+        PreparedEndpoint::open(ui, command, &path, request.ignore_working_copy, packed_git).await?;
     reply
         .validate_peer(&local.hello(request.direction, Vec::new())?)
         .map_err(failed)?;
@@ -1031,7 +1248,7 @@ async fn serve_session(
     let peer_known = receive_inventory(stream, local.known_cache_limit()?)?;
     let advertisement = local.advertisement()?;
     send_command(stream, "capture", &advertisement)?;
-    send_inventory(stream, &local.inventory)?;
+    send_inventory(stream, &local.inventory, packed_git)?;
     match request.direction {
         Direction::Receive => {
             local.send_offer(
@@ -1107,7 +1324,7 @@ fn profile_hello(
     ignore: bool,
 ) -> Result<Hello, CommandError> {
     let loader = workspace.repo_loader();
-    jj_lib::git::get_git_backend(loader.store())?;
+    let backend = jj_lib::git::get_git_backend(loader.store())?;
     if !matches!(
         loader.op_store().name(),
         SimpleOpStore::NAME | SimpleOpStore::SYNC_NAME
@@ -1125,10 +1342,35 @@ fn profile_hello(
             ));
         }
     };
-    Ok(format_hello(direction, path, ignore, hash))
+    Ok(format_hello(
+        direction,
+        path,
+        ignore,
+        hash,
+        backend.git_executable_path(),
+    ))
 }
 
-fn format_hello(direction: Direction, path: Vec<u8>, ignore: bool, hash: &str) -> Hello {
+fn format_hello(
+    direction: Direction,
+    path: Vec<u8>,
+    ignore: bool,
+    hash: &str,
+    git: &Path,
+) -> Hello {
+    let native_git = cfg!(unix)
+        && std::process::Command::new(git)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+    #[cfg(feature = "test-fakes")]
+    let native_git = native_git
+        && std::env::var("JJ_TEST_SYNC_DISABLE_NATIVE_GIT").map_or(true, |disabled| {
+            disabled != "all" && !(disabled == "helper" && path.is_empty())
+        });
     Hello {
         version: PROTOCOL_VERSION,
         direction,
@@ -1141,10 +1383,21 @@ fn format_hello(direction: Direction, path: Vec<u8>, ignore: bool, hash: &str) -
             .iter()
             .copied()
             .chain([INITIALIZE_RECEIVER_CAPABILITY])
+            .chain(native_git.then_some(NATIVE_GIT_CAPABILITY))
             .map(str::to_owned)
             .collect(),
         required_capabilities: CAPABILITIES.iter().map(|name| (*name).to_owned()).collect(),
     }
+}
+
+fn use_native_git(request: &Hello, reply: &Hello) -> bool {
+    cfg!(unix)
+        && [request, reply].iter().all(|hello| {
+            hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == NATIVE_GIT_CAPABILITY)
+        })
 }
 
 /// An invalid marker is an existing broken repository, never an init request.
@@ -1173,6 +1426,7 @@ fn validate_receiver_request(request: &Hello) -> Result<gix::hash::Kind, Command
         Vec::new(),
         request.ignore_working_copy,
         &request.object_hash,
+        Path::new("git"),
     );
     expected.validate_peer(request).map_err(failed)?;
     parse_object_hash(&request.object_hash)
@@ -1188,9 +1442,16 @@ fn parse_object_hash(hash: &str) -> Result<gix::hash::Kind, CommandError> {
     }
 }
 
-fn send_inventory(stream: &mut impl Stream, inventory: &Inventory) -> Result<(), CommandError> {
+fn send_inventory(
+    stream: &mut impl Stream,
+    inventory: &Inventory,
+    packed_git: bool,
+) -> Result<(), CommandError> {
     let mut batch = Vec::with_capacity(INVENTORY_BATCH_SIZE);
     for record in &inventory.records {
+        if packed_git && matches!(record, RecordId::Git(_)) {
+            continue;
+        }
         batch.push(WireRecordId::from(record));
         if batch.len() == INVENTORY_BATCH_SIZE {
             send_command(stream, "inventory", &batch)?;
@@ -1364,7 +1625,13 @@ mod tests {
 
     #[test]
     fn new_receiver_rejects_incompatible_negotiation_before_initialization() {
-        let valid = format_hello(Direction::Send, b"/missing".to_vec(), false, "sha1");
+        let valid = format_hello(
+            Direction::Send,
+            b"/missing".to_vec(),
+            false,
+            "sha1",
+            Path::new("git"),
+        );
         assert_eq!(
             validate_receiver_request(&valid).unwrap(),
             gix::hash::Kind::Sha1
@@ -1428,7 +1695,7 @@ mod tests {
             legacy_tree_roots: BTreeSet::new(),
         };
         let mut output = Session::new(io::empty(), Vec::new());
-        send_inventory(&mut output, &inventory).unwrap();
+        send_inventory(&mut output, &inventory, false).unwrap();
         let bytes = output.into_inner().1;
         let mut input = Session::new(io::Cursor::new(bytes), io::sink());
         assert_eq!(

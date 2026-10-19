@@ -344,6 +344,14 @@ impl Transport {
         result.map_err(|error| self.protocol_failure(error))
     }
 
+    /// Borrows the framed connection for an explicitly negotiated duplex phase.
+    /// The caller returns both streams before continuing ordinary commands.
+    pub(crate) fn framed_io_mut(
+        &mut self,
+    ) -> Result<(&mut BufReader<ChildStdout>, &mut ChildStdin), TransportError> {
+        Ok(self.active_session()?.split_mut())
+    }
+
     pub(crate) fn receive(&mut self) -> Result<Message, TransportError> {
         match self.active_session()?.receive() {
             Ok(Message::Error(error)) => {

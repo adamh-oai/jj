@@ -37,6 +37,8 @@ pub mod revset_util;
 mod source_symbol;
 #[cfg(feature = "git")]
 pub(crate) mod sync_endpoint;
+#[cfg(all(feature = "git", unix))]
+pub(crate) mod sync_git_transport;
 pub(crate) mod sync_transport;
 pub mod template_builder;
 pub mod templater;

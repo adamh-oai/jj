@@ -277,6 +277,12 @@ impl<R: Read, W: Write> Session<R, W> {
 
     /// Reads a complete bounded frame, rejecting truncated or corrupt data.
     pub fn receive(&mut self) -> Result<Message, ProtocolError> {
+        self.receive_bounded(MAX_FRAME_LEN)
+    }
+
+    /// Applies a smaller phase-specific allocation limit before reading a body.
+    pub fn receive_bounded(&mut self, maximum: usize) -> Result<Message, ProtocolError> {
+        let maximum = maximum.min(MAX_FRAME_LEN);
         let mut header = [0; HEADER_LEN];
         read_exact(&mut self.reader, &mut header[..8], "frame header")?;
         if &header[..8] != MAGIC {
@@ -286,11 +292,8 @@ impl<R: Read, W: Write> Session<R, W> {
         let kind = header[8];
         let length_bytes: [u8; 8] = header[9..17].try_into().unwrap();
         let length = u64::from_be_bytes(length_bytes);
-        if length > MAX_FRAME_LEN as u64 {
-            return Err(ProtocolError::FrameTooLarge {
-                length,
-                maximum: MAX_FRAME_LEN,
-            });
+        if length > maximum as u64 {
+            return Err(ProtocolError::FrameTooLarge { length, maximum });
         }
         let mut payload = vec![0; length as usize];
         read_exact(&mut self.reader, &mut payload, "frame payload")?;
@@ -303,6 +306,13 @@ impl<R: Read, W: Write> Session<R, W> {
     /// Returns the underlying streams, for controlled shutdown or testing.
     pub fn into_inner(self) -> (R, W) {
         (self.reader, self.writer)
+    }
+
+    /// Borrows the independent streams for a scoped, full-duplex protocol phase.
+    ///
+    /// Callers must finish that phase before resuming ordinary session framing.
+    pub fn split_mut(&mut self) -> (&mut R, &mut W) {
+        (&mut self.reader, &mut self.writer)
     }
 }
 

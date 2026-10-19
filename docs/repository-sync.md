@@ -41,6 +41,37 @@ configuration:
 jj --debug sync --send 'ssh://host/home/user/code/project'
 ```
 
+## Git object transfer
+
+When both peers support native packed transfers and have Git available, Unix
+endpoints use Git's ordinary push or fetch transport for Git objects. Temporary
+refs cover the frozen retained history, including commits needed only by old
+operations, predecessor metadata, and legacy conflict trees. These refs live in
+disposable bare repositories; they do not change either repository's bookmarks
+or ordinary Git refs.
+
+Git negotiates objects already present at the receiver and transfers compressed
+packs with deltas. Received objects stay packed during quarantine and after
+installation, instead of being staged as expanded blob bodies. Both local paths
+and SSH carry Git's protocol over the existing synchronization connection;
+receiving never requires a reverse SSH connection. Bidirectional sync runs the
+two transfers in sequence.
+
+Original operations, views, shared events, and exact Jujutsu commit metadata
+travel separately. Commit metadata is checked even when Git already knows the
+commit's object ID. The receiver validates the complete history before retaining
+objects and publishing its integration operation.
+
+Older peers and endpoints without native Git support continue to use the
+existing object-record transfer. That path expands each object it sends, so
+upgrading both endpoints is necessary to obtain packed transfers. The optional
+transport capability does not change the stored synchronization format.
+
+Native Git uses the backend object database through alternates and has the
+same trust assumptions as ordinary Git push and fetch. Choose peers trusted
+with this repository's object data; temporary refs do not isolate that data
+from a malicious peer.
+
 ## Creating a destination
 
 Sending to a path without a Jujutsu repository initializes a colocated

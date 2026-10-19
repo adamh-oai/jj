@@ -738,6 +738,119 @@ fn test_sync_receiver_enforces_its_own_quarantine_budget(direction: &str) {
     assert!(bookmarks(receiver).contains("source"));
 }
 
+#[cfg(unix)]
+#[test_case("--send"; "remote_native_receiver")]
+#[test_case("--receive"; "local_native_receiver")]
+fn test_sync_native_git_budget_failure_cleans_up_and_allows_retry(direction: &str) {
+    let env = TestEnvironment::default();
+    env.add_config("snapshot.max-new-file-size = '25MiB'\n");
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    let (source, receiver) = if direction == "--receive" {
+        (&right, &left)
+    } else {
+        (&left, &right)
+    };
+    describe_and_bookmark(receiver, "receiver");
+    // The compressed pack must exceed both the receiver's 1 MiB storage
+    // budget and the extra 16 MiB allowed for native protocol overhead.
+    let mut seed = 42u64;
+    let contents: Vec<u8> = (0..20 * 1024 * 1024)
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as u8
+        })
+        .collect();
+    fs::write(source.root().join("budget.bin"), &contents).unwrap();
+    describe_and_bookmark(source, "source");
+    let source_commit = revision_id(source, "source");
+    let source_op = source.current_operation_id();
+    let source_git = gix::open(source.root().join(".jj/repo/store/git")).unwrap();
+    let tree = source_git
+        .find_commit(gix::ObjectId::from_hex(source_commit.as_bytes()).unwrap())
+        .unwrap()
+        .tree()
+        .unwrap();
+    let blob = tree
+        .iter()
+        .map(Result::unwrap)
+        .find(|entry| entry.filename() == b"budget.bin")
+        .unwrap()
+        .oid()
+        .to_owned();
+    receiver.write_file(
+        ".jj/repo/config.toml",
+        "sync.max-quarantine-bytes = '1MiB'\n",
+    );
+    let before = receiver.current_operation_id();
+    let before_view = operation(receiver, &before).view_id;
+    let git_refs = || {
+        let git = gix::open(receiver.root().join(".jj/repo/store/git")).unwrap();
+        let refs: BTreeSet<_> = git
+            .references()
+            .unwrap()
+            .all()
+            .unwrap()
+            .map(Result::unwrap)
+            .map(|reference| {
+                (
+                    reference.name().as_bstr().to_string(),
+                    format!("{:?}", reference.target()),
+                )
+            })
+            .collect();
+        refs
+    };
+    let before_refs = git_refs();
+    let started = Instant::now();
+    let output = left.run_jj_with(|command| {
+        command
+            .args(["--debug", "sync", direction, "../right"])
+            .timeout(Duration::from_secs(20))
+    });
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert!(!output.status.success());
+    let stderr = anstream::adapter::strip_str(output.stderr.raw()).to_string();
+    assert!(
+        stderr.contains("Transferring Git objects with native Git"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("sync.max-quarantine-bytes"), "{stderr}");
+    assert_eq!(receiver.current_operation_id(), before);
+    assert_eq!(operation(receiver, &before).view_id, before_view);
+    assert_eq!(bookmarks(receiver), BTreeSet::from(["receiver".to_owned()]));
+    assert_eq!(git_refs(), before_refs);
+    assert!(
+        !receiver
+            .root()
+            .join(format!(".jj/repo/op_store/operations/{source_op}"))
+            .exists()
+    );
+    let receiver_git = gix::open(receiver.root().join(".jj/repo/store/git")).unwrap();
+    assert!(receiver_git.try_find_header(blob).unwrap().is_none());
+
+    // The failed quarantine must release its processes, locks, and temporary
+    // storage so the same transfer can succeed with a sufficient local budget.
+    receiver.write_file(
+        ".jj/repo/config.toml",
+        "sync.max-quarantine-bytes = '100MiB'\n",
+    );
+    left.run_jj_with(|command| {
+        command
+            .args(["sync", direction, "../right"])
+            .timeout(Duration::from_secs(20))
+    })
+    .success();
+    assert_eq!(revision_id(receiver, "source"), source_commit);
+    assert_imported_history(source, receiver, &source_op);
+    let receiver_git = gix::open(receiver.root().join(".jj/repo/store/git")).unwrap();
+    assert_eq!(
+        receiver_git.try_find_header(blob).unwrap().unwrap().size(),
+        contents.len() as u64
+    );
+    assert!(!receiver.root().join("budget.bin").exists());
+}
+
 #[test]
 fn test_sync_no_change_three_peer_convergence() {
     let env = TestEnvironment::default();
@@ -1307,6 +1420,196 @@ fn ssh_sync_url(peer: &TestWorkDir<'_>) -> String {
 }
 
 #[cfg(unix)]
+#[test_case("--send", false; "local_send")]
+#[test_case("--receive", false; "local_receive")]
+#[test_case("--bidi", false; "local_bidirectional")]
+#[test_case("--send", true; "ssh_send")]
+#[test_case("--receive", true; "ssh_receive")]
+#[test_case("--bidi", true; "ssh_bidirectional")]
+fn test_sync_native_git_preserves_packed_history_on_repeat(direction: &str, ssh: bool) {
+    let mut env = TestEnvironment::default();
+    env.add_config("snapshot.max-new-file-size = '10MiB'\n");
+    // Exhaust the raw-record cache without constructing 65,536 objects. Git's
+    // own negotiation must still avoid sending known historical blob bodies.
+    env.add_env_var("JJ_TEST_SYNC_KNOWN_RECORD_IDS", "1");
+    if ssh {
+        configure_fake_sync_ssh(&mut env);
+    }
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    let (source, receiver) = if direction == "--receive" {
+        (&right, &left)
+    } else {
+        (&left, &right)
+    };
+    describe_and_bookmark(receiver, "receiver");
+    // Keep enough distinct data that resending the entire compressed pack
+    // exceeds the repeat-transfer limit, while most of the blob compresses.
+    let mut seed = 42u64;
+    let mut contents: String = (0..128 * 1024)
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            char::from(b' ' + ((seed >> 32) % 95) as u8)
+        })
+        .collect();
+    contents.push_str(&"retained historical content compresses well\n".repeat(128 * 1024));
+    source.write_file("historical.txt", &contents);
+    source
+        .run_jj(["describe", "-m", "historical blob"])
+        .success();
+    source
+        .run_jj(["bookmark", "create", "historical"])
+        .success();
+    let historical = revision_id(source, "historical");
+    source.run_jj(["new"]).success();
+    fs::remove_file(source.root().join("historical.txt")).unwrap();
+    describe_and_bookmark(source, "source");
+    let source_op = source.current_operation_id();
+    let receiver_wc = revision_id(receiver, "@");
+    let peer = if ssh {
+        ssh_sync_url(&right)
+    } else {
+        right.root().to_str().unwrap().to_owned()
+    };
+    let output = left.run_jj(["--debug", "sync", direction, &peer]).success();
+    let stderr = anstream::adapter::strip_str(output.stderr.raw()).to_string();
+    for phase in [
+        "Transferring Git objects with native Git",
+        "Native Git object transfer completed",
+    ] {
+        assert!(stderr.contains(phase), "missing {phase}: {stderr}");
+    }
+    assert!(stderr.contains("sending=true"), "{stderr}");
+    assert!(stderr.contains("sending=false"), "{stderr}");
+    assert_eq!(revision_id(receiver, "historical"), historical);
+    assert_imported_history(source, receiver, &source_op);
+    assert_eq!(revision_id(receiver, "@"), receiver_wc);
+    assert!(!receiver.root().join("historical.txt").exists());
+    let received = receiver
+        .run_jj(["file", "show", "-r", "historical", "historical.txt"])
+        .success();
+    assert!(
+        received.stdout.raw() == contents,
+        "received historical blob contents changed"
+    );
+    if direction == "--bidi" {
+        assert!(bookmarks(source).contains("receiver"));
+    }
+
+    let git = gix::open(receiver.root().join(".jj/repo/store/git")).unwrap();
+    let tree = git
+        .find_commit(gix::ObjectId::from_hex(historical.as_bytes()).unwrap())
+        .unwrap()
+        .tree()
+        .unwrap();
+    let blob = tree
+        .iter()
+        .map(Result::unwrap)
+        .find(|entry| entry.filename() == b"historical.txt")
+        .unwrap()
+        .oid()
+        .to_owned()
+        .to_string();
+    let object_directory = receiver.root().join(".jj/repo/store/git/objects");
+    assert!(
+        !object_directory.join(&blob[..2]).join(&blob[2..]).exists(),
+        "native transfer should keep the historical blob packed"
+    );
+    let pack_bytes = || {
+        fs::read_dir(object_directory.join("pack"))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "pack"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum::<u64>()
+    };
+    let before = pack_bytes();
+    assert!(
+        before > 64 * 1024,
+        "fixture pack must exceed the allowed repeat-transfer size"
+    );
+    assert!(
+        before < contents.len() as u64 / 20,
+        "historical blob expanded to {before} bytes instead of staying compressed"
+    );
+    let receiver_op = receiver.current_operation_id();
+    let repeated = left.run_jj(["--debug", "sync", direction, &peer]).success();
+    assert_eq!(receiver.current_operation_id(), receiver_op);
+    let repeated_stderr = anstream::adapter::strip_str(repeated.stderr.raw()).to_string();
+    assert!(
+        repeated_stderr.contains("Native Git object transfer completed"),
+        "{repeated_stderr}"
+    );
+    let byte_fields = regex::Regex::new(r"(?:sent_bytes|received_bytes)=(\d+)").unwrap();
+    let mut reports = 0;
+    for captures in byte_fields.captures_iter(&repeated_stderr) {
+        let bytes = captures[1].parse::<u64>().unwrap();
+        assert!(
+            bytes < 64 * 1024,
+            "repeat synchronization resent {bytes} bytes of native Git data"
+        );
+        reports += 1;
+    }
+    assert!(reports > 0, "no transfer sizes reported: {repeated_stderr}");
+    assert!(
+        pack_bytes() <= before + 16 * 1024,
+        "repeat synchronization duplicated historical Git objects"
+    );
+}
+
+#[cfg(unix)]
+#[test_case("helper"; "mixed_capabilities")]
+#[test_case("all"; "raw_only")]
+fn test_sync_raw_fallback_preserves_metadata_and_undo(disabled: &str) {
+    let mut env = TestEnvironment::default();
+    configure_fake_sync_ssh(&mut env);
+    env.add_env_var("JJ_TEST_SYNC_DISABLE_NATIVE_GIT", disabled);
+    let source = init_repo(&env, "source");
+    let receiver = init_repo(&env, "receiver");
+    describe_and_bookmark(&source, "source");
+    source
+        .run_jj(["describe", "-m", "rewritten source description"])
+        .success();
+    describe_and_bookmark(&receiver, "receiver");
+    let source_commit = revision_id(&source, "source");
+    let source_op = source.current_operation_id();
+    let source_change = source
+        .run_jj(["log", "--no-graph", "-r", "source", "-T", "change_id"])
+        .success();
+    let receiver_wc = revision_id(&receiver, "@");
+    let output = receiver
+        .run_jj(["--debug", "sync", "--receive", &ssh_sync_url(&source)])
+        .success();
+    let stderr = anstream::adapter::strip_str(output.stderr.raw()).to_string();
+    assert!(
+        stderr.contains("Synchronization transfer progress"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Transferring Git objects with native Git"),
+        "{stderr}"
+    );
+    assert_eq!(revision_id(&receiver, "source"), source_commit);
+    let received_change = receiver
+        .run_jj(["log", "--no-graph", "-r", "source", "-T", "change_id"])
+        .success();
+    assert_eq!(received_change.stdout.raw(), source_change.stdout.raw());
+    assert_imported_history(&source, &receiver, &source_op);
+    receiver.run_jj(["undo"]).success();
+    assert_eq!(
+        bookmarks(&receiver),
+        BTreeSet::from(["receiver".to_owned()])
+    );
+    receiver.run_jj(["redo"]).success();
+    assert_eq!(
+        bookmarks(&receiver),
+        BTreeSet::from(["receiver".to_owned(), "source".to_owned()])
+    );
+    assert_eq!(revision_id(&receiver, "@"), receiver_wc);
+    assert!(!receiver.root().join("source.txt").exists());
+}
+
+#[cfg(unix)]
 #[test_case(false; "ordinary_failure")]
 #[test_case(true; "debug_failure")]
 fn test_sync_ssh_init_failure_reports_destination_and_helper_stderr(debug: bool) {
@@ -1469,9 +1772,13 @@ fn test_sync_initializes_missing_ssh_peer(direction: &str) {
     assert!(!env.env_root().join("escaped").exists());
 }
 
-#[test]
-fn test_sync_streams_large_packed_git_blob() {
-    let env = TestEnvironment::default();
+#[test_case(false; "raw_records")]
+#[cfg_attr(unix, test_case(true; "native_git"))]
+fn test_sync_streams_large_packed_git_blob(native_git: bool) {
+    let mut env = TestEnvironment::default();
+    if !native_git {
+        env.add_env_var("JJ_TEST_SYNC_DISABLE_NATIVE_GIT", "all");
+    }
     env.add_config("snapshot.max-new-file-size = '100MiB'\n");
     let source = init_repo(&env, "source");
     let receiver = init_repo(&env, "receiver");
@@ -1483,9 +1790,15 @@ fn test_sync_streams_large_packed_git_blob() {
     source.run_jj(["bookmark", "create", "large"]).success();
     source.run_jj(["util", "gc", "--expire", "now"]).success();
     let commit = revision_id(&source, "@");
-    receiver
-        .run_jj(["sync", "--receive", "../source"])
+    let output = receiver
+        .run_jj(["--debug", "sync", "--receive", "../source"])
         .success();
+    let stderr = anstream::adapter::strip_str(output.stderr.raw()).to_string();
+    assert_eq!(
+        stderr.contains("Transferring Git objects with native Git"),
+        native_git,
+        "{stderr}"
+    );
     assert_eq!(revision_id(&receiver, "large"), commit);
     let git = gix::open(receiver.root().join(".jj/repo/store/git")).unwrap();
     let tree = git
