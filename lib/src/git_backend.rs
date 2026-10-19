@@ -234,6 +234,17 @@ pub struct GitBackend {
     write_change_id_header: bool,
 }
 
+/// Immutable metadata used by a batch of object exports and preflight checks.
+pub(crate) struct GitMetadataSnapshot {
+    heads: Vec<Arc<ReadonlyTable>>,
+}
+
+impl GitMetadataSnapshot {
+    fn get_value(&self, key: &[u8]) -> Option<&[u8]> {
+        self.heads.iter().find_map(|table| table.get_value(key))
+    }
+}
+
 impl GitBackend {
     pub const NAME: &str = "git";
 
@@ -501,6 +512,17 @@ impl GitBackend {
         Ok(table)
     }
 
+    /// Captures a batch's metadata, releasing the writer lock before returning.
+    pub(crate) fn capture_metadata_snapshot(&self) -> BackendResult<GitMetadataSnapshot> {
+        let (heads, _lock) = self
+            .extra_metadata_store
+            .get_head_tables_locked()
+            .map_err(GitBackendError::ReadMetadata)?;
+        // Do not merge heads here: a merge could hide a competing identity
+        // from later validation or an importer using a newer snapshot.
+        Ok(GitMetadataSnapshot { heads })
+    }
+
     fn save_extra_metadata_table(
         &self,
         mut_table: MutableTable,
@@ -522,6 +544,14 @@ impl GitBackend {
     /// the normal table lock. The caller must separately transfer referenced objects,
     /// including predecessor commits and legacy conflict trees in the extras.
     pub fn export_object(&self, id: &gix::oid) -> BackendResult<GitObjectRecord> {
+        self.export_object_with_metadata(id, None)
+    }
+
+    pub(crate) fn export_object_with_metadata(
+        &self,
+        id: &gix::oid,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<GitObjectRecord> {
         let mut git_repo = self.git_repo();
         // Replacement refs are a local interpretation, not the immutable object
         // identified by the requested hash.
@@ -549,8 +579,15 @@ impl GitBackend {
         let commit_extras = if object.kind == gix::objs::Kind::Commit {
             let commit_id = CommitId::from_bytes(id.as_bytes());
             let commit = commit_from_git_without_root_parent(&commit_id, &object, false)?;
-            let (table, _table_lock) = self.read_extra_metadata_table_locked()?;
-            Some(match table.get_value(id.as_bytes()) {
+            let fresh_table;
+            let extras = match metadata {
+                Some(metadata) => metadata.get_value(id.as_bytes()),
+                None => {
+                    fresh_table = self.read_extra_metadata_table_locked()?.0;
+                    fresh_table.get_value(id.as_bytes())
+                }
+            };
+            Some(match extras {
                 Some(extras) => {
                     validate_object_extras(id, extras)?;
                     extras.to_vec()
@@ -573,6 +610,14 @@ impl GitBackend {
     /// No body-sized buffer is allocated. A commit without stored extras is
     /// scanned to recover its change ID without retaining its message or signature.
     pub fn export_object_header(&self, id: &gix::oid) -> BackendResult<GitObjectHeader> {
+        self.export_object_header_with_metadata(id, None)
+    }
+
+    pub(crate) fn export_object_header_with_metadata(
+        &self,
+        id: &gix::oid,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<GitObjectHeader> {
         let mut git_repo = self.git_repo();
         git_repo.objects.ignore_replacements = true;
         if id.as_bytes() == self.empty_tree_id.as_bytes() {
@@ -598,9 +643,15 @@ impl GitBackend {
             commit_extras: None,
         };
         if header.kind == gix::objs::Kind::Commit {
-            let (table, table_lock) = self.read_extra_metadata_table_locked()?;
-            header.commit_extras = table.get_value(id.as_bytes()).map(<[u8]>::to_vec);
-            drop(table_lock);
+            let fresh_table;
+            header.commit_extras = match metadata {
+                Some(metadata) => metadata.get_value(id.as_bytes()),
+                None => {
+                    fresh_table = self.read_extra_metadata_table_locked()?.0;
+                    fresh_table.get_value(id.as_bytes())
+                }
+            }
+            .map(<[u8]>::to_vec);
             if let Some(extras) = &header.commit_extras {
                 validate_object_extras(id, extras)?;
             } else {
@@ -622,7 +673,15 @@ impl GitBackend {
 
     /// Exports the immutable per-commit entry, independently of its Git body.
     pub fn export_commit_metadata(&self, id: &gix::oid) -> BackendResult<GitCommitMetadata> {
-        let header = self.export_object_header(id)?;
+        self.export_commit_metadata_with_metadata(id, None)
+    }
+
+    pub(crate) fn export_commit_metadata_with_metadata(
+        &self,
+        id: &gix::oid,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<GitCommitMetadata> {
+        let header = self.export_object_header_with_metadata(id, metadata)?;
         let extras = header.commit_extras.ok_or_else(|| {
             BackendError::Other("commit metadata requested for a non-commit object".into())
         })?;
@@ -651,6 +710,7 @@ impl GitBackend {
     pub(crate) fn inspect_packed_commit<T, E>(
         &self,
         metadata: &GitCommitMetadata,
+        snapshot: &GitMetadataSnapshot,
         from: &mut dyn io::Read,
         inspect: impl FnOnce(&mut dyn io::Read) -> Result<T, E>,
     ) -> Result<T, E>
@@ -665,13 +725,8 @@ impl GitBackend {
         let result = inspect(&mut reader)?;
         io::copy(&mut reader, &mut io::sink())?;
         let identity = reader.scanner.finish()?;
-        let (tables, _lock) = self
-            .extra_metadata_store
-            .get_head_tables_locked()
-            .map_err(GitBackendError::ReadMetadata)
-            .map_err(BackendError::from)?;
         let header = metadata.header();
-        for table in tables {
+        for table in &snapshot.heads {
             if let Some(existing) = table.get_value(metadata.id.as_bytes()) {
                 identity.validate_existing(&header, existing)?;
             }
@@ -806,14 +861,29 @@ impl GitBackend {
         header: &GitObjectHeader,
         from: &mut dyn io::Read,
     ) -> BackendResult<()> {
+        self.validate_object_stream_with_metadata(header, from, None)
+    }
+
+    pub(crate) fn validate_object_stream_with_metadata(
+        &self,
+        header: &GitObjectHeader,
+        from: &mut dyn io::Read,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<()> {
         validate_stream_header(&self.git_repo(), header)?;
         let Some(identity) = scan_object_stream(header, from, &mut io::sink())? else {
             return Ok(());
         };
-        let (tables, _lock) = self
-            .extra_metadata_store
-            .get_head_tables_locked()
-            .map_err(GitBackendError::ReadMetadata)?;
+        let (tables, _lock) = match metadata {
+            Some(metadata) => (metadata.heads.clone(), None),
+            None => {
+                let (tables, lock) = self
+                    .extra_metadata_store
+                    .get_head_tables_locked()
+                    .map_err(GitBackendError::ReadMetadata)?;
+                (tables, Some(lock))
+            }
+        };
         for table in tables {
             if let Some(existing) = table.get_value(header.id.as_bytes()) {
                 identity.validate_existing(header, existing)?;
@@ -891,14 +961,28 @@ impl GitBackend {
     /// not a reservation: importing repeats the checks under the metadata lock
     /// to detect a concurrent writer after validation.
     pub fn validate_object_import(&self, record: &GitObjectRecord) -> BackendResult<()> {
+        self.validate_object_import_with_metadata(record, None)
+    }
+
+    pub(crate) fn validate_object_import_with_metadata(
+        &self,
+        record: &GitObjectRecord,
+        metadata: Option<&GitMetadataSnapshot>,
+    ) -> BackendResult<()> {
         let git_repo = self.git_repo();
         let Some(commit) = validate_object_record(&git_repo, record)? else {
             return Ok(());
         };
-        let (tables, _table_lock) = self
-            .extra_metadata_store
-            .get_head_tables_locked()
-            .map_err(GitBackendError::ReadMetadata)?;
+        let (tables, _table_lock) = match metadata {
+            Some(metadata) => (metadata.heads.clone(), None),
+            None => {
+                let (tables, lock) = self
+                    .extra_metadata_store
+                    .get_head_tables_locked()
+                    .map_err(GitBackendError::ReadMetadata)?;
+                (tables, Some(lock))
+            }
+        };
         for table in tables {
             if let Some(existing_extras) = table.get_value(record.id.as_bytes()) {
                 validate_existing_object_extras(record, &commit, existing_extras)?;

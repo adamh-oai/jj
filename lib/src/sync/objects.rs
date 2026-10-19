@@ -43,6 +43,7 @@ use crate::backend::CommitId;
 use crate::backend::TreeId;
 use crate::git_backend::GitBackend;
 use crate::git_backend::GitCommitMetadata;
+use crate::git_backend::GitMetadataSnapshot;
 use crate::git_backend::GitObjectHeader;
 use crate::git_backend::GitObjectRecord;
 use crate::object_id::ObjectId as _;
@@ -412,20 +413,22 @@ pub struct RepositoryObjects<'a> {
     operations: &'a SimpleOpStore,
     anchors: &'a AnchorStore,
     backend: &'a GitBackend,
+    metadata: GitMetadataSnapshot,
 }
 
 impl<'a> RepositoryObjects<'a> {
-    /// Uses existing stores without creating directories or mutating roots.
+    /// Captures immutable metadata without retaining the writer lock.
     pub fn new(
         operations: &'a SimpleOpStore,
         anchors: &'a AnchorStore,
         backend: &'a GitBackend,
-    ) -> Self {
-        Self {
+    ) -> SyncResult<Self> {
+        Ok(Self {
             operations,
             anchors,
             backend,
-        }
+            metadata: backend.capture_metadata_snapshot()?,
+        })
     }
 
     /// Exports and authenticates one record; roots are virtual and have no record.
@@ -444,7 +447,9 @@ impl<'a> RepositoryObjects<'a> {
                 Record::SharedEvent(id.clone(), AnchorStore::encode(&self.anchors.read(id)?)?)
             }
             RecordId::Git(id) => {
-                let header = self.backend.export_object_header(id)?;
+                let header = self
+                    .backend
+                    .export_object_header_with_metadata(id, Some(&self.metadata))?;
                 if header
                     .size
                     .saturating_add(header.commit_extras.as_ref().map_or(0, Vec::len) as u64)
@@ -452,7 +457,10 @@ impl<'a> RepositoryObjects<'a> {
                 {
                     Record::GitHeader(header)
                 } else {
-                    Record::Git(self.backend.export_object(id)?)
+                    Record::Git(
+                        self.backend
+                            .export_object_with_metadata(id, Some(&self.metadata))?,
+                    )
                 }
             }
         };
@@ -500,8 +508,10 @@ impl<'a> RepositoryObjects<'a> {
                         .git_commits
                         .contains(&CommitId::from_bytes(id.as_bytes())) =>
                 {
-                    let record =
-                        Record::GitCommitMetadata(self.backend.export_commit_metadata(id)?);
+                    let record = Record::GitCommitMetadata(
+                        self.backend
+                            .export_commit_metadata_with_metadata(id, Some(&self.metadata))?,
+                    );
                     self.validate_record(&record)?;
                     emit(record)?;
                 }
@@ -541,7 +551,8 @@ impl<'a> RepositoryObjects<'a> {
             InventoryReaders {
                 read: |id: &RecordId| match id {
                     RecordId::Git(id) => Ok(Record::GitCommitMetadata(
-                        self.backend.export_commit_metadata(id)?,
+                        self.backend
+                            .export_commit_metadata_with_metadata(id, Some(&self.metadata))?,
                     )),
                     _ => self.export_record(id),
                 },
@@ -600,7 +611,9 @@ impl<'a> RepositoryObjects<'a> {
             Record::SharedEvent(id, bytes) => {
                 AnchorStore::decode(id, bytes)?;
             }
-            Record::Git(record) => self.backend.validate_object_import(record)?,
+            Record::Git(record) => self
+                .backend
+                .validate_object_import_with_metadata(record, Some(&self.metadata))?,
             Record::GitCommitMetadata(metadata) => {
                 self.backend.validate_commit_metadata_encoding(metadata)?;
             }
@@ -771,9 +784,11 @@ impl Quarantine {
                     return Err(invalid("streamed object body is incomplete"));
                 }
                 stream.body.as_file_mut().rewind()?;
-                receiver
-                    .backend
-                    .validate_object_stream(&stream.header, stream.body.as_file_mut())?;
+                receiver.backend.validate_object_stream_with_metadata(
+                    &stream.header,
+                    stream.body.as_file_mut(),
+                    Some(&receiver.metadata),
+                )?;
                 stream.body.as_file().sync_all()?;
                 stream
                     .body
@@ -1157,16 +1172,19 @@ fn build_inventory(
                             return Err(invalid("packed object changed during validation"));
                         }
                         if let Some(metadata) = &metadata {
-                            receiver
-                                .backend
-                                .inspect_packed_commit(metadata, from, |from| {
+                            receiver.backend.inspect_packed_commit(
+                                metadata,
+                                &receiver.metadata,
+                                from,
+                                |from| {
                                     streamed_dependencies(
                                         &header,
                                         from,
                                         &mut pending,
                                         &mut inventory,
                                     )
-                                })
+                                },
+                            )
                         } else {
                             streamed_dependencies(&header, from, &mut pending, &mut inventory)
                         }
@@ -1316,9 +1334,11 @@ fn build_inventory(
                     return Err(invalid("streamed object length does not match its header"));
                 }
                 body.as_file_mut().rewind()?;
-                receiver
-                    .backend
-                    .validate_object_stream(&header, body.as_file_mut())?;
+                receiver.backend.validate_object_stream_with_metadata(
+                    &header,
+                    body.as_file_mut(),
+                    Some(&receiver.metadata),
+                )?;
                 body.as_file_mut().rewind()?;
                 streamed_dependencies(&header, body.as_file_mut(), &mut pending, &mut inventory)?;
             }
@@ -1845,10 +1865,12 @@ mod tests {
 
     use super::*;
     use crate::config::StackedConfig;
+    use crate::lock::FileLock;
     use crate::op_store;
     use crate::op_store::OpStore as _;
     use crate::op_store::RootOperationData;
     use crate::settings::UserSettings;
+    use crate::stacked_table::TableStore;
     use crate::sync::shared::SharedEvent;
     use crate::sync::shared::SharedView;
     use crate::tests::TestResult;
@@ -1889,7 +1911,7 @@ mod tests {
         }
 
         fn objects(&self) -> RepositoryObjects<'_> {
-            RepositoryObjects::new(&self.operations, &self.anchors, &self.backend)
+            RepositoryObjects::new(&self.operations, &self.anchors, &self.backend).unwrap()
         }
 
         fn object(
@@ -1989,6 +2011,159 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn inventories_and_exports_release_the_metadata_writer_lock() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let mut parents = vec![];
+        for index in 0..16 {
+            let commit = source.commit(empty.id, &parents, &[], &format!("commit {index}"));
+            parents = vec![commit.id];
+        }
+        let head = source.operation(parents[0], None, "captured history");
+        let objects = source.objects();
+        let (completed, completion) = std::sync::mpsc::channel();
+        std::thread::scope(|threads| -> TestResult {
+            let writer = FileLock::lock(source.directory.path().join("store/extra/lock"))?;
+            threads.spawn(|| {
+                let result = (|| -> SyncResult<usize> {
+                    let raw = objects.inventory(std::slice::from_ref(&head), &[])?;
+                    let packed = objects.inventory_packed(std::slice::from_ref(&head), &[])?;
+                    assert_eq!(raw, packed);
+                    for id in &raw.records {
+                        objects.export_records(id, |_| Ok(()))?;
+                    }
+                    let mut commits = 0;
+                    objects.export_metadata_records(&packed, &BTreeSet::new(), |record| {
+                        commits += usize::from(matches!(record, Record::GitCommitMetadata(_)));
+                        Ok(())
+                    })?;
+                    Ok(commits)
+                })();
+                completed.send(result).unwrap();
+            });
+            let result = completion.recv_timeout(std::time::Duration::from_secs(10));
+            // Release before checking the timeout so a regression cannot leave
+            // the scoped worker blocked while the test tries to join it.
+            drop(writer);
+            assert_eq!(result??, 16);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn metadata_snapshots_preserve_divergent_heads_and_writer_checks() -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(empty.id, &[], &[], "competing identity");
+        let extra_path = destination.directory.path().join("store/extra");
+        let tables = TableStore::load(extra_path.clone(), commit.id.as_bytes().len());
+        let parent = tables.get_head()?;
+        let mut left = parent.start_mutation();
+        left.add_entry(
+            commit.id.as_bytes().to_vec(),
+            commit.commit_extras.clone().unwrap(),
+        );
+        tables.save_table(left)?;
+        let mut right = parent.start_mutation();
+        let mut conflicting =
+            crate::protos::git_store::Commit::decode(commit.commit_extras.as_deref().unwrap())?;
+        conflicting.change_id[0] ^= 1;
+        right.add_entry(commit.id.as_bytes().to_vec(), conflicting.encode_to_vec());
+        tables.save_table(right)?;
+        let metadata_files = || -> std::io::Result<BTreeSet<_>> {
+            [extra_path.clone(), extra_path.join("heads")]
+                .into_iter()
+                .flat_map(|path| fs::read_dir(path).unwrap())
+                .map(|entry| entry.map(|entry| entry.path()))
+                .collect()
+        };
+        let previous_files = metadata_files()?;
+        assert_eq!(fs::read_dir(extra_path.join("heads"))?.count(), 2);
+        for _ in 0..2 {
+            let objects = destination.objects();
+            assert!(
+                objects
+                    .validate_record(&Record::Git(commit.clone()))
+                    .is_err()
+            );
+            assert_eq!(metadata_files()?, previous_files);
+        }
+        assert!(destination.backend.import_object(&commit).is_err());
+        assert_eq!(metadata_files()?, previous_files);
+        assert!(
+            destination
+                .backend
+                .git_repo()
+                .try_find_object(commit.id)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test_case(false; "raw")]
+    #[test_case(true; "packed")]
+    fn stale_metadata_snapshot_cannot_hide_a_later_conflicting_import(packed: bool) -> TestResult {
+        let source = Fixture::new(gix::hash::Kind::Sha1);
+        let destination = Fixture::new(gix::hash::Kind::Sha1);
+        let empty = source.object(gix::objs::Kind::Tree, vec![], None);
+        let commit = source.commit(empty.id, &[], &[], "late competing identity");
+        let head = source.operation(commit.id, None, "incoming");
+        let objects = source.objects();
+        let inventory = if packed {
+            objects.inventory_packed(std::slice::from_ref(&head), &[])?
+        } else {
+            objects.inventory(std::slice::from_ref(&head), &[])?
+        };
+        let receiver = destination.objects();
+        let limits = QuarantineLimits::for_directory(destination.directory.path())?;
+        let mut quarantine = Quarantine::with_limits(
+            destination.directory.path(),
+            destination.backend.root_commit_id().clone(),
+            limits.clone(),
+        )?;
+        if packed {
+            let known = receiver.inventory_packed(&[], &[])?;
+            let receiving = GitPackRepository::receiver(
+                destination.directory.path(),
+                &destination.backend,
+                &known,
+                &limits,
+            )?;
+            let sending = GitPackRepository::sender(
+                source.directory.path(),
+                &source.backend,
+                &inventory,
+                &limits,
+            )?;
+            fetch_test_pack(&sending, &receiving, &destination.backend);
+            quarantine.set_git_pack_repository(receiving)?;
+            objects.export_metadata_records(&inventory, &BTreeSet::new(), |record| {
+                quarantine.stage(&receiver, &record)
+            })?;
+        } else {
+            for id in &inventory.records {
+                objects.export_records(id, |record| quarantine.stage(&receiver, &record))?;
+            }
+        }
+        let mut conflicting = commit.clone();
+        let mut extras =
+            crate::protos::git_store::Commit::decode(commit.commit_extras.as_deref().unwrap())?;
+        extras.change_id[0] ^= 1;
+        conflicting.commit_extras = Some(extras.encode_to_vec());
+        destination.backend.import_object(&conflicting)?;
+        // Preflight uses the captured view; installation must still consult
+        // every current metadata head under the ordinary writer lock.
+        assert_eq!(
+            quarantine.validate(&receiver, std::slice::from_ref(&head), &[])?,
+            inventory
+        );
+        assert!(quarantine.install(&receiver, &inventory).is_err());
+        assert_eq!(destination.backend.export_object(&commit.id)?, conflicting);
+        Ok(())
     }
 
     #[test_case(gix::hash::Kind::Sha1; "sha1")]

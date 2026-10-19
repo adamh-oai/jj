@@ -930,11 +930,7 @@ fn objects<'a>(
         .downcast_ref::<SimpleOpStore>()
         .ok_or_else(|| user_error("Synchronization requires the built-in operation store"))?;
     let backend = jj_lib::git::get_git_backend(helper.repo().store())?;
-    Ok(RepositoryObjects::new(
-        operations,
-        endpoint.anchors(),
-        backend,
-    ))
+    RepositoryObjects::new(operations, endpoint.anchors(), backend).map_err(failed)
 }
 
 fn collect_inventory(

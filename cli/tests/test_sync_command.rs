@@ -1420,6 +1420,59 @@ fn ssh_sync_url(peer: &TestWorkDir<'_>) -> String {
 }
 
 #[cfg(unix)]
+#[test_case(false; "native_git")]
+#[test_case(true; "raw_fallback")]
+fn test_sync_metadata_lock_count_does_not_grow_with_history(raw_fallback: bool) {
+    let mut env = TestEnvironment::default();
+    if raw_fallback {
+        env.add_env_var("JJ_TEST_SYNC_DISABLE_NATIVE_GIT", "all");
+    }
+    let source = init_repo(&env, "source");
+    let small = init_repo(&env, "small");
+    let large = init_repo(&env, "large");
+    let lock_path = source.root().join(".jj/repo/store/extra/lock");
+    let lock_path = lock_path.to_str().unwrap();
+    let count_locks = |stderr: &str| {
+        let stderr = anstream::adapter::strip_str(stderr).to_string();
+        stderr
+            .lines()
+            .filter(|line| line.contains("Attempting to lock") && line.contains(lock_path))
+            .count()
+    };
+    for i in 0..4 {
+        source
+            .run_jj(["new", "-m", &format!("history {i}")])
+            .success();
+    }
+    let output = source
+        .run_jj(["--debug", "sync", "--send", small.root().to_str().unwrap()])
+        .success();
+    let small_locks = count_locks(output.stderr.raw());
+    assert!(
+        small_locks > 0,
+        "metadata lock instrumentation was not enabled"
+    );
+
+    for i in 4..36 {
+        source
+            .run_jj(["new", "-m", &format!("history {i}")])
+            .success();
+    }
+    let source_op = source.current_operation_id();
+    let output = source
+        .run_jj(["--debug", "sync", "--send", large.root().to_str().unwrap()])
+        .success();
+    let large_locks = count_locks(output.stderr.raw());
+    // A small allowance covers fixed setup work. Traversing another 32 commits
+    // must not acquire the metadata lock for every commit or validation pass.
+    assert!(
+        large_locks <= small_locks + 4,
+        "metadata lock acquisitions grew from {small_locks} to {large_locks} with history"
+    );
+    assert_imported_history(&source, &large, &source_op);
+}
+
+#[cfg(unix)]
 #[test_case("--send", false; "local_send")]
 #[test_case("--receive", false; "local_receive")]
 #[test_case("--bidi", false; "local_bidirectional")]

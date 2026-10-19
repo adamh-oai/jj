@@ -358,7 +358,7 @@ impl Endpoint {
             .ok_or(EndpointError::WrongRepository)?;
         let backend = crate::git::get_git_backend(repo.store())
             .map_err(|_| EndpointError::WrongRepository)?;
-        let objects = super::objects::RepositoryObjects::new(operations, &self.anchors, backend);
+        let objects = super::objects::RepositoryObjects::new(operations, &self.anchors, backend)?;
         quarantine.install(&objects, inventory)?;
         locked.state_mut().retain_peer(
             peer,
