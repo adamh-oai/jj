@@ -840,8 +840,10 @@ fn finalize_subvolume_root(ui: &Ui, root: &Path, colocated: bool) -> Result<(), 
         finalize_root_path(root)
             .map_err(|err| user_error(format!("Failed to finalize AWACS root paths: {err}")))?;
         if colocated {
-            configure_git_fsmonitor(root)
-                .map_err(|err| user_error(format!("Failed to configure Git fsmonitor: {err}")))?;
+            configure_git_fsmonitor(root, |message| {
+                let _status_result = writeln!(ui.status(), "awacs: {message}");
+            })
+            .map_err(|err| user_error(format!("Failed to configure Git fsmonitor: {err}")))?;
             refresh_git_awacs_baseline(ui, root)?;
         }
     }
@@ -862,6 +864,10 @@ fn finalize_subvolume_root(ui: &Ui, root: &Path, colocated: bool) -> Result<(), 
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+        writeln!(
+            ui.status(),
+            "awacs: set Git config --local worktree.btrfsSnapshot=true"
+        )?;
     }
     Ok(())
 }

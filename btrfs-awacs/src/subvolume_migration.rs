@@ -261,7 +261,7 @@ impl SubvolumeMigration {
 pub fn convert_subvolume_root(
     destination: impl AsRef<Path>,
     options: MigrationOptions,
-    mut progress: impl FnMut(&'static str),
+    mut progress: impl FnMut(&str),
 ) -> Result<CommittedMigration, MigrationError> {
     let destination = destination.as_ref().to_owned();
     progress("preparing Btrfs subvolume conversion");
@@ -276,16 +276,18 @@ pub fn convert_subvolume_root(
     }
     progress("publishing Btrfs subvolume conversion");
     let committed = migration.commit()?;
-    progress("enabling Git fsmonitor");
-    configure_git_fsmonitor(&destination)?;
+    configure_git_fsmonitor(&destination, progress)?;
     Ok(committed)
 }
 
 /// Defaults to Git's selected fsmonitor implementation and fatal hook errors.
 /// Existing local settings are preserved, including an explicit fallback
 /// policy. Roots without usable Git metadata remain valid, and no hook path
-/// or protocol version is installed.
-pub fn configure_git_fsmonitor(destination: &Path) -> Result<(), MigrationError> {
+/// or protocol version is installed. Reports each setting after writing it.
+pub fn configure_git_fsmonitor(
+    destination: &Path,
+    mut progress: impl FnMut(&str),
+) -> Result<(), MigrationError> {
     if !destination.join(".git").exists() {
         return Ok(());
     }
@@ -328,6 +330,7 @@ pub fn configure_git_fsmonitor(destination: &Path) -> Result<(), MigrationError>
                 "configure Git {key} exited with {status}"
             )));
         }
+        progress(&format!("set Git config --local {key}={value}"));
     }
     Ok(())
 }
