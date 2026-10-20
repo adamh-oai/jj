@@ -682,16 +682,30 @@ fn write_git_index_atomically(
 
 /// Reflinks an entire index when supported, otherwise copies its bytes.
 /// Both files start at offset zero and the destination's old contents are
-/// replaced. The source inode remains unchanged.
+/// replaced. Preserve the source mtime: Git uses the index timestamp to
+/// decide which stat-equal entries still require a content check. Advancing
+/// it while retaining those entries can hide rapid, same-size file edits.
+/// The source inode remains unchanged.
 pub fn clone_or_copy_index(source: &File, destination: &mut File) -> io::Result<()> {
-    if !try_clone_git_index(source, destination)? {
+    clone_or_copy_index_with(source, destination, try_clone_git_index)
+}
+
+fn clone_or_copy_index_with(
+    source: &File,
+    destination: &mut File,
+    clone_index: impl FnOnce(&File, &File) -> io::Result<bool>,
+) -> io::Result<()> {
+    // Read the timestamp from the same descriptor as the bytes, before the
+    // copy. Reopening the path could observe another writer's newer index.
+    let modified = source.metadata()?.modified()?;
+    if !clone_index(source, destination)? {
         let mut source = source;
         source.rewind()?;
         destination.set_len(0)?;
         destination.rewind()?;
         io::copy(&mut source, destination)?;
     }
-    Ok(())
+    destination.set_modified(modified)
 }
 
 fn try_clone_git_index(source: &File, destination: &File) -> io::Result<bool> {
@@ -790,6 +804,13 @@ fn write_git_index_with_clone(
             lock.set_len(new_len)
                 .map_err(|error| format!("resize destination Git index: {error}"))
         })?;
+        // Only extensions changed; the original timestamp must continue to
+        // protect stat entries which Git considers racily clean. Set it
+        // after the last write and before syncing and publishing the file.
+        source_metadata
+            .modified()
+            .and_then(|modified| lock.set_modified(modified))
+            .map_err(|error| format!("preserve destination Git index timestamp: {error}"))?;
         timed_git_phase("index_seed_sync", || lock.sync_all()).map_err(|error| {
             format!(
                 "sync destination Git index {}: {error}",
@@ -1103,6 +1124,56 @@ mod tests {
     }
 
     #[test]
+    fn index_copy_preserves_timestamp_through_capture_and_publication() {
+        for cloned in [false, true] {
+            let root = TestDir::new("index-copy-timestamp");
+            let index = root.path.join("index");
+            let original = b"captured index contents";
+            fs::write(&index, original).unwrap();
+            let source = File::open(&index).unwrap();
+            let modified = UNIX_EPOCH + std::time::Duration::new(946_684_800, 123_456_789);
+            source.set_modified(modified).unwrap();
+            let modified = source.metadata().unwrap().modified().unwrap();
+            let mut captured = tempfile::tempfile().unwrap();
+            captured
+                .write_all(b"longer stale destination contents")
+                .unwrap();
+            clone_or_copy_index_with(&source, &mut captured, |source, destination| {
+                let mut destination = destination;
+                if cloned {
+                    let mut source = source;
+                    source.rewind()?;
+                    destination.set_len(0)?;
+                    destination.rewind()?;
+                    io::copy(&mut source, &mut destination)?;
+                    Ok(true)
+                } else {
+                    destination.write_all(b"partial unsupported clone")?;
+                    Ok(false)
+                }
+            })
+            .unwrap();
+            assert_eq!(captured.metadata().unwrap().modified().unwrap(), modified);
+            captured.rewind().unwrap();
+            let mut contents = Vec::new();
+            captured.read_to_end(&mut contents).unwrap();
+            assert_eq!(contents, original);
+
+            // The child/JJ publication copies the captured descriptor again.
+            // Its timestamp must survive that second copy, too.
+            let mut published = tempfile::tempfile().unwrap();
+            clone_or_copy_index(&captured, &mut published).unwrap();
+            assert_eq!(published.metadata().unwrap().modified().unwrap(), modified);
+            published.rewind().unwrap();
+            contents.clear();
+            published.read_to_end(&mut contents).unwrap();
+            assert_eq!(contents, original);
+            assert_eq!(fs::read(&index).unwrap(), original);
+            assert_eq!(source.metadata().unwrap().modified().unwrap(), modified);
+        }
+    }
+
+    #[test]
     fn index_writer_handles_clone_and_partial_unsupported_clone_fallback() {
         use std::io::Seek as _;
         use std::io::Write as _;
@@ -1118,6 +1189,9 @@ mod tests {
                 original.extend_from_slice(b"old tail data");
                 fs::write(&index, &original).unwrap();
                 let source = fs::File::open(&index).unwrap();
+                source
+                    .set_modified(UNIX_EPOCH + std::time::Duration::new(946_684_800, 123_456_789))
+                    .unwrap();
                 let metadata = source.metadata().unwrap();
                 let slices = [&prefix[..], &[][..], tail];
                 super::write_git_index_with_clone(
@@ -1141,6 +1215,11 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(fs::read(&index).unwrap(), slices.concat());
+                assert_eq!(
+                    fs::metadata(&index).unwrap().modified().unwrap(),
+                    metadata.modified().unwrap(),
+                    "an extension-only rewrite must retain Git's racy-entry timestamp"
+                );
                 assert!(!root.path.join("index.lock").exists());
                 let mut source = source;
                 source.rewind().unwrap();

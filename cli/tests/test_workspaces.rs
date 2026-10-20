@@ -897,10 +897,53 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         }
         cmd.arg(&child).output()?
     } else if race {
-        // This edit belongs to replay from the copied index cursor to the
-        // leased source cut. Optional index writes remain disabled so the
-        // copied cursor and clean bitmap still predate it.
-        std::fs::write(root.join("two"), "before\n")?;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::time::Duration;
+
+        // A same-size edit in the index's timestamp second needs Git's
+        // racy-clean content check even when fsmonitor marks it dirty. Warm
+        // the real index and edit in the same second, then cross that boundary
+        // before capture. Replacing the index timestamp during handoff used
+        // to hide the edit from reset --hard. Retry scheduling if a loaded
+        // host spends more than a second warming this tiny fixture.
+        run(git_command(&root).args(["config", "core.checkStat", "minimal"]))?;
+        let mut scheduled = false;
+        for _ in 0..8 {
+            let next_second = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + 1;
+            let start = UNIX_EPOCH + Duration::from_secs(next_second) + Duration::from_millis(20);
+            if let Ok(delay) = start.duration_since(SystemTime::now()) {
+                std::thread::sleep(delay);
+            }
+            std::fs::write(root.join("two"), "second\n")?;
+            run(git_command(&root).args(["update-index", "--refresh", "--force-write-index"]))?;
+            let before = std::fs::metadata(root.join("two"))?;
+            let index_time = std::fs::metadata(&index_path)?.mtime();
+            std::fs::write(root.join("two"), "before\n")?;
+            let after = std::fs::metadata(root.join("two"))?;
+            assert_eq!(before.ino(), after.ino());
+            assert_eq!(before.len(), after.len());
+            if before.mtime() != index_time
+                || after.mtime() != index_time
+                || before.ctime() != after.ctime()
+            {
+                continue;
+            }
+            // Model a coarse index timestamp even when Git was built with
+            // nanosecond support. Together with checkStat=minimal, this
+            // requires the racy-content check on every supported build.
+            std::fs::File::open(&index_path)?
+                .set_modified(UNIX_EPOCH + Duration::from_secs(u64::try_from(index_time)?))?;
+            // Neither the source index nor its cursor may be refreshed
+            // between this edit and capture by worktree creation.
+            let after_index_second =
+                UNIX_EPOCH + Duration::from_secs(u64::try_from(index_time)? + 1);
+            if let Ok(delay) = after_index_second.duration_since(SystemTime::now()) {
+                std::thread::sleep(delay);
+            }
+            scheduled = true;
+            break;
+        }
+        assert!(scheduled, "could not schedule a same-second source edit");
         let real_git =
             run(command(std::ffi::OsStr::new("sh"), &base).args(["-c", "command -v git"]))?;
         let real_git = std::path::PathBuf::from(String::from_utf8(real_git.stdout)?.trim());
