@@ -379,12 +379,18 @@ impl Store {
             // the following index read observes any write it could finish.
             let mut completed = Vec::new();
             let mut alternate_indexes = BTreeSet::new();
+            let mut live_indexes = BTreeSet::new();
             for (snapshot_id, reason) in candidates {
                 if let Some(publisher) = GitPublisher::from_reason(&reason) {
+                    let exited = has_exited(&publisher);
                     if let Some(path) = publisher.index_path.as_ref() {
-                        alternate_indexes.insert((publisher.mount_namespace, path.clone()));
+                        let index = (publisher.mount_namespace, path.clone());
+                        alternate_indexes.insert(index.clone());
+                        if !exited {
+                            live_indexes.insert(index);
+                        }
                     }
-                    if has_exited(&publisher) {
+                    if exited {
                         let index = publisher
                             .index_path
                             .map(|path| (publisher.mount_namespace, path));
@@ -409,7 +415,7 @@ impl Store {
                     Some(baseline),
                 )?;
             }
-            let mut uncertain_external = BTreeSet::new();
+            let mut missing_live_indexes = BTreeSet::new();
             for (index_namespace, path) in &alternate_indexes {
                 if mount_namespace != Some(*index_namespace) {
                     // ENOENT in another filesystem view is not evidence that
@@ -423,10 +429,11 @@ impl Store {
                 };
                 let baseline = match open_index_file(&resolved)? {
                     Some(mut index) => read_open_index(&mut index)?,
-                    None if path.is_absolute() => {
-                        // An external file can have moved independently. Keep
-                        // this path's roots without blocking unrelated cleanup.
-                        uncertain_external.insert((*index_namespace, path.clone()));
+                    None if live_indexes.contains(&(*index_namespace, path.clone())) => {
+                        // Git may still publish its in-memory index. Keep its
+                        // current root and completed responses until every
+                        // publisher is finished, regardless of path location.
+                        missing_live_indexes.insert((*index_namespace, path.clone()));
                         continue;
                     }
                     None => None,
@@ -442,7 +449,7 @@ impl Store {
             for (candidate_snapshot, reason, index) in completed {
                 if index.as_ref().is_some_and(|(namespace, path)| {
                     mount_namespace != Some(*namespace)
-                        || uncertain_external.contains(&(*namespace, path.clone()))
+                        || missing_live_indexes.contains(&(*namespace, path.clone()))
                 }) {
                     continue;
                 }
@@ -583,10 +590,9 @@ fn read_index_baseline(root: &Path) -> Result<Option<SnapshotBaseline>, String> 
 fn read_index_file(path: &Path) -> Result<Option<SnapshotBaseline>, String> {
     match open_index_file(path)? {
         Some(mut index) => read_open_index(&mut index),
-        None => Err(
-            "Git index is missing; snapshot collection is paused until its references can be read"
-                .to_owned(),
-        ),
+        // Alternate-only repositories can legitimately lack a canonical index.
+        // Reconciliation preserves its old roots while handling other indexes.
+        None => Ok(None),
     }
 }
 
@@ -597,7 +603,14 @@ fn open_index_file(path: &Path) -> Result<Option<File>, String> {
         .open(path)
     {
         Ok(index) => Ok(Some(index)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
         Err(error) => Err(format!("open Git index for snapshot retention: {error}")),
     }
 }
@@ -1031,24 +1044,30 @@ mod tests {
     fn repeated_temporary_indexes_do_not_accumulate_permanent_response_pins() {
         let mut fixture = Fixture::new();
         fixture.write_index(Some(&baseline(2)), 20);
-        for index in 0..12 {
-            let path = fixture
-                .directory
-                .path()
-                .join(format!("temporary-index-{index}"));
+        let external = tempfile::tempdir().unwrap();
+        for index in 0..24 {
+            let parent = if index < 12 {
+                fixture.directory.path()
+            } else {
+                external.path()
+            };
+            let path = parent.join(format!("temporary-index-{index}"));
             let mut alternate_publisher = publisher();
             alternate_publisher.index_path = Some(path.clone());
+            let response = baseline(3 + index % 3);
             fixture
                 .store
-                .retain_git_response(&baseline(4), Some(&alternate_publisher))
+                .retain_git_response(&response, Some(&alternate_publisher))
                 .unwrap();
-            fs::write(&path, index_bytes(Some(&baseline(4)), 20)).unwrap();
-            fixture
-                .store
-                .refresh_git_index_roots_with(|_| true, read_index_baseline)
-                .unwrap();
-            assert_eq!(fixture.roots().len(), 2);
-            fs::remove_file(path).unwrap();
+            if index % 2 == 0 {
+                fs::write(&path, index_bytes(Some(&response), 20)).unwrap();
+                fixture
+                    .store
+                    .refresh_git_index_roots_with(|_| true, read_index_baseline)
+                    .unwrap();
+                assert_eq!(fixture.roots().len(), 2);
+                fs::remove_file(path).unwrap();
+            }
             fixture
                 .store
                 .refresh_git_index_roots_with(|_| true, read_index_baseline)
@@ -1154,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_external_index_keeps_only_its_roots_without_blocking_other_collection() {
+    fn a_deleted_external_index_releases_roots_after_all_publishers_exit() {
         let mut fixture = Fixture::new();
         fixture.write_index(Some(&baseline(2)), 20);
         let external = tempfile::tempdir().unwrap();
@@ -1176,21 +1195,175 @@ mod tests {
             .unwrap();
         fs::remove_file(path).unwrap();
         let before = fixture.roots();
+        // The live publisher can still rename its index.lock into place.
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| false, read_index_baseline)
+            .unwrap();
+        assert_eq!(fixture.roots(), before);
+
+        let mut another_publisher = external_publisher.clone();
+        another_publisher.start_time += 1;
+        fixture
+            .store
+            .retain_git_response(&baseline(6), Some(&another_publisher))
+            .unwrap();
+        let before = fixture.roots();
+        // One completed response does not prove that the path is finished.
+        fixture
+            .store
+            .refresh_git_index_roots_with(
+                |publisher| publisher.start_time == external_publisher.start_time,
+                read_index_baseline,
+            )
+            .unwrap();
+        assert_eq!(fixture.roots(), before);
+
         fixture
             .store
             .refresh_git_index_roots_with(|_| true, read_index_baseline)
             .unwrap();
-        assert_eq!(fixture.roots(), before);
+        assert_eq!(fixture.roots(), [(2, CURRENT_REASON.to_owned())]);
         let deletions = fixture
             .store
             .reserve_unpinned_snapshot_deletes([9; 16], 100, 200, 16)
             .unwrap();
-        assert!(deletions.iter().any(|deletion| deletion.snapshot_id == 1));
-        assert!(
-            deletions
-                .iter()
-                .all(|deletion| ![2, 4, 5].contains(&deletion.snapshot_id))
+        assert!(deletions.iter().any(|deletion| deletion.snapshot_id == 4));
+        assert!(deletions.iter().any(|deletion| deletion.snapshot_id == 5));
+        assert!(deletions.iter().all(|deletion| deletion.snapshot_id != 2));
+    }
+
+    #[test]
+    fn registering_an_external_index_copy_preserves_its_baseline_when_the_old_path_is_removed() {
+        let mut fixture = Fixture::new();
+        fixture.write_index(Some(&baseline(2)), 20);
+        let external = tempfile::tempdir().unwrap();
+        let old_path = external.path().join("old-index");
+        let new_path = external.path().join("new-index");
+        let mut old_publisher = publisher();
+        old_publisher.index_path = Some(old_path.clone());
+        fixture
+            .store
+            .retain_git_response(&baseline(4), Some(&old_publisher))
+            .unwrap();
+        fs::write(&old_path, index_bytes(Some(&baseline(4)), 20)).unwrap();
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| true, read_index_baseline)
+            .unwrap();
+
+        fs::copy(&old_path, &new_path).unwrap();
+        let mut new_publisher = publisher();
+        new_publisher.index_path = Some(new_path.clone());
+        fixture
+            .store
+            .retain_git_response(&baseline(5), Some(&new_publisher))
+            .unwrap();
+        fs::remove_file(old_path).unwrap();
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| false, read_index_baseline)
+            .unwrap();
+        assert_eq!(
+            fixture.roots(),
+            [
+                (2, CURRENT_REASON.to_owned()),
+                (4, index_reason(new_publisher.mount_namespace, &new_path)),
+                (5, new_publisher.reason()),
+            ]
         );
+
+        fs::write(&new_path, index_bytes(Some(&baseline(5)), 20)).unwrap();
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| true, read_index_baseline)
+            .unwrap();
+        assert_eq!(
+            fixture.roots(),
+            [
+                (2, CURRENT_REASON.to_owned()),
+                (5, index_reason(new_publisher.mount_namespace, &new_path)),
+            ]
+        );
+    }
+
+    #[test]
+    fn deleted_external_indexes_release_roots_without_a_canonical_index() {
+        let mut fixture = Fixture::new();
+        let external = tempfile::tempdir().unwrap();
+        let path = external.path().join("index");
+        let mut alternate_publisher = publisher();
+        alternate_publisher.index_path = Some(path.clone());
+        insert_pin(fixture.store.connection(), 3, [90; 16], "jj").unwrap();
+        fixture
+            .store
+            .retain_git_response(&baseline(4), Some(&alternate_publisher))
+            .unwrap();
+        fs::write(&path, index_bytes(Some(&baseline(4)), 20)).unwrap();
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| true, read_index_baseline)
+            .unwrap();
+        assert_eq!(
+            fixture.roots(),
+            [(4, index_reason(alternate_publisher.mount_namespace, &path))]
+        );
+        fixture
+            .store
+            .retain_git_response(&baseline(5), Some(&alternate_publisher))
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| true, read_index_baseline)
+            .unwrap();
+        assert!(fixture.roots().is_empty());
+        let deletions = fixture
+            .store
+            .reserve_unpinned_snapshot_deletes([9; 16], 100, 200, 16)
+            .unwrap();
+        assert!(deletions.iter().any(|deletion| deletion.snapshot_id == 4));
+        assert!(deletions.iter().any(|deletion| deletion.snapshot_id == 5));
+        assert!(deletions.iter().all(|deletion| deletion.snapshot_id != 3));
+    }
+
+    #[test]
+    fn deleted_external_index_parent_replaced_by_a_file_releases_roots() {
+        let mut fixture = Fixture::new();
+        fixture.write_index(Some(&baseline(2)), 20);
+        let external = tempfile::tempdir().unwrap();
+        let parent = external.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("index");
+        let mut alternate_publisher = publisher();
+        alternate_publisher.index_path = Some(path.clone());
+        fixture
+            .store
+            .retain_git_response(&baseline(4), Some(&alternate_publisher))
+            .unwrap();
+        fs::write(&path, index_bytes(Some(&baseline(4)), 20)).unwrap();
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| true, read_index_baseline)
+            .unwrap();
+        fixture
+            .store
+            .retain_git_response(&baseline(5), Some(&alternate_publisher))
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(&parent).unwrap();
+        fs::write(parent, b"not a directory").unwrap();
+        let before = fixture.roots();
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| false, read_index_baseline)
+            .unwrap();
+        assert_eq!(fixture.roots(), before);
+        fixture
+            .store
+            .refresh_git_index_roots_with(|_| true, read_index_baseline)
+            .unwrap();
+        assert_eq!(fixture.roots(), [(2, CURRENT_REASON.to_owned())]);
     }
 
     #[test]
@@ -1305,7 +1478,7 @@ mod tests {
             .unwrap();
         let before = fixture.roots();
         fs::remove_file(fixture.directory.path().join(".git/index")).unwrap();
-        assert!(fixture.store.refresh_git_index_roots(BOOT).is_err());
+        fixture.store.refresh_git_index_roots(BOOT).unwrap();
         assert_eq!(fixture.roots(), before);
         fs::remove_dir(fixture.directory.path().join(".git")).unwrap();
         fs::write(fixture.directory.path().join(".git"), b"not a gitfile").unwrap();

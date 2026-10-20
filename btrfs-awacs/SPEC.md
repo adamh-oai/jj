@@ -229,10 +229,16 @@ O(control-plane metadata)
 Completed Git responses that no published index references do not retain one
 physical snapshot or full namespace index per historical token. Explicit
 alternate index paths are tracked independently within their mount namespace.
-Paths inside the checkout follow checkout relocation; deleting such an index
-releases its root after its publisher exits. Other namespace views and missing
-external paths remain conservative because they cannot prove a reference ended.
-Missing external paths retain their own roots while allowing unrelated cleanup.
+Paths inside the checkout follow checkout relocation. A missing alternate index
+releases its roots after every publisher for that registered path has exited,
+including indexes outside the checkout. While a publisher remains live, both
+the current index root and its response candidates stay protected. Other
+namespace views remain conservative because they cannot prove absence.
+A missing canonical index preserves its known roots without blocking alternate
+index reconciliation.
+To move an external index independently, copy it to the new path and run Git
+with the new `GIT_INDEX_FILE` before removing the old path, so the hook registers
+the new location while the old reference remains protected.
 Responses whose process identity cannot be read also remain conservatively pinned.
 A highest observed Git cursor that never advances can retain an
 indefinitely growing logical event interval. The 128-cut/24-hour cache limits
