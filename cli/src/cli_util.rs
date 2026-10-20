@@ -2487,8 +2487,7 @@ to the current parents may contain changes from multiple commits.
             ));
         }
         if tx.base_repo().op_id() != self.repo().op_id()
-            || tx.parent_ops().len() != 1
-            || tx.parent_ops()[0].id() != self.repo().op_id()
+            || tx.parent_ops().first().map(|op| op.id()) != Some(self.repo().op_id())
         {
             return Err(user_error(
                 "The synchronization baseline changed; retry the command",
@@ -2565,8 +2564,9 @@ to the current parents may contain changes from multiple commits.
         #[cfg(feature = "git")]
         if self.env.working_copy_shared_with_git && self.env.command.should_commit_transaction() {
             if (self.may_update_working_copy
-                || tx.base_repo().op_store().name()
-                    != jj_lib::simple_op_store::SimpleOpStore::SYNC_NAME)
+                || !jj_lib::simple_op_store::SimpleOpStore::is_sync_name(
+                    tx.base_repo().op_store().name(),
+                ))
                 && let Some(wc_commit) = &maybe_new_wc_commit
             {
                 try_reset_git_head(

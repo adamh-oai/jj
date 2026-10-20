@@ -670,7 +670,7 @@ pub async fn import_some_refs(
 
     // Exclude real remote tags, which should never be updated by Git.
     let all_remote_tags = false;
-    let only_changed_git_refs = mut_repo.op_store().name() == SimpleOpStore::SYNC_NAME;
+    let only_changed_git_refs = SimpleOpStore::is_sync_name(mut_repo.op_store().name());
     let refs_to_import = diff_refs_to_import(
         mut_repo.view(),
         &git_repo,
@@ -3475,7 +3475,7 @@ impl<'a> GitFetch<'a> {
     pub async fn import_refs(&mut self) -> Result<GitImportStats, GitImportError> {
         tracing::debug!("import_refs");
         let all_remote_tags = true;
-        let only_changed_git_refs = self.mut_repo.op_store().name() == SimpleOpStore::SYNC_NAME;
+        let only_changed_git_refs = SimpleOpStore::is_sync_name(self.mut_repo.op_store().name());
         let refs_to_import = diff_refs_to_import(
             self.mut_repo.view(),
             &self.git_repo,

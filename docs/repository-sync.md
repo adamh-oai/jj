@@ -25,7 +25,9 @@ jj sync --receive 'ssh://user@example.com:2222/home/user/project'
 ```
 
 The remote machine needs a compatible `jj` executable on its command search
-path. Local paths and SSH use the same synchronization protocol. Quote paths
+path. Both endpoints must support native operation-graph synchronization; older
+sync implementations are rejected before a destination is initialized or an
+existing repository is upgraded. Local paths and SSH use the same protocol. Quote paths
 containing spaces as you would for other shell commands.
 
 SSH URL paths are absolute on the remote machine: `ssh://host/code/project`
@@ -67,7 +69,7 @@ and SSH carry Git's protocol over the existing synchronization connection;
 receiving never requires a reverse SSH connection. Bidirectional sync runs the
 two transfers in sequence.
 
-Original operations, views, shared events, and exact Jujutsu commit metadata
+Original operations, views, and exact Jujutsu commit metadata
 travel separately. Operations and views are content-addressed files in the
 operation store; commit metadata lives in the Git backend's extra metadata
 tables. They are not stored as Git objects.
@@ -77,10 +79,10 @@ metadata in progressively smaller commit-ID ranges. Matching ranges need no
 metadata payloads. A known Git commit ID alone cannot prove that its Jujutsu
 change ID, predecessors, or legacy conflict data match. Installation still
 checks current local metadata under its writer lock before accepting incoming
-data. Older packed-transfer peers continue to send every commit's metadata.
+data. Compatible peers without this optimization send every commit's metadata.
 
 When both Unix endpoints support immutable file transfers and have `rsync` 3.1
-or newer available, original operations, views, and shared events travel as
+or newer available, original operations and views travel as
 immutable files. The sender prepares a temporary tree containing exactly the
 captured history. The receiver prepares a read-only comparison snapshot of its
 pinned retained history, including operations imported by earlier exchanges.
@@ -94,9 +96,10 @@ Both local paths and SSH carry rsync's protocol over the existing synchronizatio
 connection, without another SSH connection.
 
 Received files are validated under their original content identities and retained
-before the receiver merges shared state and publishes its local integration
-operation. Per-commit metadata still uses its separate negotiation and writer
-lock; Git objects still use Git's packed transfer.
+before the receiver merges shared state and publishes its integration as an
+ordinary operation with local and received history as parents. Per-commit
+metadata still uses its separate negotiation and writer lock; Git objects still
+use Git's packed transfer.
 
 Peers without this optional capability, including those without `rsync`, retain
 the previous ID-inventory and missing-record transfer. That path's bounded
@@ -106,9 +109,9 @@ change transfers only missing file payloads without making total synchronization
 time proportional only to the change. Complete dependency validation also walks
 the history before objects are retained and the integration is published.
 
-Older peers and endpoints without native Git support continue to use the
-existing object-record transfer. That path expands each object it sends, so
-upgrading both endpoints is necessary to obtain packed transfers. The optional
+Compatible endpoints without native Git support use the object-record
+transfer. That path expands each object it sends, so both endpoints need the
+packed-transfer capability to avoid expansion. The optional
 transport capability does not change the stored synchronization format.
 
 Native Git uses the backend object database through alternates and has the
@@ -146,8 +149,8 @@ contain a repository.
 
 The destination has its own initialized workspace; synchronization does not
 check out the source's `@`. If a transfer fails after initialization, the new
-repository remains available for retry. Undoing the integration restores its
-previous view, rather than deleting the initialized repository.
+repository remains available for retry. Restoring an earlier operation restores
+its view, rather than deleting the initialized repository.
 
 ## Shared history and local workspaces
 
@@ -174,14 +177,55 @@ separate commit roots; it does not create a commit merging their file contents.
 Concurrent changes to the same bookmark or tag can produce the usual reference
 conflicts.
 
-Each receiving repository records its integration as a local operation, so
-`jj undo` and `jj redo` work normally. Undo is itself a new causal change;
-it restores that receiver's view while retaining downloaded history and the
-synchronization storage format. Each receiver's publication is independent.
-Receiving an unchanged peer again does not simply restore a target that was
-already received and then undone. Repeated exchanges without new work do not
-need additional integration operations. Native operation IDs can differ across
-repositories because their local workspace state differs.
+Reconciliation uses Jujutsu's ordinary operation-merge behavior, including
+rebasing descendants of rewritten commits. For example, suppose both machines
+start with commit `P`. Machine A rewrites it as `P'`, while machine B creates
+child `C` on the original `P`. Sync can rebase `C` onto `P'`, producing `C'`.
+The imported original commits and operations remain available in history.
+Concurrent rewrites of the same change remain divergent versions; sync does not
+choose one as the winner. File conflicts from rebasing are recorded normally.
+
+Each receiving repository publishes an ordinary merge operation. Its first
+parent is the receiver's previous local operation; the other parents retain the
+received history. Original operation and view IDs are unchanged. The resulting
+view reconciles shared fields while retaining local workspace and Git
+observations. Imported operations are then ordinary ancestors: inspecting
+history and retaining it during garbage collection use the same operation graph
+as local work.
+
+`jj undo` and `jj op revert` do not cross merge operations, including sync
+merges. There is no separate `jj sync undo` command. To recover the view from
+before a sync, use `jj op log` to find the previous local operation, inspect it
+with `jj --at-op=<operation ID> log`, then run:
+
+```shell
+jj op restore <previous-local-operation-ID>
+```
+
+This creates an ordinary local operation; it does not delete downloaded objects
+or the sync merge from history. Later syncs respect that restore as new work,
+so receiving the same unchanged peer does not reapply the old result. Ordinary
+undo and redo still work on later operations that have a single parent.
+
+Repeated exchanges without new work do not create more merge operations.
+Receivers can produce different operation IDs because their workspace state
+and local parent order differ. Sync recognizes a local publication wrapper only
+when its recorded digest still matches its parents and shared view, and one of
+its actual parents has the same shared view and already contains the verified
+authored history of every other parent. That wrapper adds no shared work beyond
+the parent, so sync follows that parent's history to compare the authored frontier. A digest
+alone is insufficient proof.
+
+The ordinary merge that actually reconciles shared changes remains a real
+operation, including any descendant rebases it produced. Local wrappers around
+that same result can differ while representing the same authored frontier. If
+both endpoints already represent that frontier, there is nothing to merge.
+Sync advertises that ordinary result directly; a receiver-only wrapper becomes
+part of transferred history when a later authored operation descends from it.
+Ordinary operations, including restores and workspace renames, contribute their
+own IDs even when their shared views are unchanged. Rewriting a wrapper's
+parents invalidates its digest and makes it a new operation for synchronization.
+This convergence check belongs to `jj sync`; running `jj converge` is unnecessary.
 
 ## Working copies and snapshots
 
@@ -205,19 +249,36 @@ history has been transferred.
 
 ## Compatibility, retries, and retention
 
-The first version supports Git-backed repositories with Jujutsu's built-in
-operation store. First use enables synchronization storage in each participating
-repository. Commands using the original format hold a shared repository lock.
-The first sync waits for those commands to finish, enables synchronization under
-an exclusive lock, and reopens the repository. New commands wait until that
-transition finishes. Repositories already using the synchronization format do
-not retain this shared lock, so simultaneous syncs can proceed independently.
+Synchronization supports Git-backed repositories with Jujutsu's built-in
+operation store. First use enables the native synchronization format,
+`simple_op_store_sync_v2`, in each participating repository. Commands using the
+original format hold a shared repository lock. The first sync waits for those
+commands to finish, changes the format under an exclusive lock, and reopens the
+repository. New commands wait until that transition finishes. Repositories
+already using a synchronization format do not retain this shared lock, so
+simultaneous syncs can proceed independently.
 
-Binaries predating this locking protocol do not participate in it. Commands
-already running in those binaries must finish once before the first transition;
-an advisory lock cannot exclude a process that never acquires it. Older binaries
-that do not support synchronization reject its operation-store type on later
-opens. The deployed synchronization marker and operation/view bytes are unchanged.
+Binaries predating this locking protocol do not participate in it. An already
+running old process can race with the first transition because an advisory lock
+cannot exclude a process that never acquires it. Older binaries reject the new
+operation-store type on later opens.
+
+Repositories using the deployed `simple_op_store_sync_v1` format are upgraded
+automatically after both endpoints confirm native synchronization support.
+Migration preserves the current local view and every retained original
+operation and view ID. Legacy shared events that carried additional historical
+views become ordinary operations, and an ordinary merge connects all retained
+history to the local operation graph. After that publication, completed
+acknowledgments and legacy shared-event roots no longer retain history.
+Interrupted transfer pins and publication journals remain protected until their
+session is finished or retired. Migration does not alter original operation or
+view bytes.
+
+Upgrade both machines before the next exchange. A native-format repository
+cannot be opened by an older sync binary, and a native endpoint rejects an old
+peer before initialization or migration. The protocol still negotiates optional
+packed Git, immutable-file, and incremental commit-metadata transports between
+compatible native endpoints.
 
 An exchange is not a transaction spanning two machines. One endpoint can finish
 before the connection fails or the other endpoint reports an error. Retry the
@@ -232,10 +293,13 @@ saves local edits before reconciling the workspace with the published operation;
 inspect any divergent changes reported during recovery. The published operation
 remains available in history.
 
-Garbage collection retains the histories and objects referenced by
-synchronization tracking, including legacy conflict trees referenced only by
-Jujutsu metadata. Abandoning an operation from the local operation log does not
-by itself remove histories still required by synchronization roots.
+Garbage collection follows ordinary operation parents and views, including
+imported history and legacy conflict trees referenced by Jujutsu metadata.
+Temporary transfer pins and unfinished publication journals protect work in
+progress. Completed syncs do not add permanent roots outside the operation
+graph. As with local history, `jj op abandon` can remove ancestry and allow its
+objects to be collected. Pruning can also remove the ancestry proving that a
+peer's work was already received; a later sync may receive that work again.
 
 ## Receiver resource limits
 

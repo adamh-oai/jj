@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Garbage-collection reachability across original and shared histories.
+//! Operation reachability and temporary transfer protection during collection.
 //!
 //! Callers must hold the synchronization state lock from capture through both
 //! operation and backend collection. Transfer/import must use the same lock
@@ -125,10 +125,11 @@ pub async fn collect_roots(
                     plan.commit_roots.extend(old_ids.iter().cloned());
                 }
             }
-            if let Some(value) = operation
-                .metadata
-                .attributes
-                .get(INTEGRATION_ANCHOR_ATTRIBUTE)
+            if !state.is_native()
+                && let Some(value) = operation
+                    .metadata
+                    .attributes
+                    .get(INTEGRATION_ANCHOR_ATTRIBUTE)
             {
                 shared_pending.push(parse_shared_id(value)?);
             }
@@ -377,6 +378,59 @@ mod tests {
             .is_err()
         );
         store.read_operation(&active).block_on()?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_history_uses_only_operation_parents_and_temporary_pins() -> TestResult {
+        let directory = new_temp_dir();
+        let op_path = directory.path().join("op_store");
+        fs::create_dir(&op_path)?;
+        let store = SimpleOpStore::init(
+            &op_path,
+            RootOperationData {
+                root_commit_id: CommitId::from_bytes(&[0; 20]),
+            },
+        )?;
+        // There is deliberately no sync/events directory. Old integration
+        // attributes are ordinary metadata after native migration.
+        let anchors = AnchorStore::load(directory.path());
+        let peer = write_operation(&store, "imported original operation", BTreeMap::new());
+        let pinned = write_operation(&store, "inflight transfer", BTreeMap::new());
+        let orphan = write_operation(&store, "pruned history", BTreeMap::new());
+        let mut active = store.read_operation(&peer).block_on()?;
+        active.parents = vec![peer.clone()];
+        active.metadata.description = "native synchronization merge".to_owned();
+        active.metadata.attributes.insert(
+            INTEGRATION_ANCHOR_ATTRIBUTE.to_owned(),
+            "missing legacy event".to_owned(),
+        );
+        let active = store.write_operation(&active).block_on()?;
+        let mut state = SyncState::native();
+        state.pin_transfer(
+            "transfer".to_owned(),
+            PeerState {
+                raw_heads: BTreeSet::from([pinned.hex()]),
+                shared_heads: BTreeSet::new(),
+            },
+        )?;
+        let plan =
+            collect_roots(&store, &anchors, &state, std::slice::from_ref(&active)).block_on()?;
+        assert!(plan.raw_operations.contains(&peer));
+        assert!(plan.raw_operations.contains(&pinned));
+        assert!(!plan.raw_operations.contains(&orphan));
+        assert!(plan.shared_events.is_empty());
+        state.transfer_pins.clear();
+        let plan = collect_roots(&store, &anchors, &state, &[active]).block_on()?;
+        store
+            .gc(
+                &plan.raw_operations.into_iter().collect::<Vec<_>>(),
+                SystemTime::now(),
+            )
+            .block_on()?;
+        store.read_operation(&peer).block_on()?;
+        assert!(store.read_operation(&pinned).block_on().is_err());
+        assert!(store.read_operation(&orphan).block_on().is_err());
         Ok(())
     }
 

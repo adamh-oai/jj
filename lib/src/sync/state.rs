@@ -37,6 +37,7 @@ use crate::lock::FileLock;
 use crate::lock::FileLockError;
 
 const FORMAT_VERSION: u32 = 1;
+const NATIVE_FORMAT_VERSION: u32 = 2;
 const ID_HEX_LENGTH: usize = 128;
 
 /// A synchronization tracking or publication error.
@@ -204,6 +205,42 @@ impl Default for SyncState {
 }
 
 impl SyncState {
+    /// Creates tracking state for ordinary operation-DAG synchronization.
+    pub fn native() -> Self {
+        Self {
+            format_version: NATIVE_FORMAT_VERSION,
+            ..Self::default()
+        }
+    }
+
+    /// Whether published history is retained solely by native operation parents.
+    pub fn is_native(&self) -> bool {
+        self.format_version == NATIVE_FORMAT_VERSION
+    }
+
+    /// Removes legacy roots after their equivalent native history is published.
+    ///
+    /// The caller must first publish a native operation retaining the complete
+    /// legacy closure. Temporary transfer pins and unfinished publication WAL
+    /// remain roots until their owners explicitly finish or retire them.
+    pub fn finish_native_migration(&mut self) {
+        self.format_version = NATIVE_FORMAT_VERSION;
+        self.peers.clear();
+        self.shared_anchors.clear();
+        self.normalized_operations.clear();
+        self.local_anchor = None;
+        self.pending_pruned_shared_heads.clear();
+        self.sessions
+            .retain(|_, session| session.phase != SessionPhase::Completed);
+        for session in self.sessions.values_mut() {
+            session.incoming_shared_heads.clear();
+            session.applied_anchor = None;
+        }
+        for roots in self.transfer_pins.values_mut() {
+            roots.shared_heads.clear();
+        }
+    }
+
     /// Returns roots retained by tracking and unfinished publication records.
     ///
     /// Cache entries do not pin otherwise abandoned history. Shared-event source
@@ -211,6 +248,26 @@ impl SyncState {
     /// followed by the GC caller in addition to these explicit roots.
     pub fn gc_roots(&self) -> SyncGcRoots {
         let mut roots = SyncGcRoots::default();
+        if self.is_native() {
+            for pin in self.transfer_pins.values() {
+                roots.raw_operations.extend(pin.raw_heads.iter().cloned());
+            }
+            for session in self.sessions.values() {
+                if session.phase == SessionPhase::Completed {
+                    continue;
+                }
+                roots
+                    .raw_operations
+                    .insert(session.baseline_operation.clone());
+                roots
+                    .raw_operations
+                    .extend(session.incoming_raw_heads.iter().cloned());
+                roots
+                    .raw_operations
+                    .extend(session.result_operation.iter().cloned());
+            }
+            return roots;
+        }
         roots
             .shared_events
             .extend(self.shared_anchors.iter().cloned());
@@ -306,6 +363,7 @@ impl SyncState {
         session_id: &str,
         observed_operation: &str,
     ) -> Result<(), SyncStateError> {
+        let native = self.is_native();
         let session = self
             .sessions
             .get_mut(session_id)
@@ -315,7 +373,7 @@ impl SyncState {
                 "published operation differs from prepared result".to_owned(),
             ));
         }
-        if session.applied_anchor.is_none() {
+        if !native && session.applied_anchor.is_none() {
             return Err(SyncStateError::Invalid(
                 "publication has no prepared shared anchor".to_owned(),
             ));
@@ -331,6 +389,7 @@ impl SyncState {
     /// Earlier peer roots are retained: local operation-history pruning does not
     /// request deletion of already received history.
     pub fn complete_session(&mut self, session_id: &str) -> Result<(), SyncStateError> {
+        let native = self.is_native();
         let session = self
             .sessions
             .get_mut(session_id)
@@ -339,6 +398,10 @@ impl SyncState {
             return Err(SyncStateError::Invalid(
                 "cannot complete an unconfirmed publication".to_owned(),
             ));
+        }
+        if native {
+            session.phase = SessionPhase::Completed;
+            return Ok(());
         }
         let peer = self.peers.entry(session.peer.clone()).or_default();
         peer.raw_heads
@@ -352,8 +415,26 @@ impl SyncState {
     }
 
     fn validate(&self) -> Result<(), SyncStateError> {
-        if self.format_version != FORMAT_VERSION {
+        if !matches!(self.format_version, FORMAT_VERSION | NATIVE_FORMAT_VERSION) {
             return Err(SyncStateError::UnsupportedVersion(self.format_version));
+        }
+        if self.is_native()
+            && (!self.peers.is_empty()
+                || !self.shared_anchors.is_empty()
+                || !self.normalized_operations.is_empty()
+                || self.local_anchor.is_some()
+                || !self.pending_pruned_shared_heads.is_empty()
+                || self
+                    .transfer_pins
+                    .values()
+                    .any(|pin| !pin.shared_heads.is_empty())
+                || self.sessions.values().any(|session| {
+                    !session.incoming_shared_heads.is_empty() || session.applied_anchor.is_some()
+                }))
+        {
+            return Err(SyncStateError::Invalid(
+                "native history has legacy shared-event dependencies".to_owned(),
+            ));
         }
         if self.repository_id.len() != 32
             || !self
@@ -409,18 +490,22 @@ impl SyncState {
                 check_id(id)?;
             }
             if session.phase != SessionPhase::Pending
-                && (session.applied_anchor.is_none() || session.result_operation.is_none())
+                && ((!self.is_native() && session.applied_anchor.is_none())
+                    || session.result_operation.is_none())
             {
                 return Err(SyncStateError::Invalid(
                     "published session lacks its result or anchor".to_owned(),
                 ));
             }
-            if session.result_operation.is_some() && session.applied_anchor.is_none() {
+            if !self.is_native()
+                && session.result_operation.is_some()
+                && session.applied_anchor.is_none()
+            {
                 return Err(SyncStateError::Invalid(
                     "proposed publication has no shared anchor".to_owned(),
                 ));
             }
-            if session.phase == SessionPhase::Completed {
+            if !self.is_native() && session.phase == SessionPhase::Completed {
                 let roots_retained = self.peers.get(&session.peer).is_some_and(|peer| {
                     session.incoming_raw_heads.is_subset(&peer.raw_heads)
                         && session.incoming_shared_heads.is_subset(&peer.shared_heads)
@@ -705,6 +790,88 @@ mod tests {
     }
 
     #[test]
+    fn native_publication_releases_peer_history_to_ordinary_gc() -> TestResult {
+        let directory = new_temp_dir();
+        let store = SyncStateStore::init(directory.path())?;
+        let mut locked = store.lock()?;
+        locked.state_mut().finish_native_migration();
+        let mut session = pending_session();
+        session.incoming_shared_heads.clear();
+        session.applied_anchor = None;
+        locked
+            .state_mut()
+            .begin_session("native".to_owned(), session)?;
+        locked.save()?;
+        assert_eq!(
+            locked.state().gc_roots().raw_operations,
+            BTreeSet::from([id('1'), id('2'), id('5')])
+        );
+        assert!(locked.state().gc_roots().shared_events.is_empty());
+        locked.state_mut().record_publication("native", &id('5'))?;
+        locked.state_mut().complete_session("native")?;
+        locked.save()?;
+        drop(locked);
+        let reopened = store.read()?;
+        assert!(reopened.is_native());
+        assert!(reopened.peers.is_empty());
+        assert_eq!(reopened.gc_roots(), SyncGcRoots::default());
+        assert_eq!(
+            reopened.sessions["native"].recovery(true)?,
+            SessionRecovery::Completed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn native_migration_discards_legacy_roots_but_keeps_inflight_wal() -> TestResult {
+        let mut state = SyncState {
+            local_anchor: Some(LocalAnchor {
+                raw_head: id('6'),
+                shared_anchor: id('7'),
+            }),
+            ..Default::default()
+        };
+        state.retain_peer(
+            "legacy",
+            PeerState {
+                raw_heads: BTreeSet::from([id('8')]),
+                shared_heads: BTreeSet::from([id('9')]),
+            },
+        );
+        state.begin_session("pending".to_owned(), pending_session())?;
+        state.pin_transfer(
+            "transfer".to_owned(),
+            PeerState {
+                raw_heads: BTreeSet::from([id('a')]),
+                shared_heads: BTreeSet::from([id('b')]),
+            },
+        )?;
+        state.finish_native_migration();
+        let expected = state.clone();
+        state.finish_native_migration();
+        assert_eq!(state, expected);
+        state.validate()?;
+        assert_eq!(
+            state.gc_roots().raw_operations,
+            BTreeSet::from([id('1'), id('2'), id('5'), id('a')])
+        );
+        assert!(state.gc_roots().shared_events.is_empty());
+        assert!(state.local_anchor.is_none());
+        assert!(state.peers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn native_schema_rejects_accidental_legacy_dependencies() -> TestResult {
+        let mut state = SyncState::native();
+        state.shared_anchors.insert(id('1'));
+        assert!(state.validate().is_err());
+        state.shared_anchors.clear();
+        state.validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn abandoned_temporary_file_is_not_recovery_state() -> TestResult {
         let directory = new_temp_dir();
         let store = SyncStateStore::init(directory.path())?;
@@ -722,8 +889,8 @@ mod tests {
         let state = SyncState::default();
         let encoded = toml_edit::ser::to_string(&state)?;
         assert!(matches!(
-            decode_state(&encoded.replace("format_version = 1", "format_version = 2")),
-            Err(SyncStateError::UnsupportedVersion(2))
+            decode_state(&encoded.replace("format_version = 1", "format_version = 3")),
+            Err(SyncStateError::UnsupportedVersion(3))
         ));
         let mut invalid = state;
         invalid.normalized_operations.insert(id('a'), id('A'));

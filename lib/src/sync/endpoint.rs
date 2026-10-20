@@ -99,6 +99,35 @@ pub struct Capture {
     pub current_shared: SharedEventId,
 }
 
+/// A frozen ordinary operation frontier for the native synchronization format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeCapture {
+    /// Ordinary operation roots, including all published imported history.
+    pub raw_heads: Vec<OperationId>,
+    /// The receiver's operation after ordinary working-copy snapshotting.
+    pub current_raw: OperationId,
+}
+
+/// Exclusive access while a deployed legacy synchronization store is migrated.
+pub struct NativeUpgrade {
+    repo_path: PathBuf,
+    _lock: RepoFormatLock,
+}
+
+impl NativeUpgrade {
+    /// Publishes the marker only after native history and state are durable.
+    pub fn finish(self) -> EndpointResult<()> {
+        let state = SyncStateStore::load(&self.repo_path).read()?;
+        if !state.is_native() {
+            return Err(
+                SyncError::InvalidData("native migration has not completed".to_owned()).into(),
+            );
+        }
+        write_format_marker(&self.repo_path, SimpleOpStore::NATIVE_SYNC_NAME)?;
+        Ok(())
+    }
+}
+
 /// Stores belonging to one repository; no lock survives a method call.
 pub struct Endpoint {
     repo_path: PathBuf,
@@ -114,6 +143,135 @@ impl Endpoint {
             anchors: AnchorStore::load(repo_path),
             state: SyncStateStore::load(repo_path),
         }
+    }
+
+    /// Enables native synchronization, or leaves a deployed legacy store ready
+    /// for migration. Existing plain-format handles must be dropped first.
+    pub fn enable_native(repo_path: &Path) -> EndpointResult<Self> {
+        let _format_lock = RepoFormatLock::exclusive(repo_path)?;
+        let current = fs::read_to_string(repo_path.join("op_store/type"))?;
+        match current.as_str() {
+            SimpleOpStore::NAME => {
+                let state = SyncStateStore::init(repo_path)?;
+                let mut locked = state.lock()?;
+                locked.state_mut().finish_native_migration();
+                locked.save()?;
+                write_format_marker(repo_path, SimpleOpStore::NATIVE_SYNC_NAME)?;
+            }
+            SimpleOpStore::SYNC_NAME => {
+                // Do not discard legacy roots: the caller first publishes them
+                // as ordinary operation ancestry under a NativeUpgrade guard.
+                SyncStateStore::load(repo_path).read()?;
+            }
+            SimpleOpStore::NATIVE_SYNC_NAME => {
+                if !SyncStateStore::load(repo_path).read()?.is_native() {
+                    return Err(SyncError::InvalidData(
+                        "native store has legacy synchronization state".to_owned(),
+                    )
+                    .into());
+                }
+            }
+            _ => return Err(EndpointError::WrongRepository),
+        }
+        Ok(Self::load(repo_path))
+    }
+
+    /// Serializes migration of a deployed legacy synchronization format.
+    pub fn begin_native_upgrade(&self) -> EndpointResult<NativeUpgrade> {
+        Ok(NativeUpgrade {
+            repo_path: self.repo_path.clone(),
+            _lock: RepoFormatLock::exclusive(&self.repo_path)?,
+        })
+    }
+
+    /// Captures and temporarily pins ordinary history without creating a second
+    /// causal graph. Native pruning has its usual operation-log semantics.
+    pub async fn capture_native(
+        &self,
+        repo: &Arc<ReadonlyRepo>,
+        transfer: &str,
+    ) -> EndpointResult<NativeCapture> {
+        self.check_repository(repo)?;
+        let mut locked = self.state.lock()?;
+        if !locked.state().is_native() {
+            return Err(EndpointError::NotEnabled);
+        }
+        ensure_current(repo).await?;
+        let capture = NativeCapture {
+            // Pure receiver wrappers carry only local workspace observations.
+            // Advertise the ordinary authored result they already represent.
+            raw_heads: super::native::frontier(
+                repo.op_store().as_ref(),
+                std::slice::from_ref(repo.op_id()),
+            )
+            .await?,
+            current_raw: repo.op_id().clone(),
+        };
+        if capture.raw_heads.len() != 1 {
+            return Err(SyncError::InvalidData(
+                "one operation must represent one authored result".to_owned(),
+            )
+            .into());
+        }
+        let mut pinned = capture.raw_heads.clone();
+        pinned.push(capture.current_raw.clone());
+        locked
+            .state_mut()
+            .pin_transfer(transfer.to_owned(), roots(&pinned, &[]))?;
+        locked.save()?;
+        Ok(capture)
+    }
+
+    /// Computes and pins an unpublished ordinary merge operation. Its exact
+    /// commits can be sent to the other receiver before either side publishes.
+    pub async fn reconcile_native(
+        &self,
+        repo: &Arc<ReadonlyRepo>,
+        incoming: &[OperationId],
+        transfer: &str,
+    ) -> EndpointResult<OperationId> {
+        self.check_repository(repo)?;
+        let mut locked = self.state.lock()?;
+        let mut heads = vec![repo.op_id().clone()];
+        heads.extend_from_slice(incoming);
+        let selected = super::native::reconcile(repo, &heads).await?;
+        locked.state_mut().pin_transfer(
+            transfer.to_owned(),
+            roots(std::slice::from_ref(&selected), &[]),
+        )?;
+        locked.save()?;
+        Ok(selected)
+    }
+
+    /// Installs validated incoming native objects and pins their ordinary roots
+    /// atomically with respect to collection. The session releases this pin.
+    #[cfg(feature = "git")]
+    pub fn install_native(
+        &self,
+        repo: &Arc<ReadonlyRepo>,
+        quarantine: &super::objects::Quarantine,
+        inventory: &super::objects::Inventory,
+        transfer: &str,
+    ) -> EndpointResult<()> {
+        self.check_repository(repo)?;
+        let mut locked = self.state.lock()?;
+        let operations = repo
+            .op_store()
+            .downcast_ref::<SimpleOpStore>()
+            .ok_or(EndpointError::WrongRepository)?;
+        let backend = crate::git::get_git_backend(repo.store())
+            .map_err(|_| EndpointError::WrongRepository)?;
+        let objects = super::objects::RepositoryObjects::new(operations, &self.anchors, backend)?;
+        quarantine.install(&objects, inventory)?;
+        locked.state_mut().pin_transfer(
+            transfer.to_owned(),
+            roots(
+                &inventory.raw_heads.iter().cloned().collect::<Vec<_>>(),
+                &[],
+            ),
+        )?;
+        locked.save()?;
+        Ok(())
     }
 
     /// Enables synchronization after waiting for plain operation-store users.
@@ -179,6 +337,53 @@ impl Endpoint {
     /// it while ordinary finalization runs without holding the state lock.
     pub fn acquire_session_lease(&self, session: &str) -> EndpointResult<FileLock> {
         Ok(FileLock::lock(self.session_lease_path(session)).map_err(SyncStateError::from)?)
+    }
+
+    /// Owns one transfer's temporary roots until its network work has stopped.
+    /// Acquire this before capture; the lease is separate from the short state
+    /// writer lock and can safely remain held during network waits.
+    pub fn acquire_transfer_lease(&self, transfer: &str) -> EndpointResult<FileLock> {
+        let owner = transfer_owner(transfer).ok_or_else(|| {
+            SyncError::InvalidData("invalid synchronization transfer owner".to_owned())
+        })?;
+        self.acquire_session_lease(&format!("transfer-{owner}"))
+    }
+
+    /// Releases temporary native roots left by transfers that no longer run.
+    ///
+    /// A nonblocking lease check excludes live transfers, including transfers
+    /// that have not yet established their first pin. Unfinished publication
+    /// receipts retain their own roots independently. Legacy histories keep
+    /// their deployed retention semantics until native migration completes.
+    pub fn retire_inactive_native_transfers(&self) -> EndpointResult<()> {
+        let snapshot = self.state.read()?;
+        if !snapshot.is_native() {
+            return Ok(());
+        }
+        let owners = snapshot
+            .transfer_pins
+            .keys()
+            .filter_map(|key| transfer_owner(key).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        for owner in owners {
+            let Some(_lease) =
+                FileLock::try_lock(self.session_lease_path(&format!("transfer-{owner}")))
+                    .map_err(SyncStateError::from)?
+            else {
+                continue;
+            };
+            let mut locked = self.state.lock()?;
+            if !locked.state().is_native() {
+                return Ok(());
+            }
+            let prefix = format!("{owner}-");
+            locked
+                .state_mut()
+                .transfer_pins
+                .retain(|key, _| key != &owner && !key.starts_with(&prefix));
+            locked.save()?;
+        }
+        Ok(())
     }
 
     /// Captures the actual current raw operation, never an advertised cached tip.
@@ -509,14 +714,16 @@ impl Endpoint {
             return Ok(false);
         }
         let state = locked.state_mut();
-        state.retain_peer(
-            &receipt.peer,
-            PeerState {
-                raw_heads: receipt.incoming_raw_heads,
-                shared_heads: receipt.incoming_shared_heads,
-            },
-        );
-        state.shared_anchors.extend(receipt.applied_anchor);
+        if !state.is_native() {
+            state.retain_peer(
+                &receipt.peer,
+                PeerState {
+                    raw_heads: receipt.incoming_raw_heads,
+                    shared_heads: receipt.incoming_shared_heads,
+                },
+            );
+            state.shared_anchors.extend(receipt.applied_anchor);
+        }
         state.sessions.remove(session);
         locked.save()?;
         Ok(true)
@@ -543,7 +750,10 @@ impl Endpoint {
         {
             return Err(EndpointError::WrongRepository);
         }
-        if fs::read_to_string(self.repo_path.join("op_store/type"))? != SimpleOpStore::SYNC_NAME {
+        if !matches!(
+            fs::read_to_string(self.repo_path.join("op_store/type"))?.as_str(),
+            SimpleOpStore::SYNC_NAME | SimpleOpStore::NATIVE_SYNC_NAME
+        ) {
             return Err(EndpointError::NotEnabled);
         }
         Ok(())
@@ -558,11 +768,33 @@ async fn ensure_current(repo: &ReadonlyRepo) -> EndpointResult<()> {
     Ok(())
 }
 
+fn write_format_marker(repo_path: &Path, name: &str) -> EndpointResult<()> {
+    let marker = repo_path.join("op_store/type");
+    let permissions = fs::metadata(&marker)?.permissions();
+    let mut temporary = NamedTempFile::new_in(marker.parent().unwrap())?;
+    temporary.write_all(name.as_bytes())?;
+    temporary.as_file().set_permissions(permissions)?;
+    temporary.as_file().sync_all()?;
+    persist_temp_file(temporary, &marker)?;
+    #[cfg(unix)]
+    fs::File::open(marker.parent().unwrap())?.sync_all()?;
+    Ok(())
+}
+
 fn roots(raw: &[OperationId], shared: &[SharedEventId]) -> PeerState {
     PeerState {
         raw_heads: raw.iter().map(|id| id.hex()).collect(),
         shared_heads: shared.iter().map(|id| id.hex()).collect(),
     }
+}
+
+fn transfer_owner(transfer: &str) -> Option<&str> {
+    let owner = transfer.split('-').next()?;
+    (owner.len() == 32
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some(owner)
 }
 
 fn parse_raw_id(value: &str) -> EndpointResult<OperationId> {
@@ -698,6 +930,84 @@ mod tests {
             fs::read(directory.path().join("op_heads/local-head"))?,
             b"original active head"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_native_transfer_pins_retire_but_live_transfers_and_wal_remain() -> TestResult {
+        let directory = new_temp_dir();
+        make_repository(directory.path(), SimpleOpStore::NATIVE_SYNC_NAME)?;
+        let state_store = SyncStateStore::init(directory.path())?;
+        let endpoint = Endpoint::load(directory.path());
+        let active = "1".repeat(32);
+        let abandoned = "2".repeat(32);
+        let active_root = OperationId::from_bytes(&[1; 64]);
+        let abandoned_root = OperationId::from_bytes(&[2; 64]);
+        let wal_root = OperationId::from_bytes(&[3; 64]);
+        {
+            let mut locked = state_store.lock()?;
+            let state = locked.state_mut();
+            state.finish_native_migration();
+            for key in [active.clone(), format!("{active}-incoming")] {
+                state.pin_transfer(key, roots(std::slice::from_ref(&active_root), &[]))?;
+            }
+            for key in [abandoned.clone(), format!("{abandoned}-selected")] {
+                state.pin_transfer(key, roots(std::slice::from_ref(&abandoned_root), &[]))?;
+            }
+            state.begin_session(
+                "pending-publication".to_owned(),
+                super::super::state::SyncSession {
+                    peer: "peer".to_owned(),
+                    baseline_operation: wal_root.hex(),
+                    incoming_raw_heads: BTreeSet::from([abandoned_root.hex()]),
+                    incoming_shared_heads: BTreeSet::new(),
+                    applied_anchor: None,
+                    result_operation: None,
+                    phase: SessionPhase::Pending,
+                },
+            )?;
+            locked.save()?;
+        }
+        // A subphase key must take the owner's lease, just like retirement.
+        let lease = endpoint.acquire_transfer_lease(&format!("{active}-incoming"))?;
+        endpoint.retire_inactive_native_transfers()?;
+        let state = state_store.read()?;
+        assert_eq!(
+            state.transfer_pins.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([active.clone(), format!("{active}-incoming")])
+        );
+        assert!(state.gc_roots().raw_operations.contains(&active_root.hex()));
+        assert!(
+            state
+                .gc_roots()
+                .raw_operations
+                .contains(&abandoned_root.hex())
+        );
+        assert!(state.gc_roots().raw_operations.contains(&wal_root.hex()));
+        drop(lease);
+        endpoint.retire_inactive_native_transfers()?;
+        let state = state_store.read()?;
+        assert!(state.transfer_pins.is_empty());
+        assert_eq!(
+            state.gc_roots().raw_operations,
+            BTreeSet::from([abandoned_root.hex(), wal_root.hex()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_transfer_retirement_does_not_change_legacy_roots() -> TestResult {
+        let directory = new_temp_dir();
+        make_repository(directory.path(), SimpleOpStore::NAME)?;
+        let endpoint = Endpoint::enable(directory.path())?;
+        endpoint.pin_transfer(
+            &"a".repeat(32),
+            &[OperationId::from_bytes(&[1; 64])],
+            &[SharedEventId::from_bytes(&[2; 64])],
+        )?;
+        let before = endpoint.state_store().read()?;
+        endpoint.retire_inactive_native_transfers()?;
+        assert_eq!(endpoint.state_store().read()?, before);
         Ok(())
     }
 }

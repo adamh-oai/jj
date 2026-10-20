@@ -52,6 +52,7 @@ use crate::git_backend::GitMetadataSnapshot;
 use crate::git_backend::GitObjectHeader;
 use crate::git_backend::GitObjectRecord;
 use crate::object_id::ObjectId as _;
+use crate::op_store::OpStore as _;
 use crate::op_store::OperationId;
 use crate::op_store::ViewId;
 use crate::simple_op_store::SimpleOpStore;
@@ -1593,7 +1594,12 @@ fn build_inventory(
                         }
                     }
                 }
-                if let Some(anchor) = op.metadata.attributes.get(INTEGRATION_ANCHOR_ATTRIBUTE) {
+                // The deployed v1 format used sidecar causal links. After the
+                // native migration their contents are ordinary operation parents;
+                // historical attributes are retained as opaque original metadata.
+                if receiver.operations.name() != SimpleOpStore::NATIVE_SYNC_NAME
+                    && let Some(anchor) = op.metadata.attributes.get(INTEGRATION_ANCHOR_ATTRIBUTE)
+                {
                     let id = SharedEventId::try_from_hex(anchor)
                         .filter(|id| id.as_bytes().len() == 64)
                         .ok_or_else(|| {
@@ -2242,7 +2248,6 @@ mod tests {
     use crate::config::StackedConfig;
     use crate::lock::FileLock;
     use crate::op_store;
-    use crate::op_store::OpStore as _;
     use crate::op_store::RootOperationData;
     use crate::settings::UserSettings;
     use crate::stacked_table::TableStore;

@@ -189,7 +189,7 @@ pub async fn cmd_undo(
     }
 
     let mut tx = workspace_command.start_transaction();
-    if tx.base_repo().op_store().name() == jj_lib::simple_op_store::SimpleOpStore::SYNC_NAME {
+    if jj_lib::simple_op_store::SimpleOpStore::is_sync_name(tx.base_repo().op_store().name()) {
         tx.record_empty_operation();
     }
     let new_view = view_with_desired_portions_restored(

@@ -35,12 +35,14 @@ use jj_lib::repo::Repo as _;
 use jj_lib::settings::HumanByteSize;
 use jj_lib::simple_op_store::SimpleOpStore;
 use jj_lib::sync::SyncError;
-use jj_lib::sync::endpoint::Capture;
 use jj_lib::sync::endpoint::Endpoint;
 use jj_lib::sync::endpoint::EndpointError;
+use jj_lib::sync::endpoint::NativeCapture;
 use jj_lib::sync::metadata::KnownCommitMetadata;
 use jj_lib::sync::metadata::MetadataInventory;
 use jj_lib::sync::metadata::MetadataSummary;
+use jj_lib::sync::native;
+use jj_lib::sync::native::prepare_integration;
 #[cfg(unix)]
 use jj_lib::sync::objects::ImmutableFiles;
 use jj_lib::sync::objects::Inventory;
@@ -56,7 +58,6 @@ use jj_lib::sync::protocol::Hello;
 use jj_lib::sync::protocol::Message;
 use jj_lib::sync::protocol::PROTOCOL_VERSION;
 use jj_lib::sync::protocol::Session;
-use jj_lib::sync::reconcile::prepare_integration;
 use jj_lib::sync::shared::SharedEventId;
 use jj_lib::sync::state::SessionPhase;
 use jj_lib::sync::state::SyncSession;
@@ -83,7 +84,7 @@ use crate::ui::Ui;
 
 const CAPABILITIES: [&str; 4] = [
     "raw-history-v1",
-    "shared-causal-v1",
+    "native-operation-graph-v1",
     "streaming-objects-v1",
     "local-workspaces-v1",
 ];
@@ -333,8 +334,7 @@ fn check_peer_error(message: Message) -> Result<Message, CommandError> {
 struct Advertisement {
     peer: String,
     raw_heads: Vec<String>,
-    shared_heads: Vec<String>,
-    current_shared: String,
+    current_operation: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -380,25 +380,17 @@ impl Advertisement {
         self.raw_heads.iter().map(|id| parse_raw(id)).collect()
     }
 
-    fn shared_heads(&self) -> Result<Vec<SharedEventId>, CommandError> {
-        if self.shared_heads.is_empty() {
-            return Err(user_error("Peer advertised no shared operation heads"));
-        }
-        self.shared_heads
-            .iter()
-            .map(|id| parse_shared(id))
-            .collect()
-    }
-
     fn validate(&self) -> Result<(), CommandError> {
         if self.peer.is_empty() || self.peer.len() > 1024 {
             return Err(user_error("Peer advertised an invalid endpoint identity"));
         }
         self.raw_heads()?;
-        let shared = self.shared_heads()?;
-        if !shared.contains(&parse_shared(&self.current_shared)?) {
+        if !self
+            .raw_heads()?
+            .contains(&parse_raw(&self.current_operation)?)
+        {
             return Err(user_error(
-                "Peer's current shared operation is not a captured head",
+                "Peer's current operation is not a captured head",
             ));
         }
         Ok(())
@@ -409,19 +401,20 @@ impl Advertisement {
 #[serde(deny_unknown_fields)]
 struct Applied {
     operation: String,
-    captured_anchor: String,
-    current_anchor: String,
+    captured_operation: String,
+    current_operation: String,
 }
 
 struct PreparedEndpoint {
     helper: WorkspaceCommandHelper,
     endpoint: Endpoint,
-    capture: Capture,
+    capture: NativeCapture,
     inventory: Inventory,
     root: PathBuf,
     progress: SyncProgress,
     ignore_working_copy: bool,
     transfer: String,
+    _transfer_lease: FileLock,
     pins: Vec<String>,
     publication_leases: Vec<FileLock>,
     packed_git: bool,
@@ -452,7 +445,7 @@ impl PreparedEndpoint {
         jj_lib::git::get_git_backend(helper.repo().store())?;
         if !matches!(
             helper.repo().op_store().name(),
-            SimpleOpStore::NAME | SimpleOpStore::SYNC_NAME
+            SimpleOpStore::NAME | SimpleOpStore::SYNC_NAME | SimpleOpStore::NATIVE_SYNC_NAME
         ) {
             return Err(user_error(
                 "Repository synchronization requires the built-in operation store",
@@ -471,16 +464,19 @@ impl PreparedEndpoint {
             drop(helper);
             #[cfg(feature = "test-fakes")]
             crate::cli_util::pause_for_test("JJ_TEST_SYNC_BEFORE_FORMAT_TRANSITION_PAUSE_DIR");
-            Endpoint::enable(&repo_path).map_err(failed)?;
+            Endpoint::enable_native(&repo_path).map_err(failed)?;
             helper = load_helper(ui, command, &root, ignore_working_copy).await?;
         }
         let endpoint = Endpoint::load(helper.repo_path());
-        if endpoint
-            .state_store()
-            .read()
-            .map_err(failed)?
-            .local_anchor
-            .is_none()
+        if helper.repo().op_store().name() == SimpleOpStore::SYNC_NAME {
+            progress.phase(ui, "Migrating retained history to ordinary operations")?;
+            migrate_legacy(ui, &mut helper, &endpoint).await?;
+            helper = load_helper(ui, command, &root, ignore_working_copy).await?;
+        }
+        let transfer_lease = endpoint.acquire_transfer_lease(&transfer).map_err(failed)?;
+        endpoint
+            .retire_inactive_native_transfers()
+            .map_err(failed)?;
         {
             // Establish the receiver's physical observations before any peer
             // view can change the corresponding shared remote-tag targets.
@@ -514,14 +510,12 @@ impl PreparedEndpoint {
         )
         .await?;
         progress.phase(ui, "Collecting history objects")?;
-        let inventory = collect_inventory(
-            &helper,
-            &endpoint,
-            &capture.raw_heads,
-            &capture.shared_heads,
-            packed_git,
-        )?;
-        let pins = vec![transfer.clone()];
+        let inventory = collect_inventory(&helper, &endpoint, &capture.raw_heads, &[], packed_git)?;
+        let pins = vec![
+            transfer.clone(),
+            format!("{transfer}-incoming"),
+            format!("{transfer}-selected"),
+        ];
         #[cfg(unix)]
         let (pins, immutable_basis) = if rsync_immutable {
             progress.phase(ui, "Preparing history comparison")?;
@@ -548,6 +542,7 @@ impl PreparedEndpoint {
             pins,
             publication_leases: Vec::new(),
             transfer,
+            _transfer_lease: transfer_lease,
             packed_git,
             rsync_immutable,
             #[cfg(unix)]
@@ -566,19 +561,18 @@ impl PreparedEndpoint {
     }
 
     fn advertisement(&self) -> Result<Advertisement, CommandError> {
-        self.advertise_inventory(&self.inventory, &self.capture.current_shared)
+        self.advertise_inventory(&self.inventory, &self.capture.raw_heads[0])
     }
 
     fn advertise_inventory(
         &self,
         inventory: &Inventory,
-        shared: &SharedEventId,
+        selected: &OperationId,
     ) -> Result<Advertisement, CommandError> {
         Ok(Advertisement {
             peer: self.endpoint.identity().map_err(failed)?,
             raw_heads: inventory.raw_heads.iter().map(|id| id.hex()).collect(),
-            shared_heads: inventory.shared_heads.iter().map(|id| id.hex()).collect(),
-            current_shared: shared.hex(),
+            current_operation: selected.hex(),
         })
     }
 
@@ -587,7 +581,7 @@ impl PreparedEndpoint {
         ui: &Ui,
         stream: &mut impl Stream,
         inventory: &Inventory,
-        shared: &SharedEventId,
+        selected: &OperationId,
         known: &BTreeSet<RecordId>,
     ) -> Result<(), CommandError> {
         tracing::debug!(
@@ -597,7 +591,7 @@ impl PreparedEndpoint {
         send_command(
             stream,
             "offer",
-            &self.advertise_inventory(inventory, shared)?,
+            &self.advertise_inventory(inventory, selected)?,
         )?;
         self.progress.phase(ui, "Preparing objects to send")?;
         let objects = objects(&self.helper, &self.endpoint)?;
@@ -862,7 +856,7 @@ impl PreparedEndpoint {
         );
         self.progress.phase(ui, "Validating received history")?;
         let inventory = quarantine
-            .validate(&objects, &offered.raw_heads()?, &offered.shared_heads()?)
+            .validate(&objects, &offered.raw_heads()?, &[])
             .map_err(failed)?;
         tracing::debug!(
             path = %self.root.display(),
@@ -875,7 +869,12 @@ impl PreparedEndpoint {
         );
         self.progress.phase(ui, "Installing received objects")?;
         self.endpoint
-            .install_and_retain(self.helper.repo(), &quarantine, &inventory, &offered.peer)
+            .install_native(
+                self.helper.repo(),
+                &quarantine,
+                &inventory,
+                &format!("{}-incoming", self.transfer),
+            )
             .map_err(failed)?;
         tracing::debug!(
             path = %self.root.display(),
@@ -1046,17 +1045,13 @@ impl PreparedEndpoint {
         Ok(limits)
     }
 
-    async fn select(
-        &self,
-        ui: &Ui,
-        incoming: &Advertisement,
-    ) -> Result<SharedEventId, CommandError> {
+    async fn select(&self, ui: &Ui, incoming: &Advertisement) -> Result<OperationId, CommandError> {
         self.progress.phase(ui, "Merging repository views")?;
         self.endpoint
-            .reconcile(
+            .reconcile_native(
                 self.helper.repo(),
-                &self.capture.current_shared,
-                &incoming.shared_heads()?,
+                &[parse_raw(&incoming.current_operation)?],
+                &format!("{}-selected", self.transfer),
             )
             .await
             .map_err(failed)
@@ -1065,24 +1060,22 @@ impl PreparedEndpoint {
     fn selected_inventory(
         &self,
         ui: &Ui,
-        selected: &SharedEventId,
+        selected: &OperationId,
     ) -> Result<Inventory, CommandError> {
         self.progress
             .phase(ui, "Collecting merged history objects")?;
-        collect_inventory(
-            &self.helper,
-            &self.endpoint,
-            &self.capture.raw_heads,
-            std::slice::from_ref(selected),
-            self.packed_git,
-        )
+        let mut roots = self.capture.raw_heads.clone();
+        roots.push(selected.clone());
+        roots.sort_unstable();
+        roots.dedup();
+        collect_inventory(&self.helper, &self.endpoint, &roots, &[], self.packed_git)
     }
 
     async fn apply(
         &mut self,
         ui: &Ui,
         command: &CommandHelper,
-        selected: &SharedEventId,
+        selected: &OperationId,
         incoming: &Advertisement,
     ) -> Result<Applied, CommandError> {
         self.progress.phase(ui, "Applying synchronized history")?;
@@ -1106,23 +1099,9 @@ impl PreparedEndpoint {
             &refreshed_pin,
         )
         .await?;
-        let applied = self
-            .endpoint
-            .reconcile(
-                self.helper.repo(),
-                &current.current_shared,
-                std::slice::from_ref(selected),
-            )
+        if let Some(tx) = prepare_integration(self.helper.repo(), std::slice::from_ref(selected))
             .await
-            .map_err(failed)?;
-        if let Some(tx) = prepare_integration(
-            self.helper.repo(),
-            self.endpoint.anchors(),
-            &current.current_shared,
-            &applied,
-        )
-        .await
-        .map_err(failed)?
+            .map_err(failed)?
         {
             let session_key = format!("{}-apply", self.transfer);
             // A separate per-session lease proves that another live command
@@ -1136,9 +1115,14 @@ impl PreparedEndpoint {
             let session = SyncSession {
                 peer: incoming.peer.clone(),
                 baseline_operation: current.current_raw.hex(),
-                incoming_raw_heads: incoming.raw_heads.iter().cloned().collect(),
-                incoming_shared_heads: incoming.shared_heads.iter().cloned().collect(),
-                applied_anchor: Some(applied.hex()),
+                incoming_raw_heads: incoming
+                    .raw_heads
+                    .iter()
+                    .cloned()
+                    .chain([selected.hex()])
+                    .collect(),
+                incoming_shared_heads: BTreeSet::new(),
+                applied_anchor: None,
                 result_operation: None,
                 phase: SessionPhase::Pending,
             };
@@ -1184,8 +1168,24 @@ impl PreparedEndpoint {
         .await?;
         Ok(Applied {
             operation: self.helper.repo().op_id().hex(),
-            captured_anchor: selected.hex(),
-            current_anchor: final_capture.current_shared.hex(),
+            captured_operation: selected.hex(),
+            current_operation: if native::frontier(
+                self.helper.repo().op_store().as_ref(),
+                std::slice::from_ref(selected),
+            )
+            .await
+            .map_err(failed)?
+                == native::frontier(
+                    self.helper.repo().op_store().as_ref(),
+                    &final_capture.raw_heads,
+                )
+                .await
+                .map_err(failed)?
+            {
+                selected.hex()
+            } else {
+                final_capture.current_raw.hex()
+            },
         })
     }
 }
@@ -1209,6 +1209,113 @@ async fn load_helper(
     Ok(helper)
 }
 
+async fn migrate_legacy(
+    ui: &Ui,
+    helper: &mut WorkspaceCommandHelper,
+    endpoint: &Endpoint,
+) -> Result<(), CommandError> {
+    let upgrade = endpoint.begin_native_upgrade().map_err(failed)?;
+    if !endpoint.state_store().read().map_err(failed)?.is_native() {
+        endpoint
+            .recover_published(helper.repo())
+            .await
+            .map_err(failed)?;
+        retire_interrupted_publications(endpoint, helper.repo()).await?;
+        // Keep the deployed v1 collector's roots valid until publication. A
+        // crash before the final state/marker change can safely retry migration.
+        let key = format!("migration-{:032x}", rand::random::<u128>());
+        let capture = endpoint
+            .capture(helper.repo(), &key)
+            .await
+            .map_err(failed)?;
+        let prepared_key = format!("{key}-prepared");
+        let (tx, migration_roots) = {
+            let mut state = endpoint.state_store().lock().map_err(failed)?;
+            let tx = jj_lib::sync::migrate::prepare_legacy_migration(
+                helper.repo(),
+                state.state(),
+                endpoint.anchors(),
+            )
+            .await
+            .map_err(failed)?;
+            state
+                .state_mut()
+                .pin_transfer(
+                    prepared_key.clone(),
+                    jj_lib::sync::state::PeerState {
+                        raw_heads: tx.parent_ops().iter().map(|op| op.id().hex()).collect(),
+                        shared_heads: BTreeSet::new(),
+                    },
+                )
+                .map_err(failed)?;
+            state.save().map_err(failed)?;
+            (tx, state.state().gc_roots())
+        };
+        let baseline = helper.repo().op_id().hex();
+        let _lease = endpoint.acquire_session_lease(&key).map_err(failed)?;
+        helper
+            .finish_sync_transaction(
+                ui,
+                tx,
+                "migrate synchronized history to ordinary operations",
+                |state, operation| {
+                    check_migration_roots(state.state(), &migration_roots, None)?;
+                    state
+                        .state_mut()
+                        .begin_session(
+                            key.clone(),
+                            SyncSession {
+                                peer: "native-format-migration".to_owned(),
+                                baseline_operation: baseline.clone(),
+                                incoming_raw_heads: BTreeSet::from([operation.id().hex()]),
+                                incoming_shared_heads: BTreeSet::new(),
+                                applied_anchor: Some(capture.current_shared.hex()),
+                                result_operation: Some(operation.id().hex()),
+                                phase: SessionPhase::Pending,
+                            },
+                        )
+                        .map_err(failed)
+                },
+            )
+            .await?;
+        endpoint
+            .recover_published(helper.repo())
+            .await
+            .map_err(failed)?;
+        let mut state = endpoint.state_store().lock().map_err(failed)?;
+        check_migration_roots(state.state(), &migration_roots, Some(helper.repo().op_id()))?;
+        state.state_mut().finish_native_migration();
+        // Failed attempts left converted roots pinned. The exclusive upgrade
+        // guard excludes another live migration, and the published join now
+        // retains every checked root from those attempts through ordinary parents.
+        state
+            .state_mut()
+            .transfer_pins
+            .retain(|key, _| !key.starts_with("migration-"));
+        state.save().map_err(failed)?;
+    }
+    upgrade.finish().map_err(failed)
+}
+
+fn check_migration_roots(
+    state: &jj_lib::sync::state::SyncState,
+    prepared: &jj_lib::sync::state::SyncGcRoots,
+    published: Option<&OperationId>,
+) -> Result<(), CommandError> {
+    let roots = state.gc_roots();
+    if !roots.shared_events.is_subset(&prepared.shared_events)
+        || roots.raw_operations.iter().any(|id| {
+            !prepared.raw_operations.contains(id)
+                && published.is_none_or(|operation| operation.hex() != *id)
+        })
+    {
+        return Err(user_error(
+            "Synchronization history changed during migration; retry the command",
+        ));
+    }
+    Ok(())
+}
+
 async fn capture_current(
     ui: &Ui,
     command: &CommandHelper,
@@ -1217,9 +1324,9 @@ async fn capture_current(
     root: &Path,
     ignore: bool,
     transfer: &str,
-) -> Result<Capture, CommandError> {
+) -> Result<NativeCapture, CommandError> {
     for _ in 0..8 {
-        match endpoint.capture(helper.repo(), transfer).await {
+        match endpoint.capture_native(helper.repo(), transfer).await {
             Ok(capture) => return Ok(capture),
             Err(EndpointError::StaleCapture) => {
                 *helper = load_helper(ui, command, root, ignore).await?;
@@ -1450,7 +1557,7 @@ pub(crate) async fn synchronize(
                 )?;
                 let ready: String = receive_command(&mut transport, "ready")?;
                 if ready != selected.hex() {
-                    return Err(user_error("Peer changed the selected shared result"));
+                    return Err(user_error("Peer changed the selected operation result"));
                 }
             }
             let applied = local.apply(ui, command, &selected, &incoming).await?;
@@ -1481,7 +1588,7 @@ pub(crate) async fn synchronize(
                 ui,
                 &mut transport,
                 &local.inventory,
-                &local.capture.current_shared,
+                &local.capture.raw_heads[0],
                 &remote_known,
             )?;
             writeln!(
@@ -1639,7 +1746,7 @@ async fn serve_session(
                 ui,
                 stream,
                 &local.inventory,
-                &local.capture.current_shared,
+                &local.capture.raw_heads[0],
                 &peer_known,
             )?;
         }
@@ -1654,30 +1761,38 @@ async fn serve_session(
                 ui,
                 stream,
                 &local.inventory,
-                &local.capture.current_shared,
+                &local.capture.raw_heads[0],
                 &peer_known,
             )?;
             let incoming = local.receive_offer(ui, stream, &peer.peer, None)?;
-            let selected = parse_shared(&incoming.current_shared)?;
-            for original in [
-                &local.capture.current_shared,
-                &parse_shared(&peer.current_shared)?,
-            ] {
-                if !local
-                    .endpoint
-                    .anchors()
-                    .is_ancestor(original, &selected)
-                    .map_err(failed)?
-                {
-                    return Err(user_error(
-                        "Selected shared result does not include both captured histories",
-                    ));
-                }
+            let selected = parse_raw(&incoming.current_operation)?;
+            let selected_frontier = native::frontier(
+                local.helper.repo().op_store().as_ref(),
+                std::slice::from_ref(&selected),
+            )
+            .await
+            .map_err(failed)?;
+            let combined_frontier = native::frontier(
+                local.helper.repo().op_store().as_ref(),
+                &[
+                    selected.clone(),
+                    local.capture.current_raw.clone(),
+                    parse_raw(&peer.current_operation)?,
+                ],
+            )
+            .await
+            .map_err(failed)?;
+            if selected_frontier != combined_frontier {
+                return Err(user_error(
+                    "Selected operation result does not include both captured histories",
+                ));
             }
             send_command(stream, "ready", &selected.hex())?;
             let requested: String = receive_command(stream, "apply")?;
             if requested != selected.hex() {
-                return Err(user_error("Initiator changed the selected shared result"));
+                return Err(user_error(
+                    "Initiator changed the selected operation result",
+                ));
             }
             let applied = local.apply(ui, command, &selected, &incoming).await?;
             send_command(stream, "result", &applied)?;
@@ -1711,7 +1826,7 @@ fn profile_hello(
     let backend = jj_lib::git::get_git_backend(loader.store())?;
     if !matches!(
         loader.op_store().name(),
-        SimpleOpStore::NAME | SimpleOpStore::SYNC_NAME
+        SimpleOpStore::NAME | SimpleOpStore::SYNC_NAME | SimpleOpStore::NATIVE_SYNC_NAME
     ) {
         return Err(user_error(
             "Repository synchronization requires the built-in operation store",
@@ -2102,7 +2217,7 @@ fn receive_command<T: for<'de> Deserialize<'de>>(
 }
 
 fn print_applied(ui: &Ui, endpoint: &str, result: &Applied) -> Result<(), CommandError> {
-    if result.current_anchor != result.captured_anchor {
+    if result.current_operation != result.captured_operation {
         writeln!(
             ui.status(),
             "{endpoint} applied the captured history; newer local changes remain for the next \
@@ -2112,11 +2227,11 @@ fn print_applied(ui: &Ui, endpoint: &str, result: &Applied) -> Result<(), Comman
     Ok(())
 }
 
-fn check_applied(result: &Applied, selected: Option<&SharedEventId>) -> Result<(), CommandError> {
+fn check_applied(result: &Applied, selected: Option<&OperationId>) -> Result<(), CommandError> {
     parse_raw(&result.operation)?;
-    parse_shared(&result.captured_anchor)?;
-    parse_shared(&result.current_anchor)?;
-    if selected.is_some_and(|id| result.captured_anchor != id.hex()) {
+    parse_raw(&result.captured_operation)?;
+    parse_raw(&result.current_operation)?;
+    if selected.is_some_and(|id| result.captured_operation != id.hex()) {
         return Err(user_error(
             "Peer reported a different applied synchronization result",
         ));
@@ -2130,8 +2245,7 @@ fn check_captured_offer(
 ) -> Result<(), CommandError> {
     if offered.peer != captured.peer
         || offered.raw_heads != captured.raw_heads
-        || offered.shared_heads != captured.shared_heads
-        || offered.current_shared != captured.current_shared
+        || offered.current_operation != captured.current_operation
     {
         return Err(user_error(
             "Peer changed its frozen synchronization cutoff after advertising it",
@@ -2505,8 +2619,7 @@ mod tests {
         let advertised = Advertisement {
             peer: "peer".to_owned(),
             raw_heads: vec![String::new(); MAX_PHASE_CONTROL_BYTES / 3],
-            shared_heads: vec!["02".repeat(64)],
-            current_shared: "02".repeat(64),
+            current_operation: "01".repeat(64),
         };
         assert!(serde_json::to_vec(&advertised).unwrap().len() > MAX_PHASE_CONTROL_BYTES);
         for phase in ["capture", "offer"] {
@@ -2560,17 +2673,15 @@ mod tests {
         let captured = Advertisement {
             peer: "peer".to_owned(),
             raw_heads: vec!["01".repeat(64)],
-            shared_heads: vec!["02".repeat(64)],
-            current_shared: "02".repeat(64),
+            current_operation: "01".repeat(64),
         };
         check_captured_offer(&captured, &captured).unwrap();
-        for field in 0..4 {
+        for field in 0..3 {
             let mut changed = captured.clone();
             match field {
                 0 => changed.peer = "other".to_owned(),
                 1 => changed.raw_heads = vec!["03".repeat(64)],
-                2 => changed.shared_heads = vec!["04".repeat(64)],
-                3 => changed.current_shared = "05".repeat(64),
+                2 => changed.current_operation = "05".repeat(64),
                 _ => unreachable!(),
             }
             assert!(check_captured_offer(&changed, &captured).is_err());

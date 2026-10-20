@@ -96,6 +96,13 @@ impl SimpleOpStore {
     pub const NAME: &str = "simple_op_store";
     /// Identifies repositories whose operation writes participate in sync.
     pub const SYNC_NAME: &str = "simple_op_store_sync_v1";
+    /// Identifies synchronized repositories whose history uses native parents.
+    pub const NATIVE_SYNC_NAME: &str = "simple_op_store_sync_v2";
+
+    /// Whether this format participates in repository synchronization.
+    pub fn is_sync_name(name: &str) -> bool {
+        matches!(name, Self::SYNC_NAME | Self::NATIVE_SYNC_NAME)
+    }
 
     /// Creates an empty OpStore. Returns error if it already exists.
     pub fn init(
@@ -116,6 +123,14 @@ impl SimpleOpStore {
     pub fn load_sync(store_path: &Path, root_data: RootOperationData) -> Self {
         Self {
             name: Self::SYNC_NAME,
+            ..Self::new(store_path, root_data)
+        }
+    }
+
+    /// Loads synchronized history retained by ordinary operation ancestry.
+    pub fn load_native_sync(store_path: &Path, root_data: RootOperationData) -> Self {
+        Self {
+            name: Self::NATIVE_SYNC_NAME,
             ..Self::new(store_path, root_data)
         }
     }

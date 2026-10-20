@@ -62,7 +62,7 @@ pub async fn cmd_util_gc(
     let workspace_command = command.workspace_helper(ui).await?;
 
     let repo = workspace_command.repo();
-    if repo.op_store().name() == SimpleOpStore::SYNC_NAME {
+    if SimpleOpStore::is_sync_name(repo.op_store().name()) {
         #[cfg(feature = "git")]
         {
             return collect_synced_repo(repo, workspace_command.repo_path(), keep_newer).await;
@@ -96,6 +96,11 @@ async fn collect_synced_repo(
     use jj_lib::sync::gc::collect_roots;
     use jj_lib::sync::state::SyncStateStore;
 
+    jj_lib::sync::endpoint::Endpoint::load(repo_path)
+        .retire_inactive_native_transfers()
+        .map_err(|err| {
+            user_error_with_message("Cannot retire interrupted synchronization transfers", err)
+        })?;
     // Missing state in an enabled repository is corruption, not a new empty
     // store. Hold the same lock used to establish transfer/import roots until
     // both collectors have finished; no network work occurs under this lock.

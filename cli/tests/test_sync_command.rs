@@ -27,14 +27,13 @@ use jj_lib::op_store::Operation;
 use jj_lib::op_store::OperationId;
 use jj_lib::op_store::RootOperationData;
 use jj_lib::simple_op_store::SimpleOpStore;
-use jj_lib::sync::anchor::AnchorStore;
+use jj_lib::sync::native::LOCAL_PARENT_ATTRIBUTE;
+use jj_lib::sync::native::contains;
 use jj_lib::sync::protocol::Direction;
 use jj_lib::sync::protocol::Hello;
 use jj_lib::sync::protocol::Message;
 use jj_lib::sync::protocol::PROTOCOL_VERSION;
 use jj_lib::sync::protocol::Session;
-use jj_lib::sync::shared::SharedEventId;
-use jj_lib::sync::state::SyncStateStore;
 use pollster::FutureExt as _;
 use test_case::test_case;
 
@@ -90,6 +89,37 @@ fn operation(dir: &TestWorkDir<'_>, id: &str) -> Operation {
         .read_operation(&OperationId::try_from_hex(id).unwrap())
         .block_on()
         .unwrap()
+}
+
+fn assert_sync_merge(dir: &TestWorkDir<'_>, local: &str, peer: &str) {
+    let integrated = operation(dir, &dir.current_operation_id());
+    assert!(integrated.parents.len() >= 2);
+    assert_eq!(integrated.parents[0].hex(), local);
+    assert_eq!(
+        integrated.metadata.attributes[LOCAL_PARENT_ATTRIBUTE],
+        local
+    );
+    let store = SimpleOpStore::load(
+        &dir.root().join(".jj/repo/op_store"),
+        RootOperationData {
+            root_commit_id: CommitId::from_bytes(&[0; 20]),
+        },
+    );
+    assert!(
+        contains(
+            &store,
+            &OperationId::try_from_hex(peer).unwrap(),
+            &OperationId::try_from_hex(dir.current_operation_id()).unwrap(),
+        )
+        .block_on()
+        .unwrap()
+    );
+}
+
+fn restore_before_sync(dir: &TestWorkDir<'_>) {
+    let integrated = operation(dir, &dir.current_operation_id());
+    let local = &integrated.metadata.attributes[LOCAL_PARENT_ATTRIBUTE];
+    dir.run_jj(["op", "restore", local]).success();
 }
 
 fn assert_imported_history(source: &TestWorkDir<'_>, receiver: &TestWorkDir<'_>, id: &str) {
@@ -166,22 +196,14 @@ fn test_sync_unrelated_local_repositories(direction: &str) {
     if direction != "--send" {
         assert_eq!(bookmarks(&left), both);
         assert_imported_history(&right, &left, &right_op);
-        assert_eq!(
-            operation(&left, &left.current_operation_id()).parents.len(),
-            1
-        );
+        assert_sync_merge(&left, &left_op, &right_op);
     } else {
         assert_eq!(bookmarks(&left), BTreeSet::from(["left".to_owned()]));
     }
     if direction != "--receive" {
         assert_eq!(bookmarks(&right), both);
         assert_imported_history(&left, &right, &left_op);
-        assert_eq!(
-            operation(&right, &right.current_operation_id())
-                .parents
-                .len(),
-            1
-        );
+        assert_sync_merge(&right, &right_op, &left_op);
     } else {
         assert_eq!(bookmarks(&right), BTreeSet::from(["right".to_owned()]));
     }
@@ -245,9 +267,9 @@ fn test_sync_initializes_missing_peer_at_exact_path(direction: &str) {
         .run_jj(["--ignore-working-copy", "sync", direction, "new-peer"])
         .success();
     assert_eq!(receiver.current_operation_id(), received);
-    receiver.run_jj(["undo"]).success();
+    restore_before_sync(&receiver);
     assert!(bookmarks(&receiver).is_empty());
-    receiver.run_jj(["redo"]).success();
+    receiver.run_jj(["op", "restore", &received]).success();
     assert_eq!(bookmarks(&receiver), BTreeSet::from(["source".to_owned()]));
 }
 
@@ -365,20 +387,34 @@ fn test_sync_does_not_initialize_existing_git_with_incompatible_object_hash() {
     assert_eq!(fs::read(config_path).unwrap(), existing_config);
 }
 
-#[test_case("version")]
-#[test_case("backend")]
-#[test_case("operation_store")]
-#[test_case("object_hash")]
-#[test_case("required_capability")]
-#[test_case("missing_capability")]
-fn test_sync_helper_rejects_incompatible_request_before_initialization(field: &str) {
+#[test_case("version", false)]
+#[test_case("backend", false)]
+#[test_case("operation_store", false)]
+#[test_case("object_hash", false)]
+#[test_case("required_capability", false)]
+#[test_case("missing_capability", false; "native_required_before_initialization")]
+#[test_case("missing_capability", true; "native_required_before_migration")]
+fn test_sync_helper_rejects_incompatible_request_before_initialization(
+    field: &str,
+    legacy_repository: bool,
+) {
     let env = TestEnvironment::default();
     let receiver = env.env_root().join("receiver");
+    let legacy_state = if legacy_repository {
+        init_repo(&env, "receiver");
+        let repo = receiver.join(".jj/repo");
+        jj_lib::sync::state::SyncStateStore::init(&repo).unwrap();
+        jj_lib::sync::anchor::AnchorStore::init(&repo).unwrap();
+        fs::write(repo.join("op_store/type"), SimpleOpStore::SYNC_NAME).unwrap();
+        Some(fs::read(repo.join("sync/state.toml")).unwrap())
+    } else {
+        None
+    };
     let capabilities: Vec<_> = [
         "raw-history-v1",
-        "shared-causal-v1",
         "streaming-objects-v1",
         "local-workspaces-v1",
+        "native-operation-graph-v1",
     ]
     .map(str::to_owned)
     .into();
@@ -446,7 +482,18 @@ fn test_sync_helper_rejects_incompatible_request_before_initialization(field: &s
         panic!("helper accepted incompatible {field}");
     };
     assert!(message.contains(diagnostic), "{message}");
-    assert!(!receiver.exists());
+    if let Some(state) = legacy_state {
+        assert_eq!(
+            fs::read_to_string(receiver.join(".jj/repo/op_store/type")).unwrap(),
+            SimpleOpStore::SYNC_NAME,
+        );
+        assert_eq!(
+            fs::read(receiver.join(".jj/repo/sync/state.toml")).unwrap(),
+            state
+        );
+    } else {
+        assert!(!receiver.exists());
+    }
 }
 
 #[test]
@@ -531,26 +578,47 @@ fn test_sync_does_not_replace_dangling_destination_marker(marker: &str) {
 }
 
 #[test]
-fn test_sync_receive_undo_redo() {
+fn test_sync_receive_recovery_uses_ordinary_operation_restore() {
     let env = TestEnvironment::default();
     let left = init_repo(&env, "left");
     let right = init_repo(&env, "right");
     describe_and_bookmark(&left, "left");
     describe_and_bookmark(&right, "right");
     let wc = revision_id(&left, "@");
+    let before = left.current_operation_id();
+    let peer = right.current_operation_id();
     left.run_jj(["sync", "--receive", "../right"]).success();
-    left.run_jj(["undo"]).success();
+    let integrated = left.current_operation_id();
+    assert_sync_merge(&left, &before, &peer);
+    let output = left.run_jj(["undo"]);
+    assert!(!output.status.success());
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Cannot undo a merge operation")
+    );
+    assert!(output.stderr.raw().contains("jj op restore"));
+    assert_eq!(left.current_operation_id(), integrated);
+
+    left.run_jj(["op", "restore", &before]).success();
     assert_eq!(bookmarks(&left), BTreeSet::from(["left".to_owned()]));
-    let undone = left.current_operation_id();
-    // Receiving the same acknowledged history does not recreate an undone
-    // shared target or insert an operation that breaks ordinary redo.
+    let restored = left.current_operation_id();
+    assert_eq!(operation(&left, &restored).parents[0].hex(), integrated);
+    // Restore is an authored operation. Retrying an already received peer
+    // respects that new causal state instead of applying the sync again.
     left.run_jj(["sync", "--receive", "../right"]).success();
-    assert_eq!(left.current_operation_id(), undone);
-    left.run_jj(["redo"]).success();
+    assert_eq!(left.current_operation_id(), restored);
+    assert_imported_history(&right, &left, &peer);
+
+    // Ordinary commands after the merge still support ordinary undo and redo.
+    left.run_jj(["undo"]).success();
     assert_eq!(
         bookmarks(&left),
         BTreeSet::from(["left".to_owned(), "right".to_owned()])
     );
+    left.run_jj(["redo"]).success();
+    assert_eq!(bookmarks(&left), BTreeSet::from(["left".to_owned()]));
     assert_eq!(revision_id(&left, "@"), wc);
     assert!(!left.root().join("right.txt").exists());
 }
@@ -581,12 +649,12 @@ fn test_sync_workspace_only_operation_is_retained_without_workspace_changes() {
     );
     left.run_jj(["sync", "--receive", "../right"]).success();
     assert_eq!(left.current_operation_id(), integrated);
-    left.run_jj(["undo"]).success();
+    left.run_jj(["op", "restore", &before]).success();
     assert_eq!(
         operation(&left, &left.current_operation_id()).view_id,
         before_view
     );
-    left.run_jj(["redo"]).success();
+    left.run_jj(["op", "restore", &integrated]).success();
     assert_eq!(
         operation(&left, &left.current_operation_id()).view_id,
         before_view
@@ -868,16 +936,18 @@ fn test_sync_no_change_three_peer_convergence() {
     for dir in [&left, &right, &third] {
         assert_eq!(bookmarks(dir), expected);
     }
-    // The causal shared state converges even though native operation IDs and
-    // workspace projections remain different on each machine.
+    // Integration wrappers represent the same authored operation frontier even
+    // though their native IDs and workspace state differ on each machine.
     let before = [
         left.current_operation_id(),
         right.current_operation_id(),
         third.current_operation_id(),
     ];
-    left.run_jj(["sync", "--bidi", "../right"]).success();
-    right.run_jj(["sync", "--bidi", "../third"]).success();
-    left.run_jj(["sync", "--bidi", "../third"]).success();
+    for _ in 0..3 {
+        left.run_jj(["sync", "--bidi", "../right"]).success();
+        right.run_jj(["sync", "--bidi", "../third"]).success();
+        left.run_jj(["sync", "--bidi", "../third"]).success();
+    }
     assert_eq!(
         [
             left.current_operation_id(),
@@ -979,37 +1049,42 @@ fn test_sync_snapshots_only_selected_workspace() {
 }
 
 #[test]
-fn test_sync_retained_peer_history_survives_operation_abandon_and_gc() {
+fn test_sync_imported_history_uses_ordinary_gc_and_pruning() {
     let env = TestEnvironment::default();
     let left = init_repo(&env, "left");
     let right = init_repo(&env, "right");
     describe_and_bookmark(&left, "left");
     describe_and_bookmark(&right, "right");
     let original = left.current_operation_id();
-    let commit = revision_id(&left, "@");
+    let before = right.current_operation_id();
     right.run_jj(["sync", "--receive", "../left"]).success();
-    right.run_jj(["op", "abandon", "..@-"]).success();
+    let integrated = right.current_operation_id();
     right.run_jj(["util", "gc", "--expire", "now"]).success();
     assert_imported_history(&left, &right, &original);
-    assert_eq!(
-        right
-            .run_jj([
-                "--at-op",
-                &original,
-                "log",
-                "--no-graph",
-                "-r",
-                &commit,
-                "-T",
-                "commit_id"
-            ])
-            .success()
-            .stdout
-            .raw(),
-        commit,
+
+    // As with local history, restoring a view does not remove its ancestry.
+    right.run_jj(["op", "restore", &before]).success();
+    right.run_jj(["util", "gc", "--expire", "now"]).success();
+    assert_imported_history(&left, &right, &original);
+    assert!(!bookmarks(&right).contains("left"));
+
+    // Explicitly pruning that ancestry permits normal GC to remove it. Sync
+    // does not retain abandoned peer history through a second history graph.
+    right
+        .run_jj(["op", "abandon", &format!("..{integrated}")])
+        .success();
+    right.run_jj(["util", "gc", "--expire", "now"]).success();
+    assert!(
+        !right
+            .root()
+            .join(format!(".jj/repo/op_store/operations/{original}"))
+            .exists()
     );
+
+    // Pruning also forgets receipt. The same peer can be received afresh.
     right.run_jj(["sync", "--receive", "../left"]).success();
     assert!(bookmarks(&right).contains("left"));
+    assert_imported_history(&left, &right, &original);
 }
 
 #[test_case("--receive", true; "receive_before_publication")]
@@ -1061,6 +1136,105 @@ fn test_sync_publication_failure_retry(direction: &str, before_publication: bool
     let finished = receiver.current_operation_id();
     left.run_jj(["sync", direction, "../right"]).success();
     assert_eq!(receiver.current_operation_id(), finished);
+}
+
+#[test_case(true; "before_publication")]
+#[test_case(false; "after_publication")]
+fn test_sync_legacy_migration_retries_interrupted_publication(before_publication: bool) {
+    let env = TestEnvironment::default();
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    describe_and_bookmark(&left, "left");
+    describe_and_bookmark(&right, "right");
+    let before_left = left.current_operation_id();
+    let before_right = right.current_operation_id();
+    let wc_left = revision_id(&left, "@");
+    let wc_right = revision_id(&right, "@");
+    for dir in [&left, &right] {
+        let repo = dir.root().join(".jj/repo");
+        jj_lib::sync::state::SyncStateStore::init(&repo).unwrap();
+        jj_lib::sync::anchor::AnchorStore::init(&repo).unwrap();
+        fs::write(repo.join("op_store/type"), SimpleOpStore::SYNC_NAME).unwrap();
+    }
+    let hook = if before_publication {
+        "JJ_TEST_SYNC_FAIL_BEFORE_PUBLISH"
+    } else {
+        "JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH"
+    };
+    let failure = left.run_jj_with(|cmd| cmd.args(["sync", "--bidi", "../right"]).env(hook, "1"));
+    assert!(!failure.status.success(), "{failure}");
+    assert!(
+        failure.stderr.raw().contains("Injected failure"),
+        "{failure}"
+    );
+    // Until the migration join and its native retention state are durable,
+    // reopening still selects the deployed format and its old retention rules.
+    assert_eq!(
+        left.read_file(".jj/repo/op_store/type"),
+        SimpleOpStore::SYNC_NAME,
+    );
+
+    left.run_jj(["sync", "--bidi", "../right"]).success();
+    let expected = BTreeSet::from(["left".to_owned(), "right".to_owned()]);
+    for dir in [&left, &right] {
+        assert_eq!(
+            dir.read_file(".jj/repo/op_store/type"),
+            SimpleOpStore::NATIVE_SYNC_NAME,
+        );
+        assert!(
+            jj_lib::sync::state::SyncStateStore::load(&dir.root().join(".jj/repo"))
+                .read()
+                .unwrap()
+                .is_native()
+        );
+        assert_eq!(bookmarks(dir), expected);
+    }
+    assert_eq!(revision_id(&left, "@"), wc_left);
+    assert_eq!(revision_id(&right, "@"), wc_right);
+    assert_eq!(left.read_file("left.txt"), "left contents\n");
+    assert_eq!(right.read_file("right.txt"), "right contents\n");
+    assert!(!left.root().join("right.txt").exists());
+    assert!(!right.root().join("left.txt").exists());
+    assert_imported_history(&left, &right, &before_left);
+    assert_imported_history(&right, &left, &before_right);
+    let finished = [left.current_operation_id(), right.current_operation_id()];
+    left.run_jj(["sync", "--bidi", "../right"]).success();
+    assert_eq!(
+        [left.current_operation_id(), right.current_operation_id()],
+        finished,
+    );
+}
+
+#[test]
+fn test_sync_finishes_native_migration_marker_after_state_is_saved() {
+    let env = TestEnvironment::default();
+    let left = init_repo(&env, "left");
+    let right = init_repo(&env, "right");
+    describe_and_bookmark(&left, "left");
+    describe_and_bookmark(&right, "right");
+    left.run_jj(["sync", "--bidi", "../right"]).success();
+    let finished = [left.current_operation_id(), right.current_operation_id()];
+    // Simulate a crash after native state was saved but before the final marker
+    // replacement. Legacy events are unnecessary once native ancestry is saved.
+    let repo = left.root().join(".jj/repo");
+    fs::write(repo.join("op_store/type"), SimpleOpStore::SYNC_NAME).unwrap();
+    let events = repo.join("sync/events");
+    if events.exists() {
+        fs::remove_dir_all(events).unwrap();
+    }
+    left.run_jj(["sync", "--bidi", "../right"]).success();
+    assert_eq!(
+        left.read_file(".jj/repo/op_store/type"),
+        SimpleOpStore::NATIVE_SYNC_NAME,
+    );
+    assert_eq!(
+        [left.current_operation_id(), right.current_operation_id()],
+        finished,
+    );
+    assert_eq!(
+        bookmarks(&left),
+        BTreeSet::from(["left".to_owned(), "right".to_owned()]),
+    );
 }
 
 #[test_case(false; "local_gc")]
@@ -1140,7 +1314,7 @@ fn test_sync_first_transition_waits_for_legacy_gc(gc_in_peer: bool) {
 
     assert_eq!(
         fs::read_to_string(marker).unwrap(),
-        SimpleOpStore::SYNC_NAME
+        SimpleOpStore::NATIVE_SYNC_NAME
     );
     assert_eq!(
         bookmarks(&right),
@@ -1211,7 +1385,7 @@ fn test_sync_crossed_first_transitions_do_not_deadlock() {
     for dir in [&left, &right] {
         assert_eq!(
             dir.read_file(".jj/repo/op_store/type"),
-            SimpleOpStore::SYNC_NAME
+            SimpleOpStore::NATIVE_SYNC_NAME
         );
         assert_eq!(
             bookmarks(dir),
@@ -1454,11 +1628,12 @@ fn test_sync_rewritten_ancestor_checkout_recovers_after_publication() {
 
 #[test_case(false; "one_head")]
 #[test_case(true; "divergent_heads")]
-fn test_sync_undo_survives_pruning_interrupted_publication(divergent_heads: bool) {
+fn test_sync_restore_and_pruning_after_interrupted_publication(divergent_heads: bool) {
     let env = TestEnvironment::default();
     let left = init_repo(&env, "left");
     let right = init_repo(&env, "right");
     describe_and_bookmark(&right, "peer-work");
+    let before = left.current_operation_id();
     let source_op = right.current_operation_id();
     let output = left.run_jj_with(|cmd| {
         cmd.args(["--ignore-working-copy", "sync", "--receive", "../right"])
@@ -1474,13 +1649,20 @@ fn test_sync_undo_survives_pruning_interrupted_publication(divergent_heads: bool
     );
     let published = left.current_operation_id();
     assert!(bookmarks(&left).contains("peer-work"));
-    left.run_jj(["--ignore-working-copy", "undo"]).success();
+    left.run_jj(["--ignore-working-copy", "op", "restore", &before])
+        .success();
     assert!(bookmarks(&left).is_empty());
     if divergent_heads {
-        // Create another ordinary undo from the same integration. Abandon
-        // must preserve causal knowledge from every actual native head.
-        left.run_jj(["--ignore-working-copy", "--at-op", &published, "undo"])
-            .success();
+        // Both restores are ordinary authored operations, even with equal views.
+        left.run_jj([
+            "--ignore-working-copy",
+            "--at-op",
+            &published,
+            "op",
+            "restore",
+            &before,
+        ])
+        .success();
         assert_eq!(
             fs::read_dir(left.root().join(".jj/repo/op_heads/heads"))
                 .unwrap()
@@ -1488,45 +1670,30 @@ fn test_sync_undo_survives_pruning_interrupted_publication(divergent_heads: bool
             2
         );
     }
-    left.run_jj(["--ignore-working-copy", "op", "abandon", &published])
-        .success();
+    left.run_jj([
+        "--ignore-working-copy",
+        "op",
+        "abandon",
+        &format!("..{published}"),
+    ])
+    .success();
     left.run_jj(["--ignore-working-copy", "util", "gc", "--expire", "now"])
         .success();
-    assert_imported_history(&right, &left, &source_op);
 
+    // Native pruning has removed the causal edge proving earlier receipt.
+    // Retrying the interrupted session must use the current history, not replay
+    // an obsolete prepared operation or retain a separate acknowledgment graph.
     left.run_jj(["--ignore-working-copy", "sync", "--receive", "../right"])
         .success();
-    assert!(bookmarks(&left).is_empty());
-    let left_repo = left.root().join(".jj/repo");
-    let right_repo = right.root().join(".jj/repo");
-    let received = SyncStateStore::load(&right_repo)
-        .read()
-        .unwrap()
-        .local_anchor
-        .unwrap()
-        .shared_anchor;
-    let current = SyncStateStore::load(&left_repo)
-        .read()
-        .unwrap()
-        .local_anchor
-        .unwrap()
-        .shared_anchor;
-    assert!(
-        AnchorStore::load(&left_repo)
-            .is_ancestor(
-                &SharedEventId::try_from_hex(&received).unwrap(),
-                &SharedEventId::try_from_hex(&current).unwrap(),
-            )
-            .unwrap()
-    );
+    assert!(bookmarks(&left).contains("peer-work"));
+    assert_imported_history(&right, &left, &source_op);
     let finished = left.current_operation_id();
     left.run_jj(["--ignore-working-copy", "util", "gc", "--expire", "now"])
         .success();
     left.run_jj(["--ignore-working-copy", "sync", "--receive", "../right"])
         .success();
     assert_eq!(left.current_operation_id(), finished);
-    assert!(bookmarks(&left).is_empty());
-    assert_imported_history(&right, &left, &source_op);
+    assert!(bookmarks(&left).contains("peer-work"));
 }
 
 #[cfg(unix)]
@@ -1797,7 +1964,10 @@ fn rsync_is_available() -> bool {
 #[test_case("--send", true; "ssh_send")]
 #[test_case("--receive", true; "ssh_receive")]
 #[test_case("--bidi", true; "ssh_bidirectional")]
-fn test_sync_rsync_immutable_history_is_additive_and_preserves_undo(direction: &str, ssh: bool) {
+fn test_sync_rsync_immutable_history_is_additive_and_preserves_restored_state(
+    direction: &str,
+    ssh: bool,
+) {
     if !rsync_is_available() {
         return;
     }
@@ -1876,7 +2046,7 @@ fn test_sync_rsync_immutable_history_is_additive_and_preserves_undo(direction: &
     assert_eq!(revision_id(source, "remote"), remote_commit);
     assert_imported_history(receiver, source, &remote_operation);
     assert!(!source.root().join("remote.txt").exists());
-    source.run_jj(["undo"]).success();
+    restore_before_sync(source);
     assert!(!bookmarks(source).contains("remote"));
     left.run_jj(["sync", reverse, &peer]).success();
     assert!(!bookmarks(source).contains("remote"));
@@ -1915,7 +2085,7 @@ fn test_sync_rsync_fallback_preserves_history(disabled: &str) {
         "{stderr}"
     );
     assert_imported_history(&source, &receiver, &source_operation);
-    receiver.run_jj(["undo"]).success();
+    restore_before_sync(&receiver);
     source.run_jj(["sync", "--send", &peer]).success();
     assert_eq!(
         bookmarks(&receiver),
@@ -2029,7 +2199,7 @@ fn test_sync_adaptive_metadata_rejects_incompatible_existing_sidecar() {
 #[cfg(unix)]
 #[test_case("helper"; "mixed_capabilities")]
 #[test_case("all"; "raw_only")]
-fn test_sync_raw_fallback_preserves_metadata_and_undo(disabled: &str) {
+fn test_sync_raw_fallback_preserves_metadata_and_restored_state(disabled: &str) {
     let mut env = TestEnvironment::default();
     configure_fake_sync_ssh(&mut env);
     env.add_env_var("JJ_TEST_SYNC_DISABLE_NATIVE_GIT", disabled);
@@ -2064,12 +2234,13 @@ fn test_sync_raw_fallback_preserves_metadata_and_undo(disabled: &str) {
         .success();
     assert_eq!(received_change.stdout.raw(), source_change.stdout.raw());
     assert_imported_history(&source, &receiver, &source_op);
-    receiver.run_jj(["undo"]).success();
+    let integrated = receiver.current_operation_id();
+    restore_before_sync(&receiver);
     assert_eq!(
         bookmarks(&receiver),
         BTreeSet::from(["receiver".to_owned()])
     );
-    receiver.run_jj(["redo"]).success();
+    receiver.run_jj(["op", "restore", &integrated]).success();
     assert_eq!(
         bookmarks(&receiver),
         BTreeSet::from(["receiver".to_owned(), "source".to_owned()])

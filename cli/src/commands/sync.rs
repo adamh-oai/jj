@@ -38,10 +38,17 @@ use crate::ui::Ui;
 /// --ignore-working-copy to skip snapshots and checkout updates at both ends.
 /// Workspace names, checkout pointers, and local Git observations stay local.
 ///
-/// The first use enables a repository format that older jj versions reject.
+/// Receiving publishes an ordinary merge operation. Workspace state stays local,
+/// while received operations become ancestors in the local operation log. Use
+/// `jj op restore` with the previous local operation to recover the earlier view;
+/// ordinary `jj undo` does not undo merge operations.
+///
+/// Both endpoints must support native operation-graph synchronization. First use
+/// enables a repository format that older jj versions reject, and upgrades
+/// repositories using the earlier sync format while retaining their history.
 /// This transition waits for other commands using updated jj versions to finish.
-/// Already-running older binaries do not participate in the lock and must finish
-/// before the first sync.
+/// Already-running older binaries do not participate in the lock and can race
+/// with the first transition.
 #[derive(clap::Args, Clone, Debug)]
 #[command(group(clap::ArgGroup::new("direction").required(true).multiple(false).args(["receive", "send", "bidi"])))]
 pub(crate) struct SyncArgs {

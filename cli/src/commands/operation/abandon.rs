@@ -107,9 +107,10 @@ pub async fn cmd_op_abandon(
         return Err(err);
     }
 
-    // Preserve causal knowledge before native history is reparented. Hold its
-    // GC guard through publication of the new operation heads, then release it
-    // before acquiring a working-copy lock.
+    // Only the legacy format keeps causal history outside operation parents.
+    // Native synchronization follows ordinary operation-pruning semantics.
+    // Hold the legacy GC guard through publication, then release it before
+    // acquiring a working-copy lock.
     let sync_endpoint = (op_store.name() == SimpleOpStore::SYNC_NAME)
         .then(|| Endpoint::load(workspace.repo_path()));
     let sync_history_guard = if let Some(endpoint) = &sync_endpoint {

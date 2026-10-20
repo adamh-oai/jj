@@ -21,6 +21,8 @@ pub mod gc;
 pub mod metadata;
 #[cfg(feature = "git")]
 mod metadata_limits;
+pub mod migrate;
+pub mod native;
 pub mod normalize;
 #[cfg(feature = "git")]
 pub mod objects;

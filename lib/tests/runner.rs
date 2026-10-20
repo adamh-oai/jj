@@ -32,6 +32,7 @@ mod test_merge_operations;
 mod test_merge_trees;
 mod test_merged_tree;
 mod test_mut_repo;
+mod test_native_sync;
 mod test_operations;
 mod test_refs;
 mod test_revset;
