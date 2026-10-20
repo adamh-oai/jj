@@ -30,12 +30,12 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use futures::AsyncReadExt as _;
+use futures::StreamExt as _;
 use jj_lib::backend::CopyId;
 use jj_lib::backend::TreeValue;
 use jj_lib::fsmonitor::FsmonitorSettings;
 use jj_lib::local_working_copy::TreeState;
 use jj_lib::local_working_copy::TreeStateSettings;
-use jj_lib::merge::Merge;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::merged_tree_builder::MergedTreeBuilder;
 use jj_lib::object_id::ObjectId as _;
@@ -234,7 +234,7 @@ fn add_file(
     let id = store.write_file(&path, &mut reader).block_on()?;
     builder.set_or_remove(
         path,
-        Merge::normal(TreeValue::File {
+        Some(TreeValue::File {
             id,
             executable: false,
             copy_id: CopyId::placeholder(),
@@ -362,12 +362,9 @@ fn setup_fixture(
                 let target_name = "awacs-benchmark-missing-symlink-target";
                 let id = store.write_symlink(&repo_path, target_name).block_on()?;
                 if !old_directories.contains(path) {
-                    base.set_or_remove(
-                        repo_path.clone(),
-                        Merge::normal(TreeValue::Symlink(id.clone())),
-                    );
+                    base.set_or_remove(repo_path.clone(), Some(TreeValue::Symlink(id.clone())));
                 }
-                target.set_or_remove(repo_path, Merge::normal(TreeValue::Symlink(id)));
+                target.set_or_remove(repo_path, Some(TreeValue::Symlink(id)));
                 fs::create_dir_all(disk_path.parent().unwrap())?;
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(target_name, &disk_path)?;
@@ -506,7 +503,8 @@ fn usage() -> Result<Usage> {
 fn validate_contents(tree: &MergedTree, expected: &BTreeMap<String, Expected>) -> Result<String> {
     let mut actual_files = 0;
     let mut digest = Sha256::new();
-    for (path, value) in tree.entries() {
+    let mut entries = tree.entries_stream();
+    while let Some((path, value)) = entries.next().block_on() {
         let value = value?;
         let name = path.as_internal_file_string();
         let expected = expected.get(name).ok_or("unexpected result-tree path")?;
