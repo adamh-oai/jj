@@ -4085,7 +4085,7 @@ Initialize a replacement checkout, then atomically activate it
   Possible values: `true`, `false`
 
 * `--keep` — Keep a partial migration checkout after failure
-* `--rebuild-baseline` — Discard and rebuild the committed AWACS cursor for an already enabled checkout
+* `--rebuild-baseline` — Delete this checkout's old AWACS snapshots and state, then rebuild its committed baseline in the configured store
 
 
 
