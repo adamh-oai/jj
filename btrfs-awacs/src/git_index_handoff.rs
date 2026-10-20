@@ -421,6 +421,50 @@ fn rewrite_git_fsmonitor_index(
             replacements.push(replacement);
         }
     }
+    // EOIE hashes every extension header, including lengths changed by FSMN
+    // and UNTR. Rebuild it at the end instead of retaining the source digest.
+    // Also add it when absent: Git permits that format, but retention must be
+    // able to inspect a large published index without scanning its entries.
+    let extension_start = layout
+        .extensions()
+        .first()
+        .map_or(checksum_start, |(_, range)| range.start - 8);
+    let mut extension_headers = Vec::with_capacity(layout.extensions().len() + 1);
+    for (signature, range) in layout.extensions() {
+        if signature == b"EOIE" {
+            continue;
+        }
+        let header = replacements
+            .iter()
+            .find(|replacement| replacement.range.as_ref() == Some(range))
+            .map_or(&bytes[range.start - 8..range.start], |replacement| {
+                replacement.header.as_slice()
+            });
+        extension_headers.push(header);
+    }
+    for replacement in replacements
+        .iter()
+        .filter(|replacement| replacement.range.is_none())
+    {
+        extension_headers.push(replacement.header.as_slice());
+    }
+    let extension_digest = git_index_checksum_slices(extension_headers, hash_len)?;
+    let mut eoie = b"EOIE".to_vec();
+    eoie.extend_from_slice(&((4 + hash_len) as u32).to_be_bytes());
+    eoie.extend_from_slice(
+        &u32::try_from(extension_start)
+            .map_err(|_| "Git index entries exceed EOIE offset range")?
+            .to_be_bytes(),
+    );
+    eoie.extend_from_slice(&extension_digest);
+    for (signature, range) in layout.extensions() {
+        if signature == b"EOIE" {
+            let mut replacement =
+                GitIndexExtensionReplacement::new(Some(range.clone()), b"EOIE", Vec::new(), &[])?;
+            replacement.header.clear();
+            replacements.push(replacement);
+        }
+    }
     replacements.sort_unstable_by_key(|replacement| replacement.header_start(checksum_start));
     let unchanged_prefix_len = replacements[0].header_start(checksum_start);
     let mut slices = Vec::with_capacity(4 * replacements.len() + 2);
@@ -437,6 +481,7 @@ fn rewrite_git_fsmonitor_index(
             .map_or(checksum_start, |range| range.end);
     }
     slices.push(&bytes[offset..checksum_start]);
+    slices.push(&eoie);
     let checksum = timed_git_phase("index_seed_checksum", || {
         git_index_checksum_slices(slices.iter().copied(), hash_len)
     })?;
@@ -844,6 +889,7 @@ mod tests {
             .len()
             .checked_sub(hash_len)
             .ok_or_else(|| "Git index has no checksum trailer".to_owned())?;
+        let layout = super::git_index_layout(bytes, hash_len)?;
         let fsmonitor = super::git_index_extension_data_range(&bytes, hash_len, b"FSMN")?;
         let untracked = super::git_index_extension_data_range(&bytes, hash_len, b"UNTR")?;
         let token = super::encode_git_fsmonitor_token(baseline)?;
@@ -890,6 +936,11 @@ mod tests {
         if let (Some(range), Some(payload)) = (untracked.as_ref(), untracked_payload.as_ref()) {
             replacements.push((range, b"UNTR", payload.as_slice()));
         }
+        for (signature, range) in layout.extensions() {
+            if signature == b"EOIE" {
+                replacements.push((range, b"EOIE", &[]));
+            }
+        }
         replacements.sort_unstable_by_key(|(range, _, _)| range.start);
 
         let mut rewritten = Vec::with_capacity(bytes.len() + fsmonitor_payload.len() + 8);
@@ -900,7 +951,7 @@ mod tests {
                 .checked_sub(8)
                 .ok_or_else(|| "Git index extension header is malformed".to_owned())?;
             rewritten.extend_from_slice(&bytes[offset..header_start]);
-            if signature != b"UNTR" || inherited_bitmap.is_some() {
+            if signature != b"EOIE" && (signature != b"UNTR" || inherited_bitmap.is_some()) {
                 super::append_git_index_extension(&mut rewritten, signature, payload)?;
             }
             offset = range.end;
@@ -909,9 +960,27 @@ mod tests {
         if fsmonitor.is_none() {
             super::append_git_index_extension(&mut rewritten, b"FSMN", &fsmonitor_payload)?;
         }
+        let entries_end = layout
+            .extensions()
+            .first()
+            .map_or(checksum_start, |(_, range)| range.start - 8);
+        append_test_eoie(&mut rewritten, hash_len, entries_end);
         let checksum = crate::status::git_index_checksum(&rewritten, hash_len)?;
         rewritten.extend_from_slice(&checksum);
         Ok(rewritten)
+    }
+
+    fn append_test_eoie(bytes: &mut Vec<u8>, hash_len: usize, entries_end: usize) {
+        let mut headers = Vec::new();
+        let mut offset = entries_end;
+        while offset < bytes.len() {
+            headers.extend_from_slice(&bytes[offset..offset + 8]);
+            offset += 8 + read_be_u32(&bytes[offset + 4..offset + 8]).unwrap() as usize;
+        }
+        assert_eq!(offset, bytes.len());
+        let mut payload = (entries_end as u32).to_be_bytes().to_vec();
+        payload.extend_from_slice(&crate::status::git_index_checksum(&headers, hash_len).unwrap());
+        append_git_index_extension(bytes, b"EOIE", &payload).unwrap();
     }
 
     fn reference_relocate_git_untracked_cache(
@@ -983,6 +1052,8 @@ mod tests {
             &[b"UNTR"],
             &[b"FSMN", b"UNTR"],
             &[b"UNTR", b"FSMN"],
+            &[b"EOIE", b"FSMN"],
+            &[b"FSMN", b"UNTR", b"EOIE"],
         ];
         for hash_len in [20, 32] {
             for order in orders {
@@ -995,6 +1066,10 @@ mod tests {
                     bytes.extend_from_slice(&0_u32.to_be_bytes());
                     super::append_git_index_extension(&mut bytes, b"TREE", &[0x33; 8192]).unwrap();
                     for signature in *order {
+                        if *signature == b"EOIE" {
+                            append_test_eoie(&mut bytes, hash_len, 12);
+                            continue;
+                        }
                         let payload = if *signature == b"FSMN" {
                             &fsmonitor
                         } else {
@@ -1255,8 +1330,7 @@ mod tests {
         .unwrap();
 
         let rewritten = fs::read(&index_path).unwrap();
-        // The seed changes extension lengths, so its inherited EOIE digest is
-        // stale. The new file reader must still recover the destination token.
+        // The seed changes extension lengths and must update the EOIE digest.
         let seeded = inherited_git_fsmonitor_baseline(&index_path, 20).unwrap();
         assert_eq!(seeded, destination_baseline);
         let untracked = super::git_index_extension_data_range(&rewritten, 20, b"UNTR")
@@ -1306,6 +1380,141 @@ mod tests {
             dirty_bitmap,
             "rewriting the destination cursor must preserve every dirty bitmap bit"
         );
+    }
+
+    #[test]
+    fn seeded_large_indexes_remain_readable_by_bounded_retention() {
+        use crate::status::read_git_index_extension_bounded_from_file;
+
+        let baseline = SnapshotBaseline {
+            identity: crate::scan::SnapshotIdentity {
+                filesystem_uuid: [4; 16],
+                subvolume_uuid: [5; 16],
+                read_only: true,
+            },
+            continuity_token: b"c:btrfs-awacs:scan:1:destination".to_vec(),
+            retention_token: vec![6; 16],
+        };
+        for hash_len in [20, 32] {
+            for version in [2_u32, 4] {
+                for has_fsmonitor in [true, false] {
+                    for eoie_state in ["valid", "absent", "stale", "nonfinal"] {
+                        for invalidation in
+                            [Invalidation::ExactPaths(Vec::new()), Invalidation::Full]
+                        {
+                            let root = TestDir::new("large-seeded-index");
+                            let index_path = root.path.join("index");
+                            let mut original = b"DIRC".to_vec();
+                            original.extend_from_slice(&version.to_be_bytes());
+                            original.extend_from_slice(&1_u32.to_be_bytes());
+                            let entry_start = original.len();
+                            original.extend_from_slice(&[0x55; 40]);
+                            original[entry_start + 24..entry_start + 28]
+                                .copy_from_slice(&0o100644_u32.to_be_bytes());
+                            original.resize(original.len() + hash_len, 0x44);
+                            original.extend_from_slice(&6_u16.to_be_bytes());
+                            if version == 4 {
+                                original.push(0); // No prefix removed from the previous path.
+                            }
+                            original.extend_from_slice(b"staged\0");
+                            if version != 4 {
+                                let padded_len = (original.len() - entry_start + 7) & !7;
+                                original.resize(entry_start + padded_len, 0);
+                            }
+                            let entries_end = original.len();
+                            let payload = vec![0x5a; 1024 * 1024];
+                            append_git_index_extension(&mut original, b"XTRA", &payload).unwrap();
+                            let mut untracked = Vec::new();
+                            let identity = b"Location /source, system Linux";
+                            append_git_varint(&mut untracked, identity.len());
+                            untracked.extend_from_slice(identity);
+                            untracked.extend_from_slice(b"cached directories\0");
+                            append_git_index_extension(&mut original, b"UNTR", &untracked).unwrap();
+                            if has_fsmonitor {
+                                append_git_index_extension(
+                                    &mut original,
+                                    b"FSMN",
+                                    &git_fsmonitor_extension_payload("short-source-token", None, 1),
+                                )
+                                .unwrap();
+                            }
+                            if eoie_state != "absent" {
+                                append_test_eoie(&mut original, hash_len, entries_end);
+                                if eoie_state == "stale" {
+                                    *original.last_mut().unwrap() ^= 1;
+                                } else if eoie_state == "nonfinal" {
+                                    append_git_index_extension(
+                                        &mut original,
+                                        b"LAST",
+                                        b"after EOIE",
+                                    )
+                                    .unwrap();
+                                }
+                            }
+                            // Both a normal checksum and deployed index.skipHash indexes
+                            // must preserve their entries through the rewrite.
+                            let checksum = if version == 4 {
+                                vec![0; hash_len]
+                            } else {
+                                crate::status::git_index_checksum(&original, hash_len).unwrap()
+                            };
+                            original.extend_from_slice(&checksum);
+                            fs::write(&index_path, &original).unwrap();
+
+                            seed_git_fsmonitor_index(
+                                &index_path,
+                                &root.path.join("a-longer-destination"),
+                                hash_len,
+                                &baseline,
+                                &invalidation,
+                            )
+                            .unwrap();
+
+                            let mut file = File::open(&index_path).unwrap();
+                            let fsmonitor = read_git_index_extension_bounded_from_file(
+                                &mut file, hash_len, b"FSMN",
+                            )
+                            .unwrap()
+                            .unwrap();
+                            assert_eq!(git_fsmonitor_baseline(&fsmonitor).unwrap(), baseline);
+                            let rewritten = fs::read(&index_path).unwrap();
+                            assert_eq!(&rewritten[..entries_end], &original[..entries_end]);
+                            let layout = git_index_layout(&rewritten, hash_len).unwrap();
+                            assert_eq!(layout.extensions().last().unwrap().0, *b"EOIE");
+                            assert_eq!(
+                                &rewritten[layout.extension_data_range(b"XTRA").unwrap()],
+                                payload,
+                            );
+                            assert_eq!(
+                                layout.extension_data_range(b"UNTR").is_some(),
+                                has_fsmonitor && !matches!(invalidation, Invalidation::Full),
+                            );
+                            let checksum_start = rewritten.len() - hash_len;
+                            assert_eq!(
+                                &rewritten[checksum_start..],
+                                crate::status::git_index_checksum(
+                                    &rewritten[..checksum_start],
+                                    hash_len
+                                )
+                                .unwrap(),
+                            );
+                            // Bootstrap uses the same writer and also changes the token
+                            // length while removing any inherited untracked cache.
+                            write_git_fsmonitor_bootstrap_placeholder(&index_path, hash_len)
+                                .unwrap();
+                            let mut file = File::open(&index_path).unwrap();
+                            assert_eq!(
+                                read_git_index_extension_bounded_from_file(
+                                    &mut file, hash_len, b"FSMN"
+                                )
+                                .unwrap(),
+                                Some(git_fsmonitor_extension_payload("0", None, 1)),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

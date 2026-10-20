@@ -1077,6 +1077,10 @@ pub struct GitIndexLayout {
 }
 
 impl GitIndexLayout {
+    pub(crate) fn extensions(&self) -> &[([u8; 4], Range<usize>)] {
+        &self.extensions
+    }
+
     pub fn extension_data_range(&self, wanted: &[u8; 4]) -> Option<Range<usize>> {
         self.extensions
             .iter()
