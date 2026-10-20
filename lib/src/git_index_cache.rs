@@ -123,16 +123,34 @@ impl gix_object_cache::Find for TreeObjects<'_> {
 
 /// Create a verified index and a TREE cache for a resolved Git tree.
 ///
-/// Upstream gitoxide validates and builds the index first. The cache codec
-/// walks the same tree to obtain the optional cache-tree extension. It uses
-/// permissive path options because the upstream pass already validated the
-/// paths using the repository's effective settings.
+/// Build entries and their cache-tree extension in the same traversal, using
+/// the repository's effective path protections.
 pub fn index_from_tree(
     repo: &gix::Repository,
     tree: &gix::hash::oid,
 ) -> Result<gix::index::File, ErrorBox> {
+    let config = repo.config_snapshot();
+    let protect_windows = config.try_boolean("gitoxide.core.protectWindows");
+    let protect_hfs = config.try_boolean("core.protectHFS");
+    let protect_ntfs = config.try_boolean("core.protectNTFS");
+    if protect_windows.is_err() || protect_hfs.is_err() || protect_ntfs.is_err() {
+        // Upstream doesn't expose its config leniency policy. Let it reject
+        // malformed protection settings in strict repositories, or validate
+        // with their defaults in lenient repositories, before using defaults
+        // here. Valid configurations only need the single traversal below.
+        repo.index_from_tree(tree)?;
+    }
+    let options = gix_validate_cache::path::component::Options {
+        protect_windows: protect_windows.ok().flatten().unwrap_or(cfg!(windows)),
+        protect_hfs: protect_hfs
+            .ok()
+            .flatten()
+            .unwrap_or(cfg!(target_os = "macos")),
+        protect_ntfs: protect_ntfs.ok().flatten().unwrap_or(true),
+    };
+    let tree = gix_hash_cache::ObjectId::from_bytes_or_panic(tree.as_bytes());
     let started = Instant::now();
-    let result = repo.index_from_tree(tree);
+    let result = gix_index_cache::State::from_tree(&tree, TreeObjects(repo), options);
     tracing::debug!(
         phase = "git_index_from_tree_traversal",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -140,30 +158,22 @@ pub fn index_from_tree(
         entry_count = result.as_ref().map_or(0, |index| index.entries().len()),
         "Git index phase completed"
     );
-    let index = result?;
-    let entry_count = index.entries().len();
-    let old_tree = gix_hash_cache::ObjectId::from_bytes_or_panic(tree.as_bytes());
-    let options = gix_validate_cache::path::component::Options {
-        protect_windows: false,
-        protect_hfs: false,
-        protect_ntfs: false,
+    let state = match result {
+        Ok(state) => state,
+        Err(gix_index_cache::init::from_tree::Error::InvalidComponent { path, source }) => {
+            use gix::error::ErrorExt as _;
+
+            return Err(source
+                .and_raise(gix::error::message!("The path \"{path}\" is invalid").validation())
+                .into());
+        }
+        Err(err) => return Err(err.into()),
     };
-    let started = Instant::now();
-    let result = gix_index_cache::State::from_tree(&old_tree, TreeObjects(repo), options);
-    tracing::debug!(
-        phase = "git_index_cache_tree_traversal",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    let old_index = result?;
-    let tree = old_index
-        .tree()
-        .expect("tree traversal builds a cache tree");
+    let index = gix_index_cache::File::from_state(state, repo.index_path());
+    let entry_count = index.entries().len();
     let mut bytes = Vec::new();
     let started = Instant::now();
-    let result = index.write_to(&mut bytes, gix::index::write::Options::default());
+    let result = index.write_to(&mut bytes, gix_index_cache::write::Options::default());
     tracing::debug!(
         phase = "git_index_tree_conversion_encode",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -172,20 +182,6 @@ pub fn index_from_tree(
         "Git index phase completed"
     );
     result?;
-    let trailer = bytes.split_off(bytes.len() - repo.object_hash().len_in_bytes());
-    let started = Instant::now();
-    let result = tree.write_to(&mut bytes);
-    tracing::debug!(
-        phase = "git_index_cache_tree_encode",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    result?;
-    bytes.extend_from_slice(&trailer);
-    // from_bytes only decodes; the temporary trailer becomes valid when the
-    // resulting index is actually written to the reserved lock file.
     let started = Instant::now();
     let result = gix::index::State::from_bytes(
         &bytes,
@@ -304,6 +300,206 @@ pub fn write_with_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_repo(
+        path: &Path,
+        kind: gix::hash::Kind,
+        strict: bool,
+        config: &[String],
+    ) -> gix::Repository {
+        gix::ThreadSafeRepository::init_opts(
+            path,
+            gix::create::Kind::Bare,
+            gix::create::Options {
+                object_hash: Some(kind),
+                ..Default::default()
+            },
+            gix::open::Options::isolated()
+                .strict_config(strict)
+                .config_overrides(config.iter().cloned()),
+        )
+        .unwrap()
+        .to_thread_local()
+    }
+
+    fn write_tree(
+        repo: &gix::Repository,
+        entries: &[(&str, gix::objs::tree::EntryKind, gix::ObjectId)],
+    ) -> gix::ObjectId {
+        let mut entries = entries
+            .iter()
+            .map(|(name, mode, oid)| gix::objs::tree::Entry {
+                mode: (*mode).into(),
+                filename: (*name).into(),
+                oid: *oid,
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        repo.write_object(gix::objs::Tree { entries })
+            .unwrap()
+            .detach()
+    }
+
+    #[test]
+    fn index_from_tree_preserves_entries_and_cache_tree() {
+        use gix::objs::tree::EntryKind::Blob;
+        use gix::objs::tree::EntryKind::BlobExecutable;
+        use gix::objs::tree::EntryKind::Commit;
+        use gix::objs::tree::EntryKind::Link;
+        use gix::objs::tree::EntryKind::Tree;
+
+        for kind in [gix::hash::Kind::Sha1, gix::hash::Kind::Sha256] {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = init_repo(temp.path(), kind, true, &[]);
+            let blob = repo.write_blob(b"contents").unwrap().detach();
+            let empty = write_tree(&repo, &[]);
+            let child = write_tree(
+                &repo,
+                &[
+                    ("file", Blob, blob),
+                    ("run", BlobExecutable, blob),
+                    ("symlink", Link, blob),
+                    ("vendor", Commit, gix::ObjectId::null(kind)),
+                ],
+            );
+            let root = write_tree(
+                &repo,
+                &[
+                    ("a", Tree, child),
+                    ("a.c", Blob, blob),
+                    ("empty", Tree, empty),
+                    ("z", Blob, blob),
+                ],
+            );
+            for tree in [root, empty] {
+                let expected = repo.index_from_tree(&tree).unwrap();
+                let actual = index_from_tree(&repo, &tree).unwrap();
+                assert_eq!(actual.path(), repo.index_path());
+                assert_eq!(actual.object_hash(), kind);
+                assert_eq!(actual.version(), expected.version());
+                assert_eq!(actual.entries().len(), expected.entries().len());
+                for (actual_entry, expected_entry) in
+                    actual.entries().iter().zip(expected.entries())
+                {
+                    assert_eq!(actual_entry.path(&actual), expected_entry.path(&expected));
+                    assert_eq!(actual_entry.id, expected_entry.id);
+                    assert_eq!(actual_entry.mode, expected_entry.mode);
+                    assert_eq!(actual_entry.flags, expected_entry.flags);
+                    assert_eq!(actual_entry.stage(), expected_entry.stage());
+                    assert_eq!(actual_entry.stat, expected_entry.stat);
+                }
+                assert!(actual.fs_monitor().is_none());
+                assert!(actual.untracked().is_none());
+                let cache = actual.tree().expect("new index has a TREE cache");
+                assert_eq!(cache.id, tree);
+                assert_eq!(cache.num_entries, Some(actual.entries().len() as u32));
+                if tree == root {
+                    assert_eq!(cache.children.len(), 2);
+                    assert_eq!(cache.children[0].name.as_slice(), b"a");
+                    assert_eq!(cache.children[0].id, child);
+                    assert_eq!(cache.children[0].num_entries, Some(4));
+                    assert_eq!(cache.children[1].name.as_slice(), b"empty");
+                    assert_eq!(cache.children[1].id, empty);
+                    assert_eq!(cache.children[1].num_entries, Some(0));
+                } else {
+                    assert!(cache.children.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_from_tree_uses_effective_path_protections() {
+        use gix::objs::tree::EntryKind::Blob;
+        use gix::objs::tree::EntryKind::Link;
+        use gix::objs::tree::EntryKind::Tree;
+
+        // Include defaults as well as every combination of explicit settings.
+        let configs = std::iter::once(Vec::new()).chain((0..8).map(|bits| {
+            vec![
+                format!("gitoxide.core.protectWindows={}", bits & 1 != 0),
+                format!("core.protectHFS={}", bits & 2 != 0),
+                format!("core.protectNTFS={}", bits & 4 != 0),
+            ]
+        }));
+        for config in configs {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = init_repo(temp.path(), gix::hash::Kind::Sha1, true, &config);
+            let blob = repo.write_blob(b"contents").unwrap().detach();
+            let child = write_tree(&repo, &[("file", Blob, blob)]);
+            for name in [
+                "ordinary",
+                ".git",
+                ".gitmodules",
+                "git~1",
+                ".g\u{200c}it",
+                "CON",
+                "a\\b",
+                "..",
+            ] {
+                for mode in [Blob, Link, Tree] {
+                    let oid = if mode == Tree { child } else { blob };
+                    let tree = write_tree(&repo, &[(name, mode, oid)]);
+                    let expected = repo.index_from_tree(&tree);
+                    let actual = index_from_tree(&repo, &tree);
+                    assert_eq!(
+                        actual.is_ok(),
+                        expected.is_ok(),
+                        "config={config:?}, name={name:?}, mode={mode:?}"
+                    );
+                    if let Err(err) = actual {
+                        assert!(
+                            err.downcast_ref::<gix::Error>()
+                                .is_some_and(|err| err.is_validation()),
+                            "invalid paths retain validation classification: {err:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_from_tree_respects_config_error_policy() {
+        use gix::objs::tree::EntryKind::Blob;
+
+        for strict in [false, true] {
+            for key in [
+                "gitoxide.core.protectWindows",
+                "core.protectHFS",
+                "core.protectNTFS",
+            ] {
+                for mut config in [
+                    Vec::new(),
+                    vec![
+                        "gitoxide.core.protectWindows=true".to_owned(),
+                        "core.protectHFS=true".to_owned(),
+                        "core.protectNTFS=false".to_owned(),
+                    ],
+                ] {
+                    // An invalid key defaults individually, retaining valid
+                    // explicit values for the other protection settings.
+                    config.push(format!("{key}=invalid-boolean"));
+                    let temp = tempfile::tempdir().unwrap();
+                    let repo = init_repo(temp.path(), gix::hash::Kind::Sha1, strict, &config);
+                    let blob = repo.write_blob(b"contents").unwrap().detach();
+                    for name in ["ordinary", "git~1", ".g\u{200c}it", "CON", "a\\b"] {
+                        let tree = write_tree(&repo, &[(name, Blob, blob)]);
+                        let expected = repo.index_from_tree(&tree);
+                        let actual = index_from_tree(&repo, &tree);
+                        assert_eq!(
+                            actual.is_ok(),
+                            expected.is_ok(),
+                            "strict={strict}, config={config:?}, name={name:?}"
+                        );
+                        if strict || name == "ordinary" {
+                            assert_eq!(actual.is_ok(), !strict);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn make_index(path: &Path, kind: gix::hash::Kind, paths: &[(&str, u8)]) -> gix::index::File {
         let mut index = gix::index::File::from_state(gix::index::State::new(kind), path);
