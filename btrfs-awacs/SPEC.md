@@ -239,7 +239,11 @@ index reconciliation.
 To move an external index independently, copy it to the new path and run Git
 with the new `GIT_INDEX_FILE` before removing the old path, so the hook registers
 the new location while the old reference remains protected.
-Responses whose process identity cannot be read also remain conservatively pinned.
+The hook requires an identifiable Git publisher before opening a scan client.
+Direct calls without a Git ancestor, or calls whose publisher identity cannot
+be read, fail without issuing a cursor or creating response pins. Once captured,
+an identified publisher whose liveness cannot be checked remains conservatively
+pinned until its completion can be established.
 A highest observed Git cursor that never advances can retain an
 indefinitely growing logical event interval. The 128-cut/24-hour cache limits
 are not hard storage caps for protected history. Observation records contain

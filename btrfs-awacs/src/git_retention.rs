@@ -42,7 +42,7 @@ pub struct GitPublisher {
 /// Capture the nearest Git ancestor before opening the manager or taking cuts.
 ///
 /// Hooks may run through shell wrappers. If the publisher cannot be identified,
-/// callers still retain the response, without assuming a deadline for it.
+/// callers must decline the query before preparing a response they cannot track.
 pub fn capture_git_publisher() -> Option<GitPublisher> {
     let index_path = std::env::var_os("GIT_INDEX_FILE").map(PathBuf::from);
     let boot_id = *Uuid::parse_str(
@@ -271,46 +271,35 @@ impl Store {
     pub(crate) fn retain_git_response(
         &mut self,
         baseline: &SnapshotBaseline,
-        publisher: Option<&GitPublisher>,
+        publisher: &GitPublisher,
     ) -> Result<(), String> {
         let transaction = self
             .connection_mut()
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let (watch_id, snapshot_id) = validate_local_baseline(&transaction, baseline)?;
-        let publisher = publisher
-            .map(|publisher| {
-                let mut publisher = publisher.clone();
-                if let Some(path) = publisher
-                    .index_path
-                    .as_ref()
-                    .filter(|_| current_mount_namespace() == Some(publisher.mount_namespace))
-                {
-                    let root: Vec<u8> = transaction
-                        .query_row(
-                            "SELECT live_path FROM watches WHERE id = ?1",
-                            [watch_id.as_slice()],
-                            |row| row.get(0),
-                        )
-                        .map_err(|error| error.to_string())?;
-                    let root = PathBuf::from(std::ffi::OsString::from_vec(root));
-                    let root = fs::canonicalize(&root).unwrap_or(root);
-                    if let Ok(relative) = path.strip_prefix(root) {
-                        if !relative.as_os_str().is_empty() {
-                            publisher.index_path = Some(relative.to_owned());
-                        }
-                    }
-                }
-                Ok::<_, String>(publisher)
-            })
-            .transpose()?;
-        let reason = publisher
+        let mut publisher = publisher.clone();
+        if let Some(path) = publisher
+            .index_path
             .as_ref()
-            .map(GitPublisher::reason)
-            .unwrap_or_else(|| {
-                // Unknown publishers cannot be proven finished by a timeout.
-                format!("{RESPONSE_REASON_PREFIX}unknown:{}", Uuid::new_v4())
-            });
+            .filter(|_| current_mount_namespace() == Some(publisher.mount_namespace))
+        {
+            let root: Vec<u8> = transaction
+                .query_row(
+                    "SELECT live_path FROM watches WHERE id = ?1",
+                    [watch_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let root = PathBuf::from(std::ffi::OsString::from_vec(root));
+            let root = fs::canonicalize(&root).unwrap_or(root);
+            if let Ok(relative) = path.strip_prefix(root) {
+                if !relative.as_os_str().is_empty() {
+                    publisher.index_path = Some(relative.to_owned());
+                }
+            }
+        }
+        let reason = publisher.reason();
         insert_pin(
             &transaction,
             snapshot_id,
@@ -865,7 +854,7 @@ mod tests {
         for sequence in [3, 5, 4] {
             fixture
                 .store
-                .retain_git_response(&baseline(sequence), Some(&publisher))
+                .retain_git_response(&baseline(sequence), &publisher)
                 .unwrap();
         }
         fixture.store.refresh_git_index_roots(BOOT).unwrap();
@@ -893,7 +882,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&publisher()))
+            .retain_git_response(&baseline(4), &publisher())
             .unwrap();
         let completed = Cell::new(false);
         fixture
@@ -920,7 +909,7 @@ mod tests {
         fixture.write_index(Some(&baseline(2)), 20);
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&publisher()))
+            .retain_git_response(&baseline(4), &publisher())
             .unwrap();
         let barrier = Arc::new(Barrier::new(2));
         let publishing_barrier = Arc::clone(&barrier);
@@ -956,17 +945,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_publishers_and_bootstrap_indexes_preserve_existing_pins() {
+    fn bootstrap_indexes_preserve_existing_pins() {
         let mut fixture = Fixture::new();
         fixture.write_index(Some(&fixture.baseline(2)), 20);
         fixture.store.refresh_git_index_roots(BOOT).unwrap();
         fixture
             .store
-            .retain_git_response(&baseline(3), None)
-            .unwrap();
-        fixture
-            .store
-            .retain_git_response(&baseline(4), Some(&publisher()))
+            .retain_git_response(&baseline(4), &publisher())
             .unwrap();
         let before = fixture.roots();
         fixture.write_index(None, 20);
@@ -980,9 +965,7 @@ mod tests {
             .store
             .refresh_git_index_roots_with(|_| true, read_index_baseline)
             .unwrap();
-        let roots = fixture.roots();
-        assert_eq!(roots.len(), 2);
-        assert!(roots[1].1.starts_with("git-response:unknown:"));
+        assert_eq!(fixture.roots(), [(2, CURRENT_REASON.to_owned())]);
     }
 
     #[test]
@@ -994,7 +977,7 @@ mod tests {
         alternate_publisher.index_path = Some(index_path.clone());
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&alternate_publisher))
+            .retain_git_response(&baseline(4), &alternate_publisher)
             .unwrap();
         fs::write(&index_path, index_bytes(Some(&baseline(4)), 20)).unwrap();
         fixture
@@ -1057,7 +1040,7 @@ mod tests {
             let response = baseline(3 + index % 3);
             fixture
                 .store
-                .retain_git_response(&response, Some(&alternate_publisher))
+                .retain_git_response(&response, &alternate_publisher)
                 .unwrap();
             if index % 2 == 0 {
                 fs::write(&path, index_bytes(Some(&response), 20)).unwrap();
@@ -1085,7 +1068,7 @@ mod tests {
         alternate_publisher.index_path = Some(path.clone());
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&alternate_publisher))
+            .retain_git_response(&baseline(4), &alternate_publisher)
             .unwrap();
         fs::write(&path, b"corrupt").unwrap();
         let before = fixture.roots();
@@ -1116,7 +1099,7 @@ mod tests {
         other_view.index_path = Some(fixture.directory.path().join("alternate-index"));
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&other_view))
+            .retain_git_response(&baseline(4), &other_view)
             .unwrap();
         insert_pin(
             fixture.store.connection(),
@@ -1141,7 +1124,7 @@ mod tests {
         alternate_publisher.index_path = Some(fixture.directory.path().join("alternate-index"));
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&alternate_publisher))
+            .retain_git_response(&baseline(4), &alternate_publisher)
             .unwrap();
         fs::write(
             alternate_publisher.index_path.as_ref().unwrap(),
@@ -1182,7 +1165,7 @@ mod tests {
         external_publisher.index_path = Some(path.clone());
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&external_publisher))
+            .retain_git_response(&baseline(4), &external_publisher)
             .unwrap();
         fs::write(&path, index_bytes(Some(&baseline(4)), 20)).unwrap();
         fixture
@@ -1191,7 +1174,7 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .retain_git_response(&baseline(5), Some(&external_publisher))
+            .retain_git_response(&baseline(5), &external_publisher)
             .unwrap();
         fs::remove_file(path).unwrap();
         let before = fixture.roots();
@@ -1206,7 +1189,7 @@ mod tests {
         another_publisher.start_time += 1;
         fixture
             .store
-            .retain_git_response(&baseline(6), Some(&another_publisher))
+            .retain_git_response(&baseline(6), &another_publisher)
             .unwrap();
         let before = fixture.roots();
         // One completed response does not prove that the path is finished.
@@ -1244,7 +1227,7 @@ mod tests {
         old_publisher.index_path = Some(old_path.clone());
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&old_publisher))
+            .retain_git_response(&baseline(4), &old_publisher)
             .unwrap();
         fs::write(&old_path, index_bytes(Some(&baseline(4)), 20)).unwrap();
         fixture
@@ -1257,7 +1240,7 @@ mod tests {
         new_publisher.index_path = Some(new_path.clone());
         fixture
             .store
-            .retain_git_response(&baseline(5), Some(&new_publisher))
+            .retain_git_response(&baseline(5), &new_publisher)
             .unwrap();
         fs::remove_file(old_path).unwrap();
         fixture
@@ -1297,7 +1280,7 @@ mod tests {
         insert_pin(fixture.store.connection(), 3, [90; 16], "jj").unwrap();
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&alternate_publisher))
+            .retain_git_response(&baseline(4), &alternate_publisher)
             .unwrap();
         fs::write(&path, index_bytes(Some(&baseline(4)), 20)).unwrap();
         fixture
@@ -1310,7 +1293,7 @@ mod tests {
         );
         fixture
             .store
-            .retain_git_response(&baseline(5), Some(&alternate_publisher))
+            .retain_git_response(&baseline(5), &alternate_publisher)
             .unwrap();
         fs::remove_file(path).unwrap();
         fixture
@@ -1339,7 +1322,7 @@ mod tests {
         alternate_publisher.index_path = Some(path.clone());
         fixture
             .store
-            .retain_git_response(&baseline(4), Some(&alternate_publisher))
+            .retain_git_response(&baseline(4), &alternate_publisher)
             .unwrap();
         fs::write(&path, index_bytes(Some(&baseline(4)), 20)).unwrap();
         fixture
@@ -1348,7 +1331,7 @@ mod tests {
             .unwrap();
         fixture
             .store
-            .retain_git_response(&baseline(5), Some(&alternate_publisher))
+            .retain_git_response(&baseline(5), &alternate_publisher)
             .unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(&parent).unwrap();
@@ -1447,7 +1430,7 @@ mod tests {
         fixture.store.refresh_git_index_roots(BOOT).unwrap();
         fixture
             .store
-            .retain_git_response(&baseline(3), Some(&publisher()))
+            .retain_git_response(&baseline(3), &publisher())
             .unwrap();
         let before = fixture.roots();
         fs::write(fixture.directory.path().join(".git/index"), b"corrupt").unwrap();
@@ -1474,7 +1457,7 @@ mod tests {
         fixture.store.refresh_git_index_roots(BOOT).unwrap();
         fixture
             .store
-            .retain_git_response(&baseline(3), Some(&publisher()))
+            .retain_git_response(&baseline(3), &publisher())
             .unwrap();
         let before = fixture.roots();
         fs::remove_file(fixture.directory.path().join(".git/index")).unwrap();
@@ -1493,7 +1476,7 @@ mod tests {
         fixture.store.refresh_git_index_roots(BOOT).unwrap();
         fixture
             .store
-            .retain_git_response(&baseline(3), Some(&publisher()))
+            .retain_git_response(&baseline(3), &publisher())
             .unwrap();
         let before = fixture.roots();
         let root = fixture.directory.path().join("unavailable-root");

@@ -35,7 +35,6 @@ const TEST_SHORT_SCAN_TTL_NS: i64 = 300_000_000;
 pub struct DirectScanClient {
     handler: Arc<Mutex<DirectScanHandler>>,
     root_lock: Arc<File>,
-    git_hook: bool,
     git_publisher: Option<GitPublisher>,
 }
 
@@ -91,7 +90,6 @@ impl DirectScanClient {
                 unsafe { libc::getegid() },
             ))),
             root_lock: Arc::new(root_lock),
-            git_hook: false,
             git_publisher: None,
         })
     }
@@ -102,9 +100,11 @@ impl DirectScanClient {
         live_root: &Path,
         publisher: Option<GitPublisher>,
     ) -> Result<Self, ScanError> {
+        let publisher = publisher.ok_or_else(|| {
+            unavailable("cannot identify the Git publisher; refusing an untracked hook response")
+        })?;
         let mut client = Self::for_root(live_root)?;
-        client.git_hook = true;
-        client.git_publisher = publisher;
+        client.git_publisher = Some(publisher);
         Ok(client)
     }
 
@@ -209,7 +209,7 @@ impl ScanClient for DirectScanClient {
             expires_boottime_ns,
             scan_root,
         } = response;
-        if self.git_hook {
+        if let Some(publisher) = self.git_publisher.as_ref() {
             // Do this before releasing root.lock. A concurrent manager can
             // open and advance this watch as soon as Begin returns.
             let retained = self
@@ -221,7 +221,7 @@ impl ScanClient for DirectScanClient {
                 .map_err(|_| other("AWACS direct scan facade lock poisoned"))?
                 .service_mut()
                 .store_mut()
-                .retain_git_response(&next_baseline, self.git_publisher.as_ref());
+                .retain_git_response(&next_baseline, publisher);
             if let Err(error) = retained {
                 if let Ok(mut handler) = self.handler.lock() {
                     let _ = handler.finish_scan(&session_id, ScanOutcome::Aborted);
@@ -1095,6 +1095,30 @@ fn full_scan_required(message: impl Into<String>) -> ScanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unidentified_git_hook_callers_are_rejected_before_opening_root_state() {
+        let directory = tempfile::tempdir().unwrap();
+        for _ in 0..24 {
+            let error = match DirectScanClient::for_git_hook(directory.path(), None) {
+                Ok(_) => panic!("an unidentified hook caller must not open a scan client"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ScanErrorKind::Unavailable);
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot identify the Git publisher"),
+                "{error}"
+            );
+            assert!(
+                std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
+    }
 
     fn persisted_index_baseline() -> SnapshotBaseline {
         SnapshotBaseline {

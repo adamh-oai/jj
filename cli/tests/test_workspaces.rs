@@ -3970,37 +3970,52 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         "malformed cursor recovery must explain why no snapshot can safely be adopted: {}",
         String::from_utf8_lossy(&malformed_hook.stderr)
     );
-    // An index previously read by Git's built-in fsmonitor can contain its
-    // sentinel. The hook must migrate it without trusting any cached entries.
-    let builtin_hook = Command::new(&git_fsmonitor_hook)
-        .env("PATH", &path)
-        .env_remove("BTRFS_AWACS_STATE_DIR")
-        .env_remove("BTRFS_AWACS_STATE_ROOT")
-        .env_remove("BTRFS_AWACS_MANAGED_DIR")
-        .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
-        .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
-        .args(["2", "builtin:fake"])
-        .current_dir(&adopted_root)
-        .output()?;
-    assert!(
-        builtin_hook.status.success(),
-        "migrate Git's built-in fsmonitor token: {}",
-        String::from_utf8_lossy(&builtin_hook.stderr)
-    );
-    let mut builtin_response = builtin_hook.stdout.split(|byte| *byte == 0);
-    let builtin_cursor = builtin_response.next().unwrap_or_default();
-    assert!(
-        builtin_cursor.starts_with(b"awacs-git-v2:"),
-        "the migrated cursor must belong to AWACS"
-    );
-    assert_eq!(
-        builtin_response.next(),
-        Some(b"/".as_slice()),
-        "the first query must invalidate the whole index before reusing the cursor"
-    );
-    assert_eq!(builtin_response.next(), Some(b"".as_slice()));
-    assert_eq!(builtin_response.next(), None);
+    // Direct invocations have no Git publisher whose completion can release
+    // response pins. They must fail before making cuts or persistent roots,
+    // including with a valid cursor, bootstrap tokens, and alternate indexes.
+    {
+        let manager = assert_default_awacs_layout(&adopted_root);
+        let store = Store::open(&manager)?;
+        let retention_state = || {
+            store.connection().query_row(
+                "SELECT (SELECT count(*) FROM snapshot_pins), (SELECT count(*) FROM watch_cuts)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+        };
+        let before = retention_state()?;
+        for attempt in 0..24 {
+            let prior_token = [seeded_token, "builtin:fake", "123456789"][attempt % 3];
+            let mut hook = Command::new(&git_fsmonitor_hook);
+            hook.env("PATH", &path)
+                .env_remove("BTRFS_AWACS_STATE_DIR")
+                .env_remove("BTRFS_AWACS_STATE_ROOT")
+                .env_remove("BTRFS_AWACS_MANAGED_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env("XDG_RUNTIME_DIR", &runtime_dir)
+                .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
+                .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
+                .args(["2", prior_token])
+                .current_dir(&adopted_root);
+            if attempt % 2 == 1 {
+                hook.env(
+                    "GIT_INDEX_FILE",
+                    runtime_dir.join(format!("unpublished-index-{attempt}")),
+                );
+            }
+            let output = hook.output()?;
+            assert!(!output.status.success(), "an unidentified caller must fail");
+            assert!(output.stdout.is_empty(), "no cursor may be issued");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("cannot identify the Git publisher"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(retention_state()?, before);
+        assert_eq!(std::fs::read(&seeded_index_path)?, seeded_index);
+    }
 
     // Simulate an index last written by the built-in fsmonitor. A real Git
     // status must see both tracked and untracked changes, then persist the
