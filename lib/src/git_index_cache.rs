@@ -23,6 +23,7 @@ use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::path::Path;
+use std::time::Instant;
 use std::time::SystemTime;
 
 /// An index encoding or I/O error.
@@ -38,14 +39,32 @@ fn cache_hash(kind: gix::hash::Kind) -> Result<gix_hash_cache::Kind, ErrorBox> {
 
 fn cache_index(index: &gix::index::File) -> Result<gix_index_cache::File, ErrorBox> {
     let mut bytes = Vec::new();
-    index.write_to(&mut bytes, gix::index::write::Options::default())?;
+    let started = Instant::now();
+    let result = index.write_to(&mut bytes, gix::index::write::Options::default());
+    tracing::debug!(
+        phase = "git_index_cache_conversion_encode",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count = index.entries().len(),
+        "Git index phase completed"
+    );
+    result?;
     let kind = cache_hash(index.object_hash())?;
-    let (state, _) = gix_index_cache::State::from_bytes(
+    let started = Instant::now();
+    let result = gix_index_cache::State::from_bytes(
         &bytes,
         filetime::FileTime::from_system_time(SystemTime::UNIX_EPOCH),
         kind,
         gix_index_cache::decode::Options::default(),
-    )?;
+    );
+    tracing::debug!(
+        phase = "git_index_cache_conversion_decode",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count = index.entries().len(),
+        "Git index phase completed"
+    );
+    let (state, _) = result?;
     Ok(gix_index_cache::File::from_state(state, index.path()))
 }
 
@@ -112,30 +131,76 @@ pub fn index_from_tree(
     repo: &gix::Repository,
     tree: &gix::hash::oid,
 ) -> Result<gix::index::File, ErrorBox> {
-    let index = repo.index_from_tree(tree)?;
+    let started = Instant::now();
+    let result = repo.index_from_tree(tree);
+    tracing::debug!(
+        phase = "git_index_from_tree_traversal",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count = result.as_ref().map_or(0, |index| index.entries().len()),
+        "Git index phase completed"
+    );
+    let index = result?;
+    let entry_count = index.entries().len();
     let old_tree = gix_hash_cache::ObjectId::from_bytes_or_panic(tree.as_bytes());
     let options = gix_validate_cache::path::component::Options {
         protect_windows: false,
         protect_hfs: false,
         protect_ntfs: false,
     };
-    let old_index = gix_index_cache::State::from_tree(&old_tree, TreeObjects(repo), options)?;
+    let started = Instant::now();
+    let result = gix_index_cache::State::from_tree(&old_tree, TreeObjects(repo), options);
+    tracing::debug!(
+        phase = "git_index_cache_tree_traversal",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    let old_index = result?;
     let tree = old_index
         .tree()
         .expect("tree traversal builds a cache tree");
     let mut bytes = Vec::new();
-    index.write_to(&mut bytes, gix::index::write::Options::default())?;
+    let started = Instant::now();
+    let result = index.write_to(&mut bytes, gix::index::write::Options::default());
+    tracing::debug!(
+        phase = "git_index_tree_conversion_encode",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    result?;
     let trailer = bytes.split_off(bytes.len() - repo.object_hash().len_in_bytes());
-    tree.write_to(&mut bytes)?;
+    let started = Instant::now();
+    let result = tree.write_to(&mut bytes);
+    tracing::debug!(
+        phase = "git_index_cache_tree_encode",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    result?;
     bytes.extend_from_slice(&trailer);
     // from_bytes only decodes; the temporary trailer becomes valid when the
     // resulting index is actually written to the reserved lock file.
-    let (state, _) = gix::index::State::from_bytes(
+    let started = Instant::now();
+    let result = gix::index::State::from_bytes(
         &bytes,
         filetime::FileTime::from_system_time(SystemTime::UNIX_EPOCH),
         repo.object_hash(),
         gix::index::decode::Options::default(),
-    )?;
+    );
+    tracing::debug!(
+        phase = "git_index_tree_conversion_decode",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    let (state, _) = result?;
     Ok(gix::index::File::from_state(state, index.path()))
 }
 
@@ -148,12 +213,49 @@ pub fn write_preserving_cache(
     index: &gix::index::File,
     mut out: impl Write,
 ) -> Result<(), ErrorBox> {
-    let mut rebuilt = cache_index(index)?;
-    if let Some(previous) = read_cache_index(index.path(), cache_hash(index.object_hash())?)? {
+    let entry_count = index.entries().len();
+    let started = Instant::now();
+    let result = cache_index(index);
+    tracing::debug!(
+        phase = "git_index_cache_write_conversion",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    let mut rebuilt = result?;
+    let kind = cache_hash(index.object_hash())?;
+    let started = Instant::now();
+    let result = read_cache_index(index.path(), kind);
+    tracing::debug!(
+        phase = "git_index_cache_read_previous",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    let previous = result?;
+    let started = Instant::now();
+    if let Some(previous) = previous {
         rebuilt.inherit_fs_monitor_from(&previous);
         rebuilt.inherit_untracked_from(&previous);
     }
-    rebuilt.write_to(&mut out, gix_index_cache::write::Options::default())?;
+    tracing::debug!(
+        phase = "git_index_cache_inherit",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        entry_count,
+        "Git index phase completed"
+    );
+    let started = Instant::now();
+    let result = rebuilt.write_to(&mut out, gix_index_cache::write::Options::default());
+    tracing::debug!(
+        phase = "git_index_cache_encode_and_write",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    result?;
     Ok(())
 }
 

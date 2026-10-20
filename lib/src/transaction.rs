@@ -15,6 +15,7 @@
 #![expect(missing_docs)]
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -143,14 +144,30 @@ impl Transaction {
             "BUG: Descendants have not been rebased after the last rewrites."
         );
         let base_repo = mut_repo.base_repo().clone();
-        let (mut_index, view, predecessors) = mut_repo.consume().await?;
+        let started = Instant::now();
+        let result = mut_repo.consume().await;
+        tracing::debug!(
+            phase = "transaction_consume",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            "transaction phase completed"
+        );
+        let (mut_index, view, predecessors) = result?;
         assert!(
             view.is_heads_normalized(),
             "BUG: View heads must be normalized before persisting in the database"
         );
 
         let operation = {
-            let view_id = base_repo.op_store().write_view(view.store_view()).await?;
+            let started = Instant::now();
+            let result = base_repo.op_store().write_view(view.store_view()).await;
+            tracing::debug!(
+                phase = "transaction_write_view",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                succeeded = result.is_ok(),
+                "transaction phase completed"
+            );
+            let view_id = result?;
             self.op_metadata.description = description.into();
             self.op_metadata.time.end = self.end_time.unwrap_or_else(Timestamp::now);
             let parents = self.parent_ops.iter().map(|op| op.id().clone()).collect();
@@ -160,14 +177,27 @@ impl Transaction {
                 metadata: self.op_metadata,
                 commit_predecessors: Some(predecessors),
             };
-            let new_op_id = base_repo
-                .op_store()
-                .write_operation(&store_operation)
-                .await?;
+            let started = Instant::now();
+            let result = base_repo.op_store().write_operation(&store_operation).await;
+            tracing::debug!(
+                phase = "transaction_write_operation",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                succeeded = result.is_ok(),
+                "transaction phase completed"
+            );
+            let new_op_id = result?;
             Operation::new(base_repo.op_store().clone(), new_op_id, store_operation)
         };
 
-        let index = base_repo.index_store().write_index(mut_index, &operation)?;
+        let started = Instant::now();
+        let result = base_repo.index_store().write_index(mut_index, &operation);
+        tracing::debug!(
+            phase = "transaction_write_index",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            "transaction phase completed"
+        );
+        let index = result?;
         let unpublished = UnpublishedOperation::new(base_repo.loader(), operation, view, index);
         Ok(unpublished)
     }
@@ -229,10 +259,27 @@ impl UnpublishedOperation {
     }
 
     pub async fn publish(self) -> Result<Arc<ReadonlyRepo>, TransactionCommitError> {
-        let _lock = self.op_heads_store.lock().await?;
-        self.op_heads_store
+        let started = Instant::now();
+        let result = self.op_heads_store.lock().await;
+        tracing::debug!(
+            phase = "transaction_lock_op_heads",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            "transaction phase completed"
+        );
+        let _lock = result?;
+        let started = Instant::now();
+        let result = self
+            .op_heads_store
             .update_op_heads(self.operation().parent_ids(), self.operation().id())
-            .await?;
+            .await;
+        tracing::debug!(
+            phase = "transaction_update_op_heads",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            "transaction phase completed"
+        );
+        result?;
         Ok(self.repo)
     }
 

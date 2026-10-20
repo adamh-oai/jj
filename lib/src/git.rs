@@ -27,6 +27,7 @@ use std::num::NonZeroU32;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bstr::BStr;
 use bstr::BString;
@@ -2199,16 +2200,39 @@ async fn reset_index(
     wc_commit: &Commit,
     index_lock: gix::lock::File,
 ) -> Result<(), GitResetHeadError> {
-    let mut index = build_working_copy_index(repo, git_repo, wc_commit).await?;
+    let started = Instant::now();
+    let result = build_working_copy_index(repo, git_repo, wc_commit).await;
+    tracing::debug!(
+        phase = "git_index_build",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count = result.as_ref().map_or(0, |index| index.entries().len()),
+        "Git index phase completed"
+    );
+    let mut index = result?;
+    let entry_count = index.entries().len();
 
     // Match entries in the new index with entries in the old index, and copy stat
     // information if the entry didn't change.
-    let old_index = git_repo.try_index().map_err(GitResetHeadError::from_git)?;
-    let sparse_patterns = old_index
-        .as_ref()
-        .map(|old| git_sparse_patterns_from_index(git_repo, old))
-        .transpose()?
-        .flatten();
+    let started = Instant::now();
+    let result = (|| {
+        let old_index = git_repo.try_index().map_err(GitResetHeadError::from_git)?;
+        let sparse_patterns = old_index
+            .as_ref()
+            .map(|old| git_sparse_patterns_from_index(git_repo, old))
+            .transpose()?
+            .flatten();
+        Ok::<_, GitResetHeadError>((old_index, sparse_patterns))
+    })();
+    tracing::debug!(
+        phase = "git_index_read_old_and_sparse_patterns",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    let (old_index, sparse_patterns) = result?;
+    let started = Instant::now();
     if let Some(old_index) = old_index {
         index
             .entries_mut_with_paths()
@@ -2221,32 +2245,76 @@ async fn reset_index(
             .filter(|(entry, old_entry)| entry.id == old_entry.id && entry.mode == old_entry.mode)
             .for_each(|(entry, old_entry)| entry.stat = old_entry.stat);
     }
+    tracing::debug!(
+        phase = "git_index_copy_stat",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        entry_count,
+        "Git index phase completed"
+    );
 
-    if let Some(sparse_patterns) = sparse_patterns {
-        for (entry, path) in index.entries_mut_with_paths() {
-            let path = path.to_str().map_err(GitResetHeadError::from_git)?;
-            let path = RepoPath::from_internal_string(path).map_err(GitResetHeadError::from_git)?;
-            if sparse_patterns
-                .iter()
-                .any(|prefix| path.starts_with(prefix))
-            {
-                entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
-            } else {
-                // SKIP_WORKTREE is stored in the on-disk extended flags word.
-                entry.flags.insert(
-                    gix::index::entry::Flags::SKIP_WORKTREE | gix::index::entry::Flags::EXTENDED,
-                );
+    let started = Instant::now();
+    let result = (|| {
+        if let Some(sparse_patterns) = sparse_patterns {
+            for (entry, path) in index.entries_mut_with_paths() {
+                let path = path.to_str().map_err(GitResetHeadError::from_git)?;
+                let path =
+                    RepoPath::from_internal_string(path).map_err(GitResetHeadError::from_git)?;
+                if sparse_patterns
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+                {
+                    entry.flags.remove(gix::index::entry::Flags::SKIP_WORKTREE);
+                } else {
+                    // SKIP_WORKTREE is stored in the on-disk extended flags word.
+                    entry.flags.insert(
+                        gix::index::entry::Flags::SKIP_WORKTREE
+                            | gix::index::entry::Flags::EXTENDED,
+                    );
+                }
             }
         }
-    }
+        Ok::<_, GitResetHeadError>(())
+    })();
+    tracing::debug!(
+        phase = "git_index_apply_sparse_patterns",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    result?;
     debug_assert!(index.verify_entries().is_ok());
     let mut writer = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
-    git_index_cache::write_preserving_cache(&index, &mut writer)
-        .map_err(GitResetHeadError::from_git)?;
-    let index_lock = writer
-        .into_inner()
-        .map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
-    index_lock.commit().map_err(GitResetHeadError::from_git)?;
+    let started = Instant::now();
+    let result = git_index_cache::write_preserving_cache(&index, &mut writer);
+    tracing::debug!(
+        phase = "git_index_write_preserving_cache",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    result.map_err(GitResetHeadError::from_git)?;
+    let started = Instant::now();
+    let result = writer.into_inner();
+    tracing::debug!(
+        phase = "git_index_flush",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    let index_lock = result.map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
+    let started = Instant::now();
+    let result = index_lock.commit();
+    tracing::debug!(
+        phase = "git_index_commit",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        succeeded = result.is_ok(),
+        entry_count,
+        "Git index phase completed"
+    );
+    result.map_err(GitResetHeadError::from_git)?;
     Ok(())
 }
 

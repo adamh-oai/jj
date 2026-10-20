@@ -36,6 +36,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use bstr::ByteVec as _;
@@ -570,7 +571,9 @@ impl CommandHelper {
         {
             Ok(stats) => (workspace_command, stats),
             Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
-            Err(SnapshotWorkingCopyError::Retry | SnapshotWorkingCopyError::RetryWithWarnings(_)) => {
+            Err(
+                SnapshotWorkingCopyError::Retry | SnapshotWorkingCopyError::RetryWithWarnings(_),
+            ) => {
                 unreachable!("snapshot_impl retries internally")
             }
             Err(SnapshotWorkingCopyError::StaleWorkingCopy(err)) => {
@@ -2698,7 +2701,10 @@ to the current parents may contain changes from multiple commits.
             let git_sparse = if let Some(git_dir) = &self.env.git_dir {
                 jj_lib::git::sparse_patterns_in_git_dir(self.repo().as_ref(), git_dir)?
             } else if self.working_copy_shared_with_git() {
-                jj_lib::git::sparse_patterns_in_workdir(self.repo().as_ref(), self.workspace_root())?
+                jj_lib::git::sparse_patterns_in_workdir(
+                    self.repo().as_ref(),
+                    self.workspace_root(),
+                )?
             } else {
                 None
             };
@@ -3402,7 +3408,9 @@ to the current parents may contain changes from multiple commits.
                         .reacquire()
                         .map_err(snapshot_command_error)?;
                     return match result {
-                        Ok(None) => Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings)),
+                        Ok(None) => {
+                            Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings))
+                        }
                         Err(err) => Err(err),
                         Ok(Some(_)) => unreachable!(),
                     };
@@ -3870,7 +3878,15 @@ to the current parents may contain changes from multiple commits.
         let mut locked_ws = if (self.may_update_working_copy && maybe_new_wc_commit.is_some())
             || check_snapshot_ready
         {
-            let mut locked_ws = self.workspace.start_working_copy_mutation().await?;
+            let started = Instant::now();
+            let result = self.workspace.start_working_copy_mutation().await;
+            tracing::debug!(
+                phase = "lock_working_copy",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                succeeded = result.is_ok(),
+                "transaction finalization phase completed"
+            );
+            let mut locked_ws = result?;
             if check_snapshot_ready
                 && subvolume_marker.is_file() != expected_snapshot_operation.is_some()
             {
@@ -3927,18 +3943,23 @@ to the current parents may contain changes from multiple commits.
                 #[cfg(not(feature = "git"))]
                 let needs_pending_checkout = tree_changed;
                 if needs_pending_checkout {
-                    locked_ws
-                        .locked_wc()
-                        .prepare_checkout(new_commit)
-                        .map_err(|err| {
-                            internal_error_with_message(
-                                format!(
-                                    "Failed to prepare checkout of commit {}",
-                                    new_commit.id().hex()
-                                ),
-                                err,
-                            )
-                        })?;
+                    let started = Instant::now();
+                    let result = locked_ws.locked_wc().prepare_checkout(new_commit);
+                    tracing::debug!(
+                        phase = "prepare_checkout",
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        succeeded = result.is_ok(),
+                        "transaction finalization phase completed"
+                    );
+                    result.map_err(|err| {
+                        internal_error_with_message(
+                            format!(
+                                "Failed to prepare checkout of commit {}",
+                                new_commit.id().hex()
+                            ),
+                            err,
+                        )
+                    })?;
                 }
             }
             Some(locked_ws)
@@ -3947,10 +3968,10 @@ to the current parents may contain changes from multiple commits.
         };
 
         #[cfg(feature = "git")]
-        if self.env.working_copy_shared_with_git && should_commit_transaction
-        {
+        if self.env.working_copy_shared_with_git && should_commit_transaction {
             if git_checkout_needs_update && let Some(wc_commit) = &maybe_new_wc_commit {
-                try_reset_git_head(
+                let started = Instant::now();
+                let result = try_reset_git_head(
                     ui,
                     tx.repo_mut(),
                     &workspace_name,
@@ -3959,17 +3980,40 @@ to the current parents may contain changes from multiple commits.
                     wc_commit,
                     git_import_export_lock,
                 )
-                .await?;
+                .await;
+                tracing::debug!(
+                    phase = "reset_git_head_and_index",
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    succeeded = result.is_ok(),
+                    "transaction finalization phase completed"
+                );
+                result?;
             }
-            let stats = jj_lib::git::export_refs(tx.repo_mut())?;
+            let started = Instant::now();
+            let result = jj_lib::git::export_refs(tx.repo_mut());
+            tracing::debug!(
+                phase = "export_git_refs",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                succeeded = result.is_ok(),
+                "transaction finalization phase completed"
+            );
+            let stats = result?;
             crate::git_util::print_git_export_stats(ui, &stats)?;
         }
 
-        let new_repo = self
+        let started = Instant::now();
+        let result = self
             .env
             .command
             .maybe_commit_transaction(tx, description)
-            .await?;
+            .await;
+        tracing::debug!(
+            phase = "commit_transaction",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            "transaction finalization phase completed"
+        );
+        let new_repo = result?;
 
         #[cfg(feature = "test-fakes")]
         if env::var_os("JJ_TEST_FAIL_AFTER_OPERATION_PUBLISH").is_some() {
@@ -3995,18 +4039,29 @@ to the current parents may contain changes from multiple commits.
                     pause_for_test("JJ_TEST_CHECKOUT_PAUSE_DIR");
                 }
                 let result = async {
-                    let stats =
-                        locked_ws
-                            .locked_wc()
-                            .check_out(new_commit)
-                            .await
-                            .map_err(|err| {
-                                internal_error_with_message(
-                                    format!("Failed to check out commit {}", new_commit.id().hex()),
-                                    err,
-                                )
-                            })?;
-                    locked_ws.finish(new_repo.op_id().clone()).await?;
+                    let started = Instant::now();
+                    let result = locked_ws.locked_wc().check_out(new_commit).await;
+                    tracing::debug!(
+                        phase = "check_out_working_copy",
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        succeeded = result.is_ok(),
+                        "transaction finalization phase completed"
+                    );
+                    let stats = result.map_err(|err| {
+                        internal_error_with_message(
+                            format!("Failed to check out commit {}", new_commit.id().hex()),
+                            err,
+                        )
+                    })?;
+                    let started = Instant::now();
+                    let result = locked_ws.finish(new_repo.op_id().clone()).await;
+                    tracing::debug!(
+                        phase = "finish_working_copy",
+                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        succeeded = result.is_ok(),
+                        "transaction finalization phase completed"
+                    );
+                    result?;
                     Ok::<_, CommandError>(stats)
                 }
                 .await;
