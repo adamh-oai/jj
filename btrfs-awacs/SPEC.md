@@ -164,9 +164,12 @@ command before the fallback path updates the index. Initial setup and migration
 from a numeric or built-in token retain their bootstrap refresh. Explicit
 initialization or baseline recovery publishes an all-dirty numeric placeholder
 before that refresh instead of deliberately failing a hook query. A still-valid
-Git cursor bypasses this bootstrap. Older running Git processes keep their
-previous fallback policy, so drain them before an upgrade when full scans must
-be avoided.
+Git cursor skips the placeholder. Finalization still performs ordinary refreshes
+so an explicit retry can finish warming the index after an interrupted attempt.
+A second successful refresh persists clean bits for stat entries rewritten
+during initialization before children inherit the index. Older running Git
+processes keep their previous fallback policy, so drain them before an upgrade
+when full scans must be avoided.
 
 AWACS additionally tracks validated **incoming query cursors** on each watch's
 Git lane. Issuing a response is not evidence of persistence:

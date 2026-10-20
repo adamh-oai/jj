@@ -1314,11 +1314,116 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
             .status()?
             .success()
     );
+    // Interrupt initialization after its first successful refresh has fixed
+    // stat data but before the second can persist the corresponding clean bits.
+    let hook = runtime.join("git-fsmonitor-awacs");
+    let real_hook = runtime.join("real/git-fsmonitor-awacs");
+    std::fs::create_dir(real_hook.parent().unwrap())?;
+    std::fs::rename(&hook, &real_hook)?;
+    std::fs::write(
+        &hook,
+        indoc! {r#"
+            #!/bin/sh
+            runtime=$(dirname "$0")
+            counter="$runtime/finalize-query-count"
+            count=0
+            if test -f "$counter"; then count=$(cat "$counter"); fi
+            count=$((count + 1))
+            printf '%s\n' "$count" >"$counter"
+            if test "$count" -eq 2; then exit 1; fi
+            exec "$runtime/real/git-fsmonitor-awacs" "$@"
+        "#},
+    )?;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))?;
+    let failed_trace = runtime.join("interrupted-finalization.jsonl");
+    let failed = main.run_jj_with(|cmd| {
+        configure(cmd);
+        cmd.env("GIT_TRACE2_EVENT", &failed_trace)
+            .args(["util", "subvolume", "enable"])
+    });
+    assert!(!failed.status.success(), "{failed}");
+    assert!(
+        failed
+            .stderr
+            .raw()
+            .contains("Git index refresh failed with exit status: 128"),
+        "{failed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(runtime.join("finalize-query-count"))?,
+        "2\n",
+        "a failed second query must not be retried"
+    );
+    std::fs::remove_file(&hook)?;
+    std::fs::rename(&real_hook, &hook)?;
+    let index_path = root.join(".git/index");
+    let dirty_entries = || -> TestResult<usize> {
+        let index = gix_index_cache::File::at(
+            &index_path,
+            gix_index_cache::hash::Kind::Sha1,
+            false,
+            gix_index_cache::decode::Options::default(),
+        )?;
+        let mut dirty = 0;
+        index
+            .fs_monitor()
+            .expect("finalization must have published an FSMN extension")
+            .for_each_dirty_entry(|_| {
+                dirty += 1;
+                Some(())
+            })
+            .expect("finalization must preserve a valid FSMN bitmap");
+        Ok(dirty)
+    };
+    assert!(matches!(
+        inspect_git_index(&index_path)?.fsmonitor,
+        GitFsmonitorStatus::Baseline(_)
+    ));
+    assert_eq!(dirty_entries()?, 128);
+    let partial_index = std::fs::read(&index_path)?;
+    let cold_trace = runtime.join("interrupted-status.jsonl");
+    let cold_status = git_command(&root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TRACE2_EVENT", &cold_trace)
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .output()?;
+    assert!(cold_status.status.success());
+    assert!(cold_status.stdout.is_empty());
+    let cold_lstats = std::fs::read_to_string(&cold_trace)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .filter(|event| {
+            event["event"] == "data"
+                && event["category"] == "index"
+                && matches!(
+                    event["key"].as_str(),
+                    Some("refresh/sum_lstat" | "preload/sum_lstat")
+                )
+        })
+        .map(|event| event["value"].as_str().unwrap().parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .sum::<u64>();
+    assert!(
+        cold_lstats >= 128,
+        "the interrupted index must reproduce the full refresh: {cold_lstats}"
+    );
+    assert_eq!(std::fs::read(&index_path)?, partial_index);
+    assert_eq!(dirty_entries()?, 128);
+
+    // An authorized cursor alone cannot prove finalization finished warming
+    // the index. Explicit retry must finish that work without bootstrapping.
+    let retry_trace = runtime.join("retried-finalization.jsonl");
     main.run_jj_with(|cmd| {
         configure(cmd);
-        cmd.args(["util", "subvolume", "enable"])
+        cmd.env("GIT_TRACE2_EVENT", &retry_trace)
+            .args(["util", "subvolume", "enable"])
     })
     .success();
+    assert_eq!(dirty_entries()?, 0, "explicit retry must finish warming");
+    assert!(!std::fs::read_to_string(&retry_trace)?.contains("query/trivial-response"));
     assert!(matches!(
         inspect_git_index(&root.join(".git/index"))?.fsmonitor,
         GitFsmonitorStatus::Baseline(_)
@@ -1827,9 +1932,9 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
     main_dir.write_file("ignored", "preserve ignored file\n");
     std::fs::remove_file(repo_root.join("deleted"))?;
 
+    // The caller's alternate must not redirect canonical baseline refresh.
     let alternate_index = runtime_dir.join("alternate-index");
-    let alternate_index_bytes = std::fs::read(repo_root.join(".git/index"))?;
-    std::fs::write(&alternate_index, &alternate_index_bytes)?;
+    std::fs::copy(repo_root.join(".git/index"), &alternate_index)?;
 
     for arguments in [
         vec!["util", "subvolume", "enable"],
@@ -1837,17 +1942,15 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
     ] {
         let before = inspect_git_index(&repo_root.join(".git/index"))?.fsmonitor;
         let operation = arguments.join(" ");
+        let operation_trace = runtime_dir.join(format!("migration-{}.jsonl", arguments.len()));
         main_dir
             .run_jj_with(|cmd| {
                 configure(cmd);
-                cmd.env("GIT_INDEX_FILE", &alternate_index).args(&arguments)
+                cmd.env("GIT_INDEX_FILE", &alternate_index)
+                    .env("GIT_TRACE2_EVENT", &operation_trace)
+                    .args(&arguments)
             })
             .success();
-        assert_eq!(
-            std::fs::read(&alternate_index)?,
-            alternate_index_bytes,
-            "canonical baseline finalization must preserve the caller's alternate index"
-        );
         // Status is read-only: verify immediately, before any normal JJ scan
         // can lazily register the activated path and hide a migration bug.
         let status = main_dir
@@ -1864,9 +1967,18 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
         let after = inspect_git_index(&repo_root.join(".git/index"))?.fsmonitor;
         assert!(matches!(after, GitFsmonitorStatus::Baseline(_)));
         if operation.ends_with("--rebuild-baseline") {
+            let (GitFsmonitorStatus::Baseline(before), GitFsmonitorStatus::Baseline(after)) =
+                (&before, &after)
+            else {
+                panic!("rebuilding must retain an established Git lane");
+            };
             assert_eq!(
-                after, before,
-                "rebuilding the JJ baseline must preserve a still-valid Git cursor"
+                after.retention_token, before.retention_token,
+                "rebuilding the JJ baseline must preserve the established Git lane"
+            );
+            assert!(
+                !std::fs::read_to_string(&operation_trace)?.contains("query/trivial-response"),
+                "refreshing a valid Git cursor must remain incremental"
             );
         } else {
             assert_ne!(
@@ -1897,48 +2009,41 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
         );
     }
 
-    // Git's index refresh can succeed when a hook fails. An incompatible
-    // protocol must fail finalization instead of leaving a timestamp token
-    // behind while reporting a successful rebuild.
-    assert!(
-        run_git(&["config", "core.fsmonitorHookVersion", "1"])?
-            .status
-            .success()
-    );
-    // A valid existing cursor does not require a refresh. Force the v1 hook
-    // failure first so Git writes a timestamp, exercising finalization's
-    // attempt to replace an invalid baseline under the same configuration.
-    let refresh = run_git(&["update-index", "--refresh", "--force-write-index"])?;
-    assert!(
-        matches!(refresh.status.code(), Some(0 | 1)),
-        "refresh Git index with incompatible hook: {}",
-        String::from_utf8_lossy(&refresh.stderr)
-    );
-    assert!(matches!(
-        inspect_git_index(&repo_root.join(".git/index"))?.fsmonitor,
-        GitFsmonitorStatus::TimestampPlaceholder
-    ));
+    // A missing hook must fail bootstrap before any fallback invalidation.
+    // Publish the explicit placeholder instead of inducing a v1 hook failure.
+    btrfs_awacs::git_index_handoff::write_git_fsmonitor_bootstrap_placeholder(
+        &repo_root.join(".git/index"),
+        gix::open(&repo_root)?.object_hash().len_in_bytes(),
+    )
+    .map_err(std::io::Error::other)?;
+    std::fs::remove_file(&hook)?;
+    let failure_trace = runtime_dir.join("bootstrap-hook-failure.jsonl");
     let failed = main_dir.run_jj_with(|cmd| {
         configure(cmd);
-        cmd.args(["util", "subvolume", "enable", "--rebuild-baseline"])
+        cmd.env("GIT_TRACE2_EVENT", &failure_trace).args([
+            "util",
+            "subvolume",
+            "enable",
+            "--rebuild-baseline",
+        ])
     });
     assert!(!failed.status.success(), "{failed}");
     assert!(
         failed
             .stderr
             .raw()
-            .contains("Git did not publish a valid AWACS fsmonitor baseline"),
+            .contains("Git index refresh failed with exit status: 128"),
         "{failed}"
     );
-    assert_eq!(
-        run_git(&["config", "core.fsmonitorHookVersion"])?.stdout,
-        b"1\n"
-    );
-    assert!(
-        run_git(&["config", "core.fsmonitorHookVersion", "2"])?
-            .status
-            .success()
-    );
+    assert!(matches!(
+        inspect_git_index(&repo_root.join(".git/index"))?.fsmonitor,
+        GitFsmonitorStatus::TimestampPlaceholder
+    ));
+    for line in std::fs::read_to_string(&failure_trace)?.lines() {
+        let event: serde_json::Value = serde_json::from_str(line)?;
+        assert_ne!(event["label"], "apply_results");
+    }
+    std::os::unix::fs::symlink(&awacs_command, &hook)?;
 
     // Retrying enable repairs only the unfinished finalization. Preserve the
     // new manager and committed JJ journal instead of rebuilding either one.
