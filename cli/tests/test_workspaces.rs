@@ -1827,6 +1827,10 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
     main_dir.write_file("ignored", "preserve ignored file\n");
     std::fs::remove_file(repo_root.join("deleted"))?;
 
+    let alternate_index = runtime_dir.join("alternate-index");
+    let alternate_index_bytes = std::fs::read(repo_root.join(".git/index"))?;
+    std::fs::write(&alternate_index, &alternate_index_bytes)?;
+
     for arguments in [
         vec!["util", "subvolume", "enable"],
         vec!["util", "subvolume", "enable", "--rebuild-baseline"],
@@ -1836,9 +1840,14 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
         main_dir
             .run_jj_with(|cmd| {
                 configure(cmd);
-                cmd.args(&arguments)
+                cmd.env("GIT_INDEX_FILE", &alternate_index).args(&arguments)
             })
             .success();
+        assert_eq!(
+            std::fs::read(&alternate_index)?,
+            alternate_index_bytes,
+            "canonical baseline finalization must preserve the caller's alternate index"
+        );
         // Status is read-only: verify immediately, before any normal JJ scan
         // can lazily register the activated path and hide a migration bug.
         let status = main_dir
@@ -4012,6 +4021,45 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+        // Make the real AWACS hook reject the invocation, then require Git
+        // to propagate that failure before invalidating or writing its index.
+        let failure_trace = runtime_dir.join("git-hook-failure-trace.json");
+        let broken_hook = format!(
+            "core.fsmonitor=\"{}\" unsupported-protocol",
+            git_fsmonitor_hook.display()
+        );
+        let failed_git = Command::new("git")
+            .env("PATH", &path)
+            .env("GIT_OPTIONAL_LOCKS", "1")
+            .env("GIT_TRACE2_EVENT", &failure_trace)
+            .env_remove("BTRFS_AWACS_STATE_DIR")
+            .env_remove("BTRFS_AWACS_STATE_ROOT")
+            .env_remove("BTRFS_AWACS_MANAGED_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("AWACS_LOG_FILE", awacs_state.join("daemon.log"))
+            .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
+            .args(["-c", &broken_hook, "status", "--porcelain"])
+            .current_dir(&adopted_root)
+            .output()?;
+        assert_eq!(failed_git.status.code(), Some(128));
+        assert!(
+            String::from_utf8_lossy(&failed_git.stderr)
+                .contains("git-fsmonitor-awacs supports only hook protocol version 2"),
+            "{}",
+            String::from_utf8_lossy(&failed_git.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&failed_git.stderr).contains("refusing a full scan"),
+            "{}",
+            String::from_utf8_lossy(&failed_git.stderr)
+        );
+        let trace = std::fs::read_to_string(&failure_trace)?;
+        assert!(!trace.is_empty());
+        for line in trace.lines() {
+            let event: serde_json::Value = serde_json::from_str(line)?;
+            assert_ne!(event["label"], "apply_results");
         }
         assert_eq!(retention_state()?, before);
         assert_eq!(std::fs::read(&seeded_index_path)?, seeded_index);

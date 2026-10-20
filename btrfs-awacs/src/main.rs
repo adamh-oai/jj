@@ -2061,8 +2061,8 @@ fn run_git_fsmonitor_hook_inner() -> Result<(), String> {
             // git worktree add can invoke the configured hook while it is
             // still populating the destination. Do not manufacture a
             // whole-tree invalidation or a cursor before that destination has
-            // authoritative AWACS state; a hook failure makes Git use its own
-            // correctness fallback without advancing AWACS.
+            // authoritative AWACS state. Git must decline the operation
+            // rather than invent a cursor or silently scan the whole tree.
             tracing::debug!(
                 root = %root.display(),
                 error = %error,
@@ -2113,9 +2113,9 @@ fn run_git_fsmonitor_hook_inner() -> Result<(), String> {
             // order, so no cursor exclusively owns a physical snapshot.
             baseline_owner_id,
             previous_baseline,
-            // Git's protocol explicitly represents expired replay history
-            // with `/`, causing an authoritative whole-index refresh.
-            allow_full_invalidation: true,
+            // Established cursors must advance incrementally. Only explicit
+            // initialization or migration from another backend can bootstrap.
+            allow_full_invalidation: is_bootstrap,
         })
     })
     .map_err(|error| format!("begin AWACS fsmonitor scan: {error}"))?;
@@ -2160,7 +2160,9 @@ fn git_fsmonitor_invalidations(
     match invalidation {
         _ if is_bootstrap => Ok(vec![b"/".to_vec()]),
         Invalidation::ExactPaths(paths) => Ok(paths.clone()),
-        Invalidation::Full => Ok(vec![b"/".to_vec()]),
+        Invalidation::Full => Err("AWACS cannot replay this Git cursor incrementally; use an \
+                                   explicit baseline rebuild"
+            .to_owned()),
         // Git's hook protocol has no first-class prefix result. Until the
         // Git adapter proves directory-prefix semantics, fail the hook rather
         // than widening an exact AWACS answer to a whole-tree invalidation.
@@ -3612,6 +3614,17 @@ mod tests {
         assert!(
             parse_git_fsmonitor_prior_token(b"").is_err(),
             "an empty opaque cursor is not Git's numeric bootstrap placeholder"
+        );
+    }
+
+    #[test]
+    fn git_fsmonitor_established_cursor_refuses_full_invalidation() {
+        let error =
+            git_fsmonitor_invalidations(false, &btrfs_awacs::scan::Invalidation::Full).unwrap_err();
+        assert!(error.contains("explicit baseline rebuild"), "{error}");
+        assert_eq!(
+            git_fsmonitor_invalidations(true, &btrfs_awacs::scan::Invalidation::Full).unwrap(),
+            [b"/".to_vec()]
         );
     }
 

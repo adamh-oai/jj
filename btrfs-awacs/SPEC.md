@@ -157,6 +157,17 @@ processes. Older binaries cannot register their pending publications; the new
 pins protect existing references from their collectors but cannot account for
 responses those older hooks have not yet published.
 
+Deploy the paired Git update to make AWACS query failures fatal instead of
+falling back to a full index refresh. An established AWACS cursor must advance
+incrementally; unavailable replay or a whole-tree invalidation fails the Git
+command before the fallback path updates the index. Initial setup and migration
+from a numeric or built-in token retain their bootstrap refresh. Explicit
+initialization or baseline recovery publishes an all-dirty numeric placeholder
+before that refresh instead of deliberately failing a hook query. A still-valid
+Git cursor bypasses this bootstrap. Older running Git processes keep their
+previous fallback policy, so drain them before an upgrade when full scans must
+be avoided.
+
 AWACS additionally tracks validated **incoming query cursors** on each watch's
 Git lane. Issuing a response is not evidence of persistence:
 `GIT_OPTIONAL_LOCKS=0` can leave the same token in the index across arbitrarily

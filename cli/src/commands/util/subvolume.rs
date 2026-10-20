@@ -855,8 +855,8 @@ fn refresh_git_awacs_baseline(ui: &Ui, root: &Path) -> Result<(), CommandError> 
     }
     let git_dir = subvolume_status_git_directory(None, root)
         .ok_or_else(|| user_error("Failed to locate Git index for AWACS baseline refresh"))?;
+    let index_path = git_dir.join("index");
     let baseline_is_valid = || -> Result<bool, CommandError> {
-        let index_path = git_dir.join("index");
         if !index_path.try_exists().context(&index_path)? {
             return Ok(false);
         }
@@ -876,53 +876,42 @@ fn refresh_git_awacs_baseline(ui: &Ui, root: &Path) -> Result<(), CommandError> 
         ui.status(),
         "awacs: refreshing Git index snapshot baseline..."
     )?;
-    for attempt in 0..2 {
-        // A copied or rebuilt manager cannot authorize the index's old cursor.
-        // Force Git's protocol-v1 correctness fallback for one full refresh:
-        // AWACS only accepts v2, and Git persists a timestamp after v1 failure
-        // (explicit v2 failure instead persists an unusable empty token). The
-        // second refresh uses the unchanged configured protocol to bootstrap
-        // the new AWACS lane. Never fabricate cursor claims or disable the
-        // monitor, and do not accept an incompatible configured protocol.
-        let mut refresh = Command::new("git");
-        refresh.arg("-C").arg(root);
-        if attempt == 0 {
-            refresh.args(["-c", "core.fsmonitorHookVersion=1"]);
-        }
-        let refreshed = refresh
-            .args(["update-index", "--refresh", "--force-write-index"])
-            .output()
-            .map_err(|err| user_error(format!("Failed to refresh Git AWACS baseline: {err}")))?;
-        // Dirty or unmerged entries make --refresh exit 1 without changing
-        // their staged contents. Explicit index writes still persist FSMN,
-        // including for empty indexes and GIT_OPTIONAL_LOCKS=0 callers.
-        if !matches!(refreshed.status.code(), Some(0 | 1)) {
-            return Err(user_error(format!(
-                "Git index refresh failed with {}",
-                refreshed.status
-            )));
-        }
-        if attempt == 0 {
-            let index = inspect_git_index(&git_dir.join("index")).map_err(|err| {
-                user_error(format!("Failed to inspect refreshed Git index: {err}"))
-            })?;
-            if !matches!(index.fsmonitor, GitFsmonitorStatus::TimestampPlaceholder) {
-                return Err(user_error(
-                    "Git did not persist the fsmonitor timestamp required to bootstrap its new \
-                     AWACS baseline",
-                ));
-            }
-            continue;
-        }
-        // A successful index write does not prove that its hook succeeded.
-        // Require an authorized cursor instead of trusting the exit code.
-        if baseline_is_valid()? {
-            return Ok(());
-        }
+    if index_path.try_exists().context(&index_path)? {
+        let git_repo = gix::open(&git_dir)
+            .map_err(|err| user_error(format!("Failed to open Git repository: {err}")))?;
+        // A copied or rebuilt manager cannot authorize the old cursor. An
+        // explicit placeholder drops cache claims while retaining staged
+        // contents; the configured hook must then establish a real baseline.
+        btrfs_awacs::git_index_handoff::write_git_fsmonitor_bootstrap_placeholder(
+            &index_path,
+            git_repo.object_hash().len_in_bytes(),
+        )
+        .map_err(|err| user_error(format!("Failed to prepare Git AWACS bootstrap: {err}")))?;
+    }
+    let refreshed = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_INDEX_FILE", &index_path)
+        .args(["update-index", "--refresh", "--force-write-index"])
+        .output()
+        .map_err(|err| user_error(format!("Failed to refresh Git AWACS baseline: {err}")))?;
+    // Dirty or unmerged entries make --refresh exit 1 without changing
+    // their staged contents. Explicit index writes still persist FSMN,
+    // including for empty indexes and GIT_OPTIONAL_LOCKS=0 callers.
+    if !matches!(refreshed.status.code(), Some(0 | 1)) {
+        return Err(user_error(format!(
+            "Git index refresh failed with {}",
+            refreshed.status
+        )));
+    }
+    // A successful index write does not prove that its hook succeeded.
+    // Require an authorized cursor instead of trusting the exit code.
+    if baseline_is_valid()? {
+        return Ok(());
     }
     Err(user_error(
-        "Git did not publish a valid AWACS fsmonitor baseline after two index refreshes; check \
-         the configured Git fsmonitor hook and its protocol version",
+        "Git did not publish a valid AWACS fsmonitor baseline after index refresh; check the \
+         configured Git fsmonitor hook and its protocol version",
     ))
 }
 

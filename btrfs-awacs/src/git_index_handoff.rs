@@ -303,6 +303,30 @@ pub fn seed_git_fsmonitor_index(
     baseline: &SnapshotBaseline,
     invalidation: &Invalidation,
 ) -> Result<(), String> {
+    let token = encode_git_fsmonitor_token(baseline)?;
+    rewrite_git_fsmonitor_index(index_path, Some(worktree), hash_len, &token, invalidation)
+}
+
+/// Prepares an existing index for an explicitly requested AWACS bootstrap.
+///
+/// The numeric token makes no baseline claim. Mark every entry dirty and
+/// discard the untracked cache so the configured Git refresh must establish
+/// its own cursor without inheriting any cache validity. Preserve all index
+/// entries, including staged and unmerged contents, without scanning files.
+pub fn write_git_fsmonitor_bootstrap_placeholder(
+    index_path: &Path,
+    hash_len: usize,
+) -> Result<(), String> {
+    rewrite_git_fsmonitor_index(index_path, None, hash_len, "0", &Invalidation::Full)
+}
+
+fn rewrite_git_fsmonitor_index(
+    index_path: &Path,
+    worktree: Option<&Path>,
+    hash_len: usize,
+    token: &str,
+    invalidation: &Invalidation,
+) -> Result<(), String> {
     // Keep this exact file open through publication. Cloning a path reopened
     // after parsing could combine another writer's entries with our checksum.
     let (source, source_metadata, bytes) = timed_git_phase("index_seed_read", || {
@@ -330,7 +354,6 @@ pub fn seed_git_fsmonitor_index(
     let untracked = timed_git_phase("index_seed_find_untracked", || {
         Ok::<_, String>(layout.extension_data_range(b"UNTR"))
     })?;
-    let token = encode_git_fsmonitor_token(baseline)?;
     let inherited_bitmap = match fsmonitor
         .as_ref()
         .filter(|_| !matches!(invalidation, Invalidation::Full))
@@ -372,7 +395,7 @@ pub fn seed_git_fsmonitor_index(
         })
         .transpose()?;
     let fsmonitor_payload =
-        git_fsmonitor_extension_payload(&token, dirty_bitmap.as_deref(), layout.entries);
+        git_fsmonitor_extension_payload(token, dirty_bitmap.as_deref(), layout.entries);
     let mut replacements = vec![GitIndexExtensionReplacement::new(
         fsmonitor,
         b"FSMN",
@@ -380,7 +403,7 @@ pub fn seed_git_fsmonitor_index(
         &[],
     )?];
     if let Some(range) = untracked {
-        if unchanged && inherited_bitmap.is_some() {
+        if let Some(worktree) = worktree.filter(|_| unchanged && inherited_bitmap.is_some()) {
             let (prefix, suffix) = relocate_git_untracked_cache(&bytes[range.clone()], worktree)?;
             replacements.push(GitIndexExtensionReplacement::new(
                 Some(range),
@@ -1324,6 +1347,105 @@ mod tests {
             inherited_git_fsmonitor_baseline(&index_path, 20).unwrap(),
             destination_baseline
         );
+    }
+
+    #[test]
+    fn bootstrap_placeholder_preserves_staged_entries_and_invalidates_caches() {
+        for hash_len in [20, 32] {
+            for has_fsmonitor in [false, true] {
+                let root = TestDir::new("bootstrap-git-index");
+                let index_path = root.path.join("index");
+                let mut original = b"DIRC".to_vec();
+                original.extend_from_slice(&2_u32.to_be_bytes());
+                original.extend_from_slice(&4_u32.to_be_bytes());
+                for (path, stage, object_byte) in [
+                    (b"conflict".as_slice(), 1_u16, 0x11),
+                    (b"conflict".as_slice(), 2, 0x22),
+                    (b"conflict".as_slice(), 3, 0x33),
+                    (b"staged".as_slice(), 0, 0x44),
+                ] {
+                    let start = original.len();
+                    original.extend_from_slice(&[0x55; 40]);
+                    original[start + 24..start + 28].copy_from_slice(&0o100644_u32.to_be_bytes());
+                    original.resize(original.len() + hash_len, object_byte);
+                    original.extend_from_slice(&(path.len() as u16 | stage << 12).to_be_bytes());
+                    original.extend_from_slice(path);
+                    original.push(0);
+                    let padded_len = (original.len() - start + 7) & !7;
+                    original.resize(start + padded_len, 0);
+                }
+                let entries_end = original.len();
+                if has_fsmonitor {
+                    let mut payload = git_fsmonitor_extension_payload("old-cursor", None, 4);
+                    // A clean inherited bitmap must not survive bootstrapping.
+                    let literal_start = 4 + "old-cursor".len() + 1 + 20;
+                    payload[literal_start..literal_start + 8].fill(0);
+                    append_git_index_extension(&mut original, b"FSMN", &payload).unwrap();
+                }
+                append_git_index_extension(&mut original, b"UNTR", b"cached directories").unwrap();
+                append_git_index_extension(&mut original, b"XTRA", b"unchanged extension").unwrap();
+                let checksum = crate::status::git_index_checksum(&original, hash_len).unwrap();
+                original.extend_from_slice(&checksum);
+                fs::write(&index_path, &original).unwrap();
+
+                write_git_fsmonitor_bootstrap_placeholder(&index_path, hash_len).unwrap();
+
+                let rewritten = fs::read(&index_path).unwrap();
+                assert_eq!(
+                    &rewritten[..entries_end],
+                    &original[..entries_end],
+                    "bootstrap must preserve every staged object, stage, and stat entry"
+                );
+                assert_eq!(
+                    read_git_index_extension(&index_path, hash_len, b"FSMN").unwrap(),
+                    Some(git_fsmonitor_extension_payload("0", None, 4)),
+                    "the placeholder must claim no baseline and mark every entry dirty"
+                );
+                assert_eq!(
+                    read_git_index_extension(&index_path, hash_len, b"UNTR").unwrap(),
+                    None
+                );
+                assert_eq!(
+                    read_git_index_extension(&index_path, hash_len, b"XTRA").unwrap(),
+                    Some(b"unchanged extension".to_vec())
+                );
+                let checksum_start = rewritten.len() - hash_len;
+                assert_eq!(
+                    &rewritten[checksum_start..],
+                    crate::status::git_index_checksum(&rewritten[..checksum_start], hash_len)
+                        .unwrap()
+                );
+                assert!(matches!(
+                    crate::status::inspect_git_index(&index_path)
+                        .unwrap()
+                        .fsmonitor,
+                    crate::status::GitFsmonitorStatus::TimestampPlaceholder
+                ));
+                assert!(!root.path.join("index.lock").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_placeholder_preserves_an_existing_index_lock() {
+        let root = TestDir::new("bootstrap-locked-git-index");
+        let index_path = root.path.join("index");
+        let lock_path = root.path.join("index.lock");
+        let mut original = b"DIRC".to_vec();
+        original.extend_from_slice(&2_u32.to_be_bytes());
+        original.extend_from_slice(&0_u32.to_be_bytes());
+        let checksum = crate::status::git_index_checksum(&original, 20).unwrap();
+        original.extend_from_slice(&checksum);
+        fs::write(&index_path, &original).unwrap();
+        fs::write(&lock_path, b"another writer").unwrap();
+
+        assert!(
+            write_git_fsmonitor_bootstrap_placeholder(&index_path, 20)
+                .unwrap_err()
+                .contains("lock destination Git index")
+        );
+        assert_eq!(fs::read(&index_path).unwrap(), original);
+        assert_eq!(fs::read(&lock_path).unwrap(), b"another writer");
     }
 
     #[test]

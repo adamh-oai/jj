@@ -195,7 +195,7 @@ impl ScanClient for DirectScanClient {
             .handler
             .lock()
             .map_err(|_| other("AWACS direct scan handler lock poisoned"))?
-            .begin_scan(request.clone())?;
+            .begin_scan(request.clone(), self.git_publisher.is_some())?;
         tracing::info!(
             elapsed_ms = handler_started.elapsed().as_millis() as u64,
             root = %request.live_root.display(),
@@ -593,7 +593,11 @@ impl DirectScanHandler {
         Ok(())
     }
 
-    fn begin_scan(&mut self, request: BeginScanRequest) -> Result<PreparedScanLease, ScanError> {
+    fn begin_scan(
+        &mut self,
+        request: BeginScanRequest,
+        git_hook: bool,
+    ) -> Result<PreparedScanLease, ScanError> {
         let begin_started = Instant::now();
         let now_ns = unix_time_ns()?;
         let ttl_ns = self.scan_ttl_ns();
@@ -632,12 +636,13 @@ impl DirectScanHandler {
                 .previous_baseline
                 .as_ref()
                 .expect("checked Git logical baseline");
-            // The hook allows full invalidation; internal index seeding does
-            // not. Writers separately verify their published index before
+            // Hook input proves a cursor was persisted even when full
+            // invalidation is forbidden. Internal index seeding does not;
+            // writers separately verify their published index before
             // recording an observation; issuing this response proves nothing.
             // Record it before issuing the next cut, whose output may never
             // be committed to the index (e.g. GIT_OPTIONAL_LOCKS=0).
-            let retained = if request.allow_full_invalidation {
+            let retained = if git_hook || request.allow_full_invalidation {
                 facade.observe_logical_git_baseline(watch_id, baseline, unix_time_ns()?)
             } else {
                 facade.validate_logical_git_baseline(watch_id, baseline)
