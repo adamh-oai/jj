@@ -71,5 +71,9 @@ run_as_root systemctl daemon-reload
 run_as_root systemctl enable "$unit_name"
 run_as_root systemctl restart "$unit_name"
 
+if command -v og >/dev/null 2>&1; then
+  og config set git_executable "$binary_dir/git"
+fi
+
 printf '%s\n' 'Installed Git, JJ, and AWACS under /opt/awacs.' \
   'To use them: export PATH="/opt/awacs/bin:$PATH"'
