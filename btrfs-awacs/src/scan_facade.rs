@@ -3,6 +3,7 @@
 use crate::bootstrap::{RootInitPaths, git_admin_directory, open_initialized_root_service};
 use crate::btrfs::{filesystem_info, subvolume_info};
 use crate::facade::{FacadeService, PreparedQueryResult};
+use crate::git_retention::GitPublisher;
 use crate::manager::{PERMISSION_CUT, PERMISSION_READ};
 use crate::scan::{
     BeginScanRequest, Invalidation, ScanClient, ScanError, ScanErrorKind, ScanOutcome, ScanSession,
@@ -34,6 +35,8 @@ const TEST_SHORT_SCAN_TTL_NS: i64 = 300_000_000;
 pub struct DirectScanClient {
     handler: Arc<Mutex<DirectScanHandler>>,
     root_lock: Arc<File>,
+    git_hook: bool,
+    git_publisher: Option<GitPublisher>,
 }
 
 impl DirectScanClient {
@@ -88,7 +91,21 @@ impl DirectScanClient {
                 unsafe { libc::getegid() },
             ))),
             root_lock: Arc::new(root_lock),
+            git_hook: false,
+            git_publisher: None,
         })
+    }
+
+    /// Opens a Git hook client whose responses remain protected while Git can
+    /// publish them, including the interval before Begin releases the root lock.
+    pub fn for_git_hook(
+        live_root: &Path,
+        publisher: Option<GitPublisher>,
+    ) -> Result<Self, ScanError> {
+        let mut client = Self::for_root(live_root)?;
+        client.git_hook = true;
+        client.git_publisher = publisher;
+        Ok(client)
     }
 
     fn lock_root(&self) -> Result<RootLockGuard<'_>, ScanError> {
@@ -192,6 +209,26 @@ impl ScanClient for DirectScanClient {
             expires_boottime_ns,
             scan_root,
         } = response;
+        if self.git_hook {
+            // Do this before releasing root.lock. A concurrent manager can
+            // open and advance this watch as soon as Begin returns.
+            let retained = self
+                .handler
+                .lock()
+                .map_err(|_| other("AWACS direct scan handler lock poisoned"))?
+                .facade
+                .lock()
+                .map_err(|_| other("AWACS direct scan facade lock poisoned"))?
+                .service_mut()
+                .store_mut()
+                .retain_git_response(&next_baseline, self.git_publisher.as_ref());
+            if let Err(error) = retained {
+                if let Ok(mut handler) = self.handler.lock() {
+                    let _ = handler.finish_scan(&session_id, ScanOutcome::Aborted);
+                }
+                return Err(other(format!("retain unpublished Git cursor: {error}")));
+            }
+        }
         let lease = SnapshotLease::new(
             next_baseline,
             invalidation,
@@ -547,6 +584,12 @@ impl DirectScanHandler {
                 "published AWACS Git index cursor is no longer retained",
             ));
         }
+        let boot_id = facade.service().boot_id();
+        facade
+            .service_mut()
+            .store_mut()
+            .refresh_git_index_roots(boot_id)
+            .map_err(|error| other(format!("retain published Git index: {error}")))?;
         Ok(())
     }
 

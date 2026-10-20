@@ -403,8 +403,8 @@ fn remove_fixture_tree(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 #[test]
 #[ignore = "requires patched Git, JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
-fn test_git_snapshot_worktree_from_collected_fsmonitor_baseline() -> TestResult {
-    git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::CollectedCursor)
+fn test_git_snapshot_worktree_from_retained_fsmonitor_baseline() -> TestResult {
+    git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::RetainedCursor)
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
@@ -417,8 +417,15 @@ fn test_workspace_add_with_external_git_index_first_status() -> TestResult {
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 #[test]
 #[ignore = "requires patched Git, JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
-fn test_workspace_add_reuses_git_index_from_collected_fsmonitor_baseline() -> TestResult {
+fn test_workspace_add_reuses_git_index_from_retained_fsmonitor_baseline() -> TestResult {
     git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::ColocatedJjReuse)
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+#[test]
+#[ignore = "requires patched Git, JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
+fn test_awacs_retains_idle_git_index_before_next_git_query() -> TestResult {
+    git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::ColocatedJjIdleIndex)
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
@@ -459,8 +466,9 @@ fn test_git_snapshot_worktree_without_source_fsmonitor_cursor() -> TestResult {
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GitSnapshotHandoffScenario {
-    CollectedCursor,
+    RetainedCursor,
     ColocatedJjReuse,
+    ColocatedJjIdleIndex,
     ColocatedJjExternalIndex,
     ColocatedJjStagedIndex,
     ColocatedJjEmptySparse,
@@ -478,6 +486,7 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
 
     use btrfs_awacs::btrfs::OpenedSubvolume;
     use btrfs_awacs::status::GitFsmonitorStatus;
+    use btrfs_awacs::status::IndexChecksum;
     use btrfs_awacs::status::RootStatus;
     use btrfs_awacs::status::git_index_checksum;
     use btrfs_awacs::status::git_index_layout;
@@ -563,6 +572,7 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
     let colocated_jj = matches!(
         scenario,
         GitSnapshotHandoffScenario::ColocatedJjReuse
+            | GitSnapshotHandoffScenario::ColocatedJjIdleIndex
             | GitSnapshotHandoffScenario::ColocatedJjExternalIndex
             | GitSnapshotHandoffScenario::ColocatedJjStagedIndex
             | GitSnapshotHandoffScenario::ColocatedJjEmptySparse
@@ -617,6 +627,9 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         .arg(&hook))?;
     run(git_command(&root).args(["config", "core.fsmonitorHookVersion", "2"]))?;
     run(git_command(&root).args(["config", "core.untrackedCache", "true"]))?;
+    if scenario == GitSnapshotHandoffScenario::ColocatedJjIdleIndex {
+        run(git_command(&root).args(["config", "index.skipHash", "true"]))?;
+    }
     if colocated_jj {
         jj_command(&root)
             .args(["util", "subvolume", "enable"])
@@ -675,7 +688,11 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
     } else {
         None
     };
-    let GitFsmonitorStatus::Baseline(baseline) = inspect_git_index(&index_path)?.fsmonitor else {
+    let initial_index_status = inspect_git_index(&index_path)?;
+    if scenario == GitSnapshotHandoffScenario::ColocatedJjIdleIndex {
+        assert_eq!(initial_index_status.checksum, IndexChecksum::Omitted);
+    }
+    let GitFsmonitorStatus::Baseline(baseline) = initial_index_status.fsmonitor else {
         panic!("bootstrap status must persist an AWACS cursor");
     };
     let manager = assert_default_awacs_layout(&root);
@@ -689,6 +706,49 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         }
     }
     let baseline_snapshot = baseline_snapshot.expect("the initial cursor's snapshot must exist");
+
+    if scenario == GitSnapshotHandoffScenario::ColocatedJjIdleIndex {
+        // Reproduce an idle index which has not queried its newly persisted
+        // token, including an upgrade with no Git observations. Expire the
+        // supplemental cache deterministically instead of waiting a day.
+        let mut store = btrfs_awacs::store::Store::open(&manager)?;
+        let baseline_status = RootStatus::open(&root)?.inspect_baseline(&baseline);
+        let was_queried: bool = store.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM git_cursor_observations \
+             WHERE watch_id = ?1 AND cut_sequence = ?2)",
+            (
+                baseline.retention_token.as_slice(),
+                baseline_status.sequence.unwrap(),
+            ),
+            |row| row.get(0),
+        )?;
+        assert!(
+            !was_queried,
+            "the idle regression must start before Git queries its newly written cursor"
+        );
+        let transaction = store.connection_mut().transaction()?;
+        transaction.execute("DELETE FROM git_cursor_observations", [])?;
+        transaction.execute("UPDATE snapshots SET created_ns = 1", [])?;
+        transaction.commit()?;
+        drop(store);
+        for _ in 0..3 {
+            jj_command(&root).arg("status").assert().success();
+            assert_eq!(
+                std::fs::read(&index_path)?,
+                original_index,
+                "JJ must preserve Git's idle index without querying its fsmonitor hook"
+            );
+            let retained = RootStatus::open(&root)?.inspect_baseline(&baseline);
+            assert!(
+                baseline_snapshot.exists() && retained.issues.is_empty(),
+                "cleanup must retain the physical endpoint and exact replay of the idle index: {:?}",
+                retained.issues
+            );
+            let opened = OpenedSubvolume::open(&baseline_snapshot)?;
+            assert_eq!(opened.subvolume.uuid, baseline.identity.subvolume_uuid);
+            assert!(opened.subvolume.readonly());
+        }
+    }
 
     // Git is allowed to leave an unchanged index unwritten. Make that
     // deterministic even if racy stat data would otherwise cause a refresh;
@@ -735,23 +795,26 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         );
         assert!(!trace.contains("query/trivial-response"));
         assert!(
-            !baseline_snapshot.exists(),
-            "GC must collect the physical snapshot named by the unchanged cursor"
+            baseline_snapshot.exists(),
+            "GC must retain the physical snapshot named by the unchanged index"
         );
         let retained = RootStatus::open(&root)?.inspect_baseline(&baseline);
         assert!(
             retained.issues.is_empty(),
-            "the logical cursor must remain valid after physical collection: {:?}",
+            "the persisted cursor must retain its exact replay history: {:?}",
             retained.issues
         );
     }
+    if scenario == GitSnapshotHandoffScenario::ColocatedJjIdleIndex {
+        cleanup.cleanup()?;
+        return Ok(());
+    }
     if colocated_jj {
-        // The JJ journal must retain a different physical cut. A Git cursor
-        // whose snapshot was just collected cannot double as JJ's seed.
+        // The JJ journal and Git index retain independent physical cuts.
         jj_command(&root).arg("status").assert().success();
         assert!(
             std::fs::read(&index_path)? == original_index,
-            "advancing JJ must leave the stale, logically valid Git cursor unchanged"
+            "advancing JJ must leave the retained Git cursor unchanged"
         );
     }
     if scenario == GitSnapshotHandoffScenario::ColocatedJjStagedIndex {
@@ -989,7 +1052,7 @@ fi
         assert!(root.join("without-cursor").is_file());
         assert!(!child.join("without-cursor").exists());
     }
-    if scenario == GitSnapshotHandoffScenario::CollectedCursor {
+    if scenario == GitSnapshotHandoffScenario::RetainedCursor {
         let events = std::fs::read_to_string(&creation_trace)?
             .lines()
             .map(serde_json::from_str::<serde_json::Value>)

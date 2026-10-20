@@ -541,14 +541,24 @@ impl RootStatus {
 
         let mut statement = self.connection.prepare(
             "SELECT reason FROM snapshot_pins \
-              WHERE snapshot_id = ?1 AND owner_kind = 'consumer-baseline' AND owner_id = ?2",
+              WHERE snapshot_id = ?1 AND owner_kind = 'consumer-baseline' \
+                AND (owner_id = ?2 OR owner_id = ?3)",
         )?;
-        let reasons = statement.query_map(params![snapshot_id, owner_id.as_slice()], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let pin_owner = if logical_git_cursor {
+            crate::git_retention::retention_owner(owner_id)
+        } else {
+            owner_id
+        };
+        let reasons = statement.query_map(
+            params![snapshot_id, owner_id.as_slice(), pin_owner.as_slice()],
+            |row| row.get::<_, String>(0),
+        )?;
         for reason in reasons {
             match reason?.as_str() {
                 "committed" | "git-index" => status.committed_pin = true,
+                reason if logical_git_cursor && reason.starts_with("git-response:") => {
+                    status.committed_pin = true;
+                }
                 "pending" => status.pending_pin = true,
                 _ => {}
             }
@@ -634,7 +644,7 @@ pub fn inspect_git_index(index_path: &Path) -> Result<GitIndexStatus, StatusErro
     })
 }
 
-fn inspect_fsmonitor_extension(extension: &[u8]) -> GitFsmonitorStatus {
+pub(crate) fn inspect_fsmonitor_extension(extension: &[u8]) -> GitFsmonitorStatus {
     if extension.len() < 5 {
         return GitFsmonitorStatus::Invalid("fsmonitor extension is truncated".to_owned());
     }
@@ -775,8 +785,30 @@ pub fn read_git_index_extension_from_file(
     hash_len: usize,
     wanted: &[u8; 4],
 ) -> Result<Option<Vec<u8>>, String> {
+    read_git_index_extension_file(file, hash_len, wanted, None)
+}
+
+/// Reads only extension metadata for large indexes. Cleanup must defer when
+/// EOIE cannot prove the extension directory, rather than scan all entries.
+pub(crate) fn read_git_index_extension_bounded_from_file(
+    file: &mut fs::File,
+    hash_len: usize,
+    wanted: &[u8; 4],
+) -> Result<Option<Vec<u8>>, String> {
+    read_git_index_extension_file(file, hash_len, wanted, Some(1024 * 1024))
+}
+
+fn read_git_index_extension_file(
+    file: &mut fs::File,
+    hash_len: usize,
+    wanted: &[u8; 4],
+    max_full_read: Option<u64>,
+) -> Result<Option<Vec<u8>>, String> {
     let started = Instant::now();
-    let mut stats = GitIndexExtensionReadStats::default();
+    let mut stats = GitIndexExtensionReadStats {
+        max_full_read,
+        ..GitIndexExtensionReadStats::default()
+    };
     let result = (|| {
         // Keep this descriptor for every seek and for the fallback. A concurrent
         // atomic replacement of the path must not mix two versions of the index.
@@ -809,6 +841,7 @@ struct GitIndexExtensionReadStats {
     bytes_read: u64,
     mode: &'static str,
     fallback_reason: &'static str,
+    max_full_read: Option<u64>,
 }
 
 impl Default for GitIndexExtensionReadStats {
@@ -817,6 +850,7 @@ impl Default for GitIndexExtensionReadStats {
             bytes_read: 0,
             mode: "header",
             fallback_reason: "none",
+            max_full_read: None,
         }
     }
 }
@@ -904,6 +938,11 @@ fn read_git_index_extension_from_reader<R: Read + Seek>(
                 .transpose()
         }
         Err(reason) => {
+            if stats.max_full_read.is_some_and(|limit| index_len > limit) {
+                return Err(format!(
+                    "Git index extension directory is unavailable ({reason}); deferring cleanup"
+                ));
+            }
             stats.mode = "full";
             stats.fallback_reason = reason;
             let mut bytes = git_index_read_buffer(index_len)?;
@@ -1430,6 +1469,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cleanup_index_reader_defers_large_non_eoie_indexes_without_reading_entries() {
+        let mut bytes = b"DIRC".to_vec();
+        bytes.extend_from_slice(&4_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.resize(2 * 1024 * 1024, 0);
+        let mut reader = GuardedIndexReader {
+            cursor: Cursor::new(bytes.as_slice()),
+            forbidden: vec![12..bytes.len() - 64],
+            reads: Vec::new(),
+        };
+        let mut stats = GitIndexExtensionReadStats {
+            max_full_read: Some(1024 * 1024),
+            ..GitIndexExtensionReadStats::default()
+        };
+        let error = read_git_index_extension_from_reader(
+            &mut reader,
+            bytes.len() as u64,
+            20,
+            b"FSMN",
+            &mut stats,
+        )
+        .unwrap_err();
+        assert!(error.contains("deferring cleanup"));
+        assert!(stats.bytes_read < 128);
     }
 
     #[test]
@@ -2054,6 +2120,22 @@ mod tests {
             "a retained journal boundary, not a physical snapshot pin, owns a Git cursor: {:?}",
             status.issues
         );
+    }
+
+    #[test]
+    fn git_index_pin_from_retention_owner_is_reported_as_committed() {
+        let (_directory, root, mut baseline) = baseline_fixture();
+        baseline.retention_token = root.watch.id.to_vec();
+        let owner = crate::git_retention::retention_owner(root.watch.id);
+        root.connection
+            .execute(
+                "UPDATE snapshot_pins SET owner_id = ?1, reason = 'git-index'",
+                [owner.as_slice()],
+            )
+            .unwrap();
+        let status = root.inspect_baseline(&baseline);
+        assert!(status.committed_pin);
+        assert_eq!(status.issues.len(), 0);
     }
 
     #[test]

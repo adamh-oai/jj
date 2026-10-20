@@ -8,6 +8,7 @@ mod diagnostics;
 pub mod facade;
 pub mod git_index_handoff;
 pub mod git_index_invalidation;
+pub mod git_retention;
 pub mod index;
 pub mod manager;
 pub mod manifest;

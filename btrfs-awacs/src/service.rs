@@ -437,6 +437,7 @@ impl Service {
         };
         service.request_snapshot_trash_drain()?;
         let recovery_now = current_unix_time_ns()?;
+        service.cap_preparing_query_leases(recovery_now)?;
         service
             .store
             .abort_planned_operations(recovery_now)
@@ -533,6 +534,7 @@ impl Service {
             return Ok(service);
         }
         let recovery_now = current_unix_time_ns()?;
+        service.cap_preparing_query_leases(recovery_now)?;
         crate::diagnostics::timed("service abort planned operations", || {
             service.store.abort_planned_operations(recovery_now)
         })
@@ -1988,16 +1990,27 @@ impl Service {
                 self.config.maintenance_boundary_delete_limit,
             )
             .map_err(|error| ServiceError::context("expire historical comparisons", error))?;
-        let retained_boundaries = self.maintain_history(now_ns)?;
-        let orphan_history_rows = self
-            .store
-            .reclaim_orphan_history_bounded(self.config.maintenance_boundary_delete_limit)
-            .map_err(|error| ServiceError::context("reclaim orphan history", error))?;
+        let roots_retained = self.retain_git_index_roots();
+        let retained_boundaries = if roots_retained {
+            self.maintain_history_after_retaining_roots(now_ns)?
+        } else {
+            0
+        };
+        let orphan_history_rows = if roots_retained {
+            self.store
+                .reclaim_orphan_history_bounded(self.config.maintenance_boundary_delete_limit)
+                .map_err(|error| ServiceError::context("reclaim orphan history", error))?
+        } else {
+            0
+        };
         let history_rows_reclaimed = retained_boundaries
             .checked_add(orphan_history_rows)
             .ok_or_else(|| ServiceError::new("maintenance history count overflow"))?;
-        let snapshots_deleted =
-            self.collect_snapshots(now_ns, self.config.maintenance_snapshot_delete_limit)?;
+        let snapshots_deleted = if roots_retained {
+            self.collect_snapshots(now_ns, self.config.maintenance_snapshot_delete_limit)?
+        } else {
+            0
+        };
         Ok(MaintenanceReport {
             expired_query_leases,
             expired_retention_leases,
@@ -2015,6 +2028,9 @@ impl Service {
     }
 
     pub fn garbage_collect(&mut self, now_ns: i64, limit: usize) -> Result<usize, ServiceError> {
+        if !self.retain_git_index_roots() {
+            return Ok(0);
+        }
         self.store
             .expire_query_leases_bounded(now_ns, limit)
             .map_err(|error| ServiceError::context("expire query leases", error))?;
@@ -2024,7 +2040,7 @@ impl Service {
         self.store
             .expire_historical_comparisons_bounded(now_ns, limit)
             .map_err(|error| ServiceError::context("expire historical comparisons", error))?;
-        self.maintain_history(now_ns)?;
+        self.maintain_history_after_retaining_roots(now_ns)?;
         self.store
             .reclaim_orphan_history_bounded(limit)
             .map_err(|error| ServiceError::context("reclaim orphan history", error))?;
@@ -2097,6 +2113,50 @@ impl Service {
     }
 
     pub fn maintain_history(&mut self, now_ns: i64) -> Result<usize, ServiceError> {
+        if !self.retain_git_index_roots() {
+            return Ok(0);
+        }
+        self.maintain_history_after_retaining_roots(now_ns)
+    }
+
+    /// The current index and every still-publishable response are GC roots.
+    /// Failure to establish those roots defers cleanup, not the user's scan.
+    fn retain_git_index_roots(&mut self) -> bool {
+        match self.store.refresh_git_index_roots(self.config.boot_id) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_maintenance_watches_processed = 0;
+                self.last_maintenance_more_watches = false;
+                tracing::warn!(%error, "AWACS cleanup deferred: Git index roots are uncertain");
+                false
+            }
+        }
+    }
+
+    pub(crate) fn boot_id(&self) -> [u8; 16] {
+        self.config.boot_id
+    }
+
+    fn cap_preparing_query_leases(&mut self, now_ns: i64) -> Result<(), ServiceError> {
+        // Begin holds root.lock while its preparation lease is unlimited.
+        // Finding one when reopening the manager means preparation stopped;
+        // give it a finite recovery grace without invalidating live responses.
+        let expires_ns = lease_expiry(now_ns, self.config.lease_ns)?;
+        self.store
+            .connection_mut()
+            .execute(
+                "UPDATE query_leases SET lease_expires_ns = ?1 \
+                 WHERE state = 'active' AND lease_expires_ns = ?2",
+                rusqlite::params![expires_ns, i64::MAX],
+            )
+            .map_err(|error| ServiceError::context("bound interrupted query preparation", error))?;
+        Ok(())
+    }
+
+    fn maintain_history_after_retaining_roots(
+        &mut self,
+        now_ns: i64,
+    ) -> Result<usize, ServiceError> {
         let watches = self.next_maintenance_watches()?;
         self.last_maintenance_watches_processed = watches.len();
         let mut reclaimed = 0_usize;

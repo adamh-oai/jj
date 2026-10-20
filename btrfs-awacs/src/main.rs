@@ -2034,6 +2034,9 @@ fn run_git_fsmonitor_hook() -> Result<(), String> {
 }
 
 fn run_git_fsmonitor_hook_inner() -> Result<(), String> {
+    // Capture this before any long-running scan: a caller that exits must not
+    // be confused with a new parent or a reused PID at response publication.
+    let publisher = btrfs_awacs::git_retention::capture_git_publisher();
     let mut arguments = env::args_os().skip(1);
     let version = arguments
         .next()
@@ -2051,7 +2054,7 @@ fn run_git_fsmonitor_hook_inner() -> Result<(), String> {
     let mut previous_baseline = parse_git_fsmonitor_prior_token(prior_token.as_bytes())?;
     let is_bootstrap = previous_baseline.is_none();
     let mut client = match timed_git_phase("open_fsmonitor_client", || {
-        DirectScanClient::for_root(&root)
+        DirectScanClient::for_git_hook(&root, publisher)
     }) {
         Ok(client) => client,
         Err(error) if is_uninitialized_awacs_root(&error) => {

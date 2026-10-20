@@ -119,19 +119,51 @@ old snapshot deletion interrupted:
     retry deletion on the next coordinator entry
 ```
 
-Old cursor replay does not retain old snapshots or namespace indexes. At each
-adjacent cut, AWACS materializes path-level `cut_events` while both immutable
-endpoints are available. A cursor for sequence A answered at head
-B unions events from A+1 through B. Jujutsu explicitly persists its committed
-cursor, so event retention can preserve exactly the oldest Jujutsu sequence
-that may be reused. Git fsmonitor protocol v2 does not acknowledge durable
-token persistence, so AWACS tracks validated **incoming query cursors** on
-each watch's Git lane. Issuing a response is not evidence of persistence:
+Cursor replay reads adjacent events without reopening every old snapshot or
+retaining its namespace index. At each adjacent cut, AWACS materializes
+path-level `cut_events` while both immutable endpoints are available. A cursor
+for sequence A answered at head B unions events from A+1 through B. The
+physical snapshots named by the current Jujutsu journal and Git index remain
+retained independently, together with their complete replay intervals.
+
+Before cleanup, AWACS reads the worktree's published Git index directly and
+reconciles its AWACS cursor with a separate durable consumer pin. This includes
+indexes with an omitted checksum, linked-worktree administrative paths, and
+indexes which have not queried their newly persisted cursor. It does not run
+Git, rewrite its index, or walk the repository tree. A valid current index
+remains protected while idle, regardless of its age or newer JJ cuts. Failure
+to establish the index's retention roots prevents destructive cleanup rather
+than treating an uncertain root as absent.
+
+Git fsmonitor protocol v2 does not acknowledge durable token persistence.
+AWACS therefore also retains issued response candidates for the lifetime of
+the Git process that can publish them. Process identity includes its lifetime,
+so PID reuse cannot release another process's protection. Concurrent responses
+have independent protection: finishing one hook or observing a newer index
+must not release a candidate that another live process can still publish.
+Once a process exits, cleanup reconciles the actual index before releasing its
+candidate pins. These roots use separate owners in the existing v14 pin table;
+they do not change deployed cursor formats, journal records, or the database
+schema.
+
+Response protection is installed before Begin releases the root lock. Opening
+another direct client on the same boot preserves existing response leases and
+comparison pins; ordinary lease expiry reclaims abandoned work. Interrupted
+non-expiring preparations receive a finite recovery grace. Reboot recovery
+invalidates the previous boot's leases.
+
+Deploy the updated Git hook and JJ together, after draining older hook
+processes. Older binaries cannot register their pending publications; the new
+pins protect existing references from their collectors but cannot account for
+responses those older hooks have not yet published.
+
+AWACS additionally tracks validated **incoming query cursors** on each watch's
+Git lane. Issuing a response is not evidence of persistence:
 `GIT_OPTIONAL_LOCKS=0` can leave the same token in the index across arbitrarily
 many queries and newer cuts. Bootstrap requests without a cursor, internal
 index seeding alone, and scan completion do not advance this observed state.
-Creation may separately observe a cursor read back from its checksum-validated,
-published child index before releasing the scan lease.
+Creation may separately observe a cursor read back from its validated, published
+child index before releasing the scan lease.
 
 Let N be the highest valid cursor actually queried. N remains protected
 until a query with a higher cursor supersedes it. Supersession starts a grace
@@ -152,12 +184,13 @@ B is a retention heuristic, not proof that all older readers or alternate
 indexes have stopped using A.
 
 Retention preserves the **complete replay interval** from the oldest
-protected observation, Jujutsu consumer, or active query through the current
-head. The ordinary 128-cut/24-hour cache is supplemental and cannot override
-these protections. Before the first valid Git observation, that ordinary
-cache still applies; migration never infers a queried cursor from an issued
-cut. Observation and pruning validate and update their state in SQLite
-writer transactions so GC cannot slip between validation and protection.
+protected index root, response candidate, observation, Jujutsu consumer, or
+active query through the current head. The ordinary 128-cut/24-hour cache is
+supplemental and cannot override these protections. Migration never infers a
+queried cursor from an issued cut; cleanup still protects an existing published
+index before the first post-upgrade Git query. Observation and pruning validate
+and update their state in SQLite writer transactions so GC cannot slip between
+validation and protection.
 
 An elapsed grace period makes old history eligible for pruning; it does not
 invalidate history that is still retained. A late valid query can refresh
@@ -166,7 +199,8 @@ pruned, a query cannot resurrect it: Git receives a fresh token plus `/`
 for a whole-index refresh, never an empty "nothing changed" result.
 Malformed or mismatched watch, grant, filesystem, snapshot, or epoch claims
 are rejected without updating observations. This fallback preserves
-correctness for processes that outlive the grace period.
+correctness for old cursors which are no longer protected by a published
+index or live publisher; it cannot recover a previously deleted endpoint.
 
 `awacs init` and the shared conversion helper configure `core.fsmonitor=true`
 only when it is not already set in local Git configuration. Git selects the
@@ -188,17 +222,25 @@ The steady-state storage target is:
 ```text
 O(control-plane metadata)
     + O(changed paths in the retained event window)
-    + O(one current snapshot plus unlinked snapshots held by open scan fds)
+    + O(current JJ and Git snapshots plus still-publishable Git response snapshots)
+    + O(unlinked snapshots held by open scan fds)
 ```
 
-It is not O(repository size times retained cursors) and does not retain one
-physical snapshot or one full namespace index per Git token.
-However, a highest observed Git cursor that never advances can retain an
+Completed Git responses that no published index references do not retain one
+physical snapshot or full namespace index per historical token. Explicit
+alternate index paths are tracked independently within their mount namespace.
+Paths inside the checkout follow checkout relocation; deleting such an index
+releases its root after its publisher exits. Other namespace views and missing
+external paths remain conservative because they cannot prove a reference ended.
+Missing external paths retain their own roots while allowing unrelated cleanup.
+Responses whose process identity cannot be read also remain conservatively pinned.
+A highest observed Git cursor that never advances can retain an
 indefinitely growing logical event interval. The 128-cut/24-hour cache limits
 are not hard storage caps for protected history. Observation records contain
 only watch/sequence identity and timing metadata; they do not add raw token
 logging or data transmission, but the longer retention of local path events
-is intentional. Physical snapshots remain eligible for the existing GC.
+is intentional. Physical snapshots become eligible for GC after their current
+index, JJ baseline, response publisher, and scan references have ended.
 
 AWACS requires Linux, Btrfs, an appropriate privileged broker, and the reviewed
 changed-object/dirty-witness kernel support. The direct Jujutsu backend
@@ -397,11 +439,12 @@ garbage collection while holding the per-root lock.
 
 ### 7.1 Git snapshot worktree index handoff
 
-A persisted Git fsmonitor cursor names a logical replay position, not a retained
-physical snapshot. Clean Git commands may leave that cursor unchanged even after
-AWACS collects its old snapshot. Worktree creation therefore captures one stable
-copy of the source index, including cursor A and its dirty bitmap, and begins a
-source scan that returns replay A → B plus a temporary lease on physical cut B.
+A persisted Git fsmonitor cursor names a logical replay position whose physical
+endpoint remains pinned while the index references it. Clean Git commands may
+leave that cursor unchanged while JJ advances and cleanup runs. Worktree
+creation captures one stable copy of the source index, including cursor A and
+its dirty bitmap, and begins a source scan that returns replay A → B plus a
+temporary lease on physical cut B.
 
 The recursive snapshot still clones the live source. Creation establishes an
 independent child Git baseline and leases its actual cut C, then compares the

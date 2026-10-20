@@ -885,48 +885,54 @@ impl Store {
         &mut self,
         current_boot_id: [u8; 16],
     ) -> Result<RecoveryReport, ManagerError> {
-        let previous_boot_id =
-            crate::diagnostics::timed("recover process read metadata", || self.metadata())?
-                .last_boot_id;
         let transaction = crate::diagnostics::timed("recover process begin transaction", || {
             self.connection_mut()
                 .transaction_with_behavior(TransactionBehavior::Immediate)
         })?;
         let statements = crate::diagnostics::ScopeTimer::start("recover process statements");
-        let active_queries: i64 = transaction.query_row(
-            "SELECT count(*) FROM query_leases WHERE state = 'active'",
+        let previous_boot_id: Vec<u8> = transaction.query_row(
+            "SELECT last_boot_id FROM service_metadata WHERE singleton = 1",
             [],
+            |row| row.get(0),
+        )?;
+        let previous_boot_id: [u8; 16] = fixed_manager_blob(&previous_boot_id, "last_boot_id")?;
+        let boot_changed = previous_boot_id != current_boot_id;
+        // Another direct client can open this store while an existing client
+        // still owns a prepared response. Only a reboot proves those clients
+        // are gone; on the same boot their normal leases govern reclamation.
+        let active_queries: i64 = transaction.query_row(
+            "SELECT count(*) FROM query_leases WHERE state = 'active' AND ?1",
+            [boot_changed],
             |row| row.get(0),
         )?;
         transaction.execute(
             "DELETE FROM query_revision_pins WHERE query_id IN (\
-                 SELECT id FROM query_leases WHERE state = 'active'\
+                 SELECT id FROM query_leases WHERE state = 'active' AND ?1\
              )",
-            [],
+            [boot_changed],
         )?;
         transaction.execute(
             "DELETE FROM query_comparison_pins WHERE query_id IN (\
-                 SELECT id FROM query_leases WHERE state = 'active'\
+                 SELECT id FROM query_leases WHERE state = 'active' AND ?1\
              )",
-            [],
+            [boot_changed],
         )?;
         transaction.execute(
             "UPDATE query_leases SET state = 'released', lease_fence = lease_fence + 1 \
-             WHERE state = 'active'",
-            [],
+             WHERE state = 'active' AND ?1",
+            [boot_changed],
         )?;
-        // These ephemeral historical-read jobs are owned by one manager
-        // process. A restart invalidates their publication fence, but their
-        // endpoint pins must also be released so they cannot leak retained
-        // snapshots. Canonical algorithm-v2 cut comparisons are recovered by
-        // their cut operation instead of being abandoned here.
+        // Historical reads can likewise belong to another live direct client.
+        // A reboot invalidates their publication fence and releases their
+        // endpoint pins. Canonical algorithm-v2 cut comparisons are recovered
+        // by their cut operation instead of being abandoned here.
         let historical_comparison_ids = {
             let mut statement = transaction.prepare(
                 "SELECT id FROM comparisons \
-                  WHERE algorithm_version = 3 AND state = 'claimed'",
+                  WHERE algorithm_version = 3 AND state = 'claimed' AND ?1",
             )?;
             statement
-                .query_map([], |row| row.get::<_, i64>(0))?
+                .query_map([boot_changed], |row| row.get::<_, i64>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
         for comparison_id in &historical_comparison_ids {
@@ -944,8 +950,8 @@ impl Store {
             r#"UPDATE comparisons
                   SET state = 'failed', lease_owner = NULL,
                       lease_expires_ns = NULL, lease_fence = lease_fence + 1
-                WHERE algorithm_version = 3 AND state = 'claimed'"#,
-            [],
+                WHERE algorithm_version = 3 AND state = 'claimed' AND ?1"#,
+            [boot_changed],
         )?;
         let mut statement = transaction
             .prepare("SELECT id FROM watches WHERE fsmonitor_state != 'disabled' ORDER BY id")?;
@@ -982,7 +988,7 @@ impl Store {
             released_queries: usize::try_from(active_queries)
                 .map_err(|_| ManagerError::new("active query count overflow"))?,
             abandoned_historical_comparisons,
-            boot_changed: previous_boot_id != current_boot_id,
+            boot_changed,
         })
     }
 
@@ -9154,6 +9160,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "disabled");
+    }
+
+    #[test]
+    fn another_same_boot_client_preserves_prepared_query_pins_and_fence() {
+        let (temp, mut store, _watch, activation, _snapshots) = git_observation_fixture(2);
+        let lease = store
+            .begin_query_lease(&activation, Some(1), 2, [80; 16], 40_000)
+            .unwrap();
+        let query_state = |store: &Store| -> (String, i64, i64, i64, i64) {
+            store
+                .connection()
+                .query_row(
+                    "SELECT state, lease_fence, lease_expires_ns, \
+                            (SELECT count(*) FROM query_revision_pins WHERE query_id = ?1), \
+                            (SELECT count(*) FROM query_comparison_pins WHERE query_id = ?1) \
+                       FROM query_leases WHERE id = ?1",
+                    [lease.id.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let before = query_state(&store);
+        assert_eq!(before.0, "active");
+        assert!(before.3 > 0 && before.4 > 0);
+
+        let mut reopened = Store::open(&temp.path().join("state.sqlite3")).unwrap();
+        let report = reopened.recover_process_state([12; 16]).unwrap();
+        assert!(!report.boot_changed);
+        assert_eq!(report.released_queries, 0);
+        assert_eq!(query_state(&store), before);
+        store
+            .renew_query_lease_direct(&lease, 20_000, 50_000)
+            .unwrap();
+        assert_eq!(query_state(&reopened).2, 50_000);
+
+        let report = reopened.recover_process_state([99; 16]).unwrap();
+        assert!(report.boot_changed);
+        assert_eq!(report.released_queries, 1);
+        assert_eq!(
+            query_state(&store),
+            ("released".to_owned(), lease.lease_fence + 1, 50_000, 0, 0),
+        );
+        assert!(
+            store
+                .renew_query_lease_direct(&lease, 20_001, 60_000)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn another_same_boot_client_preserves_historical_comparisons_until_lease_expiry() {
+        let (temp, mut store, watch, _activation, snapshots) = git_observation_fixture(2);
+        // Require a physical comparison rather than the retained-spool path.
+        store
+            .connection_mut()
+            .execute(
+                "DELETE FROM replay_spools WHERE watch_id = ?1",
+                [watch.watch_id.as_slice()],
+            )
+            .unwrap();
+        let request = HistoricalComparisonRequest {
+            watch_id: watch.watch_id,
+            authorization_id: watch.grant_id,
+            requester_uid: 1000,
+            from_snapshot_uuid: snapshots[0].identity.subvol_uuid,
+            to_snapshot_uuid: snapshots[1].identity.subvol_uuid,
+            lease_owner: [81; 16],
+            now_ns: 10_000,
+            lease_expires_ns: 20_000,
+        };
+        let HistoricalComparisonAdmission::Claimed(claim) =
+            store.claim_historical_comparison(&request).unwrap()
+        else {
+            panic!("the missing replay spool must require a physical comparison");
+        };
+        let comparison_state = |store: &Store| -> (String, i64, i64) {
+            let owner = encode_u64(u64::try_from(claim.comparison_id).unwrap());
+            store
+                .connection()
+                .query_row(
+                    "SELECT state, lease_fence, \
+                            (SELECT count(*) FROM snapshot_pins \
+                              WHERE owner_kind = 'comparison' AND owner_id = ?2) \
+                       FROM comparisons WHERE id = ?1",
+                    params![claim.comparison_id, owner.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+        let before = comparison_state(&store);
+        assert_eq!(before, ("claimed".to_owned(), claim.lease_fence, 2));
+
+        let mut reopened = Store::open(&temp.path().join("state.sqlite3")).unwrap();
+        let report = reopened.recover_process_state([12; 16]).unwrap();
+        assert!(!report.boot_changed);
+        assert_eq!(report.abandoned_historical_comparisons, 0);
+        assert_eq!(comparison_state(&store), before);
+        assert_eq!(
+            reopened
+                .expire_historical_comparisons_bounded(20_000, 16)
+                .unwrap(),
+            1,
+        );
+        assert_eq!(
+            comparison_state(&store),
+            ("failed".to_owned(), claim.lease_fence + 1, 0),
+        );
     }
 
     #[test]
