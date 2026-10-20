@@ -835,13 +835,30 @@ fn finalize_subvolume_enable(ui: &Ui, root: &Path) -> Result<(), CommandError> {
 
 fn finalize_subvolume_root(ui: &Ui, root: &Path, colocated: bool) -> Result<(), CommandError> {
     // Synthetic CLI tests have neither real manager paths nor a Git AWACS hook.
-    if env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
-        return Ok(());
+    if env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_none() {
+        finalize_root_path(root)
+            .map_err(|err| user_error(format!("Failed to finalize AWACS root paths: {err}")))?;
+        if colocated {
+            refresh_git_awacs_baseline(ui, root)?;
+        }
     }
-    finalize_root_path(root)
-        .map_err(|err| user_error(format!("Failed to finalize AWACS root paths: {err}")))?;
     if colocated {
-        refresh_git_awacs_baseline(ui, root)?;
+        // Git worktree creation does not read JJ's subvolume-mode marker.
+        // Require snapshots so linked worktrees can subsequently be adopted.
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "--local", "worktree.btrfsSnapshot", "true"])
+            .output()
+            .map_err(|err| {
+                user_error(format!("Failed to configure Git snapshot worktrees: {err}"))
+            })?;
+        if !output.status.success() {
+            return Err(user_error(format!(
+                "Failed to configure Git snapshot worktrees: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
     }
     Ok(())
 }

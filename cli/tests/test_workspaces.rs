@@ -6638,7 +6638,28 @@ exit 1
             .contains("Git fsmonitor: invalid (timestamp placeholder)")
     );
 
-    // Re-running enable against a healthy strict marker is a true no-op.
+    let git_config = || {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(main_dir.root())
+            .args(["config", "--local", "--get", "worktree.btrfsSnapshot"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(git_config(), "true\n");
+    // Re-running enable also repairs the Git setting on existing checkouts.
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(main_dir.root())
+            .args(["config", "--local", "worktree.btrfsSnapshot", "false"])
+            .status()?
+            .success()
+    );
+
+    // Re-running enable preserves the healthy strict baseline.
     let output = main_dir
         .run_jj_with(|cmd| {
             cmd.env("PATH", &path)
@@ -6652,6 +6673,8 @@ exit 1
             .raw()
             .contains("Btrfs subvolume mode is already enabled.")
     );
+
+    assert_eq!(git_config(), "true\n");
 
     // A committed baseline from the previous layout is not enough: enable
     // must still migrate ordinary .jj metadata while preserving repository

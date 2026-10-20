@@ -93,6 +93,11 @@ subvolumes. Root snapshots then omit both metadata stores, avoiding a recursive
 copy and deletion of `.jj` when creating another workspace. Existing metadata
 subvolumes are snapshotted separately when initializing the replacement checkout.
 
+Enabling also sets `worktree.btrfsSnapshot=true` in the local Git configuration,
+so `git worktree add` requires a Btrfs snapshot that JJ can adopt. Running
+`enable` again repairs this setting for previously enabled checkouts. This
+requires a Git build with Btrfs snapshot support.
+
 The command does not rename the source while copying, building, or establishing
 the initial baseline. Only after initialization succeeds does it rename the
 original checkout aside and activate the initialized checkout at the original
