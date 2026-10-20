@@ -1834,6 +1834,169 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 #[test]
 #[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
+fn test_snapshot_retains_baseline_across_jj_metadata_subvolume_conversion() -> TestResult {
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use btrfs_awacs::btrfs::OpenedSubvolume;
+    use btrfs_awacs::btrfs::supports_changed_objects_v2;
+    use btrfs_awacs::store::Store;
+    use btrfs_awacs::subvolume_migration::MigrationOptions;
+    use btrfs_awacs::subvolume_migration::SubvolumeMigration;
+
+    let base = std::path::PathBuf::from(
+        std::env::var_os("JJ_TEST_BTRFS_ROOT").expect("JJ_TEST_BTRFS_ROOT is required"),
+    );
+    let awacs = std::fs::canonicalize(
+        std::env::var_os("BTRFS_AWACS_COMMAND").expect("BTRFS_AWACS_COMMAND is required"),
+    )?;
+    let broker = std::env::var_os("BTRFS_AWACS_BROKER_SOCKET")
+        .expect("BTRFS_AWACS_BROKER_SOCKET must select a matching broker");
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let root = base.join(format!("jj-metadata-conversion-{suffix}"));
+    let state = base.join(format!(".jj-metadata-conversion-state-{suffix}"));
+    let runtime = std::env::temp_dir().join(format!("jj-meta-{suffix}"));
+    let mut cleanup = RealBtrfsFixtureCleanup::new(root.clone(), state.clone(), runtime.clone());
+    for directory in [&state, &runtime] {
+        std::fs::create_dir(directory)?;
+    }
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
+    for directory in [&root, &root.join(".git")] {
+        let output = Command::new("btrfs")
+            .args(["subvolume", "create"])
+            .arg(directory)
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+    }
+    let live = OpenedSubvolume::open(&root)?;
+    assert!(
+        supports_changed_objects_v2(live.as_fd())?,
+        "this regression requires the changed-objects v2 ioctl"
+    );
+    std::os::unix::fs::symlink(&awacs, runtime.join("git-fsmonitor-awacs"))?;
+    let path = std::env::join_paths(std::iter::once(runtime.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))?;
+    let test_env = TestEnvironment::default();
+    let main_dir = test_env.work_dir(&root);
+    let initialized = Command::new("git")
+        .args(["init", "--quiet", "--object-format=sha1"])
+        .current_dir(&root)
+        .env_clear()
+        .env("PATH", &path)
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()?;
+    assert!(initialized.status.success(), "{initialized:?}");
+    let configure = |cmd: &mut assert_cmd::Command| {
+        cmd.env("PATH", &path)
+            .env("BTRFS_AWACS_COMMAND", &awacs)
+            .env("BTRFS_AWACS_BROKER_DIR", &broker)
+            .env("BTRFS_AWACS_BROKER_SOCKET", &broker)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env_remove("BTRFS_AWACS_STATE_DIR")
+            .env_remove("BTRFS_AWACS_STATE_ROOT")
+            .env_remove("BTRFS_AWACS_MANAGED_DIR");
+    };
+    main_dir
+        .run_jj_with(|cmd| {
+            configure(cmd);
+            cmd.args(["git", "init", "--colocate", "."])
+        })
+        .success();
+    main_dir.write_file("file", "before conversion\n");
+    main_dir.run_jj(["status"]).success();
+    assert_ne!(std::fs::metadata(root.join(".jj"))?.ino(), 256);
+
+    // Reproduce adoption's intermediate layout: the worktree is a subvolume,
+    // but .jj is still an ordinary directory when its first baseline is cut.
+    std::fs::write(root.join(".jj/working_copy/subvolume_mode"), b"enabling\n")?;
+    main_dir
+        .run_jj_with(|cmd| {
+            configure(cmd);
+            cmd.args(["util", "subvolume", "enable", "--rebuild-baseline"])
+        })
+        .success();
+    assert_ne!(std::fs::metadata(root.join(".jj"))?.ino(), 256);
+    let manager = assert_default_awacs_layout(&root);
+    let read_manager_head = || -> TestResult<([u8; 16], i64, Vec<u8>)> {
+        let store = Store::open(&manager)?;
+        let head = store.connection().query_row(
+            "SELECT s.id, s.path FROM watches w JOIN snapshots s \
+             ON s.id = w.last_cut_snapshot_id WHERE s.physical_state = 'present'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        Ok((store.metadata()?.store_uuid, head.0, head.1))
+    };
+    let retained = read_manager_head()?;
+    let retained_path = std::path::PathBuf::from(std::ffi::OsString::from_vec(retained.2.clone()));
+    assert_ne!(std::fs::metadata(retained_path.join(".jj"))?.ino(), 2);
+    assert!(retained_path.join(".jj/working_copy/checkout").is_file());
+
+    // Convert metadata without rebuilding the manager or replacing its retained
+    // baseline. The next v2 comparison must report the new .jj boundary.
+    SubvolumeMigration::prepare(&root, MigrationOptions::default())?
+        .commit()?
+        .discard_displaced()?;
+    assert_eq!(
+        OpenedSubvolume::open(&root)?.subvolume.uuid,
+        live.subvolume.uuid
+    );
+    OpenedSubvolume::open(&root.join(".jj"))?;
+    assert_eq!(read_manager_head()?, retained);
+    main_dir.write_file("file", "after conversion\n");
+    main_dir
+        .run_jj_with(|cmd| {
+            configure(cmd);
+            cmd.arg("status")
+        })
+        .success();
+    assert_eq!(
+        main_dir
+            .run_jj(["--ignore-working-copy", "file", "show", "file"])
+            .success()
+            .stdout
+            .raw(),
+        "after conversion\n"
+    );
+    assert_eq!(
+        main_dir
+            .run_jj(["--ignore-working-copy", "file", "list"])
+            .success()
+            .stdout
+            .raw(),
+        "file\n",
+        "metadata must remain excluded from the semantic tree"
+    );
+    let after = read_manager_head()?;
+    assert_eq!(after.0, retained.0, "the scan must keep the same manager");
+    assert!(after.1 > retained.1, "the scan must advance its snapshot");
+    let after_path = std::path::PathBuf::from(std::ffi::OsString::from_vec(after.2));
+    assert_eq!(std::fs::metadata(after_path.join(".jj"))?.ino(), 2);
+    assert!(std::fs::read_dir(after_path.join(".jj"))?.next().is_none());
+    main_dir
+        .run_jj_with(|cmd| {
+            configure(cmd);
+            cmd.arg("status")
+        })
+        .success();
+    cleanup.cleanup()?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+#[test]
+#[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() -> TestResult {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;

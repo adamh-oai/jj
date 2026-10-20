@@ -25,6 +25,9 @@ test-e2e:
             BTRFS_AWACS_BROKER_SOCKET="$broker_directory"; \
         cargo test -p jj-cli --features awacs --test runner \
             test_workspaces:: -- --ignored --test-threads=1; \
+        cargo test -p btrfs-awacs --lib \
+            service::tests::v2_comparison_rejects_attached_roots_but_accepts_snapshot_stubs \
+            -- --ignored --test-threads=1; \
         cargo test -p btrfs-awacs --lib btrfs::tests::remove_tree_ \
             -- --ignored --test-threads=1
 

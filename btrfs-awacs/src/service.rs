@@ -47,6 +47,10 @@ struct ParsedKernelChangedObjects {
     /// Exact canonical target rows supplied by v2. Legacy streams leave this
     /// absent and use the broker's bounded target-object tree search.
     target_objects: Option<BTreeMap<u64, Object>>,
+    /// DIR_INDEX boundaries can be empty snapshot stubs. Query actual root
+    /// references when v2 adds one, or when a legacy stream cannot prove that
+    /// no boundary was introduced.
+    requires_nested_subvolume_check: bool,
     dirty_witness_contract: bool,
     /// V2 streams must retain their endpoint/header and footer proof until
     /// the broker-verified endpoints and ioctl completion can be compared.
@@ -348,7 +352,6 @@ impl Service {
 
     fn reject_nested_subvolumes(
         &self,
-        path: &Path,
         expected: &ExpectedSubvolume,
         fd: BorrowedFd<'_>,
     ) -> Result<(), ServiceError> {
@@ -364,14 +367,14 @@ impl Service {
             .map_err(|error| ServiceError::context("query nested subvolumes", error))?;
         log::debug!(
             "AWACS immutable snapshot topology query completed: root={} elapsed={:?} has_nested_subvolumes={}",
-            path.display(),
+            expected.root_id,
             started.elapsed(),
             has_nested
         );
         if has_nested {
             return Err(ServiceError::new(format!(
-                "immutable snapshot contains nested subvolume under {}",
-                path.display()
+                "immutable snapshot contains nested subvolume under root {}",
+                expected.root_id
             )));
         }
         Ok(())
@@ -785,11 +788,7 @@ impl Service {
             let expected =
                 ExpectedSubvolume::from_observed(&snapshot_fd.filesystem, &snapshot_fd.subvolume);
             verify_recorded_snapshot(&recorded.identity, &expected)?;
-            self.reject_nested_subvolumes(
-                &operation.reserved_path,
-                &expected,
-                snapshot_fd.as_fd(),
-            )?;
+            self.reject_nested_subvolumes(&expected, snapshot_fd.as_fd())?;
             self.store
                 .publish_initial_snapshot(
                     &operation.reservation,
@@ -1310,7 +1309,7 @@ impl Service {
             ));
         }
         let phase_started = Instant::now();
-        self.reject_nested_subvolumes(&destination_path, &expected, snapshot_fd.as_fd())?;
+        self.reject_nested_subvolumes(&expected, snapshot_fd.as_fd())?;
         log::debug!(
             "AWACS initialize phase completed: source={} phase=check managed snapshot topology elapsed={:?}",
             canonical_source.display(),
@@ -1594,6 +1593,9 @@ impl Service {
             let parsed = parse_kernel_changed_objects(&bytes)
                 .map_err(|error| ServiceError::context("parse comparison manifest", error))?;
             validate_changed_objects_proof(&parsed, source_expected, target_expected, &comparison)?;
+            if parsed.requires_nested_subvolume_check {
+                self.reject_nested_subvolumes(target_expected, target)?;
+            }
             require_dirty_witness_contract(parsed.dirty_witness_contract)?;
             let required: BTreeSet<_> = parsed
                 .manifest
@@ -1796,21 +1798,18 @@ impl Service {
                 &target_expected,
                 &comparison_result,
             )?;
-            // V2 proves the target remains boundary-free from the accepted
-            // boundary-free base using mandatory DIR_INDEX transition
-            // records. Legacy kernels have no such contract, so retain the
-            // fail-closed namespace scan for them.
-            if parsed.target_objects.is_none() {
-                incremental_phase = "scan-legacy-nested-subvolumes";
+            // Root snapshots retain DIR_INDEX records for excluded nested
+            // subvolumes as empty stubs. A new record therefore requires an
+            // actual ROOT_REF query, not rejection by itself. Without an add,
+            // v2 proves no child was introduced since the accepted base;
+            // legacy streams always need the query.
+            if parsed.requires_nested_subvolume_check {
+                incremental_phase = "query-nested-subvolumes";
                 let nested_scan_started = std::time::Instant::now();
-                self.reject_nested_subvolumes(
-                    &completion.destination_path,
-                    &target_expected,
-                    target_fd.as_fd(),
-                )?;
+                self.reject_nested_subvolumes(&target_expected, target_fd.as_fd())?;
                 tracing::info!(
                     elapsed_ms = nested_scan_started.elapsed().as_millis() as u64,
-                    "query cut legacy nested-subvolume scan completed"
+                    "query cut nested-subvolume check completed"
                 );
             }
             incremental_phase = "validate-dirty-witness";
@@ -3187,12 +3186,6 @@ fn parse_kernel_changed_objects(bytes: &[u8]) -> Result<ParsedKernelChangedObjec
                 "changed-objects v2 stream does not certify subvolume boundaries",
             ));
         }
-        if let Some(boundary) = parsed.boundary_adds.iter().next() {
-            return Err(ServiceError::new(format!(
-                "immutable snapshot contains nested subvolume boundary parent={} child_root={} name={:?}",
-                boundary.parent_ino, boundary.child_root_id, boundary.name
-            )));
-        }
         let mut target_objects = BTreeMap::new();
         for (&ino, metadata) in &parsed.target_objects {
             let xattrs = parsed.target_security_xattrs.get(&ino).ok_or_else(|| {
@@ -3207,6 +3200,7 @@ fn parse_kernel_changed_objects(bytes: &[u8]) -> Result<ParsedKernelChangedObjec
         Ok(ParsedKernelChangedObjects {
             manifest: parsed.manifest,
             target_objects: Some(target_objects),
+            requires_nested_subvolume_check: !parsed.boundary_adds.is_empty(),
             dirty_witness_contract: parsed.header.dirty_witness,
             v2_proof: Some(ParsedV2Proof {
                 header: parsed.header,
@@ -3218,6 +3212,7 @@ fn parse_kernel_changed_objects(bytes: &[u8]) -> Result<ParsedKernelChangedObjec
             .map(|manifest| ParsedKernelChangedObjects {
                 manifest,
                 target_objects: None,
+                requires_nested_subvolume_check: true,
                 dirty_witness_contract: false,
                 v2_proof: None,
             })
@@ -3878,6 +3873,101 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires JJ_TEST_BTRFS_ROOT, changed-objects v2 kernel support, and matching broker"]
+    fn v2_comparison_rejects_attached_roots_but_accepts_snapshot_stubs() {
+        let root = std::env::var_os("JJ_TEST_BTRFS_ROOT")
+            .map(PathBuf::from)
+            .expect("JJ_TEST_BTRFS_ROOT must name a writable directory on real Btrfs");
+        let broker_directory = std::env::var_os("BTRFS_AWACS_BROKER_DIR")
+            .or_else(|| std::env::var_os("BTRFS_AWACS_BROKER_SOCKET"))
+            .map(PathBuf::from)
+            .expect("BTRFS_AWACS_BROKER_DIR must name a matching live AWACS broker");
+        for child_name in [".jj", "ordinary-name"] {
+            check_v2_attached_root_and_stub(&root, &broker_directory, child_name);
+        }
+    }
+
+    fn check_v2_attached_root_and_stub(root: &Path, broker_directory: &Path, child_name: &str) {
+        let fixture = tempfile::tempdir_in(root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                // The external broker owns this empty mode-0700 directory.
+                // Its parent permits rmdir without traversing the directory.
+                let _ = fs::remove_dir(self.0.join("managed/.broker-trash-default"));
+                let _ = crate::btrfs::remove_tree(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(fixture.path().to_owned());
+        let target_path = fixture.path().join("target");
+        let create_subvolume = |path: &Path| {
+            assert!(
+                std::process::Command::new("btrfs")
+                    .args(["subvolume", "create"])
+                    .arg(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        create_subvolume(&target_path);
+        let target = File::open(&target_path).unwrap();
+        let fixture_dir = File::open(fixture.path()).unwrap();
+        create_btrfs_snapshot(target.as_fd(), fixture_dir.as_fd(), b"base", true).unwrap();
+
+        // Mark the original parent read-only after attaching a child: unlike
+        // a root snapshot, it still has real child-root references. Metadata
+        // names must not receive a blanket exception from this check.
+        create_subvolume(&target_path.join(child_name));
+        crate::btrfs::set_subvolume_readonly(target.as_fd(), true).unwrap();
+        let mut base = OpenedSubvolume::open(&fixture.path().join("base")).unwrap();
+        let mut target = OpenedSubvolume::open(&target_path).unwrap();
+        stabilize_readonly_snapshot(&mut base).unwrap();
+        stabilize_readonly_snapshot(&mut target).unwrap();
+        assert!(crate::btrfs::supports_changed_objects_v2(target.as_fd()).unwrap());
+
+        let managed = fixture.path().join("managed");
+        let spool = fixture.path().join("spool");
+        create_private_snapshot_entry(&managed).unwrap();
+        create_private_snapshot_entry(&spool).unwrap();
+        let metadata = ServiceMetadata {
+            store_uuid: [21; 16],
+            clock_format_version: 1,
+            last_boot_id: [23; 16],
+            created_ns: 1,
+        };
+        let store = Store::create(&fixture.path().join("state.sqlite3"), &metadata).unwrap();
+        let config = ServiceConfig::new(managed, spool, [23; 16])
+            .with_broker_directory(broker_directory.to_owned());
+        let service = Service::new_external(store, config).unwrap();
+        let error = service
+            .compare_snapshot_roots(base.as_fd(), target.as_fd())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "immutable snapshot contains nested subvolume under root {}",
+                target.subvolume.root_id
+            )
+        );
+
+        // The same directory record survives in a nonrecursive snapshot, but
+        // the child becomes an empty inode-2 stub and must be accepted.
+        create_btrfs_snapshot(target.as_fd(), fixture_dir.as_fd(), b"stubs", true).unwrap();
+        let stub_path = fixture.path().join("stubs");
+        let mut stubs = OpenedSubvolume::open(&stub_path).unwrap();
+        stabilize_readonly_snapshot(&mut stubs).unwrap();
+        assert_eq!(fs::metadata(stub_path.join(child_name)).unwrap().ino(), 2);
+        assert_eq!(fs::read_dir(stub_path.join(child_name)).unwrap().count(), 0);
+        service
+            .compare_snapshot_roots(base.as_fd(), stubs.as_fd())
+            .unwrap();
+        drop(service);
+        fs::remove_dir(fixture.path().join("managed/.broker-trash-default")).unwrap();
+        crate::btrfs::remove_tree(fixture.path()).unwrap();
+    }
+
+    #[test]
     fn dirty_witness_capability_is_required_for_incremental_streams() {
         assert!(require_dirty_witness_contract(true).is_ok());
         let error = require_dirty_witness_contract(false).unwrap_err();
@@ -4129,6 +4219,7 @@ mod tests {
         drop(complete);
         let reused = load_staged_manifest(&complete_path, 1024).unwrap().unwrap();
         assert!(reused.parsed.manifest.objects.is_empty());
+        assert!(reused.parsed.requires_nested_subvolume_check);
         assert!(reused.broker_result.v2_ioctl.is_none());
         assert!(complete_path.exists());
 
@@ -4151,6 +4242,7 @@ mod tests {
     fn v2_endpoint_and_completion_proof_rejects_normal_mismatches() {
         let bytes = empty_v2_stream();
         let parsed = parse_kernel_changed_objects(&bytes).unwrap();
+        assert!(!parsed.requires_nested_subvolume_check);
         let parent = expected_subvolume([1; 16], [2; 16], 256, 10);
         let target = expected_subvolume([1; 16], [3; 16], 257, 11);
         let result = v2_result(&bytes, 0);
@@ -4172,6 +4264,73 @@ mod tests {
         let records_error =
             validate_changed_objects_proof(&parsed, &parent, &target, &wrong_records).unwrap_err();
         assert!(records_error.to_string().contains("completion counters"));
+    }
+
+    #[test]
+    fn v2_boundary_additions_require_topology_query_instead_of_parser_rejection() {
+        for name in [b".jj".as_slice(), b"ordinary-name".as_slice()] {
+            let bytes = v2_stream_with_boundaries(&[(6, name)]);
+            let parsed = parse_kernel_changed_objects(&bytes).unwrap();
+            assert!(parsed.requires_nested_subvolume_check);
+            let parent = expected_subvolume([1; 16], [2; 16], 256, 10);
+            let target = expected_subvolume([1; 16], [3; 16], 257, 11);
+            let result = v2_result(&bytes, 1);
+            validate_changed_objects_proof(&parsed, &parent, &target, &result).unwrap();
+
+            let wrong_target = expected_subvolume([1; 16], [9; 16], 257, 11);
+            let error = validate_changed_objects_proof(&parsed, &parent, &wrong_target, &result)
+                .unwrap_err();
+            assert!(error.to_string().contains("endpoint header"));
+        }
+
+        // DIR_INDEX changes can report both sides of an unchanged boundary.
+        // Cancellation preserves the ordinary incremental path without a
+        // root-tree query.
+        let bytes = v2_stream_with_boundaries(&[(6, b".jj"), (7, b".jj")]);
+        let parsed = parse_kernel_changed_objects(&bytes).unwrap();
+        assert!(!parsed.requires_nested_subvolume_check);
+    }
+
+    #[test]
+    fn recovered_v2_boundary_stage_still_requires_topology_query() {
+        let spool = tempdir().unwrap();
+        let path = spool
+            .path()
+            .join("manifest-0123456789abcdef0123456789abcdef-7.part");
+        let bytes = v2_stream_with_boundaries(&[(6, b".jj")]);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        write_manifest_stage_trailer(&mut file, &v2_result(&bytes, 1)).unwrap();
+        drop(file);
+
+        let staged = load_staged_manifest(&path, 1024).unwrap().unwrap();
+        assert!(staged.parsed.requires_nested_subvolume_check);
+        let parent = expected_subvolume([1; 16], [2; 16], 256, 10);
+        let target = expected_subvolume([1; 16], [3; 16], 257, 11);
+        validate_changed_objects_proof(&staged.parsed, &parent, &target, &staged.broker_result)
+            .unwrap();
+    }
+
+    #[test]
+    fn v2_without_boundary_certificate_is_still_rejected() {
+        let mut bytes = empty_v2_stream();
+        bytes[24..32].copy_from_slice(&(1_u64 << 2).to_le_bytes());
+        let completion_offset = bytes.len() - 32;
+        let checksum = test_crc32c(&bytes[..completion_offset]);
+        bytes[completion_offset + 24..completion_offset + 28]
+            .copy_from_slice(&checksum.to_le_bytes());
+        let error = parse_kernel_changed_objects(&bytes).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not certify subvolume boundaries")
+        );
     }
 
     #[test]
@@ -4211,7 +4370,7 @@ mod tests {
             "changed-objects v2 completion counters do not match broker ioctl result",
             "parse changed-objects v2 stream: changed-objects v2 completion mismatch",
             "parse changed-object manifest: changed-objects v2 endpoint header does not match broker-verified endpoints",
-            "immutable snapshot contains nested subvolume boundary parent=1 child_root=2 name=[]",
+            "immutable snapshot contains nested subvolume under root 257",
             r#"changed-objects detected an fscrypt introduction at inode 300 path "encrypted""#,
         ] {
             assert!(
@@ -4252,6 +4411,10 @@ mod tests {
     }
 
     fn empty_v2_stream() -> Vec<u8> {
+        v2_stream_with_boundaries(&[])
+    }
+
+    fn v2_stream_with_boundaries(boundaries: &[(u16, &[u8])]) -> Vec<u8> {
         let mut bytes = CHANGED_OBJECTS_V2_MAGIC.to_vec();
         push_u32(&mut bytes, CHANGED_OBJECTS_V2_VERSION);
         push_u32(&mut bytes, 112);
@@ -4263,12 +4426,20 @@ mod tests {
         push_u64(&mut bytes, 11);
         push_u64(&mut bytes, 256);
         push_u64(&mut bytes, 257);
+        for &(kind, name) in boundaries {
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&0_u16.to_le_bytes());
+            push_u32(&mut bytes, 24 + name.len() as u32);
+            push_u64(&mut bytes, ROOT_INODE);
+            push_u64(&mut bytes, 2088);
+            bytes.extend_from_slice(name);
+        }
         let stream_bytes = bytes.len() as u64;
         let checksum = test_crc32c(&bytes);
         bytes.extend_from_slice(&0xffff_u16.to_le_bytes());
         bytes.extend_from_slice(&0_u16.to_le_bytes());
         push_u32(&mut bytes, 32);
-        push_u64(&mut bytes, 0);
+        push_u64(&mut bytes, boundaries.len() as u64);
         push_u64(&mut bytes, stream_bytes);
         push_u32(&mut bytes, checksum);
         push_u32(&mut bytes, 0);
