@@ -277,14 +277,15 @@ pub fn convert_subvolume_root(
     progress("publishing Btrfs subvolume conversion");
     let committed = migration.commit()?;
     progress("enabling Git fsmonitor");
-    enable_git_fsmonitor(&destination)?;
+    configure_git_fsmonitor(&destination)?;
     Ok(committed)
 }
 
-/// Enables Git's selected fsmonitor implementation only when the worktree
-/// has no explicit local setting. Roots without usable Git metadata remain
-/// valid, and no hook path or protocol version is installed.
-fn enable_git_fsmonitor(destination: &Path) -> Result<(), MigrationError> {
+/// Defaults to Git's selected fsmonitor implementation and fatal hook errors.
+/// Existing local settings are preserved, including an explicit fallback
+/// policy. Roots without usable Git metadata remain valid, and no hook path
+/// or protocol version is installed.
+pub fn configure_git_fsmonitor(destination: &Path) -> Result<(), MigrationError> {
     if !destination.join(".git").exists() {
         return Ok(());
     }
@@ -297,31 +298,36 @@ fn enable_git_fsmonitor(destination: &Path) -> Result<(), MigrationError> {
     if !probe.status.success() {
         return Ok(());
     }
-    let existing = Command::new("git")
-        .arg("-C")
-        .arg(destination)
-        .args(["config", "--local", "--get", "core.fsmonitor"])
-        .output()
-        .map_err(|error| MigrationError::io("read local Git fsmonitor configuration", error))?;
-    if existing.status.success() {
-        return Ok(());
-    }
-    if existing.status.code() != Some(1) {
-        return Err(MigrationError::new(format!(
-            "read local Git fsmonitor configuration exited with {}",
-            existing.status
-        )));
-    }
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(destination)
-        .args(["config", "--local", "core.fsmonitor", "true"])
-        .status()
-        .map_err(|error| MigrationError::io("enable Git fsmonitor", error))?;
-    if !status.success() {
-        return Err(MigrationError::new(format!(
-            "enable Git fsmonitor exited with {status}"
-        )));
+    for (key, value) in [
+        ("core.fsmonitor", "true"),
+        ("core.fsmonitorHookFallback", "false"),
+    ] {
+        let existing = Command::new("git")
+            .arg("-C")
+            .arg(destination)
+            .args(["config", "--local", "--get", key])
+            .output()
+            .map_err(|error| MigrationError::io("read local Git fsmonitor configuration", error))?;
+        if existing.status.success() {
+            continue;
+        }
+        if existing.status.code() != Some(1) {
+            return Err(MigrationError::new(format!(
+                "read local Git {key} configuration exited with {}",
+                existing.status
+            )));
+        }
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(destination)
+            .args(["config", "--local", key, value])
+            .status()
+            .map_err(|error| MigrationError::io("configure Git fsmonitor", error))?;
+        if !status.success() {
+            return Err(MigrationError::new(format!(
+                "configure Git {key} exited with {status}"
+            )));
+        }
     }
     Ok(())
 }
@@ -894,6 +900,14 @@ exit 1
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&destination)
+                .args(["config", "--local", "--get", "core.fsmonitorHookFallback"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "false");
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&destination)
                 .args(["config", "--local", "--get", "core.fsmonitorHookVersion"])
                 .output()
                 .unwrap();
@@ -903,12 +917,13 @@ exit 1
     }
 
     #[test]
-    fn conversion_preserves_existing_git_fsmonitor_and_hook_version() {
+    fn conversion_preserves_existing_git_fsmonitor_configuration() {
         with_fake_btrfs(|root, _| {
             let destination = initialized_git_checkout(root);
             for (key, value) in [
                 ("core.fsmonitor", "/custom/fsmonitor-hook"),
                 ("core.fsmonitorHookVersion", "1"),
+                ("core.fsmonitorHookFallback", "true"),
             ] {
                 assert!(
                     Command::new("git")
@@ -926,6 +941,7 @@ exit 1
             for (key, expected) in [
                 ("core.fsmonitor", "/custom/fsmonitor-hook"),
                 ("core.fsmonitorHookVersion", "1"),
+                ("core.fsmonitorHookFallback", "true"),
             ] {
                 let output = Command::new("git")
                     .arg("-C")

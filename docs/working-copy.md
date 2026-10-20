@@ -98,6 +98,12 @@ so `git worktree add` requires a Btrfs snapshot that JJ can adopt. Running
 `enable` again repairs this setting for previously enabled checkouts. This
 requires a Git build with Btrfs snapshot support.
 
+Enabling defaults `core.fsmonitorHookFallback=false` when it has no local value.
+With the paired Git build, a failed fsmonitor hook then aborts the command before
+protocol fallback or a full index refresh. An explicit local setting is preserved;
+set it to `true` to retain Git's usual fallback. Re-running enable applies this
+default to an existing installation without `--rebuild-baseline`.
+
 The command does not rename the source while copying, building, or establishing
 the initial baseline. Only after initialization succeeds does it rename the
 original checkout aside and activate the initialized checkout at the original

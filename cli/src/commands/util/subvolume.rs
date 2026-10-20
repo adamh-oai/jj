@@ -41,6 +41,7 @@ use btrfs_awacs::status::IndexChecksum;
 use btrfs_awacs::status::RootStatus;
 use btrfs_awacs::status::inspect_git_index;
 use btrfs_awacs::subvolume_migration::MigrationOptions;
+use btrfs_awacs::subvolume_migration::configure_git_fsmonitor;
 use btrfs_awacs::subvolume_migration::convert_subvolume_root;
 use btrfs_awacs::subvolume_migration::copy_children;
 use btrfs_awacs::subvolume_migration::copy_children_except;
@@ -839,6 +840,8 @@ fn finalize_subvolume_root(ui: &Ui, root: &Path, colocated: bool) -> Result<(), 
         finalize_root_path(root)
             .map_err(|err| user_error(format!("Failed to finalize AWACS root paths: {err}")))?;
         if colocated {
+            configure_git_fsmonitor(root)
+                .map_err(|err| user_error(format!("Failed to configure Git fsmonitor: {err}")))?;
             refresh_git_awacs_baseline(ui, root)?;
         }
     }

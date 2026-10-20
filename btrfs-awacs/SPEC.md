@@ -157,9 +157,10 @@ processes. Older binaries cannot register their pending publications; the new
 pins protect existing references from their collectors but cannot account for
 responses those older hooks have not yet published.
 
-Deploy the paired Git update to make AWACS query failures fatal instead of
-falling back to a full index refresh. An established AWACS cursor must advance
-incrementally; unavailable replay or a whole-tree invalidation fails the Git
+Deploy the paired Git update with `core.fsmonitorHookFallback=false` to make
+AWACS query failures fatal instead of falling back to a full index refresh.
+Git retains its previous fallback policy by default. An established AWACS cursor
+must advance incrementally; unavailable replay or a whole-tree invalidation fails the Git
 command before the fallback path updates the index. Initial setup and migration
 from a numeric or built-in token retain their bootstrap refresh. Explicit
 initialization or baseline recovery publishes an all-dirty numeric placeholder
@@ -216,10 +217,14 @@ are rejected without updating observations. This fallback preserves
 correctness for old cursors which are no longer protected by a published
 index or live publisher; it cannot recover a previously deleted endpoint.
 
-`awacs init` and the shared conversion helper configure `core.fsmonitor=true`
-only when it is not already set in local Git configuration. Git selects the
-available fsmonitor implementation; AWACS does not configure an explicit hook
-pathname or change `core.fsmonitorHookVersion`.
+`awacs init`, the shared conversion helper, and `jj util subvolume enable`
+default `core.fsmonitor=true` and `core.fsmonitorHookFallback=false` when each
+setting is absent from local Git configuration. Explicit local values remain
+unchanged, including an opt-in to fallback. Git selects the available fsmonitor
+implementation; AWACS does not configure an explicit hook pathname or change
+`core.fsmonitorHookVersion`. Re-running enable applies the failure policy to an
+existing installation without rebuilding its baseline. The policy requires
+the paired Git build; older Git ignores the new setting.
 
 The returned scan-root fd is the intended scan-lifetime retention mechanism.
 After a newer head commits, an older snapshot pathname may be unlinked while

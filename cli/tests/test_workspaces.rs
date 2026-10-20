@@ -1979,6 +1979,9 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
     let alternate_index = runtime_dir.join("alternate-index");
     std::fs::copy(repo_root.join(".git/index"), &alternate_index)?;
 
+    // Existing installations acquire the failure policy on ordinary enable,
+    // without requiring a baseline rebuild or changing their explicit hook.
+    run_git(&["config", "--unset", "core.fsmonitorHookFallback"])?;
     for arguments in [
         vec!["util", "subvolume", "enable"],
         vec!["util", "subvolume", "enable", "--rebuild-baseline"],
@@ -2049,6 +2052,10 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
         assert_eq!(
             run_git(&["config", "core.fsmonitorHookVersion"])?.stdout,
             b"2\n"
+        );
+        assert_eq!(
+            run_git(&["config", "core.fsmonitorHookFallback"])?.stdout,
+            b"false\n"
         );
     }
 
