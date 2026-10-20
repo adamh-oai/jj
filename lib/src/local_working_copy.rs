@@ -5809,6 +5809,24 @@ pub fn reset_local_working_copy_fsmonitor(
     Ok(false)
 }
 
+/// Validates an explicit monitor reset without releasing its retained baseline.
+/// Call before replacing the AWACS store: an interrupted sparse materialization
+/// must be resolved while the journal and its original snapshots still agree.
+pub fn check_local_working_copy_fsmonitor_reset(
+    locked: &mut dyn LockedWorkingCopy,
+) -> Result<bool, SnapshotError> {
+    if let Some(snapshot) = locked.downcast_mut::<LockedLocalWorkingCopy>() {
+        snapshot
+            .wc
+            .tree_state()?
+            .check_interrupted_sparse_materialization()?;
+        return Ok(true);
+    }
+    Ok(locked
+        .downcast_mut::<crate::legacy_local_working_copy::LockedLocalWorkingCopy>()
+        .is_some())
+}
+
 /// Seeds snapshot-backed state with the semantic tree bound to the inherited
 /// filesystem baseline, without materializing or rewriting files.
 ///

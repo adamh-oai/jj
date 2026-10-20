@@ -103,7 +103,14 @@ impl RealBtrfsFixtureCleanup {
                 std::fs::remove_dir(&directory)?;
                 continue;
             }
-            for snapshot in std::fs::read_dir(directory)? {
+            // External whole-state stores add a managed/ level; older fixtures
+            // override only BTRFS_AWACS_MANAGED_DIR and store cuts directly.
+            let cuts = if directory.join("managed").is_dir() {
+                directory.join("managed")
+            } else {
+                directory
+            };
+            for snapshot in std::fs::read_dir(cuts)? {
                 let snapshot = snapshot?.path();
                 if snapshot
                     .file_name()
@@ -323,7 +330,8 @@ fn remove_fixture_git_snapshots(git_dir: &std::path::Path) -> std::io::Result<()
                 {
                     std::fs::remove_dir(&cut)?;
                 } else {
-                    remove_fixture_tree(&cut.join("snapshot"))?;
+                    let snapshot = cut.join("snapshot");
+                    remove_fixture_tree(if snapshot.exists() { &snapshot } else { &cut })?;
                 }
             }
         }
@@ -1561,7 +1569,10 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
                 );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            main.write_file("tracked/002", "edit between the JJ scan and physical clone\n");
+            main.write_file(
+                "tracked/002",
+                "edit between the JJ scan and physical clone\n",
+            );
             std::fs::write(pause.join("release"), b"release\n")?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             let status = loop {
@@ -2181,13 +2192,9 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
             else {
                 panic!("rebuilding must retain an established Git lane");
             };
-            assert_eq!(
+            assert_ne!(
                 after.retention_token, before.retention_token,
-                "rebuilding the JJ baseline must preserve the established Git lane"
-            );
-            assert!(
-                !std::fs::read_to_string(&operation_trace)?.contains("query/trivial-response"),
-                "refreshing a valid Git cursor must remain incremental"
+                "rebuilding the store must replace the Git cursor too"
             );
         } else {
             assert_ne!(
@@ -2362,6 +2369,216 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
     );
     assert_eq!(inspect_git_index(&repo_root.join(".git/index"))?.entries, 0);
     cleanup.cleanup()?;
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+#[test]
+#[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
+fn test_external_awacs_rebuild_and_gc_after_repository_deletion() -> TestResult {
+    use btrfs_awacs::store::Store;
+    use std::fs::File;
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Command;
+
+    let btrfs_root = std::path::PathBuf::from(
+        std::env::var_os("JJ_TEST_BTRFS_ROOT").expect("JJ_TEST_BTRFS_ROOT is required"),
+    );
+    let awacs_command =
+        std::env::var_os("BTRFS_AWACS_COMMAND").expect("BTRFS_AWACS_COMMAND is required");
+    let broker = std::env::var_os("BTRFS_AWACS_BROKER_DIR")
+        .or_else(|| std::env::var_os("BTRFS_AWACS_BROKER_SOCKET"))
+        .expect("BTRFS_AWACS_BROKER_DIR is required");
+    let suffix = format!("{:032x}", rand::random::<u128>());
+    let repo_root = btrfs_root.join(format!("jj-external-{suffix}"));
+    let state = btrfs_root.join(format!(".jj-external-state-{suffix}"));
+    let runtime = std::env::temp_dir().join(format!("jj-external-{suffix}"));
+    let external = state.join("managed");
+    for directory in [&repo_root, &state, &runtime, &external] {
+        std::fs::create_dir(directory)?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let mut cleanup = RealBtrfsFixtureCleanup::new(repo_root.clone(), state, runtime.clone());
+    let hook = runtime.join("git-fsmonitor-awacs");
+    std::os::unix::fs::symlink(&awacs_command, &hook)?;
+    let mut paths = vec![runtime.clone()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths)?;
+    let configure = |cmd: &mut assert_cmd::Command, use_external: bool| {
+        cmd.env("PATH", &path)
+            .env("BTRFS_AWACS_COMMAND", &awacs_command)
+            .env("BTRFS_AWACS_BROKER_DIR", &broker)
+            .env_remove("BTRFS_AWACS_MANAGED_DIR")
+            .env_remove("BTRFS_AWACS_STATE_DIR");
+        if use_external {
+            cmd.env("BTRFS_AWACS_STATE_DIR", &external);
+        }
+    };
+    let test_env = TestEnvironment::default();
+    let worktree = test_env.work_dir(&repo_root);
+    worktree
+        .run_jj_with(|cmd| {
+            configure(cmd, false);
+            cmd.args(["git", "init", "--colocate", "."])
+        })
+        .success();
+    worktree.write_file("tracked", "initial\n");
+    worktree
+        .run_jj_with(|cmd| {
+            configure(cmd, false);
+            cmd.args(["commit", "-m", "initial"])
+        })
+        .success();
+    worktree
+        .run_jj_with(|cmd| {
+            configure(cmd, false);
+            cmd.args(["util", "subvolume", "enable"])
+        })
+        .success();
+    let key = btrfs_awacs::bootstrap::root_state_key(&repo_root)?;
+    let legacy = repo_root.join(".git/awacs").join(&key);
+    let current = external.join(&key);
+    let old_store = Store::open(&legacy.join("manager.sqlite3"))?
+        .metadata()?
+        .store_uuid;
+    // Older installations kept the cut subvolume directly in managed/.
+    // Explicit rebuild must also reclaim that physical layout.
+    btrfs_awacs::btrfs::create_snapshot(
+        File::open(&repo_root)?.as_fd(),
+        File::open(legacy.join("managed"))?.as_fd(),
+        b"s-1000000",
+        true,
+    )?;
+    let sibling_key = "00000000-0000-4000-8000-000000000001";
+    let siblings = [
+        repo_root.join(".git/awacs").join(&sibling_key),
+        external.join(&sibling_key),
+    ];
+    for sibling in &siblings {
+        std::fs::create_dir(sibling)?;
+        std::fs::write(sibling.join("keep"), b"unrelated state")?;
+    }
+    worktree.write_file("tracked", "unsnapshotted edit\n");
+    worktree.write_file("new-file", "preserved\n");
+    let rebuild = || {
+        worktree
+            .run_jj_with(|cmd| {
+                configure(cmd, true);
+                cmd.args(["util", "subvolume", "enable", "--rebuild-baseline"])
+            })
+            .success()
+    };
+    rebuild();
+    assert!(
+        !legacy.exists(),
+        "rebuild must discard legacy state and snapshots"
+    );
+    assert_ne!(
+        Store::open(&current.join("manager.sqlite3"))?
+            .metadata()?
+            .store_uuid,
+        old_store
+    );
+    for sibling in &siblings {
+        assert_eq!(std::fs::read(sibling.join("keep"))?, b"unrelated state");
+        std::fs::remove_dir_all(sibling)?;
+    }
+    assert_eq!(worktree.read_file("tracked"), "unsnapshotted edit\n");
+    assert_eq!(worktree.read_file("new-file"), "preserved\n");
+    let check = || {
+        let status = worktree
+            .run_jj_with(|cmd| {
+                configure(cmd, true);
+                cmd.args(["util", "subvolume", "status"])
+            })
+            .success();
+        assert!(status.stdout.raw().contains("Consistency: OK"), "{status}");
+    };
+    check();
+
+    // Rebuild must work even when the old database can no longer be opened.
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = current.join(format!("manager.sqlite3{suffix}"));
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar)?;
+        }
+    }
+    std::fs::write(current.join("manager.sqlite3"), b"corrupt manager database")?;
+    rebuild();
+    check();
+
+    let gc = |dry_run: bool| -> std::io::Result<std::process::Output> {
+        let mut command = Command::new(&awacs_command);
+        command
+            .arg("gc")
+            .env("BTRFS_AWACS_STATE_DIR", &external)
+            .env("BTRFS_AWACS_BROKER_DIR", &broker)
+            .env_remove("BTRFS_AWACS_MANAGED_DIR");
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        command.output()
+    };
+    let renamed = btrfs_root.join(format!("jj-external-renamed-{suffix}"));
+    std::fs::rename(&repo_root, &renamed)?;
+    cleanup.track_subvolume_root(renamed.clone());
+    for dry_run in [true, false] {
+        let output = gc(dry_run)?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            current.join("manager.sqlite3").is_file(),
+            "a rename must not collect the source's store"
+        );
+    }
+    remove_fixture_tree(&renamed)?;
+    let output = gc(true)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        current.join("manager.sqlite3").is_file(),
+        "dry-run must preserve orphan state"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let output = gc(false)?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !current.exists() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "orphan state was not collected: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Snapshot deletion runs in the broker; wait for its private trash to drain.
+    loop {
+        match cleanup.cleanup() {
+            Ok(()) => break,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture cleanup failed: {error}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -6465,7 +6682,7 @@ fn test_stale_rebuild_preserves_files_when_operation_changes_during_scan() -> Te
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]
-fn test_util_subvolume_rebuild_preserves_journal_when_manager_is_missing() -> TestResult {
+fn test_util_subvolume_rebuild_preserves_journal_when_root_is_not_a_subvolume() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();
     let main_dir = test_env.work_dir("main");
@@ -6480,15 +6697,15 @@ fn test_util_subvolume_rebuild_preserves_journal_when_manager_is_missing() -> Te
     let tree_state_before = std::fs::read(&tree_state_path)?;
     let operation_before = main_dir.current_operation_id();
 
-    // The temp workspace has no AWACS manager. Do not use the synthetic scan
-    // environment: the real manager-open check must reject it before reset.
+    // The temp workspace is not a Btrfs subvolume. Do not use the synthetic
+    // scan environment: physical-state validation must reject it before reset.
     let output = main_dir.run_jj(["util", "subvolume", "enable", "--rebuild-baseline"]);
     assert!(!output.status.success(), "{output}");
     assert!(
         output
             .stderr
             .raw()
-            .contains("failed to open existing AWACS root state"),
+            .contains("failed to rebuild AWACS root state"),
         "{output}"
     );
     assert_eq!(std::fs::read(checkout_path)?, checkout_before);
@@ -7790,9 +8007,11 @@ exit 1
 "#,
     );
     let output = main_dir.run_jj_with(|cmd| {
-        cmd.env("PATH", &path)
-            .env("JJ_TEST_BTRFS_CLI", "1")
-            .args(["workspace", "remove", "secondary"])
+        cmd.env("PATH", &path).env("JJ_TEST_BTRFS_CLI", "1").args([
+            "workspace",
+            "remove",
+            "secondary",
+        ])
     });
     assert!(!output.status.success(), "{output}");
     assert!(
@@ -10941,15 +11160,21 @@ fn test_workspace_remove_does_not_need_btrfs_program_for_ordinary_target() {
     test_env.run_jj_in(".", ["git", "init", "main"]).success();
     let main_dir = test_env.work_dir("main");
     main_dir.run_jj(["workspace", "add", "../target"]).success();
-    let path = install_fake_btrfs(&test_env, r#"#!/bin/sh
+    let path = install_fake_btrfs(
+        &test_env,
+        r#"#!/bin/sh
 touch "$BTRFS_INVOKED"
 exit 1
-"#);
+"#,
+    );
     let sentinel = test_env.env_root().join("btrfs-invoked");
-    main_dir.run_jj_with(|cmd| {
-        cmd.env("PATH", &path).env("BTRFS_INVOKED", &sentinel)
-            .args(["workspace", "remove", "target"])
-    }).success();
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("BTRFS_INVOKED", &sentinel)
+                .args(["workspace", "remove", "target"])
+        })
+        .success();
     assert!(!sentinel.exists());
     assert!(!test_env.env_root().join("target").exists());
 }

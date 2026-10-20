@@ -19,7 +19,12 @@ use std::time::Instant;
 pub const ROOT_INODE: u64 = 256;
 pub const TOP_LEVEL_ROOT_ID: u64 = 5;
 const ROOT_TREE_OBJECT_ID: u64 = 1;
+const UUID_TREE_OBJECT_ID: u64 = 9;
+const ROOT_ITEM_KEY: u32 = 132;
 const ROOT_REF_KEY: u32 = 156;
+const UUID_KEY_SUBVOL: u32 = 251;
+const LAST_FREE_OBJECT_ID: u64 = u64::MAX - 255;
+const MAX_SUBVOLUME_PROBE_ITEMS: usize = 1_000_000;
 /// Input flag for `BTRFS_IOC_SNAP_CREATE_V2`.
 pub const SUBVOL_RDONLY: u64 = 1 << 1;
 /// Input flag for `BTRFS_IOC_SNAP_DESTROY_V2` that selects a subvolume by root
@@ -495,6 +500,262 @@ pub fn has_nested_subvolumes(fd: BorrowedFd<'_>, root_id: u64) -> Result<bool, B
         ));
     }
     Ok(args.header.key.nr_items == 1)
+}
+
+/// Tests a subvolume UUID against filesystem metadata, independent of its path.
+///
+/// The UUID index narrows the positive lookup, but only a current root item
+/// with nonzero root references establishes existence. Deleted root items can
+/// remain during cleanup. A negative answer requires a complete root-tree scan:
+/// the UUID index can be undergoing reconstruction.
+/// Errors and an exceeded scan bound never become evidence that a root is gone.
+/// The caller needs the credentials required by TREE_SEARCH_V2 on this fd.
+pub fn subvolume_uuid_exists(fd: BorrowedFd<'_>, uuid: [u8; 16]) -> Result<bool, BtrfsError> {
+    if uuid == [0; 16] {
+        return Err(BtrfsError::new("subvolume UUID must not be zero"));
+    }
+    let uuid_key = SearchKey {
+        object_id: u64::from_le_bytes(uuid[..8].try_into().unwrap()),
+        kind: UUID_KEY_SUBVOL,
+        offset: u64::from_le_bytes(uuid[8..].try_into().unwrap()),
+    };
+    match search_tree_items(fd, UUID_TREE_OBJECT_ID, uuid_key, uuid_key, 1) {
+        Ok(items) if !items.is_empty() => {
+            let payload = &items[0].payload;
+            if payload.is_empty() || payload.len() % 8 != 0 {
+                return Err(BtrfsError::new("invalid Btrfs UUID index item"));
+            }
+            for bytes in payload.chunks_exact(8) {
+                let root_id = u64::from_le_bytes(bytes.try_into().unwrap());
+                if root_id != TOP_LEVEL_ROOT_ID
+                    && !(ROOT_INODE..=LAST_FREE_OBJECT_ID).contains(&root_id)
+                {
+                    return Err(BtrfsError::new("invalid root ID in Btrfs UUID index"));
+                }
+                let min = SearchKey {
+                    object_id: root_id,
+                    kind: ROOT_ITEM_KEY,
+                    offset: 0,
+                };
+                let max = SearchKey {
+                    offset: u64::MAX,
+                    ..min
+                };
+                for item in search_tree_items(fd, ROOT_TREE_OBJECT_ID, min, max, 128)? {
+                    if root_item_matches_live_uuid(&item.payload, uuid)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        // Older filesystems can lack a UUID tree; the root tree still proves
+        // existence. Any other ioctl failure remains an error.
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(error) => return Err(error),
+    }
+    probe_root_items(uuid, MAX_SUBVOLUME_PROBE_ITEMS, |min, max, limit| {
+        search_tree_items(fd, ROOT_TREE_OBJECT_ID, min, max, limit)
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SearchKey {
+    object_id: u64,
+    kind: u32,
+    offset: u64,
+}
+
+impl SearchKey {
+    fn successor(self) -> Option<Self> {
+        if self.offset < u64::MAX {
+            Some(Self {
+                offset: self.offset + 1,
+                ..self
+            })
+        } else if self.kind < u8::MAX as u32 {
+            Some(Self {
+                kind: self.kind + 1,
+                offset: 0,
+                ..self
+            })
+        } else {
+            self.object_id.checked_add(1).map(|object_id| Self {
+                object_id,
+                kind: 0,
+                offset: 0,
+            })
+        }
+    }
+}
+
+struct SearchItem {
+    key: SearchKey,
+    payload: Vec<u8>,
+}
+
+fn search_tree_items(
+    fd: BorrowedFd<'_>,
+    tree_id: u64,
+    min: SearchKey,
+    max: SearchKey,
+    limit: u32,
+) -> Result<Vec<SearchItem>, BtrfsError> {
+    let mut args = BtrfsIoctlSearchArgsV2Buffer {
+        header: BtrfsIoctlSearchArgsV2 {
+            key: BtrfsIoctlSearchKey {
+                tree_id,
+                min_objectid: min.object_id,
+                max_objectid: max.object_id,
+                min_offset: min.offset,
+                max_offset: max.offset,
+                min_transid: 0,
+                max_transid: u64::MAX,
+                min_type: min.kind,
+                max_type: max.kind,
+                nr_items: limit,
+                unused: 0,
+                unused1: 0,
+                unused2: 0,
+                unused3: 0,
+                unused4: 0,
+            },
+            buf_size: (512 * size_of::<u64>()) as u64,
+        },
+        buffer: [0; 512],
+    };
+    ioctl(
+        fd,
+        BTRFS_IOC_TREE_SEARCH_V2,
+        &mut args,
+        "BTRFS_IOC_TREE_SEARCH_V2 subvolume existence",
+    )?;
+    if args.header.key.nr_items > limit {
+        return Err(BtrfsError::new(
+            "Btrfs tree search exceeded requested item count",
+        ));
+    }
+    // Headers are native-endian UAPI data; item payloads remain little-endian
+    // on-disk structures. Copying the fixed buffer avoids unaligned reads.
+    let bytes: Vec<u8> = args
+        .buffer
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .collect();
+    parse_search_items(&bytes, args.header.key.nr_items, min, max)
+}
+
+fn parse_search_items(
+    bytes: &[u8],
+    count: u32,
+    min: SearchKey,
+    max: SearchKey,
+) -> Result<Vec<SearchItem>, BtrfsError> {
+    let mut cursor = 0_usize;
+    let mut items = Vec::new();
+    for _ in 0..count {
+        let header = bytes
+            .get(cursor..cursor + 32)
+            .ok_or_else(|| BtrfsError::new("truncated Btrfs tree-search header"))?;
+        let key = SearchKey {
+            object_id: u64::from_ne_bytes(header[8..16].try_into().unwrap()),
+            offset: u64::from_ne_bytes(header[16..24].try_into().unwrap()),
+            kind: u32::from_ne_bytes(header[24..28].try_into().unwrap()),
+        };
+        if key < min
+            || key > max
+            || items
+                .last()
+                .is_some_and(|item: &SearchItem| item.key >= key)
+        {
+            return Err(BtrfsError::new(
+                "invalid Btrfs tree-search key order or range",
+            ));
+        }
+        let length = u32::from_ne_bytes(header[28..32].try_into().unwrap()) as usize;
+        cursor += 32;
+        let end = cursor
+            .checked_add(length)
+            .ok_or_else(|| BtrfsError::new("Btrfs tree-search item length overflow"))?;
+        let payload = bytes
+            .get(cursor..end)
+            .ok_or_else(|| BtrfsError::new("truncated Btrfs tree-search item"))?
+            .to_vec();
+        items.push(SearchItem { key, payload });
+        cursor = end;
+    }
+    Ok(items)
+}
+
+fn probe_root_items(
+    uuid: [u8; 16],
+    max_items: usize,
+    mut search: impl FnMut(SearchKey, SearchKey, u32) -> Result<Vec<SearchItem>, BtrfsError>,
+) -> Result<bool, BtrfsError> {
+    let mut next = SearchKey {
+        object_id: TOP_LEVEL_ROOT_ID,
+        kind: 0,
+        offset: 0,
+    };
+    let end = SearchKey {
+        object_id: LAST_FREE_OBJECT_ID,
+        kind: u8::MAX as u32,
+        offset: u64::MAX,
+    };
+    let mut inspected = 0;
+    while next <= end {
+        if inspected >= max_items {
+            return Err(BtrfsError::new(
+                "subvolume existence scan exceeded its item limit; retain state",
+            ));
+        }
+        let items = search(
+            next,
+            end,
+            u32::try_from((max_items - inspected).min(128)).unwrap(),
+        )?;
+        if items.is_empty() {
+            return Ok(false);
+        }
+        inspected += items.len();
+        for item in &items {
+            if item.key.kind != ROOT_ITEM_KEY
+                || (item.key.object_id != TOP_LEVEL_ROOT_ID && item.key.object_id < ROOT_INODE)
+            {
+                continue;
+            }
+            if root_item_matches_live_uuid(&item.payload, uuid)? {
+                return Ok(true);
+            }
+        }
+        next = items
+            .last()
+            .unwrap()
+            .key
+            .successor()
+            .ok_or_else(|| BtrfsError::new("Btrfs root search key overflow"))?;
+    }
+    Ok(false)
+}
+
+fn root_item_matches_live_uuid(payload: &[u8], uuid: [u8; 16]) -> Result<bool, BtrfsError> {
+    // Packed UAPI btrfs_root_item offsets: generation 160, refs 216,
+    // generation_v2 239, UUID 247. Kernel deletion sets refs to zero before
+    // asynchronous root cleanup; the retained UUID is not a live source.
+    if payload.len() < 263 {
+        return Err(BtrfsError::new(
+            "legacy Btrfs root item cannot prove UUID absence",
+        ));
+    }
+    let generation = u64::from_le_bytes(payload[160..168].try_into().unwrap());
+    let generation_v2 = u64::from_le_bytes(payload[239..247].try_into().unwrap());
+    if generation != generation_v2 {
+        return Err(BtrfsError::new(
+            "stale Btrfs root UUID cannot prove absence",
+        ));
+    }
+    let refs = u32::from_le_bytes(payload[216..220].try_into().unwrap());
+    Ok(payload[247..263] == uuid && refs != 0)
 }
 
 /// Resolves every path naming one inode inside the subvolume rooted at fd.
@@ -1447,6 +1708,213 @@ mod tests {
                 .to_string()
                 .contains("must not be zero")
         );
+    }
+
+    fn root_probe_item(id: u64, uuid: [u8; 16]) -> SearchItem {
+        let mut payload = vec![0; 263];
+        payload[160..168].copy_from_slice(&3_u64.to_le_bytes());
+        payload[216..220].copy_from_slice(&1_u32.to_le_bytes());
+        payload[239..247].copy_from_slice(&3_u64.to_le_bytes());
+        payload[247..263].copy_from_slice(&uuid);
+        SearchItem {
+            key: SearchKey {
+                object_id: id,
+                kind: ROOT_ITEM_KEY,
+                offset: 0,
+            },
+            payload,
+        }
+    }
+
+    #[test]
+    fn subvolume_probe_finds_uuid_without_a_path_or_uuid_index_entry() {
+        let mut calls = 0;
+        let found = probe_root_items([7; 16], 100, |next, _, _| {
+            calls += 1;
+            match calls {
+                1 => Ok(vec![root_probe_item(256, [6; 16])]),
+                2 => {
+                    assert!(
+                        next > SearchKey {
+                            object_id: 256,
+                            kind: ROOT_ITEM_KEY,
+                            offset: 0
+                        }
+                    );
+                    Ok(vec![root_probe_item(300, [7; 16])])
+                }
+                _ => panic!("must stop on matching UUID"),
+            }
+        })
+        .unwrap();
+        assert!(found);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn subvolume_probe_requires_complete_search_to_report_absence() {
+        let mut calls = 0;
+        let found = probe_root_items([7; 16], 100, |_, _, _| {
+            calls += 1;
+            Ok(if calls == 1 {
+                vec![root_probe_item(256, [6; 16])]
+            } else {
+                vec![]
+            })
+        })
+        .unwrap();
+        assert!(!found);
+        assert_eq!(calls, 2);
+        let error = probe_root_items([7; 16], 1, |_, _, _| {
+            Ok(vec![root_probe_item(256, [6; 16])])
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("item limit"));
+        assert!(
+            probe_root_items([7; 16], 100, |_, _, _| {
+                Err(BtrfsError::new("unavailable filesystem"))
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn subvolume_probe_ignores_deleted_root_items_while_snapshot_remains() {
+        let mut calls = 0;
+        assert!(
+            !probe_root_items([7; 16], 100, |_, _, _| {
+                calls += 1;
+                if calls == 1 {
+                    let mut deleted = root_probe_item(256, [7; 16]);
+                    deleted.payload[216..220].copy_from_slice(&0_u32.to_le_bytes());
+                    Ok(vec![deleted, root_probe_item(257, [8; 16])])
+                } else {
+                    Ok(vec![])
+                }
+            })
+            .unwrap()
+        );
+        assert_eq!(calls, 2, "absence still requires completing the root scan");
+    }
+
+    #[test]
+    #[ignore = "requires root and a Btrfs temporary directory"]
+    fn subvolume_probe_distinguishes_deleted_source_from_its_retained_snapshot() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let fixture = tempfile::Builder::new()
+            .prefix("awacs-probe-deleted-")
+            .tempdir()
+            .unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = remove_tree(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(fixture.path().to_owned());
+        let original = fixture.path().join("source");
+        assert!(
+            std::process::Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(&original)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(original.join("keep"), b"snapshot survives").unwrap();
+        let source = File::open(&original).unwrap();
+        let source_info = subvolume_info(source.as_fd()).unwrap();
+        let parent = File::open(fixture.path()).unwrap();
+        create_snapshot(source.as_fd(), parent.as_fd(), b"snapshot", true).unwrap();
+        let snapshot = File::open(fixture.path().join("snapshot")).unwrap();
+        let snapshot_info = subvolume_info(snapshot.as_fd()).unwrap();
+        assert!(subvolume_uuid_exists(parent.as_fd(), source_info.uuid).unwrap());
+        std::fs::rename(&original, fixture.path().join("renamed")).unwrap();
+        assert!(
+            subvolume_uuid_exists(parent.as_fd(), source_info.uuid).unwrap(),
+            "rename must preserve logical existence"
+        );
+        destroy_snapshot(parent.as_fd(), b"renamed").unwrap();
+        sync_subvolume(parent.as_fd()).unwrap();
+        let min = SearchKey {
+            object_id: source_info.root_id,
+            kind: ROOT_ITEM_KEY,
+            offset: 0,
+        };
+        let retained = search_tree_items(
+            parent.as_fd(),
+            ROOT_TREE_OBJECT_ID,
+            min,
+            SearchKey {
+                offset: u64::MAX,
+                ..min
+            },
+            128,
+        )
+        .unwrap();
+        for item in &retained {
+            assert_eq!(
+                u32::from_le_bytes(item.payload[216..220].try_into().unwrap()),
+                0
+            );
+        }
+        eprintln!("deleted source root items retained: {}", retained.len());
+        assert!(
+            !subvolume_uuid_exists(parent.as_fd(), source_info.uuid).unwrap(),
+            "deleted source must be absent while its snapshot remains"
+        );
+        assert!(subvolume_uuid_exists(parent.as_fd(), snapshot_info.uuid).unwrap());
+        assert_eq!(
+            std::fs::read(fixture.path().join("snapshot/keep")).unwrap(),
+            b"snapshot survives"
+        );
+    }
+
+    #[test]
+    fn subvolume_probe_never_treats_legacy_or_stale_root_metadata_as_absence() {
+        for stale in [false, true] {
+            let error = probe_root_items([7; 16], 100, |_, _, _| {
+                let mut item = root_probe_item(256, [6; 16]);
+                if stale {
+                    item.payload[239..247].copy_from_slice(&2_u64.to_le_bytes());
+                } else {
+                    item.payload.truncate(239);
+                }
+                Ok(vec![item])
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("cannot prove"));
+        }
+    }
+
+    #[test]
+    fn subvolume_probe_rejects_zero_uuid_before_ioctl() {
+        let file = File::open("/dev/null").unwrap();
+        assert!(
+            subvolume_uuid_exists(file.as_fd(), [0; 16])
+                .unwrap_err()
+                .to_string()
+                .contains("must not be zero")
+        );
+        assert!(subvolume_uuid_exists(file.as_fd(), [7; 16]).is_err());
+    }
+
+    #[test]
+    fn tree_search_parser_rejects_truncation_and_wrong_keys() {
+        let key = SearchKey {
+            object_id: 256,
+            kind: ROOT_ITEM_KEY,
+            offset: 0,
+        };
+        let mut bytes = vec![0; 32];
+        bytes[8..16].copy_from_slice(&key.object_id.to_ne_bytes());
+        bytes[24..28].copy_from_slice(&key.kind.to_ne_bytes());
+        bytes[28..32].copy_from_slice(&263_u32.to_ne_bytes());
+        assert!(parse_search_items(&bytes, 1, key, key).is_err());
+        bytes.resize(295, 0);
+        assert_eq!(parse_search_items(&bytes, 1, key, key).unwrap().len(), 1);
+        bytes[8..16].copy_from_slice(&257_u64.to_ne_bytes());
+        assert!(parse_search_items(&bytes, 1, key, key).is_err());
     }
 
     #[test]

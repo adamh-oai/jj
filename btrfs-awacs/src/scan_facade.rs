@@ -18,7 +18,7 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(debug_assertions)]
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -34,7 +34,8 @@ const TEST_SHORT_SCAN_TTL_NS: i64 = 300_000_000;
 /// process and serializes publication through a per-root filesystem lock.
 pub struct DirectScanClient {
     handler: Arc<Mutex<DirectScanHandler>>,
-    root_lock: Arc<File>,
+    root_lock: Arc<Mutex<File>>,
+    root_lock_path: PathBuf,
     git_publisher: Option<GitPublisher>,
 }
 
@@ -51,17 +52,20 @@ impl DirectScanClient {
             .manager_db
             .parent()
             .ok_or_else(|| other("AWACS manager database has no state directory"))?;
+        let root_lock_path = state_dir.join("root.lock");
         let root_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .mode(0o600)
-            .open(state_dir.join("root.lock"))
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&root_lock_path)
             .map_err(|error| unavailable(format!("open AWACS root lock: {error}")))?;
+        let root_lock = Mutex::new(root_lock);
         let service = {
             let lock_started = Instant::now();
-            let _state_lock = RootLockGuard::acquire(&root_lock)?;
+            let _state_lock = RootLockGuard::acquire(&root_lock, &root_lock_path)?;
             tracing::info!(
                 elapsed_ms = lock_started.elapsed().as_millis() as u64,
                 root = %root.display(),
@@ -90,6 +94,7 @@ impl DirectScanClient {
                 unsafe { libc::getegid() },
             ))),
             root_lock: Arc::new(root_lock),
+            root_lock_path,
             git_publisher: None,
         })
     }
@@ -109,7 +114,7 @@ impl DirectScanClient {
     }
 
     fn lock_root(&self) -> Result<RootLockGuard<'_>, ScanError> {
-        RootLockGuard::acquire(&self.root_lock)
+        RootLockGuard::acquire(&self.root_lock, &self.root_lock_path)
     }
 
     /// Returns the exact sequence-zero baseline for a first consumer which
@@ -237,6 +242,7 @@ impl ScanClient for DirectScanClient {
             Box::new(DirectScanSession {
                 handler: Arc::clone(&self.handler),
                 root_lock: Arc::clone(&self.root_lock),
+                root_lock_path: self.root_lock_path.clone(),
                 session_id,
             }),
         );
@@ -263,13 +269,14 @@ impl ScanClient for DirectScanClient {
 
 struct DirectScanSession {
     handler: Arc<Mutex<DirectScanHandler>>,
-    root_lock: Arc<File>,
+    root_lock: Arc<Mutex<File>>,
+    root_lock_path: PathBuf,
     session_id: Vec<u8>,
 }
 
 impl DirectScanSession {
     fn lock_root(&self) -> Result<RootLockGuard<'_>, ScanError> {
-        RootLockGuard::acquire(&self.root_lock)
+        RootLockGuard::acquire(&self.root_lock, &self.root_lock_path)
     }
 }
 
@@ -304,11 +311,17 @@ impl ScanSession for DirectScanSession {
 }
 
 struct RootLockGuard<'a> {
-    file: &'a File,
+    file: MutexGuard<'a, File>,
 }
 
 impl<'a> RootLockGuard<'a> {
-    fn acquire(file: &'a File) -> Result<Self, ScanError> {
+    fn acquire(file: &'a Mutex<File>, path: &Path) -> Result<Self, ScanError> {
+        // Client and lease sessions share one open-file description. flock
+        // does not exclude another thread using that same description, so
+        // keep the local mutex until this guard has also released flock.
+        let file = file
+            .lock()
+            .map_err(|_| other("AWACS direct scan root lock poisoned"))?;
         // SAFETY: flock only inspects the valid open file descriptor and
         // blocks until another cooperating AWACS process releases it.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
@@ -317,7 +330,10 @@ impl<'a> RootLockGuard<'a> {
                 std::io::Error::last_os_error()
             )));
         }
-        Ok(Self { file })
+        let guard = Self { file };
+        crate::gc::ensure_current_lock(&guard.file, path)
+            .map_err(|error| unavailable(error.to_string()))?;
+        Ok(guard)
     }
 }
 
@@ -1100,6 +1116,77 @@ fn full_scan_required(message: impl Into<String>) -> ScanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_root_lock_serializes_threads_and_rechecks_retirement_after_waiting() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for retire_while_waiting in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("root.lock");
+            let file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            let shared = Arc::new(Mutex::new(file));
+            let independent = File::open(&path).unwrap();
+            let first = RootLockGuard::acquire(&shared, &path).unwrap();
+            let (waiting_tx, waiting_rx) = mpsc::channel();
+            let (acquired_tx, acquired_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let timeout = Duration::from_secs(10);
+            let waiter = {
+                let shared = Arc::clone(&shared);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    // Deterministically establish that the first operation
+                    // still owns the local lock before this session waits.
+                    waiting_tx.send(shared.try_lock().is_err()).unwrap();
+                    let guard = RootLockGuard::acquire(&shared, &path);
+                    acquired_tx
+                        .send(guard.as_ref().map(|_| ()).map_err(|error| error.kind()))
+                        .unwrap();
+                    release_rx.recv_timeout(timeout).unwrap();
+                    drop(guard);
+                })
+            };
+            assert!(waiting_rx.recv_timeout(timeout).unwrap());
+            if retire_while_waiting {
+                crate::gc::mark_retired_lock(&first.file).unwrap();
+            }
+            drop(first);
+            let result = acquired_rx.recv_timeout(timeout).unwrap();
+            if retire_while_waiting {
+                assert_eq!(result, Err(ScanErrorKind::Unavailable));
+            } else {
+                assert_eq!(result, Ok(()));
+                // Dropping the first guard must not release the waiting
+                // session's kernel lock, including while it waits on work.
+                assert_ne!(
+                    unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                    0
+                );
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EWOULDBLOCK)
+                );
+            }
+            release_tx.send(()).unwrap();
+            waiter.join().unwrap();
+            assert_eq!(
+                unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            assert_eq!(
+                unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_UN) },
+                0
+            );
+        }
+    }
 
     #[test]
     fn unidentified_git_hook_callers_are_rejected_before_opening_root_state() {

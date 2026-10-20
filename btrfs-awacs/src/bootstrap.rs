@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -50,6 +51,27 @@ pub struct RootInitPaths {
 }
 
 impl RootInitPaths {
+    /// Resolves an existing UUID bundle without creating it or opening its live
+    /// worktree. Maintenance must be able to find state after that root is gone.
+    pub(crate) fn for_state_directory(state_dir: &Path) -> Result<Self, BootstrapError> {
+        let name = state_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| Uuid::parse_str(name).is_ok_and(|uuid| uuid.to_string() == *name))
+            .ok_or_else(|| {
+                BootstrapError::new("AWACS state directory must have a UUID basename")
+            })?;
+        let parent = state_dir
+            .parent()
+            .ok_or_else(|| BootstrapError::new("AWACS state directory has no parent"))?;
+        Ok(Self {
+            managed_dir: state_dir.join("managed"),
+            snapshot_trash_dir: parent.join(format!(".broker-trash-{name}")),
+            spool_dir: state_dir.join("spool"),
+            manager_db: state_dir.join("manager.sqlite3"),
+        })
+    }
+
     pub fn from_environment(root: &Path) -> Result<Self, BootstrapError> {
         let subvolume_uuid = live_subvolume_uuid(root)?;
         Self::for_subvolume_uuid(root, subvolume_uuid)
@@ -253,6 +275,14 @@ fn initialize_root_with_consumer_mode(
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| BootstrapError::new(format!("canonicalize AWACS root: {error}")))?;
     let _root_lock = lock_root_state(&canonical_root)?;
+    initialize_root_locked(&canonical_root, retain_watch_consumer, progress)
+}
+
+fn initialize_root_locked(
+    canonical_root: &Path,
+    retain_watch_consumer: bool,
+    progress: &mut impl FnMut(InitProgress),
+) -> Result<InitializedWatch, BootstrapError> {
     let now_ns = current_time_ns()?;
     progress(InitProgress::Phase("opening state"));
     let mut service = open_bootstrap_service(&canonical_root, now_ns)?;
@@ -736,14 +766,264 @@ fn open_existing_root_service(root: &Path) -> Result<(PathBuf, Service), Bootstr
     Ok((canonical_root, service))
 }
 
-/// Moves every old or partially-created managed snapshot into broker-owned
-/// trash before a caller discards this root's operational database during an
+/// Discards this live root's operational state and seeds an independent watch.
+/// Both the configured store and the root's former colocated store are retired;
+/// another worktree's UUID bundle is never included.
+pub fn rebuild_root(
+    root: &Path,
+    mut progress: impl FnMut(InitProgress),
+) -> Result<InitializedWatch, BootstrapError> {
+    let root = fs::canonicalize(root)
+        .map_err(|error| BootstrapError::new(format!("canonicalize AWACS root: {error}")))?;
+    discard_root_state(&root)?;
+    // Old clients retain the retired lock inode. They cannot use the new
+    // database even after this path acquires a fresh lock file.
+    let _root_lock = lock_root_state(&root)?;
+    initialize_root_locked(&root, false, &mut progress)
+}
+
+/// Retires exactly this root's current and legacy state bundles. The live root
+/// is required only to prove its identity; cleanup does not depend on a usable
+/// old database. Callers must serialize their own working-copy/index changes.
+pub fn discard_root_state(root: &Path) -> Result<usize, BootstrapError> {
+    let root = fs::canonicalize(root)
+        .map_err(|error| BootstrapError::new(format!("canonicalize AWACS root: {error}")))?;
+    let live = OpenedSubvolume::open(&root)
+        .map_err(|error| BootstrapError::new(format!("open AWACS root: {error}")))?;
+    let current = RootInitPaths::from_environment(&root)?;
+    let candidates = rebuild_state_candidates(&root, live.subvolume.uuid, &current)?;
+    let old_trash = candidates
+        .iter()
+        .map(|paths| paths.snapshot_trash_dir.clone())
+        .collect::<Vec<_>>();
+    let mut locked = Vec::new();
+    let mut identities = std::collections::HashSet::new();
+    for paths in candidates {
+        let state_dir = paths.manager_db.parent().expect("state bundle parent");
+        let Some(metadata) = existing_state_directory(state_dir)? else {
+            continue;
+        };
+        // Different spellings and bind mounts can refer to the same bundle.
+        if !identities.insert((metadata.dev(), metadata.ino())) {
+            continue;
+        }
+        for directory in [&paths.managed_dir, &paths.spool_dir] {
+            existing_state_directory(directory)?;
+        }
+        let lock = lock_root_state_paths_for_cleanup(&paths)?;
+        preflight_rebuild_state(&paths)?;
+        locked.push((paths, lock));
+    }
+    // Validate every bundle before retiring any of them. Active consumers or
+    // artifacts outside the scheduled cleanup must leave discovery state intact.
+    // Trash can outlive its bundle after an earlier interrupted cleanup.
+    for trash in old_trash {
+        relocate_snapshot_trash(&trash, &current.snapshot_trash_dir)?;
+    }
+    let mut trashed = 0;
+    for (mut paths, lock) in locked {
+        crate::gc::mark_retired_lock(&lock.file)
+            .map_err(|error| BootstrapError::new(format!("retire AWACS root lock: {error}")))?;
+        paths.snapshot_trash_dir = current.snapshot_trash_dir.clone();
+        for directory in [&paths.managed_dir, &paths.spool_dir] {
+            create_private_directory(directory)?;
+        }
+        trashed += trash_snapshot_paths_for_rebuild(&paths)?;
+        let state_dir = paths.manager_db.parent().expect("state bundle parent");
+        // A separately configured managed directory is not below state_dir.
+        if !paths.managed_dir.starts_with(state_dir) {
+            fs::remove_dir_all(&paths.managed_dir).map_err(|error| {
+                BootstrapError::new(format!("remove retired managed snapshots: {error}"))
+            })?;
+        }
+        fs::remove_dir_all(state_dir)
+            .map_err(|error| BootstrapError::new(format!("remove retired AWACS state: {error}")))?;
+        // The configured parent remains the durable home of broker trash.
+        if state_dir.parent() != current.manager_db.parent().and_then(Path::parent) {
+            let _ = fs::remove_dir(state_dir.parent().expect("state root parent"));
+        }
+    }
+    Ok(trashed)
+}
+
+fn rebuild_state_candidates(
+    root: &Path,
+    subvolume_uuid: [u8; 16],
+    current: &RootInitPaths,
+) -> Result<Vec<RootInitPaths>, BootstrapError> {
+    let key = Uuid::from_bytes(subvolume_uuid).to_string();
+    let mut candidates = vec![current.clone()];
+    for state_root in [default_state_root(root)?, hidden_sibling_state_root(root)?] {
+        candidates.push(RootInitPaths::for_state_directory(&state_root.join(&key))?);
+    }
+    candidates.sort_by(|left, right| left.manager_db.cmp(&right.manager_db));
+    candidates.dedup_by(|left, right| left.manager_db == right.manager_db);
+    Ok(candidates)
+}
+
+fn existing_state_directory(path: &Path) -> Result<Option<fs::Metadata>, BootstrapError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(metadata)),
+        Ok(_) => Err(BootstrapError::new(format!(
+            "AWACS state path {} must be a directory, not a symlink",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(BootstrapError::new(format!(
+            "inspect AWACS state {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn preflight_rebuild_state(paths: &RootInitPaths) -> Result<(), BootstrapError> {
+    match fs::symlink_metadata(&paths.manager_db) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(BootstrapError::new(
+                "AWACS manager database must be a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(BootstrapError::new(format!(
+                "inspect AWACS manager: {error}"
+            )));
+        }
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        &paths.manager_db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| BootstrapError::new(format!("open AWACS retention state: {error}")))?;
+    // Explicit rebuild is also the repair path for a malformed database. Old
+    // clients are fenced through their lock descriptor before it is removed.
+    match connection.query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0)) {
+        Ok(result) if result == "ok" => {}
+        Ok(_) => return Ok(()),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(BootstrapError::new(format!(
+                "inspect AWACS retention state: {error}"
+            )));
+        }
+    }
+    if let Some(reason) =
+        crate::gc::retirement_blocker(&connection, read_boot_id()?, current_time_ns()?).map_err(
+            |error| BootstrapError::new(format!("inspect AWACS active operations: {error}")),
+        )?
+    {
+        return Err(BootstrapError::new(format!(
+            "AWACS state is still in use ({reason}); retry the rebuild after the operation finishes"
+        )));
+    }
+    crate::gc::validate_storage_paths(&connection, paths).map_err(|error| {
+        BootstrapError::new(format!(
+            "cannot rebuild AWACS state {}: {error}; preserve this database and restore its \
+             original BTRFS_AWACS_STATE_DIR/BTRFS_AWACS_MANAGED_DIR configuration before \
+             retrying, or explicitly retire the recorded external artifacts first; rebuild \
+             does not discover or migrate former split storage directories",
+            paths.manager_db.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Preserves already-retired snapshots when their old state parent is about
+/// to disappear. Renaming the broker-owned directory needs no access to its
+/// contents, and an in-flight broker drain continues through its open fd.
+fn relocate_snapshot_trash(old: &Path, current: &Path) -> Result<(), BootstrapError> {
+    if old == current || existing_state_directory(old)?.is_none() {
+        return Ok(());
+    }
+    let parent = current.parent().expect("snapshot trash parent");
+    create_private_directory(parent)?;
+    let old_parent = old.parent().expect("old snapshot trash parent");
+    let current_parent = fs::canonicalize(parent)
+        .map_err(|error| BootstrapError::new(format!("resolve snapshot trash parent: {error}")))?;
+    if fs::canonicalize(old_parent).ok().as_ref() == Some(&current_parent) {
+        return Ok(());
+    }
+    let name = format!(
+        "{}-{}",
+        current
+            .file_name()
+            .expect("snapshot trash basename")
+            .to_string_lossy(),
+        Uuid::new_v4()
+    );
+    match fs::rename(old, parent.join(&name)) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EXDEV | libc::EACCES | libc::EPERM)
+            ) =>
+        {
+            // Root-owned private trash can reject a cross-parent rename on
+            // permissions before the kernel reports the subvolume boundary.
+            // The broker validates both parents and handles its protected
+            // contents without relaxing snapshot or trash permissions.
+            let broker_directory = env::var_os("BTRFS_AWACS_BROKER_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    PathBuf::from(crate::broker_transport::DEFAULT_BROKER_DIRECTORY)
+                });
+            let broker = crate::broker_protocol::BrokerClient::connect_endpoint(
+                &broker_directory,
+                *Uuid::new_v4().as_bytes(),
+            )
+            .map_err(|error| {
+                BootstrapError::new(format!("connect snapshot cleanup broker: {error}"))
+            })?;
+            let source_parent = File::open(old_parent).map_err(|error| {
+                BootstrapError::new(format!("open old snapshot trash parent: {error}"))
+            })?;
+            let target_parent = File::open(parent).map_err(|error| {
+                BootstrapError::new(format!("open new snapshot trash parent: {error}"))
+            })?;
+            broker
+                .rehome_snapshot_trash(
+                    source_parent.as_fd(),
+                    old.file_name().expect("trash basename").as_bytes(),
+                    target_parent.as_fd(),
+                    name.as_bytes(),
+                )
+                .map_err(|error| {
+                    BootstrapError::new(format!("relocate retired AWACS snapshots: {error}"))
+                })?;
+        }
+        Err(error) => {
+            return Err(BootstrapError::new(format!(
+                "relocate retired AWACS snapshots: {error}"
+            )));
+        }
+    }
+    for directory in [old_parent, parent] {
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                BootstrapError::new(format!("persist retired snapshot relocation: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
+/// Retires every old or partially-created managed snapshot through the broker
+/// before a caller discards this root's operational database during an
 /// explicit rebuild.
 ///
 /// Rebuild deliberately does not open or interpret the old manager database:
 /// it creates one throwaway store only to authenticate a cleanup-only broker
 /// session, scans physical wrapper directories, then deletes the entire old
-/// state tree. Physical Btrfs deletion continues asynchronously after this
+/// state tree. Physical Btrfs deletion may continue asynchronously after this
 /// returns.
 pub fn trash_existing_root_snapshots_for_rebuild(root: &Path) -> Result<usize, BootstrapError> {
     let canonical_root = fs::canonicalize(root)
@@ -758,7 +1038,7 @@ pub fn trash_existing_root_snapshots_for_rebuild(root: &Path) -> Result<usize, B
 /// Only direct UUID state directories and one layer of explicitly retired
 /// worktree state are included. Paths come from this discarded tree, never
 /// environment overrides, live worktree directories, or the old database.
-/// Physical deletion remains asynchronous; the caller must confirm that the
+/// Physical deletion may remain asynchronous; the caller must confirm that the
 /// containing subvolume can be destroyed before reporting completion.
 pub fn trash_discarded_git_awacs_state(state_root: &Path) -> Result<usize, BootstrapError> {
     let metadata = fs::symlink_metadata(state_root)
@@ -768,6 +1048,13 @@ pub fn trash_discarded_git_awacs_state(state_root: &Path) -> Result<usize, Boots
             "discarded AWACS state must be a directory, not a symlink",
         ));
     }
+    let external_root = env::var_os("BTRFS_AWACS_MANAGED_DIR")
+        .or_else(|| env::var_os("BTRFS_AWACS_STATE_DIR"))
+        .map(PathBuf::from);
+    if let Some(external_root) = &external_root {
+        create_private_directory(external_root)?;
+        relocate_discarded_snapshot_trash(state_root, external_root, true)?;
+    }
     let mut state_dirs = Vec::new();
     collect_discarded_state_directories(state_root, true, &mut state_dirs)?;
     let mut trashed = 0usize;
@@ -776,7 +1063,7 @@ pub fn trash_discarded_git_awacs_state(state_root: &Path) -> Result<usize, Boots
             .file_name()
             .and_then(|name| name.to_str())
             .expect("collected state directory has a UUID basename");
-        let paths = RootInitPaths {
+        let mut paths = RootInitPaths {
             managed_dir: state_dir.join("managed"),
             snapshot_trash_dir: state_dir
                 .parent()
@@ -805,11 +1092,68 @@ pub fn trash_discarded_git_awacs_state(state_root: &Path) -> Result<usize, Boots
                 }
             }
         }
+        if let Some(external_root) = &external_root {
+            let external_trash = external_root.join(format!(".broker-trash-{state_name}"));
+            relocate_snapshot_trash(&paths.snapshot_trash_dir, &external_trash)?;
+            paths.snapshot_trash_dir = external_trash;
+        }
         trashed = trashed
             .checked_add(trash_snapshot_paths_for_rebuild(&paths)?)
             .ok_or_else(|| BootstrapError::new("discarded AWACS snapshot count overflow"))?;
     }
     Ok(trashed)
+}
+
+fn relocate_discarded_snapshot_trash(
+    state_root: &Path,
+    external_root: &Path,
+    include_retired: bool,
+) -> Result<(), BootstrapError> {
+    let entries = fs::read_dir(state_root)
+        .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| BootstrapError::new(format!("list discarded snapshot trash: {error}")))?;
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_directory = entry
+            .file_type()
+            .map_err(|error| {
+                BootstrapError::new(format!("inspect discarded snapshot trash: {error}"))
+            })?
+            .is_dir();
+        if !is_directory {
+            continue;
+        }
+        if let Some(suffix) = name.strip_prefix(".broker-trash-") {
+            let Some(uuid) = suffix
+                .get(..36)
+                .filter(|uuid| Uuid::parse_str(uuid).is_ok())
+            else {
+                continue;
+            };
+            let remainder = &suffix[36..];
+            if !remainder.is_empty()
+                && !remainder
+                    .strip_prefix('-')
+                    .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok())
+            {
+                continue;
+            }
+            relocate_snapshot_trash(
+                &entry.path(),
+                &external_root.join(format!(".broker-trash-{uuid}")),
+            )?;
+        } else if include_retired
+            && name
+                .strip_prefix(".retired-worktree-")
+                .is_some_and(|suffix| {
+                    suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        {
+            relocate_discarded_snapshot_trash(&entry.path(), external_root, false)?;
+        }
+    }
+    Ok(())
 }
 
 fn collect_discarded_state_directories(
@@ -863,6 +1207,11 @@ fn trash_snapshot_paths_for_rebuild(paths: &RootInitPaths) -> Result<usize, Boot
         .manager_db
         .parent()
         .ok_or_else(|| BootstrapError::new("AWACS manager database has no state directory"))?;
+    let live_subvolume_uuid = state_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Uuid::parse_str(name).ok())
+        .ok_or_else(|| BootstrapError::new("AWACS state directory has no worktree UUID"))?;
     let cleanup_dir = state_dir.join(format!(".rebuild-cleanup-{}", Uuid::new_v4()));
     create_private_directory(&cleanup_dir)?;
     let cleanup_db = cleanup_dir.join("manager.sqlite3");
@@ -880,7 +1229,7 @@ fn trash_snapshot_paths_for_rebuild(paths: &RootInitPaths) -> Result<usize, Boot
     let service = Service::new_external_rebuild_cleanup(store, config)
         .map_err(|error| BootstrapError::new(format!("open rebuild cleanup service: {error}")))?;
     let result = service
-        .trash_managed_snapshots_for_rebuild()
+        .trash_managed_snapshots_for_rebuild(*live_subvolume_uuid.as_bytes())
         .map_err(|error| BootstrapError::new(format!("trash old AWACS snapshots: {error}")));
     drop(service);
     fs::remove_dir_all(&cleanup_dir).map_err(|error| {
@@ -922,7 +1271,7 @@ fn open_bootstrap_service(root: &Path, now_ns: i64) -> Result<Service, Bootstrap
         .map_err(|error| BootstrapError::new(format!("open AWACS bootstrap service: {error}")))
 }
 
-fn external_service_config(
+pub(crate) fn external_service_config(
     managed_dir: PathBuf,
     snapshot_trash_dir: PathBuf,
     spool_dir: PathBuf,
@@ -966,18 +1315,43 @@ fn lock_root_state(root: &Path) -> Result<RootStateLock, BootstrapError> {
 }
 
 fn lock_root_state_paths(paths: &RootInitPaths) -> Result<RootStateLock, BootstrapError> {
+    let lock = lock_root_state_paths_for_cleanup(paths)?;
+    let lock_path = paths
+        .manager_db
+        .parent()
+        .expect("state directory")
+        .join("root.lock");
+    crate::gc::ensure_current_lock(&lock.file, &lock_path)
+        .map_err(|error| BootstrapError::new(format!("validate AWACS root lock: {error}")))?;
+    Ok(lock)
+}
+
+fn lock_root_state_paths_for_cleanup(
+    paths: &RootInitPaths,
+) -> Result<RootStateLock, BootstrapError> {
     let state_dir = paths
         .manager_db
         .parent()
         .ok_or_else(|| BootstrapError::new("AWACS manager database has no state directory"))?;
+    let lock_path = state_dir.join("root.lock");
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(state_dir.join("root.lock"))
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
         .map_err(|error| BootstrapError::new(format!("open AWACS root lock: {error}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| BootstrapError::new(format!("inspect AWACS root lock: {error}")))?;
+    if !opened.is_file() || opened.uid() != unsafe { libc::geteuid() } || opened.mode() & 0o077 != 0
+    {
+        return Err(BootstrapError::new(
+            "AWACS root lock must be a private owned regular file",
+        ));
+    }
     // SAFETY: flock only inspects the valid open descriptor and blocks until
     // another cooperating AWACS caller releases this root's state lock.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
@@ -985,6 +1359,13 @@ fn lock_root_state_paths(paths: &RootInitPaths) -> Result<RootStateLock, Bootstr
             "lock AWACS root state: {}",
             std::io::Error::last_os_error()
         )));
+    }
+    let named = fs::symlink_metadata(&lock_path)
+        .map_err(|error| BootstrapError::new(format!("recheck AWACS root lock: {error}")))?;
+    if !named.is_file() || named.dev() != opened.dev() || named.ino() != opened.ino() {
+        return Err(BootstrapError::new(
+            "AWACS root lock changed while acquiring it; retry the operation",
+        ));
     }
     Ok(RootStateLock { file })
 }
@@ -997,7 +1378,7 @@ impl Drop for RootStateLock {
     }
 }
 
-fn read_boot_id() -> Result<[u8; 16], BootstrapError> {
+pub(crate) fn read_boot_id() -> Result<[u8; 16], BootstrapError> {
     let text = fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .map_err(|error| BootstrapError::new(format!("read kernel boot ID: {error}")))?;
     let uuid = Uuid::parse_str(text.trim())
@@ -1021,6 +1402,204 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn rebuild_candidates_only_include_the_live_uuid_and_own_git_admin_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("linked");
+        let git_dir = fixture.path().join("main/.git/worktrees/linked");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(
+            root.join(".git"),
+            b"gitdir: ../main/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        let id = Uuid::from_u128(1);
+        let current = RootInitPaths::for_state_directory(
+            &fixture.path().join("external").join(id.to_string()),
+        )
+        .unwrap();
+        let candidates = rebuild_state_candidates(&root, *id.as_bytes(), &current).unwrap();
+        let mut actual = candidates
+            .iter()
+            .map(|paths| paths.manager_db.clone())
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = vec![
+            current.manager_db,
+            git_dir
+                .join("awacs")
+                .join(id.to_string())
+                .join("manager.sqlite3"),
+            fixture
+                .path()
+                .join(".linked-awacs-state")
+                .join(id.to_string())
+                .join("manager.sqlite3"),
+        ];
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert!(!fixture.path().join("external").exists());
+    }
+
+    #[test]
+    fn rebuild_relocates_pending_trash_to_external_store() {
+        let fixture = tempfile::tempdir().unwrap();
+        let id = Uuid::from_u128(1);
+        let old = fixture
+            .path()
+            .join("legacy")
+            .join(format!(".broker-trash-{id}"));
+        let current = fixture
+            .path()
+            .join("external")
+            .join(format!(".broker-trash-{id}"));
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("pending"), b"retained snapshot").unwrap();
+        let retained_fd = File::open(old.join("pending")).unwrap();
+        relocate_snapshot_trash(&old, &current).unwrap();
+        assert!(!old.exists());
+        let relocated = fs::read_dir(current.parent().unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            relocated
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!(".broker-trash-{id}-"))
+        );
+        assert_eq!(
+            fs::read(relocated.join("pending")).unwrap(),
+            b"retained snapshot"
+        );
+        assert_eq!(retained_fd.metadata().unwrap().len(), 17);
+    }
+
+    #[test]
+    fn discarded_trash_without_a_state_bundle_is_relocated_with_bounded_scope() {
+        let fixture = tempfile::tempdir().unwrap();
+        let state_root = fixture.path().join("discarded");
+        let external = fixture.path().join("external");
+        let first = state_root.join(format!(".broker-trash-{}", Uuid::from_u128(1)));
+        let retired = state_root.join(format!(".retired-worktree-{:032x}", 2));
+        let second = retired.join(format!(".broker-trash-{}", Uuid::from_u128(3)));
+        let unrelated = state_root
+            .join("worktrees/live/awacs")
+            .join(format!(".broker-trash-{}", Uuid::from_u128(4)));
+        let nested = retired
+            .join(format!(".retired-worktree-{:032x}", 5))
+            .join(format!(".broker-trash-{}", Uuid::from_u128(6)));
+        for path in [&first, &second, &unrelated, &nested] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("pending"), b"retained").unwrap();
+        }
+        relocate_discarded_snapshot_trash(&state_root, &external, true).unwrap();
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert_eq!(fs::read_dir(external).unwrap().count(), 2);
+        assert_eq!(fs::read(unrelated.join("pending")).unwrap(), b"retained");
+        assert_eq!(fs::read(nested.join("pending")).unwrap(), b"retained");
+    }
+
+    #[test]
+    fn rebuild_preserves_readable_split_store_until_its_artifacts_are_configured() {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths = RootInitPaths::for_state_directory(
+            &fixture.path().join(Uuid::from_u128(1).to_string()),
+        )
+        .unwrap();
+        for directory in [&paths.managed_dir, &paths.spool_dir] {
+            create_private_directory(directory).unwrap();
+        }
+        let _lock = lock_root_state_paths_for_cleanup(&paths).unwrap();
+        let store = Store::create(
+            &paths.manager_db,
+            &ServiceMetadata::generate(read_boot_id().unwrap(), 1).unwrap(),
+        )
+        .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO filesystems(id,fs_uuid) VALUES(1,?1)",
+                [[2u8; 16].as_slice()],
+            )
+            .unwrap();
+        let internal_snapshot = paths.managed_dir.join("cut-owned/snapshot");
+        store.connection().execute(
+            "INSERT INTO snapshots(id,filesystem_id,subvol_uuid,root_id,ctransid,otransid,path,readonly,physical_state,created_ns) VALUES(1,1,?1,zeroblob(8),zeroblob(8),zeroblob(8),?2,1,'present',1)",
+            rusqlite::params![[3u8; 16].as_slice(), internal_snapshot.as_os_str().as_bytes()],
+        ).unwrap();
+        // The ordinary colocated layout remains eligible before switching
+        // to external state; no live-root lookup or migration is needed.
+        preflight_rebuild_state(&paths).unwrap();
+
+        let former_managed = fixture.path().join("former-managed");
+        let external_snapshot = former_managed.join("cut-owned/snapshot");
+        fs::create_dir_all(&external_snapshot).unwrap();
+        fs::write(external_snapshot.join("keep"), b"retained snapshot").unwrap();
+        store
+            .connection()
+            .execute(
+                "UPDATE snapshots SET path=?1 WHERE id=1",
+                [external_snapshot.as_os_str().as_bytes()],
+            )
+            .unwrap();
+        let wal = paths.manager_db.with_file_name("manager.sqlite3-wal");
+        let database_before = fs::read(&paths.manager_db).unwrap();
+        let wal_before = fs::read(&wal).unwrap();
+        let error = preflight_rebuild_state(&paths).unwrap_err().to_string();
+        assert!(error.contains("stored artifact path is outside this state bundle"));
+        assert!(error.contains("BTRFS_AWACS_MANAGED_DIR"));
+        assert_eq!(fs::read(&paths.manager_db).unwrap(), database_before);
+        assert_eq!(fs::read(&wal).unwrap(), wal_before);
+        assert!(
+            fs::read(paths.manager_db.parent().unwrap().join("root.lock"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fs::read(external_snapshot.join("keep")).unwrap(),
+            b"retained snapshot"
+        );
+
+        let configured = RootInitPaths {
+            managed_dir: former_managed,
+            ..paths
+        };
+        preflight_rebuild_state(&configured).unwrap();
+    }
+
+    #[test]
+    fn explicit_rebuild_accepts_corrupt_database_but_rejects_symlinks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let paths = RootInitPaths::for_state_directory(
+            &fixture.path().join(Uuid::from_u128(1).to_string()),
+        )
+        .unwrap();
+        fs::create_dir_all(paths.manager_db.parent().unwrap()).unwrap();
+        fs::write(&paths.manager_db, b"corrupt manager state").unwrap();
+        preflight_rebuild_state(&paths).unwrap();
+        assert_eq!(
+            fs::read(&paths.manager_db).unwrap(),
+            b"corrupt manager state"
+        );
+        fs::remove_file(&paths.manager_db).unwrap();
+        let external = fixture.path().join("external");
+        fs::write(&external, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&external, &paths.manager_db).unwrap();
+        assert!(
+            preflight_rebuild_state(&paths)
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+        assert_eq!(fs::read(external).unwrap(), b"do not touch");
+    }
 
     #[test]
     fn discarded_state_scan_is_bounded_and_does_not_follow_symlinks() {

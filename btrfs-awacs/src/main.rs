@@ -112,6 +112,13 @@ enum CliCommand {
         #[arg(long)]
         keep: bool,
     },
+    /// Collect snapshots and state in BTRFS_AWACS_STATE_DIR, even after a
+    /// worktree has been deleted.
+    Gc {
+        /// Report collectible state without changing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Git worktree lifecycle operations backed by Btrfs snapshots and AWACS.
     Git {
         #[command(subcommand)]
@@ -360,6 +367,7 @@ fn run_cli(cli: Cli) {
             compress,
             keep,
         } => finish(run_init(&root, compress, keep)),
+        CliCommand::Gc { dry_run } => finish(run_gc(dry_run)),
         CliCommand::Git { command } => match command {
             GitCommand::WorktreeAdd {
                 source,
@@ -434,6 +442,49 @@ fn run_cli(cli: Cli) {
             probe_root,
         )),
     }
+}
+
+fn run_gc(dry_run: bool) -> Result<(), String> {
+    let state_root = env::var_os("BTRFS_AWACS_STATE_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            "Set BTRFS_AWACS_STATE_DIR to the external AWACS store before running gc".to_owned()
+        })?;
+    let report = btrfs_awacs::gc::collect(&state_root, dry_run)
+        .map_err(|error| format!("collect AWACS state: {error}"))?;
+    let mut output = io::stdout().lock();
+    for entry in &report.entries {
+        let action = match entry.action {
+            "live" => "Live",
+            "would-retire" => "Would collect",
+            "retired" => "Collected",
+            "deferred" => "Kept",
+            "would-drain-trash" => "Would retry deletion",
+            "drain-trash" => "Queued deletion",
+            action => action,
+        };
+        let count = if entry.snapshots > 0 {
+            format!(" ({} snapshots)", entry.snapshots)
+        } else {
+            String::new()
+        };
+        writeln!(
+            output,
+            "{action} {}{count}: {}",
+            entry.path.display(),
+            entry.detail
+        )
+        .map_err(|error| format!("write GC report: {error}"))?;
+    }
+    if report.entries.is_empty() {
+        writeln!(
+            output,
+            "No AWACS state to collect in {}.",
+            state_root.display()
+        )
+        .map_err(|error| format!("write GC report: {error}"))?;
+    }
+    Ok(())
 }
 
 fn run_init(root: &Path, compress: Option<bool>, keep: bool) -> Result<(), String> {

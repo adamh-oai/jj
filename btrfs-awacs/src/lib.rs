@@ -6,6 +6,7 @@ pub mod btrfs;
 pub mod compat;
 mod diagnostics;
 pub mod facade;
+pub mod gc;
 pub mod git_index_handoff;
 pub mod git_index_invalidation;
 pub mod git_retention;

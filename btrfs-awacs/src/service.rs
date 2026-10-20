@@ -621,15 +621,19 @@ impl Service {
         Ok(SnapshotLifecycleWriteAccess)
     }
 
-    /// Moves every retained managed snapshot into broker-owned trash before an
+    /// Retires every managed snapshot through the broker before an
     /// explicit from-scratch rebuild removes this store. The manager database
     /// is still open here, so the ordinary authenticated broker session can
     /// authorize the same trash RPC used by normal GC.
-    pub fn trash_managed_snapshots_for_rebuild(&self) -> Result<usize, ServiceError> {
+    pub fn trash_managed_snapshots_for_rebuild(
+        &self,
+        live_subvolume_uuid: [u8; 16],
+    ) -> Result<usize, ServiceError> {
         let (trash_parent, trash_name) = self.snapshot_trash_parent_and_name()?;
         let mut trashed = 0;
         self.trash_snapshot_wrappers_for_rebuild(
             &self.config.managed_snapshot_directory,
+            live_subvolume_uuid,
             &trash_parent,
             &trash_name,
             &mut trashed,
@@ -640,6 +644,7 @@ impl Service {
     fn trash_snapshot_wrappers_for_rebuild(
         &self,
         directory: &Path,
+        live_subvolume_uuid: [u8; 16],
         trash_parent: &File,
         trash_name: &[u8],
         trashed: &mut usize,
@@ -647,10 +652,10 @@ impl Service {
         let source_parent = File::open(directory)
             .map_err(|error| ServiceError::context("open rebuild snapshot parent", error))?;
         let entries = fs::read_dir(directory)
-            .map_err(|error| ServiceError::context("read rebuild snapshot parent", error))?;
+            .map_err(|error| ServiceError::context("read rebuild snapshot parent", error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ServiceError::context("read rebuild snapshot entry", error))?;
         for entry in entries {
-            let entry = entry
-                .map_err(|error| ServiceError::context("read rebuild snapshot entry", error))?;
             let name = entry.file_name();
             if name.as_bytes().starts_with(b".broker-trash-") {
                 continue;
@@ -661,28 +666,33 @@ impl Service {
             if !metadata.file_type().is_dir() {
                 continue;
             }
-            if metadata.ino() == ROOT_INODE {
-                return Err(ServiceError::new(format!(
-                    "rebuild state contains unsupported direct snapshot {}; remove the discarded pre-wrapper state before retrying",
-                    path.display()
-                )));
-            }
-            let snapshot_path = path.join(std::ffi::OsString::from_vec(
-                MANAGED_SNAPSHOT_CHILD_NAME.to_vec(),
-            ));
-            let snapshot_metadata = match fs::symlink_metadata(&snapshot_path) {
-                Ok(metadata) => Some(metadata),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(ServiceError::context("inspect rebuild snapshot", error));
+            let target = if metadata.ino() == ROOT_INODE {
+                Some(open_legacy_snapshot_for_cleanup(
+                    &path,
+                    live_subvolume_uuid,
+                )?)
+            } else {
+                let snapshot_path = path.join(std::ffi::OsString::from_vec(
+                    MANAGED_SNAPSHOT_CHILD_NAME.to_vec(),
+                ));
+                let snapshot_metadata = match fs::symlink_metadata(&snapshot_path) {
+                    Ok(metadata) => Some(metadata),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(ServiceError::context("inspect rebuild snapshot", error));
+                    }
+                };
+                if snapshot_metadata.as_ref().is_some_and(|metadata| {
+                    metadata.file_type().is_dir() && metadata.ino() == ROOT_INODE
+                }) {
+                    Some(self.open_subvolume(&snapshot_path).map_err(|error| {
+                        ServiceError::context("open rebuild managed snapshot", error)
+                    })?)
+                } else {
+                    None
                 }
             };
-            if snapshot_metadata.as_ref().is_some_and(|metadata| {
-                metadata.file_type().is_dir() && metadata.ino() == ROOT_INODE
-            }) {
-                let target = self.open_subvolume(&snapshot_path).map_err(|error| {
-                    ServiceError::context("open rebuild managed snapshot", error)
-                })?;
+            if let Some(target) = target {
                 let expected =
                     ExpectedSubvolume::from_observed(&target.filesystem, &target.subvolume);
                 let result = self
@@ -702,7 +712,7 @@ impl Service {
                     })?;
                 log::debug!(
                     "AWACS rebuild snapshot trash completed: path={} verify={:?} rename={:?}",
-                    snapshot_path.display(),
+                    path.display(),
                     Duration::from_nanos(result.verify_elapsed_ns),
                     Duration::from_nanos(result.rename_elapsed_ns),
                 );
@@ -711,7 +721,13 @@ impl Service {
                     .ok_or_else(|| ServiceError::new("rebuild snapshot trash count overflow"))?;
                 continue;
             }
-            self.trash_snapshot_wrappers_for_rebuild(&path, trash_parent, trash_name, trashed)?;
+            self.trash_snapshot_wrappers_for_rebuild(
+                &path,
+                live_subvolume_uuid,
+                trash_parent,
+                trash_name,
+                trashed,
+            )?;
         }
         Ok(())
     }
@@ -3780,6 +3796,46 @@ fn managed_snapshot_entry_name(
         .to_vec())
 }
 
+/// Validates a retired pre-wrapper cut before broker deletion. Read-only
+/// subvolume roots cannot be renamed into wrappers on every supported kernel.
+fn open_legacy_snapshot_for_cleanup(
+    path: &Path,
+    live_subvolume_uuid: [u8; 16],
+) -> Result<OpenedSubvolume, ServiceError> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| ServiceError::new("legacy snapshot has no basename"))?
+        .as_bytes();
+    let recognized = name.strip_prefix(b"cut-").is_some_and(|suffix| {
+        std::str::from_utf8(suffix)
+            .ok()
+            .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
+    }) || name
+        .strip_prefix(b"s-")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.iter().all(u8::is_ascii_digit));
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| ServiceError::context("inspect legacy snapshot", error))?;
+    if !recognized || !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(ServiceError::new(
+            "refusing unrecognized or unowned legacy snapshot",
+        ));
+    }
+    let snapshot = OpenedSubvolume::open(path)
+        .map_err(|error| ServiceError::context("open legacy snapshot", error))?;
+    if !snapshot.subvolume.readonly() {
+        return Err(ServiceError::new("refusing writable legacy snapshot"));
+    }
+    // Explicit rebuild must also work with an unreadable manager database.
+    // The kernel-recorded snapshot parent ties this historical cut to the
+    // UUID-keyed store without trusting either its basename or database rows.
+    if snapshot.subvolume.parent_uuid != Some(live_subvolume_uuid) {
+        return Err(ServiceError::new(
+            "refusing legacy snapshot from a different worktree",
+        ));
+    }
+    Ok(snapshot)
+}
+
 fn create_private_snapshot_entry(path: &Path) -> Result<(), ServiceError> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
@@ -3857,6 +3913,59 @@ mod tests {
     };
     use crate::store::ServiceMetadata;
     use tempfile::tempdir;
+
+    #[test]
+    #[ignore = "requires JJ_TEST_BTRFS_ROOT and Btrfs snapshot deletion permissions"]
+    fn legacy_snapshot_cleanup_requires_owning_root() {
+        let root = std::env::var_os("JJ_TEST_BTRFS_ROOT")
+            .map(PathBuf::from)
+            .expect("JJ_TEST_BTRFS_ROOT must name a writable directory on real Btrfs");
+        let fixture = tempfile::tempdir_in(root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = crate::btrfs::remove_tree(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(fixture.path().to_owned());
+        for name in ["owning-worktree", "other-worktree"] {
+            assert!(
+                std::process::Command::new("btrfs")
+                    .args(["subvolume", "create"])
+                    .arg(fixture.path().join(name))
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let owning = OpenedSubvolume::open(&fixture.path().join("owning-worktree")).unwrap();
+        let other = OpenedSubvolume::open(&fixture.path().join("other-worktree")).unwrap();
+        let managed = fixture.path().join("managed");
+        create_private_snapshot_entry(&managed).unwrap();
+        let name = format!("cut-{}", Uuid::new_v4());
+        crate::btrfs::create_snapshot(
+            owning.as_fd(),
+            File::open(&managed).unwrap().as_fd(),
+            name.as_bytes(),
+            true,
+        )
+        .unwrap();
+        let snapshot = managed.join(name);
+        let snapshot_uuid = OpenedSubvolume::open(&snapshot).unwrap().subvolume.uuid;
+
+        let error = open_legacy_snapshot_for_cleanup(&snapshot, other.subvolume.uuid).unwrap_err();
+        assert!(error.to_string().contains("different worktree"));
+        assert_eq!(fs::read_dir(&managed).unwrap().count(), 1);
+        assert_eq!(
+            OpenedSubvolume::open(&snapshot).unwrap().subvolume.uuid,
+            snapshot_uuid
+        );
+
+        let validated = open_legacy_snapshot_for_cleanup(&snapshot, owning.subvolume.uuid).unwrap();
+        assert_eq!(validated.subvolume.uuid, snapshot_uuid);
+        assert!(validated.subvolume.readonly());
+        assert!(snapshot.exists());
+    }
 
     #[test]
     fn external_broker_connection_fails_immediately_when_directory_is_missing() {

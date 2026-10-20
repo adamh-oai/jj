@@ -188,7 +188,7 @@ impl GitPublisher {
         )
     }
 
-    fn from_reason(reason: &str) -> Option<Self> {
+    pub(crate) fn from_reason(reason: &str) -> Option<Self> {
         let mut fields = reason.strip_prefix(RESPONSE_REASON_PREFIX)?.split(':');
         let boot_id = *Uuid::parse_str(fields.next()?).ok()?.as_bytes();
         let pid = fields.next()?.parse().ok()?;
@@ -212,7 +212,7 @@ impl GitPublisher {
         })
     }
 
-    fn has_exited(&self, boot_id: [u8; 16]) -> bool {
+    pub(crate) fn has_exited(&self, boot_id: [u8; 16]) -> bool {
         if self.boot_id != boot_id {
             return true;
         }

@@ -31,10 +31,10 @@ use std::time::UNIX_EPOCH;
 use btrfs_awacs::bootstrap::InitProgress;
 use btrfs_awacs::bootstrap::finalize_root_path;
 use btrfs_awacs::bootstrap::initialize_root;
+use btrfs_awacs::bootstrap::rebuild_root;
 use btrfs_awacs::bootstrap::trash_discarded_git_awacs_state;
 use btrfs_awacs::scan::SnapshotBaseline;
 use btrfs_awacs::scan::SnapshotIdentity;
-use btrfs_awacs::scan_facade::DirectScanClient;
 use btrfs_awacs::status::BaselineStatus;
 use btrfs_awacs::status::GitFsmonitorStatus;
 use btrfs_awacs::status::IndexChecksum;
@@ -51,6 +51,7 @@ use futures::future::select;
 use jj_lib::file_util::IoResultExt as _;
 use jj_lib::local_working_copy::LocalWorkingCopy;
 use jj_lib::local_working_copy::WorkingCopyBaselineStatus;
+use jj_lib::local_working_copy::check_local_working_copy_fsmonitor_reset;
 use jj_lib::local_working_copy::reset_local_working_copy_fsmonitor;
 use jj_lib::local_working_copy::seed_local_working_copy_tree;
 use jj_lib::local_working_copy::snapshot_mode_has_committed_baseline;
@@ -92,8 +93,8 @@ pub enum UtilSubvolumeCommand {
         /// Keep a partial migration checkout after failure.
         #[arg(long)]
         keep: bool,
-        /// Discard and rebuild the committed AWACS cursor for an already
-        /// enabled checkout.
+        /// Delete this checkout's old AWACS snapshots and state, then rebuild
+        /// its committed baseline in the configured store.
         #[arg(long)]
         rebuild_baseline: bool,
     },
@@ -397,7 +398,12 @@ async fn rebuild_snapshot_baseline(
         ));
     }
 
-    check_awacs_root_state_for_rebuild(&workspace_root)?;
+    if !check_local_working_copy_fsmonitor_reset(locked_workspace.locked_wc())? {
+        return Err(user_error(
+            "This command requires a snapshot-backed local-disk working copy",
+        ));
+    }
+    rebuild_awacs_root_state(&workspace_root)?;
     if !reset_local_working_copy_fsmonitor(locked_workspace.locked_wc())? {
         return Err(user_error(
             "This command requires a snapshot-backed local-disk working copy",
@@ -513,18 +519,18 @@ async fn is_interrupted_snapshot_workspace_initialization(
     Ok(false)
 }
 
-fn check_awacs_root_state_for_rebuild(root: &Path) -> Result<(), CommandError> {
+fn rebuild_awacs_root_state(root: &Path) -> Result<(), CommandError> {
     // Synthetic CLI tests provide their own baseline without a real Btrfs
     // root or external manager database.
     if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
         return Ok(());
     }
-    // Git's fsmonitor hook uses the same manager independently of the JJ
-    // working-copy lock. Keep its state and outstanding leases intact; only
-    // the JJ consumer's cursor is replaced by the explicit full scan.
-    DirectScanClient::for_root(root).map_err(|err| {
+    // Rebuild is also how an enabled checkout adopts a different state store.
+    // It retires old clients and physical snapshots before creating a fresh
+    // manager. The Git lane is reseeded after the replacement JJ scan commits.
+    rebuild_root(root, |_| {}).map_err(|err| {
         user_error(format!(
-            "Cannot rebuild AWACS baseline: failed to open existing AWACS root state: {err}"
+            "Cannot rebuild AWACS baseline: failed to rebuild AWACS root state: {err}"
         ))
     })?;
     Ok(())

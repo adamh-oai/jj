@@ -1,7 +1,8 @@
 use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -36,10 +37,33 @@ impl ServiceMetadata {
 pub struct Store {
     path: PathBuf,
     connection: Connection,
+    root_lock: Option<File>,
 }
 
 impl Drop for Store {
     fn drop(&mut self) {
+        // An idle direct client can outlive GC or a baseline rebuild. Keep
+        // its explicit checkpoint outside a retiring/replaced generation.
+        // NO_CKPT_ON_CLOSE below also prevents SQLite's implicit close-time
+        // checkpoint and its associated WAL/SHM unlinking.
+        let Some(file) = &self.root_lock else {
+            // Without the generation lock captured at open time, even a
+            // current database pathname can be retired before a checkpoint.
+            return;
+        };
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return;
+        }
+        let _lock = CheckpointLock(file);
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        if crate::gc::ensure_current_lock(file, &parent.join("root.lock")).is_err() {
+            return;
+        }
+        if !database_is_current(&self.connection) {
+            return;
+        }
         let mut wal_path = self.path.as_os_str().to_os_string();
         wal_path.push("-wal");
         let Ok(metadata) = fs::metadata(wal_path) else {
@@ -73,6 +97,38 @@ impl Drop for Store {
             Err(error) => tracing::warn!(%error, "defer oversized manager WAL checkpoint"),
         }
     }
+}
+
+struct CheckpointLock<'a>(&'a File);
+
+impl Drop for CheckpointLock<'_> {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn database_is_current(connection: &Connection) -> bool {
+    let mut moved = 1;
+    // SAFETY: the connection remains open and this file-control operation
+    // only writes one c_int. HAS_MOVED compares SQLite's open database inode
+    // with its current pathname; an unsupported VFS conservatively skips GC.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut libc::c_int).cast(),
+        )
+    };
+    result == rusqlite::ffi::SQLITE_OK && moved == 0
+}
+
+fn open_root_lock(path: &Path) -> Option<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path.parent()?.join("root.lock"))
+        .ok()
 }
 
 #[derive(Debug)]
@@ -112,6 +168,7 @@ impl Store {
             Ok(Self {
                 path: path.to_owned(),
                 connection,
+                root_lock: open_root_lock(path),
             })
         })();
         if result.is_err() {
@@ -147,6 +204,7 @@ impl Store {
         Ok(Self {
             path: path.to_owned(),
             connection,
+            root_lock: open_root_lock(path),
         })
     }
 
@@ -515,6 +573,110 @@ mod tests {
     }
 
     #[test]
+    fn dropping_idle_retired_store_does_not_checkpoint_or_unlink_replacement() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manager.sqlite3");
+        let lock_path = temp.path().join("root.lock");
+        let old_lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        let old = Store::create(&path, &metadata()).unwrap();
+        assert!(database_is_current(old.connection()));
+        crate::gc::mark_retired_lock(&old_lock).unwrap();
+        for name in [
+            "manager.sqlite3",
+            "manager.sqlite3-wal",
+            "manager.sqlite3-shm",
+            "root.lock",
+        ] {
+            fs::remove_file(temp.path().join(name)).unwrap();
+        }
+        assert!(!database_is_current(old.connection()));
+        let _new_lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        let mut replacement_metadata = metadata();
+        replacement_metadata.store_uuid = [99; 16];
+        let replacement = Store::create(&path, &replacement_metadata).unwrap();
+        replacement.connection().execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE large_payload(data BLOB); INSERT INTO large_payload VALUES(zeroblob(5242880));").unwrap();
+        let wal = temp.path().join("manager.sqlite3-wal");
+        assert!(fs::metadata(&wal).unwrap().len() > MANAGER_WAL_SIZE_LIMIT);
+        let before_wal = fs::read(&wal).unwrap();
+        let before_database = fs::read(&path).unwrap();
+        let before_shm = fs::read(temp.path().join("manager.sqlite3-shm")).unwrap();
+        drop(old);
+        assert_eq!(fs::read(&wal).unwrap(), before_wal);
+        assert_eq!(fs::read(&path).unwrap(), before_database);
+        assert_eq!(
+            fs::read(temp.path().join("manager.sqlite3-shm")).unwrap(),
+            before_shm
+        );
+        assert_eq!(replacement.metadata().unwrap(), replacement_metadata);
+    }
+
+    #[test]
+    fn close_time_checkpoint_skips_a_busy_or_retired_root() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("manager.sqlite3");
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(temp.path().join("root.lock"))
+            .unwrap();
+        let store = Store::create(&path, &metadata()).unwrap();
+        store.connection().execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE large_payload(data BLOB); INSERT INTO large_payload VALUES(zeroblob(5242880));").unwrap();
+        let wal = temp.path().join("manager.sqlite3-wal");
+        let before = fs::metadata(&wal).unwrap().len();
+        assert!(before > MANAGER_WAL_SIZE_LIMIT);
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        drop(store);
+        assert_eq!(fs::metadata(&wal).unwrap().len(), before);
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let store = Store::open(&path).unwrap();
+        crate::gc::mark_retired_lock(&lock).unwrap();
+        drop(store);
+        assert_eq!(fs::metadata(&wal).unwrap().len(), before);
+    }
+
+    #[test]
+    fn close_time_checkpoint_skips_a_missing_or_unopenable_generation_lock() {
+        for lock_state in ["missing", "symlink", "created-later"] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("manager.sqlite3");
+            let lock_path = temp.path().join("root.lock");
+            if lock_state == "symlink" {
+                let target = temp.path().join("other-lock");
+                fs::write(&target, []).unwrap();
+                std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+            }
+            let store = Store::create(&path, &metadata()).unwrap();
+            assert!(store.root_lock.is_none());
+            store.connection().execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE large_payload(data BLOB); INSERT INTO large_payload VALUES(zeroblob(5242880));").unwrap();
+            if lock_state == "created-later" {
+                fs::write(&lock_path, []).unwrap();
+            }
+            let wal = temp.path().join("manager.sqlite3-wal");
+            let before_wal = fs::read(&wal).unwrap();
+            let before_database = fs::read(&path).unwrap();
+            assert!(before_wal.len() as u64 > MANAGER_WAL_SIZE_LIMIT);
+            drop(store);
+            assert!(fs::read(&wal).unwrap() == before_wal, "{lock_state}");
+            assert!(fs::read(&path).unwrap() == before_database, "{lock_state}");
+            assert_eq!(Store::open(&path).unwrap().metadata().unwrap(), metadata());
+        }
+    }
+
+    #[test]
     fn committed_wal_survives_process_exit_without_connection_cleanup() {
         const CHILD_PATH: &str = "AWACS_TEST_COMMITTED_WAL_EXIT_PATH";
         if let Some(path) = std::env::var_os(CHILD_PATH) {
@@ -592,6 +754,13 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("manager.sqlite3");
         let wal = temp.path().join("manager.sqlite3-wal");
+        let _lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(temp.path().join("root.lock"))
+            .unwrap();
         let store = Store::create(&path, &metadata()).unwrap();
         let reader = Store::open(&path).unwrap();
         reader.connection().execute_batch("BEGIN").unwrap();

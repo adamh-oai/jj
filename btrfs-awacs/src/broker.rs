@@ -1,7 +1,7 @@
 use crate::btrfs::{
     ChangedObjectsIoctlResult, FilesystemInfo, ROOT_INODE, SubvolumeInfo, changed_objects_v2,
     destroy_snapshot_by_id, filesystem_info, has_nested_subvolumes, inode_paths,
-    send_changed_objects, subvolume_info,
+    send_changed_objects, subvolume_info, subvolume_uuid_exists, sync_subvolume,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -35,6 +35,9 @@ pub enum Opcode {
     TrashSnapshot = 6,
     DrainSnapshotTrash = 7,
     InodePaths = 8,
+    // 2, 3 and 9 belonged to removed operations; do not reuse their numbers.
+    SubvolumeExists = 10,
+    RehomeSnapshotTrash = 11,
 }
 
 impl Opcode {
@@ -46,6 +49,8 @@ impl Opcode {
             6 => Ok(Self::TrashSnapshot),
             7 => Ok(Self::DrainSnapshotTrash),
             8 => Ok(Self::InodePaths),
+            10 => Ok(Self::SubvolumeExists),
+            11 => Ok(Self::RehomeSnapshotTrash),
             _ => Err(BrokerError::new(format!("unknown broker opcode {value}"))),
         }
     }
@@ -133,6 +138,14 @@ pub struct NestedSubvolumesExecution {
     pub target: ExpectedSubvolume,
 }
 
+/// Read-only lookup of an original subvolume through a private state-directory
+/// fd on its filesystem. Its pathname is deliberately not part of this claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubvolumeExistsExecution {
+    pub filesystem_uuid: [u8; 16],
+    pub subvolume_uuid: [u8; 16],
+}
+
 /// Bounded reverse path lookup for a fixed-width file of changed inode IDs.
 ///
 /// The input file contains exactly inode_count big-endian u64 values. The
@@ -179,16 +192,21 @@ pub struct SnapshotTrashResult {
 #[derive(Debug)]
 pub struct SnapshotTrash {
     sender: mpsc::Sender<OwnedFd>,
+    /// Protects partially constructed trash wrappers from the drain worker.
+    /// The worker holds it for one entry at a time, not an entire directory.
+    mutation: Arc<Mutex<()>>,
 }
 
 impl SnapshotTrash {
     pub fn new() -> Result<Self, BrokerError> {
         let (sender, receiver) = mpsc::channel();
+        let mutation = Arc::new(Mutex::new(()));
+        let worker_mutation = Arc::clone(&mutation);
         std::thread::Builder::new()
             .name("btrfs-awacs-snapshot-trash".to_owned())
-            .spawn(move || drain_snapshot_trash_worker(receiver))
+            .spawn(move || drain_snapshot_trash_worker(receiver, worker_mutation))
             .map_err(|error| BrokerError::new(format!("start snapshot trash worker: {error}")))?;
-        Ok(Self { sender })
+        Ok(Self { sender, mutation })
     }
 
     fn queue_drain(&self, trash_dir: OwnedFd) {
@@ -497,12 +515,48 @@ pub fn execute_has_nested_subvolumes(
     Ok(has_nested)
 }
 
+/// An absent result is authoritative only on the expected mounted filesystem.
+/// An inaccessible or different filesystem produces an error, never absence.
+pub fn execute_subvolume_exists(
+    request: &SubvolumeExistsExecution,
+    manager_uid: u32,
+    state_directory_fd: BorrowedFd<'_>,
+) -> Result<bool, BrokerError> {
+    if request.filesystem_uuid == [0; 16] || request.subvolume_uuid == [0; 16] {
+        return Err(BrokerError::new(
+            "subvolume existence UUIDs must not be zero",
+        ));
+    }
+    verify_private_manager_directory(state_directory_fd, manager_uid)?;
+    let before = filesystem_info(state_directory_fd).map_err(|error| {
+        BrokerError::new(format!("inspect subvolume probe filesystem: {error}"))
+    })?;
+    if before.fs_uuid != request.filesystem_uuid {
+        return Err(BrokerError::new(
+            "subvolume probe filesystem identity does not match",
+        ));
+    }
+    // As with nested-subvolume queries, reopen the passed directory in place
+    // so TREE_SEARCH_V2 uses broker credentials while remaining fd-anchored.
+    let broker_directory = reopen_directory_fd(state_directory_fd)?;
+    verify_private_manager_directory(broker_directory.as_fd(), manager_uid)?;
+    let reopened = filesystem_info(broker_directory.as_fd())
+        .map_err(|error| BrokerError::new(format!("inspect reopened probe filesystem: {error}")))?;
+    if reopened.fs_uuid != request.filesystem_uuid {
+        return Err(BrokerError::new(
+            "reopened subvolume probe filesystem identity changed",
+        ));
+    }
+    subvolume_uuid_exists(broker_directory.as_fd(), request.subvolume_uuid)
+        .map_err(|error| BrokerError::new(format!("probe source subvolume identity: {error}")))
+}
+
 /// Moves one ordinary wrapper containing an exact read-only snapshot into
 /// broker-owned trash after proving that the manager-passed target fd still
 /// names the expected root and that the same root is currently reachable by
 /// the requested wrapper/child names.
 ///
-/// The durable wrapper rename is the foreground completion boundary. A broker
+/// The durable move into trash is the foreground completion boundary. A broker
 /// worker later deletes the verified child root by ID, so slow Btrfs metadata
 /// cleanup never blocks the manager's snapshot transaction.
 pub fn execute_snapshot_trash(
@@ -537,6 +591,28 @@ pub fn execute_snapshot_trash(
     let passed_target = verify_subvolume(target_fd, &request.target)
         .map_err(|error| error.with_context("snapshot-trash passed target before rename"))?;
     let entry = open_named_directory_fd(source_parent_fd, &request.entry_name)?;
+    if fd_metadata(entry.as_fd())?.st_ino == ROOT_INODE {
+        // Historical layouts stored the readonly root directly. Linux cannot
+        // rename such a root into a wrapper: delete only its verified identity.
+        verify_manager_owned_subvolume_root(entry.as_fd(), manager_uid)?;
+        let named = verify_subvolume(entry.as_fd(), &request.target)?;
+        if named != passed_target {
+            return Err(BrokerError::new(
+                "legacy snapshot basename no longer names the passed target",
+            ));
+        }
+        let verify_elapsed_ns = elapsed_ns(verify_started);
+        let delete_started = Instant::now();
+        let _mutation = trash
+            .mutation
+            .lock()
+            .map_err(|_| BrokerError::new("snapshot trash mutation lock poisoned"))?;
+        delete_snapshot_synchronously(source_parent_fd, request.target.root_id)?;
+        return Ok(SnapshotTrashResult {
+            verify_elapsed_ns,
+            rename_elapsed_ns: elapsed_ns(delete_started),
+        });
+    }
     verify_private_manager_directory(entry.as_fd(), manager_uid)?;
     let named_target = open_named_directory_fd(entry.as_fd(), MANAGED_SNAPSHOT_CHILD_NAME)?;
     verify_manager_owned_subvolume_root(named_target.as_fd(), manager_uid)?;
@@ -553,17 +629,21 @@ pub fn execute_snapshot_trash(
         Duration::from_nanos(verify_elapsed_ns)
     );
     let rename_started = Instant::now();
+    let _mutation = trash
+        .mutation
+        .lock()
+        .map_err(|_| BrokerError::new("snapshot trash mutation lock poisoned"))?;
     let trash_dir =
         open_or_create_snapshot_trash(trash_parent_fd, manager_uid, &request.trash_name)?;
     let trash_entry_name = snapshot_trash_entry_name(&request.target);
-    rename_noreplace_at(
+    move_snapshot_wrapper(
         source_parent_fd,
         &request.entry_name,
+        entry.as_fd(),
         trash_dir.as_fd(),
         &trash_entry_name,
+        request.target.root_id,
     )?;
-    fsync_directory(source_parent_fd)?;
-    fsync_directory(trash_dir.as_fd())?;
     let rename_elapsed_ns = elapsed_ns(rename_started);
     log::debug!(
         "AWACS broker snapshot trash phase completed: phase=rename and fsync elapsed={:?}",
@@ -589,6 +669,108 @@ pub fn execute_snapshot_trash_drain(
     verify_private_manager_directory(trash_parent_fd, manager_uid)?;
     let trash_dir = open_or_create_snapshot_trash(trash_parent_fd, manager_uid, trash_name)?;
     trash.queue_drain(trash_dir);
+    Ok(())
+}
+
+/// Moves already-retired roots to a stable trash parent, including across
+/// Btrfs subvolume boundaries. The old parent can then disappear permanently.
+pub fn execute_snapshot_trash_rehome(
+    trash: &SnapshotTrash,
+    manager_uid: u32,
+    old_parent: BorrowedFd<'_>,
+    old_name: &[u8],
+    new_parent: BorrowedFd<'_>,
+    new_name: &[u8],
+) -> Result<(), BrokerError> {
+    validate_trash_basename(old_name)?;
+    validate_trash_basename(new_name)?;
+    verify_private_manager_directory(old_parent, manager_uid)?;
+    verify_private_manager_directory(new_parent, manager_uid)?;
+    let old_fs = filesystem_info(old_parent)
+        .map_err(|e| BrokerError::new(format!("inspect old trash filesystem: {e}")))?;
+    let new_fs = filesystem_info(new_parent)
+        .map_err(|e| BrokerError::new(format!("inspect new trash filesystem: {e}")))?;
+    if old_fs.fs_uuid != new_fs.fs_uuid {
+        return Err(BrokerError::new(
+            "snapshot trash cannot move to another filesystem",
+        ));
+    }
+    let _mutation = trash
+        .mutation
+        .lock()
+        .map_err(|_| BrokerError::new("snapshot trash mutation lock poisoned"))?;
+    let old = match open_named_directory_fd(old_parent, old_name) {
+        Ok(old) => old,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    verify_broker_private_directory(old.as_fd())?;
+    let new = open_or_create_snapshot_trash(new_parent, manager_uid, new_name)?;
+    let old_stat = fd_metadata(old.as_fd())?;
+    let new_stat = fd_metadata(new.as_fd())?;
+    if old_stat.st_dev == new_stat.st_dev && old_stat.st_ino == new_stat.st_ino {
+        trash.queue_drain(new);
+        return Ok(());
+    }
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", old.as_raw_fd()))
+        .map_err(|_| BrokerError::io("read old snapshot trash"))?
+    {
+        let entry = entry.map_err(|_| BrokerError::io("read old snapshot trash entry"))?;
+        let name = entry.file_name();
+        if !name.as_bytes().starts_with(SNAPSHOT_TRASH_ENTRY_PREFIX) {
+            return Err(BrokerError::new(
+                "old snapshot trash has an unexpected entry",
+            ));
+        }
+        let wrapper = open_named_directory_fd(old.as_fd(), name.as_bytes())?;
+        let metadata = fd_metadata(wrapper.as_fd())?;
+        if metadata.st_mode & 0o077 != 0
+            || (metadata.st_uid != manager_uid && metadata.st_uid != unsafe { libc::geteuid() })
+        {
+            return Err(BrokerError::new(
+                "old snapshot trash wrapper has invalid ownership",
+            ));
+        }
+        let target = match open_named_directory_fd(wrapper.as_fd(), MANAGED_SNAPSHOT_CHILD_NAME) {
+            Ok(target) => target,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                unlink_directory_at(old.as_fd(), name.as_bytes())?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        verify_manager_owned_subvolume_root(target.as_fd(), manager_uid)?;
+        let metadata = fd_metadata(target.as_fd())?;
+        if metadata.st_ino != ROOT_INODE || metadata.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(BrokerError::new(
+                "old snapshot trash child is not a subvolume root",
+            ));
+        }
+        let filesystem = filesystem_info(target.as_fd())
+            .map_err(|e| BrokerError::new(format!("inspect retired snapshot filesystem: {e}")))?;
+        let subvolume = subvolume_info(target.as_fd())
+            .map_err(|e| BrokerError::new(format!("inspect retired snapshot identity: {e}")))?;
+        let observed = ExpectedSubvolume::from_observed(&filesystem, &subvolume);
+        if !observed.readonly
+            || observed.filesystem_uuid != old_fs.fs_uuid
+            || snapshot_trash_entry_name(&observed) != name.as_bytes()
+        {
+            return Err(BrokerError::new(
+                "old snapshot trash identity does not match its entry",
+            ));
+        }
+        move_snapshot_wrapper(
+            old.as_fd(),
+            name.as_bytes(),
+            wrapper.as_fd(),
+            new.as_fd(),
+            name.as_bytes(),
+            observed.root_id,
+        )?;
+    }
+    unlink_directory_at(old_parent, old_name)?;
+    fsync_directory(new.as_fd())?;
+    trash.queue_drain(new);
     Ok(())
 }
 
@@ -632,19 +814,60 @@ fn open_or_create_snapshot_trash(
         return Err(BrokerError::io("create snapshot trash directory"));
     };
     let trash_dir = open_named_directory_fd(parent_fd, name.as_bytes())?;
-    let metadata = fd_metadata(trash_dir.as_fd())?;
-    let broker_uid = unsafe { libc::geteuid() };
-    if metadata.st_uid != broker_uid || metadata.st_mode & 0o077 != 0 {
-        return Err(BrokerError::new(
-            "snapshot trash directory must be private and owned by the broker",
-        ));
-    }
+    verify_broker_private_directory(trash_dir.as_fd())?;
     if created {
         // Persist the broker-owned trash directory itself before any later
         // snapshot rename makes it the only remaining name for that root.
         fsync_directory(parent_fd)?;
     }
     Ok(trash_dir)
+}
+
+fn verify_broker_private_directory(fd: BorrowedFd<'_>) -> Result<(), BrokerError> {
+    let metadata = fd_metadata(fd)?;
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_mode & 0o077 != 0
+    {
+        return Err(BrokerError::new(
+            "snapshot trash directory must be private and owned by the broker",
+        ));
+    }
+    Ok(())
+}
+
+fn move_snapshot_wrapper(
+    source_parent: BorrowedFd<'_>,
+    source_name: &[u8],
+    source_wrapper: BorrowedFd<'_>,
+    trash: BorrowedFd<'_>,
+    destination_name: &[u8],
+    root_id: u64,
+) -> Result<(), BrokerError> {
+    match rename_noreplace_at(source_parent, source_name, trash, destination_name) {
+        Ok(()) => {
+            fsync_directory(source_parent)?;
+            return fsync_directory(trash);
+        }
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {}
+        Err(error) => return Err(error),
+    }
+    // Ordinary wrappers cannot cross Btrfs subvolume roots, and readonly
+    // subvolume entries cannot be renamed at all. Finish this verified root's
+    // deletion before acknowledging that its old state parent may disappear.
+    delete_snapshot_synchronously(source_wrapper, root_id)?;
+    unlink_directory_at(source_parent, source_name)
+}
+
+fn delete_snapshot_synchronously(parent: BorrowedFd<'_>, root_id: u64) -> Result<(), BrokerError> {
+    let parent = reopen_directory_fd(parent)?;
+    destroy_snapshot_by_id(parent.as_fd(), root_id)
+        .map_err(|error| BrokerError::new(format!("delete verified snapshot in place: {error}")))?;
+    // The caller can remove the old store immediately after success. Commit
+    // the root deletion so a crash cannot resurrect an undiscoverable snapshot.
+    sync_subvolume(parent.as_fd())
+        .map_err(|error| BrokerError::new(format!("persist snapshot deletion: {error}")))?;
+    fsync_directory(parent.as_fd())
 }
 
 fn snapshot_trash_entry_name(target: &ExpectedSubvolume) -> Vec<u8> {
@@ -692,19 +915,22 @@ fn fsync_directory(fd: BorrowedFd<'_>) -> Result<(), BrokerError> {
     Ok(())
 }
 
-fn drain_snapshot_trash_worker(receiver: mpsc::Receiver<OwnedFd>) {
+fn drain_snapshot_trash_worker(receiver: mpsc::Receiver<OwnedFd>, mutation: Arc<Mutex<()>>) {
     while let Ok(trash_dir) = receiver.recv() {
-        if let Err(error) = drain_snapshot_trash_dir(trash_dir) {
+        if let Err(error) = drain_snapshot_trash_dir(trash_dir, &mutation) {
             log::error!("AWACS broker failed to drain snapshot trash: {error}");
         }
     }
 }
 
-fn drain_snapshot_trash_dir(trash_dir: OwnedFd) -> Result<(), BrokerError> {
+fn drain_snapshot_trash_dir(trash_dir: OwnedFd, mutation: &Mutex<()>) -> Result<(), BrokerError> {
     let path = PathBuf::from(format!("/proc/self/fd/{}", trash_dir.as_raw_fd()));
     let entries = fs::read_dir(&path).map_err(|_| BrokerError::io("read snapshot trash"))?;
     for entry in entries {
         let entry = entry.map_err(|_| BrokerError::io("read snapshot trash entry"))?;
+        let _mutation = mutation
+            .lock()
+            .map_err(|_| BrokerError::new("snapshot trash mutation lock poisoned"))?;
         let name = entry.file_name();
         if !name.as_bytes().starts_with(SNAPSHOT_TRASH_ENTRY_PREFIX) {
             log::warn!(
@@ -1694,6 +1920,31 @@ mod tests {
     }
 
     #[test]
+    fn subvolume_existence_probe_rejects_shared_or_foreign_directories() {
+        let fixture = tempdir().unwrap();
+        let directory = File::open(fixture.path()).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let request = SubvolumeExistsExecution {
+            filesystem_uuid: [1; 16],
+            subvolume_uuid: [2; 16],
+        };
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            execute_subvolume_exists(&request, uid, directory.as_fd())
+                .unwrap_err()
+                .to_string()
+                .contains("private directory")
+        );
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            execute_subvolume_exists(&request, uid.wrapping_add(1), directory.as_fd())
+                .unwrap_err()
+                .to_string()
+                .contains("owned by the manager")
+        );
+    }
+
+    #[test]
     fn subvolume_identity_reports_each_mismatched_field() {
         let expected = expected_subvolume();
         let cases = [
@@ -1880,6 +2131,261 @@ mod tests {
         assert_eq!(Opcode::decode(6).unwrap(), Opcode::TrashSnapshot);
         assert_eq!(Opcode::decode(7).unwrap(), Opcode::DrainSnapshotTrash);
         assert!(Opcode::decode(9).is_err());
+        assert_eq!(Opcode::decode(10).unwrap(), Opcode::SubvolumeExists);
+        assert_eq!(Opcode::decode(11).unwrap(), Opcode::RehomeSnapshotTrash);
+        assert!(Opcode::decode(12).is_err());
+    }
+
+    #[test]
+    fn trash_move_refuses_an_existing_empty_destination() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("snapshot")).unwrap();
+        fs::write(source.join("snapshot/data"), b"snapshot data").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = File::open(temp.path()).unwrap();
+        let wrapper = File::open(&source).unwrap();
+        move_snapshot_wrapper(
+            parent.as_fd(),
+            b"source",
+            wrapper.as_fd(),
+            parent.as_fd(),
+            b"destination",
+            256,
+        )
+        .unwrap_err();
+        assert!(source.join("snapshot/data").is_file());
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn trash_move_preserves_an_occupied_destination() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(source.join("snapshot")).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(destination.join("unrelated"), b"preserve").unwrap();
+        let parent = File::open(temp.path()).unwrap();
+        let wrapper = File::open(&source).unwrap();
+        let error = move_snapshot_wrapper(
+            parent.as_fd(),
+            b"source",
+            wrapper.as_fd(),
+            parent.as_fd(),
+            b"destination",
+            256,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EEXIST));
+        assert!(source.join("snapshot").is_dir());
+        assert_eq!(
+            fs::read(destination.join("unrelated")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    fn trash_rehome_rejects_traversal_and_foreign_parents_before_ioctls() {
+        let temp = tempdir().unwrap();
+        let parent = File::open(temp.path()).unwrap();
+        let trash = SnapshotTrash::new().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let error = execute_snapshot_trash_rehome(
+            &trash,
+            uid,
+            parent.as_fd(),
+            b"../outside",
+            parent.as_fd(),
+            b".broker-trash-test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("basename"));
+        let error = execute_snapshot_trash_rehome(
+            &trash,
+            uid.wrapping_add(1),
+            parent.as_fd(),
+            b".broker-trash-old",
+            parent.as_fd(),
+            b".broker-trash-new",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("owned"));
+    }
+
+    #[test]
+    #[ignore = "requires root and a Btrfs temporary directory"]
+    fn snapshot_trash_moves_across_subvolume_roots_and_rehomes_pending_work() {
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this test as root");
+        let temp = tempfile::Builder::new()
+            .prefix("awacs-trash-cross-root-")
+            .tempdir()
+            .unwrap();
+        // TempDir alone cannot remove nested Btrfs roots after a failed assert.
+        struct RemoveSubvolumes(PathBuf);
+        impl Drop for RemoveSubvolumes {
+            fn drop(&mut self) {
+                let _ = crate::btrfs::remove_tree(&self.0);
+            }
+        }
+        let _cleanup = RemoveSubvolumes(temp.path().to_owned());
+        for name in ["live", "legacy", "external"] {
+            let status = std::process::Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(temp.path().join(name))
+                .status()
+                .unwrap();
+            assert!(status.success(), "create fixture Btrfs subvolume");
+            fs::set_permissions(temp.path().join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(temp.path().join("live/keep"), b"live source survives").unwrap();
+        let live = File::open(temp.path().join("live")).unwrap();
+        let legacy = File::open(temp.path().join("legacy")).unwrap();
+        let external = File::open(temp.path().join("external")).unwrap();
+        fs::create_dir(temp.path().join("legacy/cut-test")).unwrap();
+        fs::set_permissions(
+            temp.path().join("legacy/cut-test"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let wrapper = File::open(temp.path().join("legacy/cut-test")).unwrap();
+        crate::btrfs::create_snapshot(live.as_fd(), wrapper.as_fd(), b"snapshot", true).unwrap();
+        let snapshot = File::open(temp.path().join("legacy/cut-test/snapshot")).unwrap();
+        let target = ExpectedSubvolume::from_observed(
+            &filesystem_info(snapshot.as_fd()).unwrap(),
+            &subvolume_info(snapshot.as_fd()).unwrap(),
+        );
+        // Retain queued drain fds until after rehome to reproduce a broker with
+        // old work still pending when a baseline rebuild relocates its trash.
+        let (sender, receiver) = mpsc::channel();
+        let mutation = Arc::new(Mutex::new(()));
+        let trash = SnapshotTrash {
+            sender,
+            mutation: Arc::clone(&mutation),
+        };
+        execute_snapshot_trash(
+            &trash,
+            &SnapshotTrashExecution {
+                target,
+                entry_name: b"cut-test".to_vec(),
+                trash_name: b".broker-trash-cross-root".to_vec(),
+            },
+            0,
+            legacy.as_fd(),
+            external.as_fd(),
+            snapshot.as_fd(),
+        )
+        .unwrap();
+        assert!(!temp.path().join("legacy/cut-test").exists());
+        assert_eq!(
+            fs::read_dir(temp.path().join("external/.broker-trash-cross-root"))
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(snapshot);
+
+        // A direct pre-wrapper readonly cut also cannot be renamed. Its exact
+        // root must be deleted without changing its readonly flag.
+        crate::btrfs::create_snapshot(live.as_fd(), legacy.as_fd(), b"s-1", true).unwrap();
+        let direct = File::open(temp.path().join("legacy/s-1")).unwrap();
+        let target = ExpectedSubvolume::from_observed(
+            &filesystem_info(direct.as_fd()).unwrap(),
+            &subvolume_info(direct.as_fd()).unwrap(),
+        );
+        execute_snapshot_trash(
+            &trash,
+            &SnapshotTrashExecution {
+                target,
+                entry_name: b"s-1".to_vec(),
+                trash_name: b".broker-trash-direct".to_vec(),
+            },
+            0,
+            legacy.as_fd(),
+            external.as_fd(),
+            direct.as_fd(),
+        )
+        .unwrap();
+        assert!(!temp.path().join("legacy/s-1").exists());
+        drop(direct);
+
+        // Same-root retirement still moves the whole ordinary wrapper and
+        // queues asynchronous deletion. Rehome must finish this pending root
+        // synchronously before its source trash parent can disappear.
+        fs::create_dir(temp.path().join("legacy/cut-pending")).unwrap();
+        fs::set_permissions(
+            temp.path().join("legacy/cut-pending"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let wrapper = File::open(temp.path().join("legacy/cut-pending")).unwrap();
+        crate::btrfs::create_snapshot(live.as_fd(), wrapper.as_fd(), b"snapshot", true).unwrap();
+        let pending = File::open(temp.path().join("legacy/cut-pending/snapshot")).unwrap();
+        let target = ExpectedSubvolume::from_observed(
+            &filesystem_info(pending.as_fd()).unwrap(),
+            &subvolume_info(pending.as_fd()).unwrap(),
+        );
+        let trash_entry = std::ffi::OsString::from_vec(snapshot_trash_entry_name(&target));
+        execute_snapshot_trash(
+            &trash,
+            &SnapshotTrashExecution {
+                target,
+                entry_name: b"cut-pending".to_vec(),
+                trash_name: b".broker-trash-old".to_vec(),
+            },
+            0,
+            legacy.as_fd(),
+            legacy.as_fd(),
+            pending.as_fd(),
+        )
+        .unwrap();
+        assert!(
+            temp.path()
+                .join("legacy/.broker-trash-old")
+                .join(&trash_entry)
+                .join("snapshot/keep")
+                .is_file()
+        );
+        execute_snapshot_trash_rehome(
+            &trash,
+            0,
+            legacy.as_fd(),
+            b".broker-trash-old",
+            external.as_fd(),
+            b".broker-trash-new",
+        )
+        .unwrap();
+        assert!(!temp.path().join("legacy/.broker-trash-old").exists());
+        assert_eq!(
+            fs::read_dir(temp.path().join("external/.broker-trash-new"))
+                .unwrap()
+                .count(),
+            0
+        );
+        // Retry after the source trash directory has gone is harmless.
+        execute_snapshot_trash_rehome(
+            &trash,
+            0,
+            legacy.as_fd(),
+            b".broker-trash-old",
+            external.as_fd(),
+            b".broker-trash-new",
+        )
+        .unwrap();
+        drop(pending);
+        drop(trash);
+        drain_snapshot_trash_worker(receiver, mutation);
+        assert_eq!(
+            fs::read(temp.path().join("live/keep")).unwrap(),
+            b"live source survives"
+        );
     }
 
     #[test]

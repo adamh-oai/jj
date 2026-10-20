@@ -1,14 +1,15 @@
-//! Fixed, bounded manager-to-broker protocol for privileged read operations.
+//! Fixed, bounded manager-to-broker protocol for privileged Btrfs operations.
 //!
-//! The broker receives only immutable endpoint fds plus a private output file
-//! for the bounded changed-object stream.
+//! Descriptors identify immutable snapshots and private state directories.
+//! Writes are limited to changed-object output and verified snapshot retirement.
 
 use crate::broker::{
     ChangedObjectsExecution, ChangedObjectsResult, ExpectedSubvolume, Frame, InodePathsExecution,
     InodePathsResult, NestedSubvolumesExecution, Opcode, PeerCredentials, SeqPacket, SessionGate,
-    SnapshotTrash, SnapshotTrashExecution, SnapshotTrashResult, execute_changed_objects,
-    execute_has_nested_subvolumes, execute_inode_paths, execute_snapshot_trash,
-    execute_snapshot_trash_drain,
+    SnapshotTrash, SnapshotTrashExecution, SnapshotTrashResult, SubvolumeExistsExecution,
+    execute_changed_objects, execute_has_nested_subvolumes, execute_inode_paths,
+    execute_snapshot_trash, execute_snapshot_trash_drain, execute_snapshot_trash_rehome,
+    execute_subvolume_exists,
 };
 use crate::broker_transport::{FileBrokerClient, FileBrokerRequest};
 use crate::btrfs::ChangedObjectsIoctlResult;
@@ -125,6 +126,16 @@ impl BrokerDispatcher {
                 let result = execute_has_nested_subvolumes(&request, fds[0].as_fd())?;
                 Ok(vec![u8::from(result)])
             }
+            Opcode::SubvolumeExists => {
+                require_fd_count(fds, 1)?;
+                let request = SubvolumeExistsExecution {
+                    filesystem_uuid: decoder.array::<16>()?,
+                    subvolume_uuid: decoder.array::<16>()?,
+                };
+                decoder.finish()?;
+                let result = execute_subvolume_exists(&request, self.manager_uid, fds[0].as_fd())?;
+                Ok(vec![u8::from(result)])
+            }
             Opcode::InodePaths => {
                 require_fd_count(fds, 3)?;
                 let request = InodePathsExecution {
@@ -165,6 +176,21 @@ impl BrokerDispatcher {
                     self.manager_uid,
                     fds[0].as_fd(),
                     &trash_name,
+                )?;
+                Ok(Vec::new())
+            }
+            Opcode::RehomeSnapshotTrash => {
+                require_fd_count(fds, 2)?;
+                let old_name = decoder.bytes()?.to_vec();
+                let new_name = decoder.bytes()?.to_vec();
+                decoder.finish()?;
+                execute_snapshot_trash_rehome(
+                    &self.snapshot_trash,
+                    self.manager_uid,
+                    fds[0].as_fd(),
+                    &old_name,
+                    fds[1].as_fd(),
+                    &new_name,
                 )?;
                 Ok(Vec::new())
             }
@@ -317,6 +343,30 @@ impl BrokerClient {
         decode_inode_paths_result(&response)
     }
 
+    /// Returns false only after an authoritative metadata lookup proves that
+    /// the source UUID is absent. Errors must leave its retained state intact.
+    pub fn subvolume_exists(
+        &self,
+        request: &SubvolumeExistsExecution,
+        state_directory: BorrowedFd<'_>,
+    ) -> Result<bool, BrokerError> {
+        let mut encoder = self.auth_encoder();
+        encoder.array(request.filesystem_uuid);
+        encoder.array(request.subvolume_uuid);
+        let response = exchange_response(
+            &self.transport,
+            &Frame::new(Opcode::SubvolumeExists, encoder.finish())?,
+            &[state_directory],
+        )?;
+        match response.as_slice() {
+            [0] => Ok(false),
+            [1] => Ok(true),
+            _ => Err(BrokerError::new(
+                "broker returned an invalid subvolume existence result",
+            )),
+        }
+    }
+
     pub fn trash_snapshot(
         &self,
         request: &SnapshotTrashExecution,
@@ -351,6 +401,29 @@ impl BrokerClient {
         if !response.is_empty() {
             return Err(BrokerError::new(
                 "broker returned an invalid snapshot trash drain result",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn rehome_snapshot_trash(
+        &self,
+        old_parent: BorrowedFd<'_>,
+        old_name: &[u8],
+        new_parent: BorrowedFd<'_>,
+        new_name: &[u8],
+    ) -> Result<(), BrokerError> {
+        let mut encoder = self.auth_encoder();
+        encoder.bytes(old_name)?;
+        encoder.bytes(new_name)?;
+        let response = exchange_response(
+            &self.transport,
+            &Frame::new(Opcode::RehomeSnapshotTrash, encoder.finish())?,
+            &[old_parent, new_parent],
+        )?;
+        if !response.is_empty() {
+            return Err(BrokerError::new(
+                "broker returned an invalid snapshot trash rehome result",
             ));
         }
         Ok(())
@@ -667,6 +740,74 @@ mod tests {
         });
         let _client = BrokerClient::connect(client_socket, [9; 16]).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn subvolume_probe_requires_authenticated_session_and_exact_descriptor_count() {
+        let uid = unsafe { libc::geteuid() };
+        let dispatcher = BrokerDispatcher::new(uid).unwrap();
+        let store = [3; 16];
+        let session = dispatcher.gate.handshake(store);
+        let peer = PeerCredentials {
+            pid: std::process::id(),
+            uid,
+            gid: unsafe { libc::getegid() },
+        };
+        let mut encoder = Encoder::default();
+        encoder.array(store);
+        encoder.array(session);
+        encoder.array([4; 16]);
+        encoder.array([5; 16]);
+        let frame = Frame::new(Opcode::SubvolumeExists, encoder.finish()).unwrap();
+        assert!(
+            dispatcher
+                .dispatch(peer, frame.clone(), &[])
+                .unwrap_err()
+                .to_string()
+                .contains("requires 1 descriptors")
+        );
+        dispatcher.gate.handshake(store);
+        assert!(
+            dispatcher
+                .dispatch(peer, frame, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("session")
+        );
+    }
+
+    #[test]
+    fn trash_rehome_requires_authenticated_session_and_two_descriptors() {
+        let uid = unsafe { libc::geteuid() };
+        let dispatcher = BrokerDispatcher::new(uid).unwrap();
+        let store = [6; 16];
+        let session = dispatcher.gate.handshake(store);
+        let peer = PeerCredentials {
+            pid: std::process::id(),
+            uid,
+            gid: unsafe { libc::getegid() },
+        };
+        let mut encoder = Encoder::default();
+        encoder.array(store);
+        encoder.array(session);
+        encoder.bytes(b".broker-trash-old").unwrap();
+        encoder.bytes(b".broker-trash-new").unwrap();
+        let frame = Frame::new(Opcode::RehomeSnapshotTrash, encoder.finish()).unwrap();
+        assert!(
+            dispatcher
+                .dispatch(peer, frame.clone(), &[])
+                .unwrap_err()
+                .to_string()
+                .contains("requires 2 descriptors")
+        );
+        dispatcher.gate.handshake(store);
+        assert!(
+            dispatcher
+                .dispatch(peer, frame, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("session")
+        );
     }
 
     #[test]

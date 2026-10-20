@@ -55,7 +55,55 @@ administrative directory. This keeps staged main-worktree activation and
 linked-worktree cleanup aligned with Git's own metadata lifecycle, while each
 root still owns a small operational manager database. Descendants create a
 fresh operational database rather than inheriting namespace state.
-`BTRFS_AWACS_STATE_DIR` may override that root. Non-Git AWACS
+`BTRFS_AWACS_STATE_DIR` may override that root. For repository-independent
+storage and collection, set it consistently for both JJ and Git hooks, for
+example in `~/.zshenv`:
+
+```sh
+export BTRFS_AWACS_STATE_DIR="$HOME/code/.awacs"
+```
+
+The private external directory contains the same UUID-keyed state bundles and
+their sibling broker-trash directories. It must be on the watched roots'
+Btrfs filesystem. Keep it outside the repositories, with no symlink back from
+`.git`; deleting or copying a repository then leaves AWACS storage independent.
+Leave `BTRFS_AWACS_MANAGED_DIR` unset so snapshots remain with their state.
+Changing the variable does not migrate an existing baseline. Run
+`jj util subvolume enable --rebuild-baseline` in each existing workspace to
+replace its state and baselines. This retires that worktree's configured and
+legacy Git-admin or hidden-sibling state, removes its old snapshots through the
+broker, and initializes new JJ and Git baselines. Other worktrees' UUID bundles
+are preserved. Rebuild refuses active scans or Git publishers; retry after
+those operations finish. Old direct clients are fenced through their retained
+lock inode before a replacement database is created.
+
+An existing split store needs its original configuration during cleanup. If a
+readable manager database records snapshots or spools outside the directories
+scheduled for rebuild, the command refuses before retiring any store or moving
+its trash. The diagnostic identifies the retained database and artifact path.
+Restore the original `BTRFS_AWACS_STATE_DIR`/`BTRFS_AWACS_MANAGED_DIR` settings
+before retrying cleanup, or explicitly retire those external artifacts before
+discarding their database. Rebuild does not discover or migrate former split
+storage directories. Explicit repair of a corrupt database remains available
+for the configured and recognized legacy directories.
+
+`awacs gc --dry-run` reports collectible state in `BTRFS_AWACS_STATE_DIR`;
+`awacs gc` collects it without requiring a current repository. For live roots,
+ordinary bounded GC preserves durable baselines and leases. To retire an
+orphan, GC asks the broker to verify that its filesystem/subvolume identity is
+absent. A missing pathname, rename, inaccessible filesystem, or failed probe
+never establishes deletion. In-flight scans, explicit retention leases and
+live Git publishers defer retirement. GC also discovers pending broker trash,
+including after a broker restart, and one level of retired linked-worktree
+state. Unexpected or unreadable state, including bundles that still reference
+artifact paths outside their current location, is reported and retained.
+Physical Btrfs deletion continues asynchronously after snapshots enter broker
+trash. Legacy direct snapshots and cleanup across subvolume boundaries use
+verified synchronous deletion when immutable snapshots cannot be moved.
+Dry-run makes no retention or collection changes; its consistent SQLite read
+transaction may use SQLite's shared-memory coordination file.
+
+Non-Git AWACS
 callers retain the legacy private hidden-sibling default. The managed snapshot
 directory remains private and on the same Btrfs filesystem as the worktree.
 There is no per-worktree daemon socket, daemon lock, pid file, or persistent
