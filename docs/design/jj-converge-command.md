@@ -3,71 +3,66 @@
 Authors: [David Rieber](mailto:drieber@google.com),
 [Martin von Zweigbergk](mailto:martinvonz@google.com)
 
-**Summary:** This document is a proposal for a new `jj converge` command to
-clean divergence and content conflicts bottom-up. For divergence, the command
-uses heuristics to rewrite the N visible commits for a given change with a
-single new commit, without introducing new divergence in the process. For a
-content conflict, it reports the exact next manual resolution step instead of
-editing files itself. By default the command is non-interactive: it either
-converges one safe bottom-most divergence or reports the next choice/conflict
-that needs human input. `--interactive` (`-i`) opts into prompts and an editor
-for exact, human-driven divergence resolution.
+**Summary:** This proposal defines a `jj converge` command that cleans up
+divergence and content conflicts, starting with ancestors. For divergence, the
+command uses heuristics to replace the N visible commits for a change with one
+new commit. It must not introduce new divergence. For a content conflict, it
+reports the exact next step for the user to take. It does not edit the files.
+By default, the command runs without interaction. It resolves one safe
+divergence with no unresolved issue below it, or reports the next choice or
+conflict that needs human input. `--interactive` (`-i`) enables prompts and an
+editor to resolve a specific divergence.
 
 ## Objective
 
-A [divergent change] occurs when multiple [visible commits] have the same change
-ID. Divergence is not a desirable state, but is not a bad state either. In this
-regard divergence is similar to conflicts: the user can choose when and how to
-deal with divergence. The [Handling divergent commits] guide has some useful
-tips, but nevertheless divergence is confusing to our users. We can do better
-than that. It should be possible to solve divergence (after the fact) in many
-scenarios with the help of this command. Solving divergence means rewriting the
-commit graph to end up with a single visible commit for the given change id. For
-the purposes of this design doc we call this commit the *"solution"*.
+A [divergent change] has multiple [visible commits] with the same change ID.
+Divergence is a supported state. As with conflicts, the user can choose when
+and how to resolve it. The [Handling divergent commits] guide gives advice,
+but users still find divergence confusing. This command should help resolve
+many cases after they occur. It rewrites the commit graph so that the change
+has one visible commit. This document calls that commit the *"solution"*.
 
-The command should produce informative messages to summarize any changes made
-or the next manual conflict step. It must not read stdin or open an editor
-unless `--interactive` is passed. The user may of course not like the solution.
-`jj undo` can be used in that case.
+The command should describe the changes it makes or the next manual step to
+resolve a conflict. It must not read stdin or open an editor unless the user
+passes `--interactive`. The user can run `jj undo` to reject the solution.
 
 ## Differences from the existing RFC
 
-This design intentionally changes the original interactive-first proposal in
-these ways:
+This design changes the original proposal, which used interaction by default:
 
 *   Normal `jj converge` never prompts or opens an editor. Its default cleanup
-    revset is `divergent() | conflicts()`. It considers only the bottom-most
-    outstanding issue, automatically converges safe divergence, and stops with
-    exact instructions for an ambiguous divergence or content conflict. The
-    caller reruns the command after each result, so descendants are not planned
-    or reported before their ancestors are clean.
-*   Unlike the original one-change-per-invocation proposal, normal
-    non-interactive `-r <revset>` names stack tips: cleanup is limited to
-    `(divergent() | conflicts()) & ancestors(<revset>)`. Thus `-r @` cleans the
-    current stack. Interactive mode and explicit resolution flags preserve
-    exact-revision targeting and require one divergent change ID.
-*   `--interactive` (`-i`) preserves the original prompt/editor flow as an
-    explicit human-only mode. Explicit resolution flags always take precedence.
-*   Each promptable attribute has a deterministic override: `--onto` chooses
-    the single canonical parent, `--author-from` copies the full author
-    signature from an exact divergent commit, and `--message-from` or `-m`
-    chooses the description.
-*   `--json` is not dry-run-only. Without `--dry-run`, it applies a safe
-    bottom-most divergence and returns `status: "resolved"`; otherwise it
-    returns machine-readable instructions for the next manual issue, a blocked
-    cleanup order, or `status: "clean"` when no issues remain.
+    revset is `divergent() | conflicts()`. It handles only the lowest
+    outstanding issue. It resolves safe divergence automatically. For an
+    ambiguous divergence or a content conflict, it stops and gives exact
+    instructions. The caller reruns the command after each result. The command
+    plans and reports descendants only after their ancestors are clean.
+*   In normal non-interactive mode, `-r <revset>` selects stack tips. Cleanup
+    covers `(divergent() | conflicts()) & ancestors(<revset>)`. Thus `-r @`
+    cleans the current stack. The original proposal selected one change per
+    invocation. Interactive mode and explicit resolution flags still select
+    exact revisions and require one divergent change ID.
+*   `--interactive` (`-i`) retains the original prompts and editor for human
+    use. Explicit resolution flags always take precedence.
+*   Each choice has a flag. `--onto` selects the solution's single parent.
+    `--author-from` copies the full author signature from an exact divergent
+    commit. `--message-from` or `-m` selects the description.
+*   `--json` works with or without `--dry-run`. Without `--dry-run`, it
+    resolves a safe divergence at the bottom and returns `status: "resolved"`.
+    Otherwise, it returns instructions for the next manual issue, reports
+    that the cleanup order is blocked, or returns `status: "clean"`.
     `--dry-run --json` reports the same next issue or blockage without
-    rewriting history. Deferred descendants are intentionally omitted because
-    the next invocation replans from current history.
-*   A solution always has exactly one commit-graph parent. Divergent commits
-    become evolution predecessors, never multiple commit-graph parents. If no
-    safe linear parent is obvious, the caller must provide `--onto` or stop.
-*   Content conflicts are never merged inside `jj converge`. A bottom-most
-    conflict produces `status: "needs_manual_resolution"` with its exact
-    commit ID, paths, and the `jj new` / `jj resolve --list` /
-    `jj squash --use-destination-message` workflow. A convergence that creates
-    conflicts returns `has_conflicts: true`; the next invocation reports that
-    conflict before any divergent descendant.
+    rewriting history. It omits descendants that must wait. The next
+    invocation plans their cleanup from the repository's current state.
+*   A solution always has exactly one commit-graph parent. The divergent
+    commits become evolution predecessors. They do not become multiple
+    commit-graph parents. If the command cannot infer a safe single parent,
+    the caller must provide `--onto` or stop.
+*   `jj converge` never merges content conflicts. For a conflict at the bottom,
+    it returns `status: "needs_manual_resolution"`, the exact commit ID and
+    paths, and the `jj new` / `jj resolve --list` /
+    `jj squash --use-destination-message` workflow. If convergence creates
+    conflicts, it returns `has_conflicts: true`. The next invocation reports
+    that conflict before any divergent descendant.
 
 [divergent change]: ../glossary.md#divergent-change
 [visible commits]: ../glossary.md#visible-commits
@@ -81,15 +76,21 @@ The cleanup form is:
 jj converge [-r <stack-tip-revset>] [--dry-run] [--json]
 ```
 
-With no `-r`, the scope is `divergent() | conflicts()`. With `-r`, the scope is
-the matching revisions and their ancestors, intersected with that default issue
-revset. A divergent family is selected if any of its visible versions is in the
-scope; all versions are then considered together. Each invocation selects one
-deterministic issue with no blocking ancestor. It either converges a safe
-divergent change, reports every unresolved choice for one divergent change,
-reports one content conflict, reports a cycle between cleanup issues, or reports
-that the scope is clean because no issues remain. `/0` and `/1` are not stable
-identifiers and are never emitted as machine-facing candidates.
+Without `-r`, the scope is `divergent() | conflicts()`. With `-r`, it includes
+issues from that default revset in the matching revisions and their ancestors.
+If any visible version of a divergent change is in scope, the command
+considers all its versions together. Each invocation selects one issue with no blocking ancestor. It
+uses a deterministic rule to select between eligible issues.
+
+The command either resolves a safe divergence or reports one of these results:
+
+*   Every unresolved choice for one divergent change.
+*   One content conflict.
+*   A cycle between cleanup issues.
+*   A clean scope, with no issues remaining.
+
+`/0` and `/1` are not stable identifiers. The command never uses them to
+identify candidates in output for programs.
 
 The exact single-divergence form is:
 
@@ -100,31 +101,41 @@ jj converge -r 'change_id(<change-id>)' \
   [--message-from <divergent-commit> | -m <message>]
 ```
 
-Explicit resolution flags imply exact-revision mode and require one divergent
-change ID. They are the escape hatch after cleanup JSON reports
-`status: "needs_input"`. Dry-run never performs a convergence transaction.
+Explicit resolution flags select exact-revision mode and require one divergent
+change ID. Use them after cleanup JSON reports `status: "needs_input"`.
+Dry-run never performs a convergence transaction.
+
 Divergence JSON includes the change ID, exact divergent commit IDs, `ready`,
-`status`, unresolved choices with their `resolve_with` flags and candidates,
-hard `blocked` reasons, `would_rebase_descendants`, and `may_conflict` once all
-choices are resolved. Conflict JSON includes `kind: "conflict"`,
-`status: "needs_manual_resolution"`, the exact commit and change IDs, conflicted
-paths, and resolution commands. A successful non-dry-run JSON invocation emits
-`kind: "divergence"`, `status: "resolved"`, the solution commit ID, rebased
-descendant count, and `has_conflicts`.
-When issues remain but none has a valid cleanup order, ordering JSON includes
-`kind: "ordering"`, `status: "blocked"`,
-`reason: "cyclic_issue_dependencies"`, and a `cycle` array of ancestor and
-descendant witnesses. Each witness includes its issue `kind` (`"divergence"`
-or `"conflict"`), change ID, and exact commit ID. Normal execution exits
-unsuccessfully for this blockage; dry-run successfully returns the diagnostic
-plan. Neither mode rewrites history when reporting a blocked order.
+and `status`. It also includes unresolved choices, their `resolve_with` flags
+and candidates, reasons that prevent resolution in `blocked`, and
+`would_rebase_descendants`. Once all choices are resolved, it includes
+`may_conflict`.
+
+Conflict JSON includes `kind: "conflict"` and
+`status: "needs_manual_resolution"`. It gives the exact commit and change IDs,
+conflicted paths, and resolution commands. When a non-dry-run JSON invocation
+resolves divergence, it emits `kind: "divergence"` and `status: "resolved"`.
+It also gives the solution commit ID, the count of rebased descendants, and
+`has_conflicts`.
+
+If issues remain but none has a valid cleanup order, ordering JSON includes
+`kind: "ordering"`, `status: "blocked"`, and
+`reason: "cyclic_issue_dependencies"`. Its `cycle` array identifies the
+ancestor and descendant for each dependency. Each entry gives the issue
+`kind` (`"divergence"` or `"conflict"`), change ID, and exact commit ID.
+Normal execution exits unsuccessfully in this case. Dry-run returns the
+diagnostic plan successfully. Neither mode rewrites history when the order
+is blocked.
+
 Human-readable divergence dry-run output uses compact `READY`, `BLOCKED`, and
-`NEEDS_INPUT` status blocks. Description and parent choices
-include copy-pasteable `jj log` commands over the exact candidate commit IDs so
-the user can inspect full descriptions and possible canonical parents.
-Callers may supply only some overrides, rerun dry-run, inspect the remaining
-choices, and apply once the plan is ready. Each invocation recomputes the plan
-from current repository state; no partial convergence state is persisted.
+`NEEDS_INPUT` status blocks. Description and parent choices include `jj log`
+commands that the user can copy and run. These commands use exact candidate
+commit IDs to show the full descriptions and possible parents.
+
+Callers can provide some overrides, rerun dry-run, and inspect the remaining
+choices. They can apply the plan when it is ready. Each invocation recomputes
+the plan from the repository's current state. It does not save partial
+convergence state.
 
 The human-driven form is:
 
@@ -132,86 +143,85 @@ The human-driven form is:
 jj converge -i -r 'change_id(<change-id>)'
 ```
 
-In interactive mode, unresolved authors and parents use prompts and unresolved
-descriptions use an editor. Explicit flags still win and suppress interaction
-for their attributes. `--interactive` and `--dry-run` are mutually exclusive.
-Interactive mode requires the revset to resolve to one divergent change ID.
+In interactive mode, the command prompts for unresolved author and parent
+choices. It opens an editor for unresolved descriptions. Explicit flags take
+precedence and suppress interaction for their attributes. The user cannot
+combine `--interactive` with `--dry-run`. The revset must select one divergent
+change ID.
 
-Some conditions are safety failures, not promptable choices: no divergent
-change, immutable commits that would be rewritten, root-commit convergence, or
-an invalid `--onto` that is hidden, has the divergent change ID, or descends
-from a divergent commit. Normal mode reports these as errors. Dry-run includes
-rewrite-immutability failures in `blocked`; invalid explicit arguments still
-fail immediately.
+The command cannot resolve these safety failures through prompts:
+
+*   There is no divergent change.
+*   The operation would rewrite immutable commits.
+*   The operation would converge the root commit.
+*   The `--onto` commit is hidden, has the divergent change ID, or descends
+    from a divergent commit.
+
+Normal mode reports these conditions as errors. Dry-run lists failures that
+would rewrite immutable commits in `blocked`. Invalid explicit arguments
+still fail immediately.
 
 ## Divergent changes
 
-Divergent commits (for the same change-id) can differ:
+Divergent commits with the same change ID can differ in these fields:
 
-*   In their commit description (including tags)
-*   In their commit trees
-*   In the parent(s) of the commits (commits *B/0* and *B/1* for change *B* have
-    different parents)
-*   In the commit author
-*   It is also possible divergence involves two commits with different
-    timestamps that are otherwise identical
+*   Commit description, including tags.
+*   Commit tree.
+*   Parents. For example, commits *B/0* and *B/1* for change *B* can have
+    different parents.
+*   Commit author.
+*   Timestamp. Two divergent commits can be identical except for their
+    timestamps.
 
-As you read this design doc it is important to not confuse the
-*predecessor / successor* relationship versus the *ancestor / descendant*
-relationship.
+A *predecessor / successor* relationship describes how a change evolved.
+An *ancestor / descendant* relationship describes the commit graph. Keep these
+relationships separate when reading the examples.
 
 ### Some divergence scenarios
 
-Divergence can be introduced in many ways. This document does not aim to explain
-any / all of those scenarios accurately, this section is only meant to be rough
-background material. Here are some examples:
+The following examples give background on how divergence can occur. They are
+rough examples, not a complete or precise account of every case.
 
-*   In one terminal you type `jj describe` to edit a commit description and
-    while the editor is open you take a coffee break, when you come back you
-    open another terminal and do something that rewrites the commit (for example
-    you modify a file and run `jj log`, causing a snapshot). When you save the
-    new description `jj describe` completes and you end up with 2 visible
-    commits with the same change id.
+*   Run `jj describe` in one terminal and leave the editor open. In another
+    terminal, rewrite the commit. For example, modify a file and run `jj log`
+    to take a snapshot. Then save the description. When `jj describe`
+    completes, two visible commits have the same change ID.
 
-*   In general any interactive jj command (`jj split -i`, `jj squash -i`, etc.)
-    can lead to divergence in a similar way.
+*   Other interactive commands, such as `jj split -i` and `jj squash -i`,
+    can cause divergence in the same way.
 
-*   You can introduce divergence by making some hidden predecessor of your
-    change visible again. There are many ways this could happen.
+*   Make a hidden predecessor of a change visible again. Several operations
+    can do this.
 
-*   Divergence can happen when mutating two workspaces. For example, assume you
-    have workspaces w1 and w2 with working copy commits *A* and *B*
-    respectively, where *B* is a child of *A*. In w2 you run `jj git fetch` and
-    then rebase the whole branch onto main. Go back to w1 (which is now stale),
-    modify some file on disk and take a snapshot (e.g. run `jj log`). This
-    introduces divergence.
+*   Change two workspaces. Suppose w1 and w2 have working-copy commits *A*
+    and *B*, and *B* is a child of *A*. In w2, run `jj git fetch` and rebase
+    the branch onto main. Then return to the stale w1 workspace. Modify a
+    file and take a snapshot, for example with `jj log`. This introduces
+    divergence.
 
-*   When using the Git backend jj propagates change-id. The change-id is stored
-    in the commit header, so after jj git fetch you can end up with a second
-    commit with the same change-id.
+*   With the Git backend, jj propagates the change ID in the commit header.
+    After `jj git fetch`, a second commit can have the same change ID.
 
-*   There is a Google-specific jj upload command to upload a commit to Google's
-    review / test / submit system, and there is an associated Google-specific
-    command to "download" a change from that system back to your jj repo. This
-    can introduce divergence very much like in the Git scenario.
+*   Google's jj commands upload commits to its review, test, and submit
+    system. A related command downloads a change into the jj repository.
+    This can introduce divergence in the same way as a Git fetch.
 
-*   At Google, snapshotting operations happen concurrently on different machines
-    (e.g. two terminals, or more commonly, a terminal and an IDE). Often times
-    they end up snapshotting the same content. Google's backend does not hold
-    locks while snapshotting because it's a distributed filesystem, so locking
-    would be slow.
+*   At Google, different machines can take snapshots concurrently. This can
+    happen in two terminals, or more often in a terminal and an IDE. They
+    often snapshot the same content. Google's backend uses a distributed
+    filesystem. It does not hold locks while taking snapshots because those
+    locks would be slow.
 
 ## Strawman proposal
 
-We look at some examples to illustrate what the command should do, starting with
-simple cases and moving on to more complex ones.
+The examples below show the proposed behavior, from simple cases to more
+complex ones.
 
 ### Examples and expected behavior (with basic evolution graph)
 
-The first few examples assume commits *B/0* and *B/1* are visible commits for
-change *B*. First we assume *B/0* and *B/1* evolve directly from a common
-predecessor commit *P*, which is now hidden (no longer visible). Later we look
-at more complex evolution graphs. Note that *P*'s change id is also *B*.
+The first examples use visible commits *B/0* and *B/1* for change *B*. Both
+evolve directly from a common predecessor *P*. Commit *P* is now hidden and
+also has change ID *B*. Later examples use more complex evolution graphs.
 
 ```
 Evolution graph for examples 1, 2, 3 and 4.
@@ -225,7 +235,7 @@ B/0
 P
 ```
 
-We will write `A⁻` to denote the parent trees of commit `A`.
+`A⁻` denotes the parent trees of commit `A`.
 
 #### Example 1: two commits for change *B*, same parent
 
@@ -238,7 +248,7 @@ B/0
 A
 ```
 
-In this simple case it is clear the solution should be a child of *A*:
+The solution should be a child of *A*:
 
 ```console
 $ jj log
@@ -251,8 +261,8 @@ $ jj log
  A
 ```
 
-Let's now consider two cases: when *P*'s parent is *A*, and when *P* has some
-other parent. First, if *P*'s parent is *A* we have:
+First, consider the case where *P* also has parent *A*. Example 2 uses a
+different parent for *P*.
 
 ```console
 $ jj log
@@ -265,9 +275,8 @@ B/0
 A
 ```
 
-Here *P*, *B/0* and *B/1* are siblings. The command needs to determine the
-description, parents, tree and author of the solution. It uses a simple data
-structure for this purpose:
+Here *P*, *B/0*, and *B/1* are siblings. The command must determine the
+solution's description, parents, tree, and author. It uses this data structure:
 
 ```rust
 struct MergedState {
@@ -278,33 +287,36 @@ struct MergedState {
 }
 ```
 
-Each of the fields of `MergedState` are populated by doing a merge of the
-corresponding fields of *P*, *B/0* and *B/1*. Loosely speaking each merge can be
-expressed as `P + (B/0 - P) + (B/1 - P)` for each of the fields. The command
-attempts to resolve the various Merge objects trivially, using `same_change:
-SameChange::Accept` (later on in this design doc we will tweak the merge
-algorithm a bit).
+The command fills each `MergedState` field by merging the corresponding
+fields from *P*, *B/0*, and *B/1*. For each field, this is approximately
+`P + (B/0 - P) + (B/1 - P)`. It tries trivial resolution of each `Merge`
+with `same_change: SameChange::Accept`. The later examples refine this
+merge algorithm.
 
-The description is merged as a String value. If the description does not
-trivially resolve, normal mode reports `--message-from <commit-id>` and
-`-m <message>` as the ways to resolve it. With `--interactive`, the user's
-merge tool is invoked with conflict markers. If author does not trivially
-resolve, normal mode reports exact `--author-from <commit-id>` candidates;
-interactive mode presents those options to the user. Once all choices are
-resolved we have our solution commit *B*.
-All descendants of *B/0* and *B/1* are rebased onto *B*. The command records the
-operation in the operation log with a new View where *B* is a visible commit
-with *{B/0, B/1}* as predecessors. *B/0* and *B/1* become hidden commits.
+The command merges the description as a String value. If trivial resolution
+fails, normal mode reports `--message-from <commit-id>` and `-m <message>`
+as the available choices. With `--interactive`, it opens the user's merge
+tool with conflict markers.
 
-Note that in some cases the solution may be identical to either *B/0* or *B/1*
-(in all regards except the commit timestamp): we choose to create a new commit
-*B* to make the evolution graph and op log more clearly show that jj converge
-was invoked. Alternatively we could keep the matching commit instead of creating
-a new commit (this could result in cycles in the evolog).
+If trivial resolution of the author fails, normal mode reports exact
+`--author-from <commit-id>` candidates. Interactive mode prompts the user to
+choose between those candidates. Once all choices are resolved, the command
+creates the solution commit *B*.
+
+The command rebases all descendants of *B/0* and *B/1* onto *B*. It records
+the operation in the operation log with a new View. In that View, *B* is
+visible and has *{B/0, B/1}* as predecessors. Commits *B/0* and *B/1*
+become hidden.
+
+The solution can match *B/0* or *B/1* in every field except the commit
+timestamp. The command still creates a new commit *B*. This lets the evolution
+graph and operation log show that `jj converge` ran. Keeping the matching
+commit would be another option, but it could create cycles in the evolution
+log.
 
 #### Example 2: two commits for change *B* with same parent (predecessor has a different parent)
 
-Now lets consider the case where *P* has a different parent:
+Now consider a different parent for *P*:
 
 ```console
 $ jj log
@@ -318,10 +330,9 @@ A
 X
 ```
 
-In this case we first rebase *P* onto *A* (in-memory) to produce `P' = A + (P -
-P⁻)`. This essentially reduces the problem to the previous case. We now produce
-the solution as before: `B = P' + (B/0 - P') + (B/1 - P')`. Note that again the
-parent of the solution is *A*.
+The command first rebases *P* onto *A* in memory to produce
+`P' = A + (P - P⁻)`. This reduces the problem to Example 1. It then computes
+`B = P' + (B/0 - P') + (B/1 - P')`. The solution's parent is again *A*.
 
 #### Example 3: divergent commits with different parents
 
@@ -336,8 +347,8 @@ B/0
 A
 ```
 
-In this case it is not immediately obvious which commit should be the parent of
-the solution. Let's first consider the case where *P* is a child of *A*.
+Here the solution's parent is less obvious. First, consider the case where
+*P* is a child of *A*.
 
 ```console
 $ jj log
@@ -352,18 +363,17 @@ B/0
 A
 ```
 
-We determine the parent(s) of the solution as follows:
+The command computes the solution's parents as follows:
 
 ```
 parents = P⁻ + (B/0⁻ - P⁻) + (B/1⁻ - P⁻)
 ```
 
-In this example the expression evaluates to `{A} + ({A} - {A}) + ({C} - {A}) =
-{C}`. Since this expression resolves trivially to *{C}*, we use that as the
-parents of the solution.
+The expression evaluates to `{A} + ({A} - {A}) + ({C} - {A}) = {C}`.
+It resolves trivially to *{C}*, so *C* becomes the solution's parent.
 
-Note that this simple algorithm produces the desired output in example 1 and
-example 2. In example 2, the expression looks like this:
+This algorithm also gives the expected result in Examples 1 and 2. In
+Example 2, the expression is:
 
 ```
 parents = P⁻ + (B/0⁻ - P⁻) + (B/1⁻ - P⁻)
@@ -371,12 +381,11 @@ parents = P⁻ + (B/0⁻ - P⁻) + (B/1⁻ - P⁻)
         = {A} + ({A} - {X})
 ```
 
-That expression resolves trivially to *{A}* when using SameChange::Accept.
+With `SameChange::Accept`, the expression resolves trivially to *{A}*.
 
 #### Example 4: divergent commits with different parents, must choose one parent
 
-If instead *P* is a child of some other commit *X*, the story is a bit
-different:
+The result changes if *P* is a child of another commit *X*:
 
 ```console
 $ jj log
@@ -392,19 +401,19 @@ A
 X
 ```
 
-In this case parents will be
+The parent expression is:
 
 ```
 {X} + ({A} - {X}) + ({C} - {X}) = {A} + ({C} - {X})
 ```
 
-Since this does not trivially resolve, normal mode exits without rewriting and
-reports *A* and *C* as exact `--onto` candidates. With `--interactive`, the
-command prompts the user to select the desired parent for the solution: either
-*A* or *C*.
+The expression does not resolve trivially. Normal mode exits without
+rewriting history and reports *A* and *C* as exact `--onto` candidates.
+With `--interactive`, the command asks the user to select *A* or *C* as the
+solution's parent.
 
-Assume the user chooses *{C}*. The command then rebases (in memory) *B/0*, *B/1*
-and *P* onto the chosen parents:
+Suppose the user chooses *{C}*. The command rebases *B/0*, *B/1*, and *P*
+onto *C* in memory:
 
 ```
 In-memory commits after rebasing B/0, B/1 and P on top of C (edges represent
@@ -423,15 +432,14 @@ B/0'
 C
 ```
 
-As a result we obtain *B/0'*, *B/1'* and *P'*, and these are sibling commits. At
-this point the command does a 3-way merge of `MergedTree` objects to produce
-`MergedState::tree` (in reality it is enough to rebase the commit *trees*).
+The resulting commits *B/0'*, *B/1'*, and *P'* are siblings. The command
+then performs a three-way merge of their `MergedTree` objects to produce
+`MergedState::tree`. It only needs to rebase the commit *trees* to do this.
 
 #### Example 5: more than 2 divergent commits
 
-There can be more than 2 visible commits for a given change-id. We are assuming
-here *B/0*, *B/1* and *B/2* are all direct successors of commit *P* (which is
-invisible).
+A change ID can have more than two visible commits. Here, *B/0*, *B/1*, and
+*B/2* are direct successors of the hidden commit *P*.
 
 ```console
 $ jj log
@@ -445,32 +453,29 @@ B/0
 A
 ```
 
-This is completely analogous to the first example, we simply have more terms on
-all merges. The same thing applies to all previous examples, in all cases we can
-deal with any number of divergent commits for change *B*.
+The command handles this case like Example 1, with more terms in each merge.
+The same extension applies to every earlier example. Each can handle any
+number of divergent commits for change *B*.
 
 ### Examples and expected behavior (with arbitrary evolution graph)
 
-So far we only considered simple cases where all divergent commits are direct
-successors of a common predecessor *P*. Now we extend the ideas to arbitrary
-evolution history. To that end we introduce the *"truncated evolution graph for
-B/0, B/1, ... , B/n"*, where *B/0, B/1, ... , B/n* are two or more commits with
-the same change-id *B*. This is a directed graph. Its nodes are commits for
-change-id *B* and the edges are from a commit to its (immediate) predecessor(s),
-ignoring predecessors with unrelated change-ids. The graph is built by
-traversing the operation log and associated View objects, adding nodes and
-predecessor edges as needed. Nodes are added this way until a single most-recent
-common predecessor commit is found. We call the most-recent common predecessor
-the *"evolution fork point of B/0, ... , B/n"*. The traversal keeps track of
-visited commits to avoid infinite loops [^footnote-about-evolog-cycles]
-[^virtual-evolution-fork-point].
+The previous examples assumed that every divergent commit was a direct
+successor of a common predecessor *P*. To handle other evolution histories,
+define the *"truncated evolution graph for B/0, B/1, ... , B/n"*. These are
+two or more commits with the same change ID *B*.
+
+This directed graph contains commits with change ID *B*. Each edge leads
+from a commit to an immediate predecessor. The graph excludes predecessors
+with other change IDs. To build it, traverse the operation log and associated
+View objects. Add nodes and predecessor edges until a single most-recent
+common predecessor is found. This commit is the *"evolution fork point of
+B/0, ... , B/n"*. Track visited commits to avoid infinite loops
+[^footnote-about-evolog-cycles] [^virtual-evolution-fork-point].
 
 #### Example 6: a two-level evolution graph
 
-We continue by looking at a truncated evolution graph that is slightly more
-complex than the basic 3-commit case. This will serve as motivation for the
-general case. Here is our truncated evolution graph (remember the edges here
-represent change evolution, not parent-child relations):
+This truncated evolution graph extends the three-commit case. Its edges show
+how the change evolved, not parent-child relationships in the commit graph:
 
 ```
 Truncated evolution graph. B/0, B/1 and Q may have other predecessors for
@@ -485,32 +490,28 @@ Q /     (description: "v2")
 P       (description: "v1")
 ```
 
-Commit *P* evolved into *Q* and *B/1*, and *Q* evolved into *B/0*. As before
-*B/0* and *B/1* are visible, *P* and *Q* are not. Since both sides of the
-evolution transitioned from "v1" to "v2", and then one side further transitioned
-to "v3", it seems a good heuristic to take "v3" as the description of the
-solution. Note that this observation would not be possible if the algorithm only
-considered the leafs (*B/0*, *B/1*) and their evolution fork point (*P*).
+Commit *P* evolved into *Q* and *B/1*. Commit *Q* then evolved into *B/0*.
+Commits *B/0* and *B/1* are visible; *P* and *Q* are hidden. Both sides
+changed the description from "v1" to "v2". One side then changed it to "v3".
+Selecting "v3" for the solution seems a useful heuristic. An algorithm that
+only examines *B/0*, *B/1*, and their evolution fork point *P* cannot
+recognize this sequence.
 
-Note: Why do we care about divergence producing two commits with the exact same
-change? It may seem this would be a very uncommon scenario, however, as
-mentioned in the last bullet point in the "Some divergence scenarios" section,
-this is in fact fairly common at Google due to the distributed nature of
-Google's backend filesystem.
+Two commits can contain the same change. As described in "Some divergence
+scenarios", this is fairly common with Google's distributed filesystem
+because different machines can snapshot the same content.
 
-To implement the heuristic we outlined above in example 6 (i.e. to produce
-"v3"), we propose introducing a new *try_resolve_deduplicating_same_diffs*
-method to `Merge<T>`, and using that in calls to attempt to resolve the
-MergedState::description, MergedState::parent, MergedState::author and
-MergedState::trees. try_resolve_deduplicate_same_diffs is similar to
-resolve_trivial, but it counts multiple identical *(X - Y)* terms exactly once,
-otherwise it follows the same flow as resolve_trivial with SameChange::Accept.
+To implement the heuristic in Example 6, this proposal adds
+*try_resolve_deduplicating_same_diffs* to `Merge<T>`. It uses that method to
+try to resolve MergedState::description, MergedState::parent,
+MergedState::author, and MergedState::trees. The method
+try_resolve_deduplicate_same_diffs counts identical *(X - Y)* terms only
+once. Otherwise, it follows resolve_trivial with SameChange::Accept.
 
-We illustrate what *try_resolve_deduplicating_same_diffs* does when resolving
-the description merge for the case in example 6. We build a `Merge<String>`,
-starting with the description of the evolution fork point *P*, then adding
-*desc(Y) - desc(X)* terms for each *X->Y* edge in the truncated evolution graph.
-Then we call *try_resolve_deduplicating_same_diffs* to get:
+For Example 6, build a `Merge<String>` that starts with the description of
+the evolution fork point *P*. Add *desc(Y) - desc(X)* for each *X->Y* edge
+in the truncated evolution graph. Then call
+*try_resolve_deduplicating_same_diffs*:
 
 ```
 P + (Q - P) + (B/1 - P) + (B/0 - Q) =
@@ -520,9 +521,9 @@ P + (Q - P) + (B/1 - P) + (B/0 - Q) =
        = v3
 ```
 
-*try_resolve_deduplicating_same_diffs* returns our desired value "v3". Note that
-resolve_trivial (with either SameChange value) would return none. Here is
-another example:
+*try_resolve_deduplicating_same_diffs* returns "v3". The existing
+resolve_trivial would return none with either SameChange value. Now consider
+this example:
 
 ```
 Truncated evolution graph:
@@ -535,71 +536,72 @@ Q /     ( foo.txt contents: "v1" )
 P       ( foo.txt contents: "v1" )
 ```
 
-In this case *try_resolve_deduplicating_same_diffs* produces none. `jj converge`
-cannot automatically resolve this merge. Normal mode reports the exact commits
-that can be selected with `--message-from`, or the caller can pass a merged
-description with `-m`. With `--interactive`, the command invokes the user's
-merge tool with base "v1" and sides "v2"/"v3".
+Here *try_resolve_deduplicating_same_diffs* returns none. The command cannot
+resolve the merge automatically. Normal mode reports the exact commits that
+the caller can select with `--message-from`. The caller can also provide a
+merged description with `-m`. With `--interactive`, the command opens the
+user's merge tool with base "v1" and sides "v2" and "v3".
 
 ### Edge cases when choosing the parents of the solution
 
-When attempting to produce the solution parents, the command applies
-*try_resolve_deduplicating_same_diffs* to MergedState::parents (of type
-`Merge<Vec<CommitId>>`). If the result is `Some<Vec<CommitId>>` we have a set of
-possible parents for the solution. If these candidate parents are all visible
-commits with change-ids other than *B*, and none of those are descendants of
-*B/0, B/1, ... B/n*, then we have the desired parents for the solution commit.
+To compute possible parents, the command applies
+*try_resolve_deduplicating_same_diffs* to MergedState::parents, of type
+`Merge<Vec<CommitId>>`. A `Some<Vec<CommitId>>` result gives a set of
+candidates. They are the desired parents if all are visible, all have change
+IDs other than *B*, and none descends from *B/0, B/1, ... B/n*.
 
-On the other hand,
+The command rejects candidates that meet either of these conditions:
 
-*   if any candidate parent is a descendant of one of the divergent commits we
-    are trying to solve, or
-*   if any of the candidate parents are hidden and the chain starting at visible
-    roots and leading up to and including the parent has any commit for the
-    divergent change we are trying to solve (*B*), or for any other visible
-    commit (divergent or not), or the chain itself has two or more commits with
-    the same change-id,
+*   A candidate parent descends from one of the divergent commits being
+    resolved.
+*   A candidate parent is hidden, and its chain from the visible roots has
+    an unsafe change ID. This includes the candidate parent itself. The
+    chain is unsafe if it contains change *B*, a change ID from any other
+    visible commit, or two or more commits with the same change ID.
 
-then we would introduce new divergence or cycles in the commit graph if we based
-the solution on such candidate parents. In these edge cases the command discards
-unsafe candidates. Normal mode reports the remaining exact `--onto` candidates,
-or errors with no valid candidates if none remain. Interactive mode instead asks
-the user to choose a parent (or quit without making any changes). Care must be
-taken when picking the options to report or present: essentially the user chooses
-between the parents of *B/0*, the parents of *B/1*, and so on, but we skip any
-*B/i* if any of its parents descends from any *B/j*. Since the commit graph is a
-DAG, at least one option is viable.
+These candidates could introduce new divergence or cycles in the commit
+graph. The command discards them. Normal mode reports the remaining exact
+`--onto` candidates. It returns an error if none remain. Interactive mode
+asks the user to choose a parent or quit without changes.
+
+The choices come from the parents of *B/0*, *B/1*, and so on. Skip a commit
+*B/i* if any of its parents descends from any *B/j*. The commit graph is a
+directed acyclic graph (DAG), so at least one option is viable.
 
 ## Bottom-up cleanup
 
-Normal non-interactive mode may discover many divergent changes and conflicted
-commits in the selected scope. It chooses only one bottom-most issue and
-re-finds the next issue on the next invocation because convergence or manual
+Normal non-interactive mode can find many divergent changes and conflicted
+commits in scope. It chooses only one issue at the bottom. The next invocation
+finds the next issue again. This is necessary because convergence or manual
 conflict resolution can rewrite descendants, remove their conflicts, or change
-their plans. It converges only a change whose author, description, and single
-canonical parent are inferred deterministically. It does not emit deferred
-descendants.
+their plans. The command resolves a change only when it can infer its author,
+description, and single parent deterministically. It does not report
+descendants that must wait.
 
-Selection has three distinct outcomes: `Clean` when the issue list is empty,
-`Next(issue)` when an issue has no blocking ancestor, and `Blocked(cycle)` when
-issues remain but none can be selected. Independent eligible issues are still
-processed before reporting a cycle on a later invocation. Failure to select an
-issue must never imply that the scope is clean.
+Selection has three outcomes:
 
-Dependencies are between cleanup issues, not individual commits. A divergent
-family groups all its visible versions, so one version of change A may precede
-change B while another version of B precedes another version of A:
+*   `Clean`: the issue list is empty.
+*   `Next(issue)`: an issue has no blocking ancestor.
+*   `Blocked(cycle)`: issues remain, but none can be selected.
+
+The command processes independent eligible issues before it reports a cycle
+on a later invocation. It must not report a clean scope just because it could
+not select an issue.
+
+Cleanup dependencies connect issues. A divergent family groups all visible
+versions of one change. Thus, one version of change A can precede change B,
+while another version of B precedes another version of A:
 
 ```text
 A0 -> B0
 B1 -> A1
 ```
 
-Both A and B must wait for the other under bottom-up cleanup. A similar cycle
+Under bottom-up cleanup, A and B must each wait for the other. A similar cycle
 can occur when a content conflict lies between two versions of the same change.
-These are cycles in the dependencies between grouped issues; the commit graph
-itself remains acyclic. The diagnostic reports a deterministic cycle with exact
-commit IDs witnessing each ancestor relationship, for example:
+The cycle connects grouped cleanup issues. The commit graph remains acyclic.
+The diagnostic selects a cycle deterministically. It gives exact commit IDs
+that show each ancestor relationship:
 
 ```json
 {
@@ -619,78 +621,69 @@ commit IDs witnessing each ancestor relationship, for example:
 }
 ```
 
-The IDs above are illustrative; actual output uses full exact IDs. After
-inspecting the witnesses, the user must choose the intended stack order and
-resolve a divergent family using exact-revision mode with explicit resolution
-options or `--interactive`. A cleanup `-r` alone still includes ancestors and
-can rediscover the same cycle. The command does not pick an order automatically.
+The example uses short labels; actual output uses full exact IDs. The user
+must inspect these commits and choose the intended stack order. They must
+then resolve one divergent family in exact-revision mode, using explicit
+resolution options or `--interactive`. Using only cleanup `-r` still includes
+ancestors and can find the same cycle again. The command does not choose a
+stack order automatically.
 
 `--interactive`, `--onto`, `--author-from`, `--message-from`, and `-m`
-switch to exact-revision mode and require exactly one selected divergent change
-ID. These choices describe one specific change and cannot safely be applied
-across a cleanup scope.
+select exact-revision mode. They require exactly one divergent change ID.
+These choices describe a specific change and cannot safely apply to a whole
+cleanup scope.
 
 ### Rebasing descendants and persisting
 
-The last step is to rebase all descendants of the divergent commits on top of
-the new solution commit, persist the changes and record the operation in the op
-log. The command will move local bookmarks pointing to any of the rewritten
-divergent commits to point to the solution commit.
+Finally, the command rebases all descendants of the divergent commits onto
+the solution commit. It saves the changes and records the operation in the
+operation log. Local bookmarks that pointed to rewritten divergent commits
+move to the solution commit.
 
 ## Other edge cases
 
-When the command starts it needs to find the divergent change-ids and their
-corresponding visible commits. If the portion of the visible commit graph
-leading up to immutable heads is too big, the command should error out.
+At startup, the command finds divergent change IDs and their visible commits.
+It should return an error if the part of the visible commit graph leading to
+immutable heads is too large.
 
-There could be pathological cases where the evolution history is too long. When
-building the truncated evolution graph, if we have traversed too many nodes (say
-50) and we have not yet completed the traversal, the algorithm will not traverse
-any more commits. We could simply error out, or we could use an incomplete
-truncated evolution graph by adding a virtual evolution fork point. It is
-probably best to error out.
+Evolution history can also be too long. The algorithm should stop if it
+reaches a node limit before it finishes building the truncated evolution
+graph. A possible limit is 50 nodes. It could then return an error or add a
+virtual evolution fork point to the incomplete graph. Returning an error is
+probably the better choice.
 
 ## Open questions
 
-*   Do we ever have divergence of committer? Is it safe to mess with committer?
+*   Can divergent commits have different committers? Is it safe to change
+    the committer?
 
 ## Alternatives considered
 
 ### Automatically resolving divergence
 
-It would be nice if divergence was avoided in the first place, at least in some
-cases, at the point where jj is about to introduce the second (or third or
-fourth, etc.) visible commit for a given change id. This should be investigated
-separately.
+Jj could prevent some divergence when it is about to create another visible
+commit for a change ID. Investigate that behavior separately.
 
 ### Resolve divergence two commits at a time
 
-The algorithm in this proposal should work when there are any number of
-divergent commits (for a given change id). In practice we expect most often
-there will be just 2 or perhaps a few divergent commits. We could design an
-algorithm for just 2 commits, but we chose to think about the more general case.
+The proposed algorithm should handle any number of divergent commits for a
+change ID. Most cases will probably have two or a few commits. An algorithm limited to
+two commits is possible, but this design covers the general case.
 
 ### Only considering the evolution fork point and visible commits
 
-As explained in example 6 this proposal uses the truncated evolution graph and
-*try_resolve_deduplicating_same_diffs* to produce the solution. That example
-shows why we think this leads to a better heuristic. We could instead only
-consider *P* and *B/0, B/1, ... , B/n*. That would be slightly simpler.
+Example 6 explains why the proposal uses the truncated evolution graph and
+*try_resolve_deduplicating_same_diffs*. That example suggests this approach
+gives a better heuristic. Considering only *P* and *B/0, B/1, ... , B/n*
+would be slightly simpler.
 
-[^footnote-about-evolog-cycles]: It is unclear if the evolution history can
-    contain cycles today, but there has been some
-    discussion about `jj undo` possibly producing
-    cycles. In any case, it is very easy to deal
-    with that possibility, so we may as well handle
-    it?
-[^virtual-evolution-fork-point]: Today there should always be a single evolution
-    fork point. However, we could handle cases
-    where a change-id "emanates from multiple
-    initial commits" by adding a single *virtual
-    evolution fork point* commit with empty state:
-    empty description, empty tree and empty author,
-    and having the root commit as its parent, and
-    treating it as a predecessor of all initial
-    commits. Again, we probably don't need to worry
-    about this, but it is good to know we could
-    handle it.
+[^footnote-about-evolog-cycles]: We do not know whether evolution history can
+    contain cycles today. There has been discussion of `jj undo` possibly
+    creating them. Tracking visited commits would handle this case with
+    little extra work.
+[^virtual-evolution-fork-point]: There should currently be a single evolution
+    fork point. If one change ID came from multiple initial commits, a virtual
+    evolution fork point could connect them. It would have an empty
+    description, tree, and author, with the root commit as its parent. Treat
+    it as a predecessor of every initial commit. This case probably does not
+    need support now, but this approach could handle it.
