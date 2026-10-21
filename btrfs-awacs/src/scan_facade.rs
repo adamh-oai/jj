@@ -46,7 +46,7 @@ impl DirectScanClient {
         let open_started = Instant::now();
         let root = std::fs::canonicalize(live_root)
             .map_err(|error| unavailable(format!("canonicalize AWACS scan root: {error}")))?;
-        let paths = RootInitPaths::from_environment(&root)
+        let paths = RootInitPaths::for_existing_root(&root)
             .map_err(|error| unavailable(format!("resolve AWACS root state: {error}")))?;
         let state_dir = paths
             .manager_db

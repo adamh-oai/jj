@@ -78,10 +78,33 @@ impl RootInitPaths {
     }
 
     fn for_subvolume_uuid(root: &Path, subvolume_uuid: [u8; 16]) -> Result<Self, BootstrapError> {
+        let paths = Self::resolve_for_subvolume_uuid(root, subvolume_uuid)?;
+        create_private_directory(paths.manager_db.parent().expect("state directory"))?;
+        for directory in [&paths.managed_dir, &paths.spool_dir] {
+            create_private_directory(directory)?;
+        }
+        Ok(paths)
+    }
+
+    /// Check for existing state before creating supporting directories that
+    /// would hide a missing or incorrectly configured state root.
+    pub(crate) fn for_existing_root(root: &Path) -> Result<Self, BootstrapError> {
+        let paths = Self::resolve_for_subvolume_uuid(root, live_subvolume_uuid(root)?)?;
+        let configured_root = env::var_os("BTRFS_AWACS_STATE_DIR").map(PathBuf::from);
+        paths.require_existing_manager(root, configured_root.as_deref())?;
+        for directory in [&paths.managed_dir, &paths.spool_dir] {
+            create_private_directory(directory)?;
+        }
+        Ok(paths)
+    }
+
+    fn resolve_for_subvolume_uuid(
+        root: &Path,
+        subvolume_uuid: [u8; 16],
+    ) -> Result<Self, BootstrapError> {
         let state_root = state_root_for_root(root)?;
         let state_dir_name = Uuid::from_bytes(subvolume_uuid).to_string();
         let state_dir = state_root.join(&state_dir_name);
-        create_private_directory(&state_dir)?;
         let (managed_dir, snapshot_trash_dir) = match env::var_os("BTRFS_AWACS_MANAGED_DIR") {
             Some(path) => {
                 let root = PathBuf::from(path);
@@ -95,19 +118,67 @@ impl RootInitPaths {
                 state_root.join(format!(".broker-trash-{state_dir_name}")),
             ),
         };
-        create_private_directory(&managed_dir)?;
         let spool_dir = state_dir.join("spool");
-        create_private_directory(&spool_dir)?;
         let manager_db = state_dir.join("manager.sqlite3");
-        if let Some(parent) = manager_db.parent() {
-            create_private_directory(parent)?;
-        }
         Ok(Self {
             managed_dir,
             snapshot_trash_dir,
             spool_dir,
             manager_db,
         })
+    }
+
+    fn require_existing_manager(
+        &self,
+        root: &Path,
+        configured_root: Option<&Path>,
+    ) -> Result<(), BootstrapError> {
+        if let Some(path) = configured_root {
+            match fs::metadata(path) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => {
+                    return Err(BootstrapError::new(format!(
+                        "BTRFS_AWACS_STATE_DIR points to {}, which is not a directory",
+                        path.display(),
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(BootstrapError::new(format!(
+                        "{} is not initialized: BTRFS_AWACS_STATE_DIR points to {}, which does \
+                         not exist; set it to the existing AWACS state directory used when \
+                         initializing or rebuilding this checkout",
+                        root.display(),
+                        path.display(),
+                    )));
+                }
+                Err(error) => {
+                    return Err(BootstrapError::new(format!(
+                        "inspect BTRFS_AWACS_STATE_DIR directory {}: {error}",
+                        path.display(),
+                    )));
+                }
+            }
+        }
+        if self.manager_db.try_exists().map_err(|error| {
+            BootstrapError::new(format!(
+                "inspect AWACS manager database {}: {error}",
+                self.manager_db.display(),
+            ))
+        })? {
+            return Ok(());
+        }
+        let configuration = match configured_root {
+            Some(path) => format!("BTRFS_AWACS_STATE_DIR is set to {}", path.display()),
+            None => "BTRFS_AWACS_STATE_DIR is unset".to_owned(),
+        };
+        Err(BootstrapError::new(format!(
+            "{} is not initialized: {configuration}; no AWACS manager database at {}. If this \
+             checkout was already initialized or rebuilt, set BTRFS_AWACS_STATE_DIR to the state \
+             directory used then; otherwise run awacs init {} first",
+            root.display(),
+            self.manager_db.display(),
+            root.display(),
+        )))
     }
 }
 
@@ -691,14 +762,7 @@ pub fn open_initialized_root_service(root: &Path) -> Result<Service, BootstrapEr
 pub fn finalize_root_path(root: &Path) -> Result<(), BootstrapError> {
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| BootstrapError::new(format!("canonicalize AWACS root: {error}")))?;
-    let paths = RootInitPaths::from_environment(&canonical_root)?;
-    if !paths.manager_db.exists() {
-        return Err(BootstrapError::new(format!(
-            "{} is not initialized; run awacs init {} first",
-            canonical_root.display(),
-            canonical_root.display(),
-        )));
-    }
+    let paths = RootInitPaths::for_existing_root(&canonical_root)?;
     let _root_lock = lock_root_state_paths(&paths)?;
     let mut store = Store::open(&paths.manager_db)
         .map_err(|error| BootstrapError::new(format!("open manager store: {error}")))?;
@@ -734,14 +798,7 @@ fn rebind_root_path(root: &Path, store: &mut Store) -> Result<bool, BootstrapErr
 fn open_existing_root_service(root: &Path) -> Result<(PathBuf, Service), BootstrapError> {
     let canonical_root = fs::canonicalize(root)
         .map_err(|error| BootstrapError::new(format!("canonicalize AWACS root: {error}")))?;
-    let paths = RootInitPaths::from_environment(&canonical_root)?;
-    if !paths.manager_db.exists() {
-        return Err(BootstrapError::new(format!(
-            "{} is not initialized; run awacs init {} first",
-            canonical_root.display(),
-            canonical_root.display(),
-        )));
-    }
+    let paths = RootInitPaths::for_existing_root(&canonical_root)?;
     let mut store =
         crate::diagnostics::timed("open manager store", || Store::open(&paths.manager_db))
             .map_err(|error| BootstrapError::new(format!("open manager store: {error}")))?;
@@ -1402,6 +1459,98 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn missing_default_manager_reports_unset_state_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("checkout");
+        let state_root = root.join(".git/awacs");
+        let paths =
+            RootInitPaths::for_state_directory(&state_root.join(Uuid::from_u128(1).to_string()))
+                .unwrap();
+        let error = paths
+            .require_existing_manager(&root, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BTRFS_AWACS_STATE_DIR is unset"), "{error}");
+        assert!(
+            error.contains(paths.manager_db.to_str().unwrap()),
+            "{error}"
+        );
+        assert!(error.contains("state directory used then"), "{error}");
+        assert!(!state_root.exists());
+
+        // The override remains optional for an initialized default store.
+        fs::create_dir_all(paths.manager_db.parent().unwrap()).unwrap();
+        let _store = Store::create(
+            &paths.manager_db,
+            &ServiceMetadata::generate([1; 16], 1).unwrap(),
+        )
+        .unwrap();
+        paths.require_existing_manager(&root, None).unwrap();
+    }
+
+    #[test]
+    fn missing_configured_state_directory_is_not_created() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("checkout");
+        let state_root = fixture.path().join("external");
+        let paths =
+            RootInitPaths::for_state_directory(&state_root.join(Uuid::from_u128(1).to_string()))
+                .unwrap();
+        let error = paths
+            .require_existing_manager(&root, Some(&state_root))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BTRFS_AWACS_STATE_DIR points to"), "{error}");
+        assert!(error.contains(state_root.to_str().unwrap()), "{error}");
+        assert!(error.contains("does not exist"), "{error}");
+        assert!(!state_root.exists());
+
+        // An existing directory without this checkout's database gets a
+        // different diagnosis, including the exact expected database path.
+        fs::create_dir(&state_root).unwrap();
+        let error = paths
+            .require_existing_manager(&root, Some(&state_root))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BTRFS_AWACS_STATE_DIR is set to"), "{error}");
+        assert!(error.contains(state_root.to_str().unwrap()), "{error}");
+        assert!(
+            error.contains(paths.manager_db.to_str().unwrap()),
+            "{error}"
+        );
+        assert!(!error.contains("does not exist"), "{error}");
+        assert_eq!(fs::read_dir(&state_root).unwrap().count(), 0);
+
+        fs::create_dir_all(paths.manager_db.parent().unwrap()).unwrap();
+        let _store = Store::create(
+            &paths.manager_db,
+            &ServiceMetadata::generate([1; 16], 1).unwrap(),
+        )
+        .unwrap();
+        paths
+            .require_existing_manager(&root, Some(&state_root))
+            .unwrap();
+    }
+
+    #[test]
+    fn configured_state_path_must_be_a_directory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let state_root = fixture.path().join("external");
+        fs::write(&state_root, b"preserve this file").unwrap();
+        let paths =
+            RootInitPaths::for_state_directory(&state_root.join(Uuid::from_u128(1).to_string()))
+                .unwrap();
+        let error = paths
+            .require_existing_manager(fixture.path(), Some(&state_root))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BTRFS_AWACS_STATE_DIR points to"), "{error}");
+        assert!(error.contains(state_root.to_str().unwrap()), "{error}");
+        assert!(error.contains("not a directory"), "{error}");
+        assert_eq!(fs::read(state_root).unwrap(), b"preserve this file");
+    }
 
     #[test]
     fn rebuild_candidates_only_include_the_live_uuid_and_own_git_admin_directory() {
