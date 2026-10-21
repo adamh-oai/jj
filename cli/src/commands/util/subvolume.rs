@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io;
 use std::io::Write as _;
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,11 +132,10 @@ async fn cmd_util_subvolume_impl(
     // outside the checkout: enable and disable can replace its directory.
     let operation_lock_path = subvolume_operation_lock_path(&recovery_root)?;
     let _operation_lock = if matches!(subcommand, UtilSubvolumeCommand::Status) {
-        if let Some(owner) = active_kernel_lock_owner(&operation_lock_path) {
-            writeln!(
-                ui.stdout(),
-                "Subvolume operation: in progress (pid={owner})"
-            )?;
+        if let Some(owner) =
+            active_kernel_lock_owner(&operation_lock_path).context(&operation_lock_path)?
+        {
+            writeln!(ui.stdout(), "Subvolume operation: in progress ({owner})")?;
             writeln!(
                 ui.stdout(),
                 "Consistency: unavailable (subvolume operation in progress)"
@@ -1282,8 +1284,11 @@ fn write_subvolume_status(
         }
     };
 
-    let locks =
-        inspect_subvolume_status_locks(workspace_root, index_path.as_deref(), root_status.as_ref());
+    let locks = inspect_subvolume_status_locks(
+        workspace_root,
+        index_path.as_deref(),
+        root_status.as_ref(),
+    )?;
     if locks.is_empty() {
         writeln!(ui.stdout(), "Locks: none")?;
     } else {
@@ -1408,7 +1413,7 @@ fn inspect_subvolume_status_locks(
     workspace_root: &Path,
     index_path: Option<&Path>,
     root_status: Option<&RootStatus>,
-) -> Vec<String> {
+) -> Result<Vec<String>, CommandError> {
     let mut locks = Vec::new();
     let working_copy_lock = workspace_root.join(".jj/working_copy/working_copy.lock");
     if working_copy_lock.exists() {
@@ -1428,29 +1433,102 @@ fn inspect_subvolume_status_locks(
     }
     if let Some(root_status) = root_status
         && let Some(parent) = root_status.database.parent()
-        && let Some(owner) = active_kernel_lock_owner(&parent.join("root.lock"))
     {
-        locks.push(format!("AWACS root (pid={owner})"));
+        let path = parent.join("root.lock");
+        if let Some(owner) = active_kernel_lock_owner(&path).context(&path)? {
+            locks.push(format!("AWACS root ({owner})"));
+        }
     }
-    locks
+    Ok(locks)
 }
 
-fn active_kernel_lock_owner(path: &Path) -> Option<String> {
-    let metadata = fs::metadata(path).ok()?;
-    let device = metadata.dev();
-    let major = libc::major(device);
-    let minor = libc::minor(device);
-    let target = format!("{major:x}:{minor:x}:{}", metadata.ino());
-    let locks = fs::read_to_string("/proc/locks").ok()?;
-    locks.lines().find_map(|line| {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        let identifier = fields.get(5)?;
-        let mut parts = identifier.split(':');
-        let major = u32::from_str_radix(parts.next()?, 16).ok()?;
-        let minor = u32::from_str_radix(parts.next()?, 16).ok()?;
-        let inode = parts.next()?;
-        (format!("{major:x}:{minor:x}:{inode}") == target).then_some(fields.get(4)?.to_string())
-    })
+fn active_kernel_lock_owner(path: &Path) -> io::Result<Option<String>> {
+    inspect_kernel_lock(path, Path::new("/proc"))
+}
+
+fn inspect_kernel_lock(path: &Path, procfs: &Path) -> io::Result<Option<String>> {
+    // Probe the existing inode without creating, rewriting, or unlinking it.
+    // A shared probe conflicts with the exclusive locks used by both JJ's
+    // subvolume operations and AWACS, but not with another status probe.
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lock is not a regular file",
+        ));
+    }
+    match file.try_lock_shared() {
+        Ok(()) => Ok(None), // Closing the probe releases its shared lock.
+        Err(fs::TryLockError::WouldBlock) => {
+            let owner = kernel_lock_owner(&metadata, procfs)
+                .map(|pid| format!("pid={pid}"))
+                .unwrap_or_else(|| "owner unknown".to_owned());
+            Ok(Some(owner))
+        }
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn kernel_lock_owner(metadata: &fs::Metadata, procfs: &Path) -> Option<u32> {
+    let locks = fs::read_to_string(procfs.join("locks")).ok()?;
+    let candidates: BTreeSet<_> = locks
+        .lines()
+        .filter_map(|line| exclusive_flock_owner(line, metadata.ino()))
+        .collect();
+    for pid in candidates {
+        let process = procfs.join(pid.to_string());
+        let Ok(descriptors) = fs::read_dir(process.join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            // Btrfs reports different device IDs in stat() and /proc/locks.
+            // Inode numbers alone can collide across subvolumes, so verify
+            // the holder's open file using stat() on both sides instead.
+            let same_file = || {
+                fs::metadata(descriptor.path()).is_ok_and(|candidate| {
+                    candidate.dev() == metadata.dev() && candidate.ino() == metadata.ino()
+                })
+            };
+            if !same_file() {
+                continue;
+            }
+            let Ok(info) = fs::read_to_string(process.join("fdinfo").join(descriptor.file_name()))
+            else {
+                continue;
+            };
+            // An open descriptor is not necessarily the one holding the lock.
+            // Recheck its identity in case it was closed and reused meanwhile.
+            if info.lines().any(|line| {
+                line.strip_prefix("lock:")
+                    .and_then(|lock| exclusive_flock_owner(lock, metadata.ino()))
+                    == Some(pid)
+            }) && same_file()
+            {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+fn exclusive_flock_owner(line: &str, inode: u64) -> Option<u32> {
+    let mut fields = line.split_whitespace();
+    fields.next()?; // Lock ID; blocked waiters have an extra "->" after it.
+    if fields.next()? != "FLOCK" || fields.next()? != "ADVISORY" || fields.next()? != "WRITE" {
+        return None;
+    }
+    let pid = fields.next()?.parse::<u32>().ok().filter(|pid| *pid != 0)?;
+    let locked_inode = fields.next()?.rsplit(':').next()?.parse::<u64>().ok()?;
+    (locked_inode == inode).then_some(pid)
 }
 
 fn write_path_status(ui: &mut Ui, label: &str, path: &Path) -> Result<(), CommandError> {
@@ -1828,4 +1906,170 @@ async fn heartbeat_delay(duration: Duration) {
         let _ = sender.send(());
     });
     let _ = receiver.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    fn hold_lock(path: &Path) -> File {
+        let file = File::create(path).unwrap();
+        file.lock().unwrap();
+        file
+    }
+
+    fn flock_record(pid: u32, inode: u64) -> String {
+        // Deliberately unlike stat().st_dev, as with Btrfs /proc lock records.
+        format!("1: FLOCK ADVISORY WRITE {pid} ffff:ffff:{inode} 0 EOF")
+    }
+
+    fn fake_descriptor(procfs: &Path, pid: u32, target: &Path, lock: &str) {
+        let process = procfs.join(pid.to_string());
+        fs::create_dir_all(process.join("fd")).unwrap();
+        fs::create_dir_all(process.join("fdinfo")).unwrap();
+        symlink(target, process.join("fd/7")).unwrap();
+        fs::write(
+            process.join("fdinfo/7"),
+            format!("pos:\t0\nlock:\t{lock}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn lock_inspection_leaves_missing_and_unlocked_files_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lock");
+        let procfs = directory.path().join("unavailable-proc");
+        assert_eq!(inspect_kernel_lock(&path, &procfs).unwrap(), None);
+        assert!(!path.exists());
+
+        fs::write(&path, b"pid=999 argv=stale owner\n").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        assert_eq!(inspect_kernel_lock(&path, &procfs).unwrap(), None);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
+        assert_eq!(fs::read(&path).unwrap(), b"pid=999 argv=stale owner\n");
+    }
+
+    #[test]
+    fn held_lock_remains_busy_without_owner_information() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lock");
+        let holder = hold_lock(&path);
+        let before = fs::metadata(&path).unwrap();
+        let procfs = directory.path().join("unavailable-proc");
+        assert_eq!(
+            inspect_kernel_lock(&path, &procfs).unwrap().as_deref(),
+            Some("owner unknown")
+        );
+        let contender = File::open(&path).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
+        assert!(fs::read(&path).unwrap().is_empty());
+        drop(holder);
+        assert_eq!(inspect_kernel_lock(&path, &procfs).unwrap(), None);
+    }
+
+    #[test]
+    fn lock_owner_uses_verified_descriptor_despite_proc_device_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lock");
+        let _holder = hold_lock(&path);
+        let procfs = directory.path().join("proc");
+        let record = flock_record(41, fs::metadata(&path).unwrap().ino());
+        fake_descriptor(&procfs, 41, &path, &record);
+        fs::write(procfs.join("locks"), &record).unwrap();
+
+        assert_eq!(
+            inspect_kernel_lock(&path, &procfs).unwrap().as_deref(),
+            Some("pid=41")
+        );
+    }
+
+    #[test]
+    fn lock_owner_does_not_trust_candidate_inode_or_an_unlocked_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lock");
+        let _holder = hold_lock(&path);
+        let other = directory.path().join("other");
+        fs::write(&other, b"other file").unwrap();
+        let procfs = directory.path().join("proc");
+        let inode = fs::metadata(&path).unwrap().ino();
+
+        // The global record claims the same inode, but its open descriptor
+        // names a different file. Another candidate opens the right file
+        // without holding a lock on that descriptor.
+        let wrong_file = flock_record(41, inode);
+        fake_descriptor(&procfs, 41, &other, &wrong_file);
+        let unlocked_descriptor = flock_record(42, inode);
+        fake_descriptor(&procfs, 42, &path, "");
+        fs::write(
+            procfs.join("locks"),
+            format!("{wrong_file}\n{unlocked_descriptor}\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_kernel_lock(&path, &procfs).unwrap().as_deref(),
+            Some("owner unknown")
+        );
+    }
+
+    #[test]
+    fn lock_owner_ignores_waiters_posix_locks_and_shared_locks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lock");
+        let _holder = hold_lock(&path);
+        let procfs = directory.path().join("proc");
+        let inode = fs::metadata(&path).unwrap().ino();
+        let held = flock_record(41, inode);
+        fake_descriptor(&procfs, 41, &path, &held);
+
+        for unsupported in [
+            format!("1: -> FLOCK ADVISORY WRITE 41 ffff:ffff:{inode} 0 EOF"),
+            format!("1: POSIX ADVISORY WRITE 41 ffff:ffff:{inode} 0 EOF"),
+            format!("1: FLOCK ADVISORY READ 41 ffff:ffff:{inode} 0 EOF"),
+        ] {
+            // Neither the global candidate record nor its fdinfo record can
+            // substitute a waiter or a different lock type for the holder.
+            for (candidate, descriptor) in [(&unsupported, &held), (&held, &unsupported)] {
+                fs::write(procfs.join("locks"), candidate).unwrap();
+                fs::write(procfs.join("41/fdinfo/7"), format!("lock:\t{descriptor}\n")).unwrap();
+                assert_eq!(
+                    inspect_kernel_lock(&path, &procfs).unwrap().as_deref(),
+                    Some("owner unknown"),
+                    "candidate={candidate}; descriptor={descriptor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lock_inspection_rejects_symlinks_and_nonregular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let procfs = directory.path().join("unavailable-proc");
+        let target = directory.path().join("target");
+        fs::write(&target, b"preserve target\n").unwrap();
+        let link = directory.path().join("lock");
+        symlink(&target, &link).unwrap();
+        assert!(inspect_kernel_lock(&link, &procfs).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"preserve target\n");
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            inspect_kernel_lock(directory.path(), &procfs)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 }
