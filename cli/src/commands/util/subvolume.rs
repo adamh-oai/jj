@@ -18,6 +18,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
@@ -32,9 +33,12 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use btrfs_awacs::bootstrap::InitProgress;
+use btrfs_awacs::bootstrap::configure_state_root;
+use btrfs_awacs::bootstrap::configure_state_root_for_conversion;
 use btrfs_awacs::bootstrap::finalize_root_path;
 use btrfs_awacs::bootstrap::initialize_root;
 use btrfs_awacs::bootstrap::rebuild_root;
+use btrfs_awacs::bootstrap::state_root_for_root;
 use btrfs_awacs::bootstrap::trash_discarded_git_awacs_state;
 use btrfs_awacs::scan::SnapshotBaseline;
 use btrfs_awacs::scan::SnapshotIdentity;
@@ -217,6 +221,7 @@ async fn cmd_util_subvolume_impl(
                 if colocated && !require_colocated_workspace(&workspace_command)? {
                     require_main_subvolume_mode_for_linked_workspace(&workspace_command)?;
                 }
+                configure_awacs_state_root(&workspace_root)?;
                 rebuild_snapshot_baseline(
                     ui,
                     command,
@@ -243,6 +248,7 @@ async fn cmd_util_subvolume_impl(
                 // Activation may have succeeded before finalization was
                 // interrupted. Repair paths and the Git cursor without
                 // replacing the committed JJ baseline or manager history.
+                configure_awacs_state_root(&workspace_root)?;
                 finalize_subvolume_enable(ui, &workspace_root)?;
                 writeln!(ui.status(), "Btrfs subvolume mode is already enabled.")?;
                 drop(recovery_guard);
@@ -527,15 +533,24 @@ fn rebuild_awacs_root_state(root: &Path) -> Result<(), CommandError> {
     if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
         return Ok(());
     }
-    // Rebuild is also how an enabled checkout adopts a different state store.
-    // It retires old clients and physical snapshots before creating a fresh
-    // manager. The Git lane is reseeded after the replacement JJ scan commits.
+    // Rebuild retires old clients and physical snapshots before creating a
+    // fresh manager in the saved store. The Git lane is reseeded after the
+    // replacement JJ scan commits.
     rebuild_root(root, |_| {}).map_err(|err| {
         user_error(format!(
             "Cannot rebuild AWACS baseline: failed to rebuild AWACS root state: {err}"
         ))
     })?;
     Ok(())
+}
+
+fn configure_awacs_state_root(root: &Path) -> Result<(), CommandError> {
+    if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some() {
+        return Ok(());
+    }
+    configure_state_root(root)
+        .map(|_| ())
+        .map_err(|err| user_error(format!("Cannot configure AWACS state: {err}")))
 }
 
 async fn init_subvolume_at(
@@ -625,6 +640,10 @@ async fn init_subvolume_at_inner(
         require_no_linked_awacs_state(source_root, "migrate")?;
     } else {
         require_main_subvolume_mode_for_linked_workspace(source_command)?;
+    }
+    if std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_none() {
+        configure_state_root_for_conversion(source_root)
+            .map_err(|err| user_error(format!("Cannot migrate AWACS state: {err}")))?;
     }
     for name in [".git", ".jj"] {
         let metadata_path = source_root.join(name);
@@ -1644,22 +1663,44 @@ fn require_no_linked_awacs_state(workspace_root: &Path, action: &str) -> Result<
         if !file_type.is_dir() {
             continue;
         }
-        let awacs = entry.path().join("awacs");
-        match fs::symlink_metadata(&awacs) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).context(&awacs).map_err(Into::into),
-            Ok(_) => {
-                return Err(user_error(format!(
-                    "Cannot {action} the main workspace while linked Git worktree AWACS state \
-                     remains at {}",
-                    awacs.display()
-                ))
-                .hinted(
-                    "Remove the linked workspaces with `jj workspace remove <name>` before \
-                     changing the main workspace's subvolume layout. If they were already \
-                     removed, inspect their stale Git administrative state first; this command \
-                     will not discard it.",
-                ));
+        let mut state_paths = vec![entry.path().join("awacs")];
+        if matches!(fs::symlink_metadata(&state_paths[0]), Err(err) if err.kind() == io::ErrorKind::NotFound)
+        {
+            let gitfile_path = entry.path().join("gitdir");
+            let gitfile_bytes = fs::read(&gitfile_path).context(&gitfile_path)?;
+            let gitfile_bytes = gitfile_bytes.strip_suffix(b"\n").unwrap_or(&gitfile_bytes);
+            let gitfile = PathBuf::from(std::ffi::OsString::from_vec(gitfile_bytes.to_vec()));
+            let gitfile = if gitfile.is_absolute() {
+                gitfile
+            } else {
+                entry.path().join(gitfile)
+            };
+            if let Some(linked_root) = gitfile.parent()
+                && let Ok(key) = btrfs_awacs::bootstrap::root_state_key(linked_root)
+            {
+                let state_root = state_root_for_root(workspace_root).map_err(|err| {
+                    user_error(format!("Cannot resolve linked AWACS state: {err}"))
+                })?;
+                state_paths.push(state_root.join(key));
+            }
+        }
+        for awacs in state_paths {
+            match fs::symlink_metadata(&awacs) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err).context(&awacs).map_err(Into::into),
+                Ok(_) => {
+                    return Err(user_error(format!(
+                        "Cannot {action} the main workspace while linked Git worktree AWACS state \
+                         remains at {}",
+                        awacs.display()
+                    ))
+                    .hinted(
+                        "Remove the linked workspaces with `jj workspace remove <name>` before \
+                         changing the main workspace's subvolume layout. If they were already \
+                         removed, inspect their stale Git administrative state first; this \
+                         command will not discard it.",
+                    ));
+                }
             }
         }
     }
@@ -1708,7 +1749,10 @@ fn convert_subvolume_to_directory(
         // these snapshots. Retire them through the broker before removing the
         // old metadata subvolume; unprivileged deletion cannot destroy a
         // read-only snapshot, and must not relax its protection instead.
-        trash_discarded_git_awacs_state(&discarded_awacs).map_err(|err| {
+        let root = path.parent().expect("Git directory has a workspace parent");
+        let state_root = state_root_for_root(root)
+            .map_err(|err| user_error(format!("Cannot resolve AWACS state: {err}")))?;
+        trash_discarded_git_awacs_state(&discarded_awacs, &state_root).map_err(|err| {
             user_error(format!(
                 "Failed to retire discarded AWACS state at {}: {err}; old metadata retained at {}",
                 discarded_awacs.display(),

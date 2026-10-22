@@ -27,7 +27,7 @@ The AWACS library embedded by Jujutsu, and the short-lived
 independent state bundle per worktree:
 
 ```text
-<git-admin-dir>/awacs/<live-subvolume-uuid>/
+<awacs.stateDir>/<live-subvolume-uuid>/
     manager.sqlite3
     manager.sqlite3-wal
     manager.sqlite3-shm
@@ -49,28 +49,45 @@ The WAL is committed database state: copying only `manager.sqlite3` is not a
 backup. Use SQLite's backup API or take a consistent snapshot of the complete
 state bundle, including WAL files.
 
-For a main worktree, `<git-admin-dir>` is `<worktree-root>/.git`; for a linked
-worktree, it is that worktree's resolved `$GIT_COMMON_DIR/worktrees/<id>`
-administrative directory. This keeps staged main-worktree activation and
-linked-worktree cleanup aligned with Git's own metadata lifecycle, while each
-root still owns a small operational manager database. Descendants create a
-fresh operational database rather than inheriting namespace state.
-`BTRFS_AWACS_STATE_DIR` may override that root. For repository-independent
-storage and collection, set it consistently for both JJ and Git hooks, for
-example in `~/.zshenv`:
+Initialization records the absolute state directory in `awacs.stateDir` in
+the repository's common Git config. Main and linked worktrees read that same
+setting. Each worktree still has its own UUID and manager database. A new
+worktree creates a fresh database and retains its parent's snapshot baseline.
+
+Set `BTRFS_AWACS_STATE_DIR` when initializing a repository for the first time:
 
 ```sh
-export BTRFS_AWACS_STATE_DIR="$HOME/code/.awacs"
+BTRFS_AWACS_STATE_DIR="$HOME/code/.awacs" jj util subvolume enable
 ```
+
+`awacs init ROOT` records the same setting. After initialization, JJ, Git hooks,
+and worktree commands use the saved path. They ignore `BTRFS_AWACS_STATE_DIR`,
+even if it names a different directory. Initialization fails if neither the
+saved setting nor the variable supplies a path. Normal commands fail if the
+saved setting is missing. Neither path falls back to `.git/awacs` or a sibling
+directory.
+
+For a repository initialized by an older version, record the directory that
+already contains its UUID-keyed state bundles:
+
+```sh
+git config --local awacs.stateDir /absolute/path/to/existing/awacs-state
+```
+
+This registers the existing data; it does not rebuild or move any snapshot.
+Use the same location with older binaries during a mixed-version update.
 
 The private external directory contains the same UUID-keyed state bundles and
 their sibling broker-trash directories. It must be on the watched roots'
 Btrfs filesystem. Keep it outside the repositories, with no symlink back from
 `.git`; deleting or copying a repository then leaves AWACS storage independent.
+Topology conversion rejects a saved directory inside the checkout before it
+moves files. Existing internal stores remain readable in place.
 Leave `BTRFS_AWACS_MANAGED_DIR` unset so snapshots remain with their state.
-Changing the variable does not migrate an existing baseline. Run
-`jj util subvolume enable --rebuild-baseline` in each existing workspace to
-replace its state and baselines. This retires that worktree's configured and
+Changing the environment does not move an existing baseline. A deliberate
+change to `awacs.stateDir` must account for every linked worktree that uses the
+shared config. `jj util subvolume enable --rebuild-baseline` replaces the
+current worktree's state and baselines. This retires that worktree's configured and
 legacy Git-admin or hidden-sibling state, removes its old snapshots through the
 broker, and initializes new JJ and Git baselines. Other worktrees' UUID bundles
 are preserved. Rebuild refuses active scans or Git publishers; retry after
@@ -81,14 +98,15 @@ An existing split store needs its original configuration during cleanup. If a
 readable manager database records snapshots or spools outside the directories
 scheduled for rebuild, the command refuses before retiring any store or moving
 its trash. The diagnostic identifies the retained database and artifact path.
-Restore the original `BTRFS_AWACS_STATE_DIR`/`BTRFS_AWACS_MANAGED_DIR` settings
+Restore the original `awacs.stateDir` and `BTRFS_AWACS_MANAGED_DIR` settings
 before retrying cleanup, or explicitly retire those external artifacts before
 discarding their database. Rebuild does not discover or migrate former split
 storage directories. Explicit repair of a corrupt database remains available
 for the configured and recognized legacy directories.
 
-`awacs gc --dry-run` reports collectible state in `BTRFS_AWACS_STATE_DIR`;
-`awacs gc` collects it without requiring a current repository. For live roots,
+`awacs gc --dry-run` reports collectible state in the current repository's
+saved directory. `awacs gc --state-dir /absolute/path` works outside a
+repository, including after the repository was deleted. For live roots,
 ordinary bounded GC preserves durable baselines and leases. To retire an
 orphan, GC asks the broker to verify that its filesystem/subvolume identity is
 absent. A missing pathname, rename, inaccessible filesystem, or failed probe

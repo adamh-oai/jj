@@ -18,6 +18,7 @@ pub mod recursive_snapshot;
 pub mod scan;
 pub mod scan_facade;
 pub mod service;
+mod state_config;
 pub mod status;
 pub mod store;
 pub mod subvolume_migration;

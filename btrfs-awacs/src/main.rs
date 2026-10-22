@@ -27,6 +27,8 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use btrfs_awacs::bootstrap::InitProgress;
+use btrfs_awacs::bootstrap::configure_state_root;
+use btrfs_awacs::bootstrap::configure_state_root_for_conversion;
 use btrfs_awacs::bootstrap::initialize_descendant_root_with_watch_consumer;
 use btrfs_awacs::bootstrap::initialize_root;
 use btrfs_awacs::bootstrap::require_retained_descendant_baseline;
@@ -100,7 +102,7 @@ struct Cli {
 
 #[derive(Debug, ClapSubcommand)]
 enum CliCommand {
-    /// Convert a directory to a Btrfs subvolume and seed its AWACS watch.
+    /// Convert a Git-backed repository to Btrfs subvolumes and seed its AWACS watch.
     Init {
         #[arg(value_name = "ROOT")]
         root: PathBuf,
@@ -112,9 +114,12 @@ enum CliCommand {
         #[arg(long)]
         keep: bool,
     },
-    /// Collect snapshots and state in BTRFS_AWACS_STATE_DIR, even after a
-    /// worktree has been deleted.
+    /// Collect snapshots and state from the repository's saved AWACS directory.
     Gc {
+        /// Use an explicit state directory, including after the repository
+        /// has been deleted.
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
         /// Report collectible state without changing it.
         #[arg(long)]
         dry_run: bool,
@@ -367,7 +372,7 @@ fn run_cli(cli: Cli) {
             compress,
             keep,
         } => finish(run_init(&root, compress, keep)),
-        CliCommand::Gc { dry_run } => finish(run_gc(dry_run)),
+        CliCommand::Gc { state_dir, dry_run } => finish(run_gc(state_dir.as_deref(), dry_run)),
         CliCommand::Git { command } => match command {
             GitCommand::WorktreeAdd {
                 source,
@@ -444,12 +449,24 @@ fn run_cli(cli: Cli) {
     }
 }
 
-fn run_gc(dry_run: bool) -> Result<(), String> {
-    let state_root = env::var_os("BTRFS_AWACS_STATE_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            "Set BTRFS_AWACS_STATE_DIR to the external AWACS store before running gc".to_owned()
-        })?;
+fn run_gc(state_dir: Option<&Path>, dry_run: bool) -> Result<(), String> {
+    let state_root = match state_dir {
+        Some(path) => path.to_owned(),
+        None => {
+            let cwd = env::current_dir()
+                .map_err(|error| format!("read current directory for AWACS collection: {error}"))?;
+            let root = cwd
+                .ancestors()
+                .find(|path| path.join(".git").exists() || path.join(".jj").exists())
+                .ok_or_else(|| {
+                    "No repository found for AWACS collection; pass --state-dir with the absolute \
+                     path of the existing AWACS state directory"
+                        .to_owned()
+                })?;
+            state_root_for_root(root)
+                .map_err(|error| format!("resolve AWACS state directory: {error}"))?
+        }
+    };
     let report = btrfs_awacs::gc::collect(&state_root, dry_run)
         .map_err(|error| format!("collect AWACS state: {error}"))?;
     let mut output = io::stdout().lock();
@@ -495,6 +512,14 @@ fn run_init(root: &Path, compress: Option<bool>, keep: bool) -> Result<(), Strin
     let preserves_git_metadata =
         OpenedSubvolume::open(root).is_ok() && OpenedSubvolume::open(&root.join(".git")).is_ok();
     require_safe_init_git_metadata(root, preserves_git_metadata)?;
+    // Save the explicit location before conversion can move Git metadata or
+    // create snapshots. Later commands must not depend on this shell's env.
+    if preserves_git_metadata {
+        configure_state_root(root)
+    } else {
+        configure_state_root_for_conversion(root)
+    }
+    .map_err(|error| format!("configure AWACS state directory: {error}"))?;
     let interactive = io::stderr().is_terminal();
     let committed = convert_subvolume_root(
         root,
@@ -1796,6 +1821,10 @@ fn run_git_worktree_add_inner(options: &GitWorktreeAdd<'_>) -> Result<(), String
             &[],
         );
     }
+    // Check the saved location before Git creates a branch or registers the
+    // destination. Worktree creation must not initialize a second state store.
+    state_root_for_root(&source)
+        .map_err(|error| format!("resolve source AWACS state directory: {error}"))?;
     let pending_jj_source = timed_git_phase("read_source_jj_seed", || {
         read_pending_jj_source_seed(&source)
     })?;
