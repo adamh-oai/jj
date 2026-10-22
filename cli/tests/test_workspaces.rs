@@ -197,25 +197,23 @@ impl Drop for RealBtrfsFixtureCleanup {
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-fn default_awacs_state_root(root: &std::path::Path) -> std::path::PathBuf {
-    gix::open(root)
-        .expect("real Btrfs fixture must be a Git repository")
-        .git_dir()
-        .join("awacs")
+fn configured_awacs_state_root(root: &std::path::Path) -> std::path::PathBuf {
+    btrfs_awacs::bootstrap::state_root_for_root(root)
+        .expect("real Btrfs fixture must have a saved AWACS state directory")
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-fn assert_default_awacs_layout(root: &std::path::Path) -> std::path::PathBuf {
+fn assert_configured_awacs_layout(root: &std::path::Path) -> std::path::PathBuf {
     use std::os::unix::fs::MetadataExt as _;
 
-    let state_root = default_awacs_state_root(root);
+    let state_root = configured_awacs_state_root(root);
     let root_key = btrfs_awacs::bootstrap::root_state_key(root)
         .expect("real Btrfs fixture must have a stable subvolume identity");
     let state_dir = state_root.join(root_key);
     let manager = state_dir.join("manager.sqlite3");
     assert!(
         manager.is_file(),
-        "manager must use the production Git-admin path: {}",
+        "manager must use the saved AWACS state directory: {}",
         manager.display()
     );
     let managed = state_dir.join("managed");
@@ -225,14 +223,14 @@ fn assert_default_awacs_layout(root: &std::path::Path) -> std::path::PathBuf {
         managed.display()
     );
     let physical_snapshots = std::fs::read_dir(&managed)
-        .expect("default managed snapshot directory must be readable")
+        .expect("configured managed snapshot directory must be readable")
         .filter_map(Result::ok)
         .filter_map(|cut| std::fs::metadata(cut.path().join("snapshot")).ok())
         .filter(|metadata| metadata.ino() == 256)
         .count();
     assert!(
         physical_snapshots > 0,
-        "the default managed directory must contain physical Btrfs snapshots, not copied \
+        "the configured managed directory must contain physical Btrfs snapshots, not copied \
          placeholders: {}",
         managed.display()
     );
@@ -240,49 +238,27 @@ fn assert_default_awacs_layout(root: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-fn assert_awacs_state_retired(
-    root: &std::path::Path,
-    removed_state_root: &std::path::Path,
+fn assert_external_awacs_state_preserved(
+    state_dir: &std::path::Path,
     expected_identity: &jj_lib::file_util::FileIdentity,
-) -> std::path::PathBuf {
+) {
     use std::os::unix::fs::MetadataExt as _;
 
-    let admin_dir = removed_state_root.parent().unwrap();
-    assert!(
-        !admin_dir.exists(),
-        "removed workspace's Git administrative directory must actually be pruned: {}",
-        admin_dir.display()
+    assert_eq!(
+        jj_lib::file_util::FileIdentity::from_symlink_path(state_dir).unwrap(),
+        *expected_identity,
+        "removing a workspace must preserve its external state for GC"
     );
-    let retired = std::fs::read_dir(default_awacs_state_root(root))
+    let physical_snapshots = std::fs::read_dir(state_dir.join("managed"))
         .unwrap()
         .map(Result::unwrap)
-        .find(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".retired-worktree-")
-                && jj_lib::file_util::FileIdentity::from_symlink_path(entry.path()).unwrap()
-                    == *expected_identity
-        })
-        .expect("removed workspace's AWACS directory must be retired by identity")
-        .path();
-    let mut physical_snapshots = 0;
-    for state in std::fs::read_dir(&retired).unwrap() {
-        let managed = state.unwrap().path().join("managed");
-        if managed.is_dir() {
-            physical_snapshots += std::fs::read_dir(managed)
-                .unwrap()
-                .map(Result::unwrap)
-                .filter_map(|cut| std::fs::metadata(cut.path().join("snapshot")).ok())
-                .filter(|metadata| metadata.ino() == 256)
-                .count();
-        }
-    }
+        .filter_map(|cut| std::fs::metadata(cut.path().join("snapshot")).ok())
+        .filter(|metadata| metadata.ino() == 256)
+        .count();
     assert!(
         physical_snapshots > 0,
-        "retirement must preserve physical snapshots until subvolume disable"
+        "external snapshots must remain until GC can collect the removed workspace"
     );
-    retired
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
@@ -640,11 +616,15 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
     }
     if colocated_jj {
         jj_command(&root)
+            .env("BTRFS_AWACS_STATE_DIR", state.join("managed"))
             .args(["util", "subvolume", "enable"])
             .assert()
             .success();
     } else {
-        run(command(awacs.as_os_str(), &base).arg("init").arg(&root))?;
+        run(command(awacs.as_os_str(), &base)
+            .env("BTRFS_AWACS_STATE_DIR", state.join("managed"))
+            .arg("init")
+            .arg(&root))?;
     }
     // Subvolume enable can select core.fsmonitor=true. Keep this fixture on
     // the requested AWACS hook even when that Git build interprets true as
@@ -703,7 +683,7 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
     let GitFsmonitorStatus::Baseline(baseline) = initial_index_status.fsmonitor else {
         panic!("bootstrap status must persist an AWACS cursor");
     };
-    let manager = assert_default_awacs_layout(&root);
+    let manager = assert_configured_awacs_layout(&root);
     let mut baseline_snapshot = None;
     for entry in std::fs::read_dir(manager.parent().unwrap().join("managed"))? {
         let snapshot = entry?.path().join("snapshot");
@@ -722,8 +702,8 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         let mut store = btrfs_awacs::store::Store::open(&manager)?;
         let baseline_status = RootStatus::open(&root)?.inspect_baseline(&baseline);
         let was_queried: bool = store.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM git_cursor_observations \
-             WHERE watch_id = ?1 AND cut_sequence = ?2)",
+            "SELECT EXISTS(SELECT 1 FROM git_cursor_observations WHERE watch_id = ?1 AND \
+             cut_sequence = ?2)",
             (
                 baseline.retention_token.as_slice(),
                 baseline_status.sequence.unwrap(),
@@ -749,7 +729,8 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
             let retained = RootStatus::open(&root)?.inspect_baseline(&baseline);
             assert!(
                 baseline_snapshot.exists() && retained.issues.is_empty(),
-                "cleanup must retain the physical endpoint and exact replay of the idle index: {:?}",
+                "cleanup must retain the physical endpoint and exact replay of the idle index: \
+                 {:?}",
                 retained.issues
             );
             let opened = OpenedSubvolume::open(&baseline_snapshot)?;
@@ -1312,7 +1293,8 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
         std::fs::create_dir(directory)?;
     }
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))?;
-    let mut cleanup = RealBtrfsFixtureCleanup::new(root.clone(), unused_state, runtime.clone());
+    let mut cleanup =
+        RealBtrfsFixtureCleanup::new(root.clone(), unused_state.clone(), runtime.clone());
     std::os::unix::fs::symlink(&awacs, runtime.join("git-fsmonitor-awacs"))?;
     let mut paths = vec![runtime.clone()];
     paths.extend(std::env::split_paths(
@@ -1390,6 +1372,7 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
     let failed = main.run_jj_with(|cmd| {
         configure(cmd);
         cmd.env("GIT_TRACE2_EVENT", &failed_trace)
+            .env("BTRFS_AWACS_STATE_DIR", unused_state.join("managed"))
             .args(["util", "subvolume", "enable"])
     });
     assert!(!failed.status.success(), "{failed}");
@@ -1619,7 +1602,7 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
             creation_lstats <= 8,
             "workspace creation refreshed {creation_lstats} tracked entries"
         );
-        assert_default_awacs_layout(&child);
+        assert_configured_awacs_layout(&child);
         let child_repo = gix::open(&child)?;
         let initial_index = child_repo.open_index()?;
         assert_eq!(
@@ -1934,16 +1917,17 @@ fn test_snapshot_retains_baseline_across_jj_metadata_subvolume_conversion() -> T
     main_dir
         .run_jj_with(|cmd| {
             configure(cmd);
-            cmd.args(["util", "subvolume", "enable", "--rebuild-baseline"])
+            cmd.env("BTRFS_AWACS_STATE_DIR", state.join("managed"))
+                .args(["util", "subvolume", "enable", "--rebuild-baseline"])
         })
         .success();
     assert_ne!(std::fs::metadata(root.join(".jj"))?.ino(), 256);
-    let manager = assert_default_awacs_layout(&root);
+    let manager = assert_configured_awacs_layout(&root);
     let read_manager_head = || -> TestResult<([u8; 16], i64, Vec<u8>)> {
         let store = Store::open(&manager)?;
         let head = store.connection().query_row(
-            "SELECT s.id, s.path FROM watches w JOIN snapshots s \
-             ON s.id = w.last_cut_snapshot_id WHERE s.physical_state = 'present'",
+            "SELECT s.id, s.path FROM watches w JOIN snapshots s ON s.id = w.last_cut_snapshot_id \
+             WHERE s.physical_state = 'present'",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )?;
@@ -2008,7 +1992,7 @@ fn test_snapshot_retains_baseline_across_jj_metadata_subvolume_conversion() -> T
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 #[test]
 #[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
-fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() -> TestResult {
+fn test_util_subvolume_migration_preserves_saved_awacs_paths_and_git_cursor() -> TestResult {
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
     use std::time::SystemTime;
@@ -2102,7 +2086,7 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
         .env("PATH", &path)
         .env("BTRFS_AWACS_BROKER_SOCKET", &broker_socket)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env_remove("BTRFS_AWACS_STATE_DIR")
+        .env("BTRFS_AWACS_STATE_DIR", awacs_state.join("managed"))
         .env_remove("BTRFS_AWACS_STATE_ROOT")
         .env_remove("BTRFS_AWACS_MANAGED_DIR")
         .output()?;
@@ -2143,7 +2127,7 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
         "source Git AWACS cursor must belong to its current manager before migration: {:?}",
         original_git_status.issues
     );
-    assert_default_awacs_layout(&repo_root);
+    assert_configured_awacs_layout(&repo_root);
     main_dir.write_file("file", "modified before migration\n");
     main_dir.write_file("untracked", "preserve new file\n");
     main_dir.write_file("ignored", "preserve ignored file\n");
@@ -2183,7 +2167,7 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
             status.stdout.raw().contains("Consistency: OK"),
             "immediate `{operation}` consistency failed before any normal JJ/Git scan:\n{status}"
         );
-        assert_default_awacs_layout(&repo_root);
+        assert_configured_awacs_layout(&repo_root);
         let after = inspect_git_index(&repo_root.join(".git/index"))?.fsmonitor;
         assert!(matches!(after, GitFsmonitorStatus::Baseline(_)));
         if operation.ends_with("--rebuild-baseline") {
@@ -2376,11 +2360,12 @@ fn test_util_subvolume_migration_finalizes_default_awacs_paths_and_git_cursor() 
 #[test]
 #[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_external_awacs_rebuild_and_gc_after_repository_deletion() -> TestResult {
-    use btrfs_awacs::store::Store;
     use std::fs::File;
     use std::os::fd::AsFd as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::process::Command;
+
+    use btrfs_awacs::store::Store;
 
     let btrfs_root = std::path::PathBuf::from(
         std::env::var_os("JJ_TEST_BTRFS_ROOT").expect("JJ_TEST_BTRFS_ROOT is required"),
@@ -2434,18 +2419,23 @@ fn test_external_awacs_rebuild_and_gc_after_repository_deletion() -> TestResult 
         .success();
     worktree
         .run_jj_with(|cmd| {
-            configure(cmd, false);
+            configure(cmd, true);
             cmd.args(["util", "subvolume", "enable"])
         })
         .success();
     let key = btrfs_awacs::bootstrap::root_state_key(&repo_root)?;
     let legacy = repo_root.join(".git/awacs").join(&key);
     let current = external.join(&key);
-    let old_store = Store::open(&legacy.join("manager.sqlite3"))?
+    let old_store = Store::open(&current.join("manager.sqlite3"))?
         .metadata()?
         .store_uuid;
-    // Older installations kept the cut subvolume directly in managed/.
-    // Explicit rebuild must also reclaim that physical layout.
+    // Keep a leftover from an older Git-admin store alongside the active
+    // external store. Explicit rebuild must reclaim its physical snapshots.
+    for directory in [legacy.join("managed"), legacy.join("spool")] {
+        std::fs::create_dir_all(&directory)?;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    std::fs::write(legacy.join("manager.sqlite3"), b"interrupted legacy state")?;
     btrfs_awacs::btrfs::create_snapshot(
         File::open(&repo_root)?.as_fd(),
         File::open(legacy.join("managed"))?.as_fd(),
@@ -2466,7 +2456,7 @@ fn test_external_awacs_rebuild_and_gc_after_repository_deletion() -> TestResult 
     let rebuild = || {
         worktree
             .run_jj_with(|cmd| {
-                configure(cmd, true);
+                configure(cmd, false);
                 cmd.args(["util", "subvolume", "enable", "--rebuild-baseline"])
             })
             .success()
@@ -2491,7 +2481,7 @@ fn test_external_awacs_rebuild_and_gc_after_repository_deletion() -> TestResult 
     let check = || {
         let status = worktree
             .run_jj_with(|cmd| {
-                configure(cmd, true);
+                configure(cmd, false);
                 cmd.args(["util", "subvolume", "status"])
             })
             .success();
@@ -2513,8 +2503,9 @@ fn test_external_awacs_rebuild_and_gc_after_repository_deletion() -> TestResult 
     let gc = |dry_run: bool| -> std::io::Result<std::process::Output> {
         let mut command = Command::new(&awacs_command);
         command
-            .arg("gc")
-            .env("BTRFS_AWACS_STATE_DIR", &external)
+            .args(["gc", "--state-dir"])
+            .arg(&external)
+            .env_remove("BTRFS_AWACS_STATE_DIR")
             .env("BTRFS_AWACS_BROKER_DIR", &broker)
             .env_remove("BTRFS_AWACS_MANAGED_DIR");
         if dry_run {
@@ -3894,6 +3885,76 @@ exit 1
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]
+fn test_util_subvolume_enable_requires_explicit_awacs_state() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "preserved\n");
+    let config = std::fs::read(main_dir.root().join(".git/config")).unwrap();
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env_remove("BTRFS_AWACS_STATE_DIR")
+            .env_remove("JJ_TEST_AWACS_SCAN_ROOT")
+            .args(["util", "subvolume", "enable"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(
+        output.stderr.raw().contains("BTRFS_AWACS_STATE_DIR"),
+        "{output}"
+    );
+    assert!(output.stderr.raw().contains("awacs.stateDir"), "{output}");
+    assert_eq!(
+        std::fs::read(main_dir.root().join(".git/config")).unwrap(),
+        config
+    );
+    assert_eq!(main_dir.read_file("file"), "preserved\n");
+    assert!(!main_dir.root().join(".git/awacs").exists());
+    assert!(
+        !main_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
+fn test_util_subvolume_enable_rejects_state_inside_checkout_before_changes() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    main_dir.write_file("file", "preserved\n");
+    let config = std::fs::read(main_dir.root().join(".git/config")).unwrap();
+    let state_root = main_dir.root().join(".git/awacs");
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("BTRFS_AWACS_STATE_DIR", &state_root)
+            .env_remove("JJ_TEST_AWACS_SCAN_ROOT")
+            .args(["util", "subvolume", "enable"])
+    });
+    assert!(!output.status.success(), "{output}");
+    assert!(output.stderr.raw().contains("inside"), "{output}");
+    assert_eq!(
+        std::fs::read(main_dir.root().join(".git/config")).unwrap(),
+        config,
+        "a rejected location must not be saved in Git config"
+    );
+    assert!(!state_root.exists());
+    assert_eq!(main_dir.read_file("file"), "preserved\n");
+    assert!(
+        !main_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[cfg(feature = "awacs")]
+#[test]
 #[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     use std::os::unix::ffi::OsStrExt as _;
@@ -4008,9 +4069,26 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     let output = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
-            cmd.args(["util", "subvolume", "enable"])
+            cmd.env("BTRFS_AWACS_STATE_DIR", awacs_state.join("managed"))
+                .args(["util", "subvolume", "enable"])
         })
         .success();
+    assert_eq!(
+        configured_awacs_state_root(&repo_root),
+        awacs_state.join("managed"),
+        "initialization must save the selected state root in Git config"
+    );
+    let wrong_state = awacs_state.join("must-not-be-used");
+    main_dir
+        .run_jj_with(|cmd| {
+            configure_awacs(cmd);
+            cmd.env("BTRFS_AWACS_STATE_DIR", &wrong_state).arg("status")
+        })
+        .success();
+    assert!(
+        !wrong_state.exists(),
+        "runtime commands must use the saved path even when the environment changes"
+    );
     let activated_status = main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
@@ -4021,7 +4099,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         activated_status.stdout.raw().contains("Consistency: OK"),
         "activation must be consistent before any normal JJ/Git scan:\n{activated_status}"
     );
-    assert_default_awacs_layout(&repo_root);
+    assert_configured_awacs_layout(&repo_root);
     assert!(
         output
             .stderr
@@ -4358,7 +4436,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         String::from_utf8_lossy(&worktree_add.stdout),
         String::from_utf8_lossy(&worktree_add.stderr)
     );
-    assert_default_awacs_layout(&adopted_root);
+    assert_configured_awacs_layout(&adopted_root);
     assert!(
         !adopted_root.join(".jj").exists(),
         "a Git snapshot worktree must not inherit the source JJ repository"
@@ -4518,7 +4596,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     // response pins. They must fail before making cuts or persistent roots,
     // including with a valid cursor, bootstrap tokens, and alternate indexes.
     {
-        let manager = assert_default_awacs_layout(&adopted_root);
+        let manager = assert_configured_awacs_layout(&adopted_root);
         let store = Store::open(&manager)?;
         let retention_state = || {
             store.connection().query_row(
@@ -4738,13 +4816,11 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         String::from_utf8_lossy(&disable_hook_version.stderr)
     );
 
-    let adopted_state_root = default_awacs_state_root(&adopted_root);
-    let mut checked_shared_replay = false;
-    for directory in std::fs::read_dir(&adopted_state_root)? {
-        let manager_db = directory?.path().join("manager.sqlite3");
-        if !manager_db.is_file() {
-            continue;
-        }
+    let adopted_state_root = configured_awacs_state_root(&adopted_root);
+    {
+        let manager_db = adopted_state_root
+            .join(btrfs_awacs::bootstrap::root_state_key(&adopted_root)?)
+            .join("manager.sqlite3");
         let store = Store::open(&manager_db)?;
         let connection = store.connection();
         let (replay_floor, first_cut_sequence, retained_first_base): (i64, i64, i64) = connection
@@ -4771,12 +4847,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             "shared replay must retain the first transition from the pinned JJ baseline: \
              floor={replay_floor}, first_cut={first_cut_sequence}"
         );
-        checked_shared_replay = true;
     }
-    assert!(
-        checked_shared_replay,
-        "the adopted worktree has no AWACS manager database"
-    );
 
     let adopted_dir = test_env.work_dir(&adopted_root);
     adopted_dir.write_file("file", "edited after Git checkout\n");
@@ -4840,7 +4911,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
             .contains("Consistency: OK"),
         "adopted activation must be consistent before another scan:\n{adopted_enabled_status}"
     );
-    assert_default_awacs_layout(&adopted_root);
+    assert_configured_awacs_layout(&adopted_root);
     assert_eq!(std::fs::metadata(adopted_root.join(".jj"))?.ino(), 256);
     main_dir
         .run_jj_with(|cmd| {
@@ -4947,7 +5018,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         "workspace add must not rebuild the child map by walking it: {workspace_add}"
     );
     let secondary_dir = test_env.work_dir(&secondary_root);
-    assert_default_awacs_layout(&secondary_root);
+    assert_configured_awacs_layout(&secondary_root);
     secondary_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
@@ -4957,13 +5028,13 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
 
     let mut parent_store = None;
     let mut child_store = None;
-    let parent_state_root = default_awacs_state_root(&repo_root);
-    let child_state_root = default_awacs_state_root(&secondary_root);
-    assert_ne!(
+    let parent_state_root = configured_awacs_state_root(&repo_root);
+    let child_state_root = configured_awacs_state_root(&secondary_root);
+    assert_eq!(
         parent_state_root, child_state_root,
-        "linked worktrees must keep independent AWACS state roots"
+        "linked worktrees must inherit the saved common state root"
     );
-    for state_root in [&parent_state_root, &child_state_root] {
+    for state_root in [&parent_state_root] {
         for entry in std::fs::read_dir(state_root)? {
             let manager_db = entry?.path().join("manager.sqlite3");
             if !manager_db.is_file() {
@@ -5073,10 +5144,12 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         child_manager_identity
     );
 
-    // Removing the worktree retires its snapshots and private broker trash
-    // without copying them, then removes its Git administrative directory.
+    // Removing the worktree prunes its Git administration and preserves the
+    // external UUID bundle until GC can collect its retained snapshots.
+    let child_state_dir = child_db.parent().unwrap().to_owned();
     let child_state_identity =
-        jj_lib::file_util::FileIdentity::from_symlink_path(&child_state_root)?;
+        jj_lib::file_util::FileIdentity::from_symlink_path(&child_state_dir)?;
+    let child_admin = gix::open(&secondary_root)?.git_dir().to_owned();
     main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
@@ -5084,11 +5157,13 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         })
         .success();
     assert!(!secondary_root.exists());
-    let retired_state =
-        assert_awacs_state_retired(&repo_root, &child_state_root, &child_state_identity);
-    let retired_manager = retired_state.join(child_db.strip_prefix(&child_state_root)?);
+    assert!(
+        !child_admin.exists(),
+        "worktree administration must be pruned"
+    );
+    assert_external_awacs_state_preserved(&child_state_dir, &child_state_identity);
     assert_eq!(
-        jj_lib::file_util::FileIdentity::from_symlink_path(retired_manager)?,
+        jj_lib::file_util::FileIdentity::from_symlink_path(&child_db)?,
         child_manager_identity,
         "retirement must preserve the removed workspace's manager file"
     );
@@ -5455,7 +5530,8 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
     main_dir
         .run_jj_with(|cmd| {
             configure_awacs(cmd);
-            cmd.args(["util", "subvolume", "enable"])
+            cmd.env("BTRFS_AWACS_STATE_DIR", awacs_state.join("managed"))
+                .args(["util", "subvolume", "enable"])
         })
         .success();
     let activated_status = main_dir
@@ -5468,7 +5544,7 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
         activated_status.stdout.raw().contains("Consistency: OK"),
         "stress activation must be consistent before any ordinary scan:\n{activated_status}"
     );
-    assert_default_awacs_layout(&repo_root);
+    assert_configured_awacs_layout(&repo_root);
 
     let stress_command = StressCommand {
         jj: TestEnvironment::jj_executable(),
@@ -5503,7 +5579,7 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
                 ])
             })
             .success();
-        assert_default_awacs_layout(&workspace_root);
+        assert_configured_awacs_layout(&workspace_root);
         run_workload(&stress_command, &workspace_root, width, rounds);
         let observed = observed_tree(&stress_command, &workspace_root, width * 100_000);
         assert_eq!(
@@ -5522,7 +5598,10 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
     }
 
     for (workspace_name, workspace_root) in workspace_names {
-        let state_root = default_awacs_state_root(&workspace_root);
+        let state_root = assert_configured_awacs_layout(&workspace_root)
+            .parent()
+            .unwrap()
+            .to_owned();
         let state_identity = jj_lib::file_util::FileIdentity::from_symlink_path(&state_root)?;
         main_dir
             .run_jj_with(|cmd| {
@@ -5530,7 +5609,7 @@ fn test_awacs_real_btrfs_deterministic_concurrent_mutations() -> TestResult {
                 cmd.args(["workspace", "remove", &workspace_name])
             })
             .success();
-        assert_awacs_state_retired(&repo_root, &state_root, &state_identity);
+        assert_external_awacs_state_preserved(&state_root, &state_identity);
     }
     main_dir
         .run_jj_with(|cmd| {
@@ -6699,7 +6778,13 @@ fn test_util_subvolume_rebuild_preserves_journal_when_root_is_not_a_subvolume() 
 
     // The temp workspace is not a Btrfs subvolume. Do not use the synthetic
     // scan environment: physical-state validation must reject it before reset.
-    let output = main_dir.run_jj(["util", "subvolume", "enable", "--rebuild-baseline"]);
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env(
+            "BTRFS_AWACS_STATE_DIR",
+            test_env.env_root().join("awacs-state"),
+        )
+        .args(["util", "subvolume", "enable", "--rebuild-baseline"])
+    });
     assert!(!output.status.success(), "{output}");
     assert!(
         output
@@ -7538,6 +7623,10 @@ exit 1
     let output = main_dir.run_jj_with(|cmd| {
         cmd.env("PATH", &path)
             .env("JJ_TEST_BTRFS_CLI", "1")
+            .env(
+                "BTRFS_AWACS_STATE_DIR",
+                test_env.env_root().join("awacs-state"),
+            )
             .args(["util", "subvolume", "enable"])
     });
     assert!(!output.status.success(), "{output}");
@@ -7660,8 +7749,14 @@ exit 1
     );
 
     let root_inode = std::fs::metadata(main_dir.root()).unwrap().ino();
-    let output =
-        main_dir.run_jj_with(|cmd| cmd.env("PATH", &path).args(["util", "subvolume", "enable"]));
+    let output = main_dir.run_jj_with(|cmd| {
+        cmd.env("PATH", &path)
+            .env(
+                "BTRFS_AWACS_STATE_DIR",
+                test_env.env_root().join("awacs-state"),
+            )
+            .args(["util", "subvolume", "enable"])
+    });
     assert!(!output.status.success(), "{output}");
     assert_eq!(
         std::fs::metadata(main_dir.root()).unwrap().ino(),
