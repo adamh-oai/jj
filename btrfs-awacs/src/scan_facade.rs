@@ -5,6 +5,7 @@ use crate::btrfs::{filesystem_info, subvolume_info};
 use crate::facade::{FacadeService, PreparedQueryResult};
 use crate::git_retention::GitPublisher;
 use crate::manager::{PERMISSION_CUT, PERMISSION_READ};
+use crate::namespace::RootView;
 use crate::scan::{
     BeginScanRequest, Invalidation, ScanClient, ScanError, ScanErrorKind, ScanOutcome, ScanSession,
     SnapshotBaseline, SnapshotIdentity, SnapshotLease,
@@ -13,7 +14,6 @@ use crate::status::{GitFsmonitorStatus, IndexChecksum, inspect_git_index};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(debug_assertions)]
 use std::path::Component;
@@ -399,16 +399,12 @@ impl DirectScanHandler {
         &self,
         facade: &mut FacadeService,
         requested_root: &Path,
-    ) -> Result<(PathBuf, [u8; 16]), ScanError> {
-        let root = std::fs::canonicalize(requested_root)
-            .map_err(|err| unavailable(format!("canonicalize AWACS scan root: {err}")))?;
-        let root_bytes = root.as_os_str().as_bytes();
-        let root_file =
-            File::open(&root).map_err(|err| unavailable(format!("open AWACS scan root: {err}")))?;
-        let filesystem = filesystem_info(root_file.as_fd())
-            .map_err(|err| unavailable(format!("inspect AWACS scan filesystem: {err}")))?;
-        let subvolume = subvolume_info(root_file.as_fd())
-            .map_err(|err| unavailable(format!("inspect AWACS scan subvolume: {err}")))?;
+    ) -> Result<(RootView, [u8; 16]), ScanError> {
+        let root = RootView::open(requested_root)
+            .map_err(|err| unavailable(format!("open AWACS scan root: {err}")))?;
+        let root_bytes = root.binding().root_path.as_slice();
+        let filesystem = &root.source().filesystem;
+        let subvolume = &root.source().subvolume;
         let mut existing = facade
             .service()
             .store()
@@ -434,7 +430,7 @@ impl DirectScanHandler {
                 facade.forget_view(watch_id);
                 tracing::info!(
                     watch_id = %Uuid::from_bytes(watch_id),
-                    root = %root.display(),
+                    root = %root.path().display(),
                     "rebound AWACS watch to moved subvolume path"
                 );
             }
@@ -442,12 +438,12 @@ impl DirectScanHandler {
         let (watch_id, grant_id) = existing.ok_or_else(|| {
             unavailable(format!(
                 "{} is not initialized; run awacs init {} first",
-                root.display(),
-                root.display(),
+                root.path().display(),
+                root.path().display(),
             ))
         })?;
         match facade.view_binding(watch_id) {
-            Some(binding) if binding.root_path.as_slice() == root_bytes => {}
+            Some(binding) if binding.same_root(root.binding()) => {}
             Some(_) => {
                 return Err(ScanError::new(
                     ScanErrorKind::Unauthorized,
@@ -590,7 +586,7 @@ impl DirectScanHandler {
             .lock()
             .map_err(|_| other("AWACS facade lock poisoned"))?;
         let (root, watch_id) = self.ensure_registered_root(&mut facade, live_root)?;
-        validate_persisted_git_index(&root, expected_baseline)?;
+        validate_persisted_git_index(root.path(), expected_baseline)?;
         if !facade
             .observe_logical_git_baseline(watch_id, expected_baseline, unix_time_ns()?)
             .map_err(|err| other(format!("observe published AWACS Git index: {err}")))?
@@ -632,8 +628,7 @@ impl DirectScanHandler {
         // Every direct scan remains bound to the caller's exact canonical
         // root.
         let registration_started = Instant::now();
-        let (_requested_root, watch_id) =
-            self.ensure_registered_root(&mut facade, &request.live_root)?;
+        let (root, watch_id) = self.ensure_registered_root(&mut facade, &request.live_root)?;
         tracing::info!(
             elapsed_ms = registration_started.elapsed().as_millis() as u64,
             root = %request.live_root.display(),
@@ -706,6 +701,7 @@ impl DirectScanHandler {
         let prepared = facade
             .prepare_scan_query(
                 watch_id,
+                &root,
                 previous_baseline,
                 self.requester_uid,
                 self.requester_gid,
@@ -778,7 +774,7 @@ impl DirectScanHandler {
             }
         };
         #[cfg(debug_assertions)]
-        if let Err(err) = self.maybe_mutate_live_after_begin(&_requested_root) {
+        if let Err(err) = self.maybe_mutate_live_after_begin(root.path()) {
             let _ = facade.finish_query_response(prepared);
             return Err(err);
         }

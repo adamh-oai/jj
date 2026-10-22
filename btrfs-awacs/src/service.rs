@@ -1352,7 +1352,34 @@ impl Service {
             .map_err(|error| ServiceError::context("publish initial snapshot", error))
     }
 
-    pub fn changes(&mut self, options: &ChangesOptions) -> Result<PublishedCut, ServiceError> {
+    /// Makes the cut from the caller's opened source, never by reopening its
+    /// pathname. Check the object before joining another caller's pending cut.
+    pub fn changes(
+        &mut self,
+        live: &OpenedSubvolume,
+        options: &ChangesOptions,
+    ) -> Result<PublishedCut, ServiceError> {
+        let matches_watch: bool = self
+            .store
+            .connection()
+            .query_row(
+                r"SELECT EXISTS (
+                SELECT 1 FROM watches w JOIN filesystems f ON f.id = w.filesystem_id
+                 WHERE w.id = ?1 AND w.state = 'active'
+                   AND w.live_subvol_uuid = ?2 AND f.fs_uuid = ?3)",
+                rusqlite::params![
+                    options.watch_id.as_slice(),
+                    live.subvolume.uuid.as_slice(),
+                    live.filesystem.fs_uuid.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| ServiceError::context("validate opened scan root", error))?;
+        if !matches_watch {
+            return Err(ServiceError::new(
+                "opened scan root does not match the registered subvolume",
+            ));
+        }
         let admission_expiry = lease_expiry(options.now_ns, self.config.lease_ns)?;
         if let Some(admission) = crate::diagnostics::timed("cut check existing admission", || {
             self.store.admit_planned_cut(
@@ -1373,13 +1400,6 @@ impl Service {
         let write_access = crate::diagnostics::timed("cut preflight writable", || {
             self.preflight_snapshot_lifecycle_writable()
         })?;
-        let (live_path, _base_path) = crate::diagnostics::timed("cut load watch paths", || {
-            self.watch_paths(options.watch_id)
-        })?;
-        let live = crate::diagnostics::timed("cut open live subvolume", || {
-            self.open_subvolume(&live_path)
-        })
-        .map_err(|error| ServiceError::context("open watched subvolume", error))?;
         let destination_name = operation_name(b"cut-");
         let destination_path =
             managed_snapshot_path(&self.config.managed_snapshot_directory, &destination_name);
@@ -1446,7 +1466,7 @@ impl Service {
         })
         .map_err(|error| ServiceError::context("start cut effect", error))?;
         let snapshot_started = std::time::Instant::now();
-        let target = self.create_snapshot(&write_access, &live, &destination_name, true)?;
+        let target = self.create_snapshot(&write_access, live, &destination_name, true)?;
         tracing::info!(
             elapsed_ms = snapshot_started.elapsed().as_millis() as u64,
             "query cut snapshot created"

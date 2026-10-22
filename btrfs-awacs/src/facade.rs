@@ -5,13 +5,12 @@ use crate::compat::{
     project_events,
 };
 use crate::manager::{FacadeActivation, QueryLeaseReservation};
-use crate::namespace::NamespaceMonitor;
+use crate::namespace::RootView;
 use crate::namespace::ViewBinding;
 use crate::service::{ChangesOptions, Service};
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -37,7 +36,7 @@ pub struct PreparedQueryResult {
 struct ActiveView {
     authorization_id: [u8; 16],
     activation: FacadeActivation,
-    monitor: NamespaceMonitor,
+    binding: ViewBinding,
 }
 
 pub struct FacadeService {
@@ -118,7 +117,7 @@ impl FacadeService {
     }
 
     pub fn view_binding(&self, watch_id: [u8; 16]) -> Option<&ViewBinding> {
-        self.views.get(&watch_id).map(|view| view.monitor.binding())
+        self.views.get(&watch_id).map(|view| &view.binding)
     }
 
     /// Drops a stale in-memory namespace binding before a durable watch is
@@ -131,7 +130,7 @@ impl FacadeService {
         &mut self,
         watch_id: [u8; 16],
         authorization_id: [u8; 16],
-        root: &Path,
+        root: &RootView,
     ) -> Result<(), FacadeError> {
         if !self
             .service
@@ -143,32 +142,15 @@ impl FacadeService {
             ));
         }
         let activation_started = std::time::Instant::now();
-        let monitor_arm_started = std::time::Instant::now();
-        let monitor = NamespaceMonitor::arm(root)
-            .map_err(|error| FacadeError::context("arm namespace monitor", error))?;
-        tracing::info!(
-            elapsed_ms = monitor_arm_started.elapsed().as_millis() as u64,
-            root = %root.display(),
-            "facade activation armed namespace monitor"
-        );
-        let continuity_started = std::time::Instant::now();
-        monitor
-            .check_continuity()
-            .map_err(|error| FacadeError::context("validate namespace monitor", error))?;
-        tracing::info!(
-            elapsed_ms = continuity_started.elapsed().as_millis() as u64,
-            root = %root.display(),
-            "facade activation checked namespace continuity"
-        );
         let store_activation_started = std::time::Instant::now();
         let activation = self
             .service
             .store_mut()
-            .activate_snapshot_facade(watch_id, authorization_id, monitor.binding())
+            .activate_snapshot_facade(watch_id, authorization_id, root.binding())
             .map_err(|error| FacadeError::context("activate facade in store", error))?;
         tracing::info!(
             elapsed_ms = store_activation_started.elapsed().as_millis() as u64,
-            root = %root.display(),
+            root = %root.path().display(),
             "facade activation committed store binding"
         );
         self.views.insert(
@@ -176,12 +158,12 @@ impl FacadeService {
             ActiveView {
                 authorization_id,
                 activation,
-                monitor,
+                binding: root.binding().clone(),
             },
         );
         tracing::info!(
             elapsed_ms = activation_started.elapsed().as_millis() as u64,
-            root = %root.display(),
+            root = %root.path().display(),
             "facade activation completed"
         );
         Ok(())
@@ -197,6 +179,7 @@ impl FacadeService {
     pub fn prepare_scan_query(
         &mut self,
         watch_id: [u8; 16],
+        root: &RootView,
         previous_baseline: Option<&crate::scan::SnapshotBaseline>,
         requester_uid: u32,
         requester_gid: u32,
@@ -204,20 +187,28 @@ impl FacadeService {
         lease_expires_ns: i64,
         allow_replay_invalidation: bool,
     ) -> Result<PreparedQueryResult, FacadeError> {
-        crate::diagnostics::timed("query pre-cut namespace check", || {
-            self.check_continuity_or_invalidate(watch_id, "pre-cut namespace check")
-        })?;
-        let view = self.views.get(&watch_id).expect("checked active view");
+        let view = self
+            .views
+            .get(&watch_id)
+            .ok_or_else(|| FacadeError::new("scan facade is not active"))?;
+        if !view.binding.same_root(root.binding()) {
+            return Err(FacadeError::new(
+                "opened scan root does not match its active view",
+            ));
+        }
         let authorization_id = view.authorization_id;
         let activation = view.activation.clone();
         let published = crate::diagnostics::timed("query take synchronized cut", || {
-            self.service.changes(&ChangesOptions {
-                watch_id,
-                authorization_id,
-                requester_uid,
-                requester_gid,
-                now_ns,
-            })
+            self.service.changes(
+                root.source(),
+                &ChangesOptions {
+                    watch_id,
+                    authorization_id,
+                    requester_uid,
+                    requester_gid,
+                    now_ns,
+                },
+            )
         })
         .map_err(|error| FacadeError::context("take synchronized scan cut", error))?;
         // The opaque cursor identifies this exact immutable snapshot
@@ -467,18 +458,14 @@ impl FacadeService {
             allow_replay_invalidation,
         } = input;
         let watch_id = activation.watch_id;
-        self.check_continuity_or_invalidate(watch_id, "post-cut namespace check")?;
-        let view = self.views.get(&watch_id).expect("checked active view");
+        let view = self
+            .views
+            .get(&watch_id)
+            .expect("active view was checked before the cut");
         self.service
             .store_mut()
-            .finalize_cut_boundary(
-                &activation,
-                view.monitor.binding(),
-                published.sequence,
-                None,
-            )
+            .finalize_cut_boundary(&activation, &view.binding, published.sequence, None)
             .map_err(|error| FacadeError::context("finalize scan boundary", error))?;
-        self.check_continuity_or_invalidate(watch_id, "pre-response namespace check")?;
 
         let metadata = self
             .service
@@ -584,34 +571,6 @@ impl FacadeService {
             }
         };
         let cursor = encode_direct_scan_cursor(&claims);
-        if let Err(continuity) =
-            self.check_continuity_or_invalidate(watch_id, "final response namespace check")
-        {
-            let release = self
-                .service
-                .store_mut()
-                .release_query_lease(&lease, &activation);
-            let invalidation = match &release {
-                Ok(()) => {
-                    let result = self
-                        .service
-                        .store_mut()
-                        .invalidate_snapshot_facade(&activation);
-                    if result.is_ok() {
-                        self.views.remove(&watch_id);
-                    }
-                    result.err()
-                }
-                Err(_) => None,
-            };
-            let mut message = continuity.to_string();
-            if let Err(release) = release {
-                message.push_str(&format!("; scan lease release failed: {release}"));
-            } else if let Some(invalidation) = invalidation {
-                message.push_str(&format!("; durable invalidation failed: {invalidation}"));
-            }
-            return Err(FacadeError::new(message));
-        }
         Ok(PreparedQueryResult {
             result: QueryResult {
                 cursor,
@@ -693,41 +652,6 @@ impl FacadeService {
         self.service
             .snapshot_path(prepared.snapshot_id)
             .map_err(|error| FacadeError::context("load prepared query snapshot path", error))
-    }
-
-    fn check_continuity_or_invalidate(
-        &mut self,
-        watch_id: [u8; 16],
-        context: &str,
-    ) -> Result<(), FacadeError> {
-        let check = self
-            .views
-            .get(&watch_id)
-            .ok_or_else(|| FacadeError::new("scan facade is not active"))?
-            .monitor
-            .check_continuity();
-        if let Err(error) = check {
-            let activation = self
-                .views
-                .get(&watch_id)
-                .expect("failed check came from active view")
-                .activation
-                .clone();
-            let invalidation = self
-                .service
-                .store_mut()
-                .invalidate_snapshot_facade(&activation);
-            return Err(match invalidation {
-                Ok(()) => {
-                    self.views.remove(&watch_id);
-                    FacadeError::context(context, error)
-                }
-                Err(invalidation) => FacadeError::new(format!(
-                    "{context}: {error}; durable invalidation failed: {invalidation}"
-                )),
-            });
-        }
-        Ok(())
     }
 
     fn snapshot_uuid(&self, snapshot_id: i64) -> Result<[u8; 16], FacadeError> {
