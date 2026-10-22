@@ -3979,6 +3979,7 @@ fn test_subvolume_mode_recovers_pending_materialization_incrementally(marker: &s
         interpretation_input_fingerprint: vec![3; 32],
         ..Default::default()
     });
+    journal.untracked_scan_complete = true;
     journal.mutation_kind = "checkout".to_owned();
     write_compact_working_copy_state(&state_path, &journal)?;
     std::fs::write(state_path.join("subvolume_mode"), format!("{marker}\n"))?;
@@ -4984,6 +4985,7 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
         retention_token: Vec::new(),
         interpretation_input_fingerprint: vec![3; 32],
     });
+    journal.untracked_scan_complete = true;
     write_compact_working_copy_state(&state_path, &journal)?;
     testutils::write_working_copy_file(&scan_root, path, "leased again\n");
     std::fs::remove_file(untouched_path.to_fs_path_unchecked(&scan_root))?;
