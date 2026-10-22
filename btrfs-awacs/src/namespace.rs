@@ -1,34 +1,19 @@
-//! Mandatory client-view continuity monitor used before clocks can be minted.
+//! Identity checks for the opened root of each direct snapshot scan.
 
 use crate::btrfs::OpenedSubvolume;
-use std::collections::BTreeMap;
-use std::ffi::{CString, OsString};
 use std::fmt;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-const IN_BINDING_MASK: u32 = libc::IN_CREATE
-    | libc::IN_DELETE
-    | libc::IN_MOVED_FROM
-    | libc::IN_MOVED_TO
-    | libc::IN_DELETE_SELF
-    | libc::IN_MOVE_SELF
-    | libc::IN_UNMOUNT
-    | libc::IN_IGNORED
-    | libc::IN_Q_OVERFLOW;
-const IN_SELF_MASK: u32 = libc::IN_DELETE_SELF
-    | libc::IN_MOVE_SELF
-    | libc::IN_UNMOUNT
-    | libc::IN_IGNORED
-    | libc::IN_Q_OVERFLOW;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ViewBinding {
+    // Retained in existing stored records and cursor encodings. This identifies
+    // the activation; it does not imply that a kernel monitor is running.
     pub monitor_session_id: [u8; 16],
     pub root_path: Vec<u8>,
     pub fs_uuid: [u8; 16],
@@ -43,190 +28,107 @@ pub struct ViewBinding {
     pub watched_root_mnt_id: u64,
 }
 
+impl ViewBinding {
+    /// Compares the requested root with an existing activation. Each request
+    /// opens its root again, but may reuse the activation for that same object.
+    pub fn same_root(&self, other: &Self) -> bool {
+        self.root_path == other.root_path
+            && self.fs_uuid == other.fs_uuid
+            && self.subvol_uuid == other.subvol_uuid
+            && self.mount_ns_dev == other.mount_ns_dev
+            && self.mount_ns_ino == other.mount_ns_ino
+            && self.process_root_dev == other.process_root_dev
+            && self.process_root_ino == other.process_root_ino
+            && self.process_root_mnt_id == other.process_root_mnt_id
+            && self.watched_root_dev == other.watched_root_dev
+            && self.watched_root_ino == other.watched_root_ino
+            && self.watched_root_mnt_id == other.watched_root_mnt_id
+    }
+}
+
+/// One request's opened source. Snapshot creation must use this descriptor,
+/// so a later rename or replacement of its pathname cannot redirect the cut.
 #[derive(Debug)]
-pub struct NamespaceMonitor {
-    inotify: OwnedFd,
-    mountinfo: File,
-    watched_names: BTreeMap<i32, Option<Vec<u8>>>,
-    canonical_root: PathBuf,
+pub struct RootView {
+    source: OpenedSubvolume,
+    path: PathBuf,
     binding: ViewBinding,
 }
 
-impl NamespaceMonitor {
-    pub fn arm(root: &Path) -> Result<Self, NamespaceError> {
-        let canonical_root = std::fs::canonicalize(root)
-            .map_err(|error| NamespaceError::context("canonicalize watched root", error))?;
-        if !canonical_root.is_absolute() {
-            return Err(NamespaceError::new("watched root must be absolute"));
-        }
-        reject_descendant_mounts(&canonical_root)?;
-        let opened = OpenedSubvolume::open(&canonical_root)
-            .map_err(|error| NamespaceError::context("open watched subvolume", error))?;
-        // SAFETY: successful inotify_init1 returns one new descriptor.
-        let inotify_fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
-        if inotify_fd < 0 {
-            return Err(NamespaceError::io("inotify_init1"));
-        }
-        // SAFETY: ownership of the just-created descriptor is transferred.
-        let inotify = unsafe { OwnedFd::from_raw_fd(inotify_fd) };
-        let watched_names = arm_component_chain(inotify.as_fd(), &canonical_root)?;
-        let mountinfo = File::open("/proc/self/mountinfo")
-            .map_err(|error| NamespaceError::context("open mountinfo monitor", error))?;
-        let mount_namespace = std::fs::metadata("/proc/self/ns/mnt")
+impl RootView {
+    pub fn open(root: &Path) -> Result<Self, NamespaceError> {
+        let path = std::fs::canonicalize(root)
+            .map_err(|error| NamespaceError::context("canonicalize scan root", error))?;
+        reject_descendant_mounts(&path)?;
+        let source = OpenedSubvolume::open(&path)
+            .map_err(|error| NamespaceError::context("open scan subvolume", error))?;
+        let mount_namespace = File::open("/proc/self/ns/mnt")
+            .and_then(|file| file.metadata())
             .map_err(|error| NamespaceError::context("stat mount namespace", error))?;
-        let process_root = std::fs::metadata("/proc/self/root")
-            .map_err(|error| NamespaceError::context("stat process root", error))?;
-        let process_root_fd = File::open("/proc/self/root")
+        let process_root = File::open("/proc/self/root")
             .map_err(|error| NamespaceError::context("open process root", error))?;
-        let root_metadata = std::fs::metadata(&canonical_root)
-            .map_err(|error| NamespaceError::context("stat watched root", error))?;
+        let process_root_identity = file_identity(process_root.as_fd())?;
+        let root_identity = file_identity(source.as_fd())?;
         let binding = ViewBinding {
             monitor_session_id: *Uuid::new_v4().as_bytes(),
-            root_path: canonical_root.as_os_str().as_bytes().to_vec(),
-            fs_uuid: opened.filesystem.fs_uuid,
-            subvol_uuid: opened.subvolume.uuid,
+            root_path: path.as_os_str().as_bytes().to_vec(),
+            fs_uuid: source.filesystem.fs_uuid,
+            subvol_uuid: source.subvolume.uuid,
             mount_ns_dev: mount_namespace.dev(),
             mount_ns_ino: mount_namespace.ino(),
-            process_root_dev: process_root.dev(),
-            process_root_ino: process_root.ino(),
-            process_root_mnt_id: mount_id(process_root_fd.as_fd())?,
-            watched_root_dev: root_metadata.dev(),
-            watched_root_ino: root_metadata.ino(),
-            watched_root_mnt_id: mount_id(opened.as_fd())?,
+            process_root_dev: process_root_identity.device,
+            process_root_ino: process_root_identity.inode,
+            process_root_mnt_id: process_root_identity.mount,
+            watched_root_dev: root_identity.device,
+            watched_root_ino: root_identity.inode,
+            watched_root_mnt_id: root_identity.mount,
         };
-        let monitor = Self {
-            inotify,
-            mountinfo,
-            watched_names,
-            canonical_root,
+        Ok(Self {
+            source,
+            path,
             binding,
-        };
-        monitor.check_continuity()?;
-        Ok(monitor)
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn source(&self) -> &OpenedSubvolume {
+        &self.source
     }
 
     pub fn binding(&self) -> &ViewBinding {
         &self.binding
     }
-
-    pub fn check_continuity(&self) -> Result<(), NamespaceError> {
-        self.reject_binding_events()?;
-        self.reject_mount_events()?;
-        let current_namespace = std::fs::metadata("/proc/self/ns/mnt")
-            .map_err(|error| NamespaceError::context("recheck mount namespace", error))?;
-        let current_process_root = std::fs::metadata("/proc/self/root")
-            .map_err(|error| NamespaceError::context("recheck process root", error))?;
-        let current_process_root_fd = File::open("/proc/self/root")
-            .map_err(|error| NamespaceError::context("reopen process root", error))?;
-        let current_root = std::fs::metadata(&self.canonical_root)
-            .map_err(|error| NamespaceError::context("recheck watched root", error))?;
-        let opened = OpenedSubvolume::open(&self.canonical_root)
-            .map_err(|error| NamespaceError::context("reopen watched subvolume", error))?;
-        let binding = &self.binding;
-        if current_namespace.dev() != binding.mount_ns_dev
-            || current_namespace.ino() != binding.mount_ns_ino
-            || current_process_root.dev() != binding.process_root_dev
-            || current_process_root.ino() != binding.process_root_ino
-            || mount_id(current_process_root_fd.as_fd())? != binding.process_root_mnt_id
-            || current_root.dev() != binding.watched_root_dev
-            || current_root.ino() != binding.watched_root_ino
-            || mount_id(opened.as_fd())? != binding.watched_root_mnt_id
-            || opened.filesystem.fs_uuid != binding.fs_uuid
-            || opened.subvolume.uuid != binding.subvol_uuid
-        {
-            return Err(NamespaceError::new("client namespace binding changed"));
-        }
-        self.reject_binding_events()?;
-        self.reject_mount_events()?;
-        Ok(())
-    }
-
-    fn reject_mount_events(&self) -> Result<(), NamespaceError> {
-        poll_mountinfo(&self.mountinfo)
-    }
-
-    fn reject_binding_events(&self) -> Result<(), NamespaceError> {
-        let mut buffer = [0_u8; 16 * 1024];
-        loop {
-            // SAFETY: buffer is writable and the descriptor is nonblocking.
-            let read = unsafe {
-                libc::read(
-                    self.inotify.as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
-                )
-            };
-            if read < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(());
-                }
-                return Err(NamespaceError::context("read binding monitor", error));
-            }
-            if read == 0 {
-                return Err(NamespaceError::new("binding monitor reached EOF"));
-            }
-            let mut offset = 0;
-            let read = read as usize;
-            while offset < read {
-                if read - offset < 16 {
-                    return Err(NamespaceError::new("truncated inotify event"));
-                }
-                let wd = i32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap());
-                let mask = u32::from_ne_bytes(buffer[offset + 4..offset + 8].try_into().unwrap());
-                let length =
-                    u32::from_ne_bytes(buffer[offset + 12..offset + 16].try_into().unwrap())
-                        as usize;
-                let end = offset
-                    .checked_add(16 + length)
-                    .ok_or_else(|| NamespaceError::new("inotify event overflow"))?;
-                if end > read {
-                    return Err(NamespaceError::new("truncated inotify name"));
-                }
-                let name = buffer[offset + 16..end]
-                    .split(|byte| *byte == 0)
-                    .next()
-                    .unwrap_or_default();
-                let expected = self.watched_names.get(&wd);
-                let self_event = mask
-                    & (libc::IN_DELETE_SELF
-                        | libc::IN_MOVE_SELF
-                        | libc::IN_UNMOUNT
-                        | libc::IN_IGNORED
-                        | libc::IN_Q_OVERFLOW)
-                    != 0;
-                if self_event
-                    || expected.is_some_and(|expected| {
-                        expected.as_deref().is_none_or(|expected| expected == name)
-                    })
-                {
-                    return Err(NamespaceError::new(format!(
-                        "root-path binding monitor observed a relevant event (wd={wd}, mask={mask:#x}, name={name:?}, expected={expected:?})"
-                    )));
-                }
-                offset = end;
-            }
-        }
-    }
 }
 
-fn poll_mountinfo(mountinfo: &File) -> Result<(), NamespaceError> {
-    let mut pollfd = libc::pollfd {
-        fd: mountinfo.as_raw_fd(),
-        events: libc::POLLPRI | libc::POLLERR,
-        revents: 0,
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    mount: u64,
+}
+
+fn file_identity(fd: BorrowedFd<'_>) -> Result<FileIdentity, NamespaceError> {
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: stat is writable, fd is live, and AT_EMPTY_PATH selects it.
+    let result = unsafe {
+        libc::statx(
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT,
+            libc::STATX_INO | libc::STATX_MNT_ID,
+            &mut stat,
+        )
     };
-    // SAFETY: pollfd is one initialized entry and timeout zero is nonblocking.
-    let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
-    if result < 0 {
-        return Err(NamespaceError::io("poll mountinfo"));
+    if result != 0 {
+        return Err(NamespaceError::io("stat opened root identity"));
     }
-    if pollfd.revents & (libc::POLLPRI | libc::POLLERR | libc::POLLNVAL) != 0 {
-        return Err(NamespaceError::new(
-            "mount topology monitor observed a change",
-        ));
-    }
-    Ok(())
+    Ok(FileIdentity {
+        device: libc::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+        inode: stat.stx_ino,
+        mount: stat.stx_mnt_id,
+    })
 }
 
 fn reject_descendant_mounts(root: &Path) -> Result<(), NamespaceError> {
@@ -279,60 +181,6 @@ fn unescape_mountinfo(encoded: &[u8]) -> Result<Vec<u8>, NamespaceError> {
         cursor += 4;
     }
     Ok(result)
-}
-
-fn arm_component_chain(
-    inotify: BorrowedFd<'_>,
-    root: &Path,
-) -> Result<BTreeMap<i32, Option<Vec<u8>>>, NamespaceError> {
-    let components: Vec<OsString> = root
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_os_string()),
-            _ => None,
-        })
-        .collect();
-    let mut directory = PathBuf::from("/");
-    let mut watches = BTreeMap::new();
-    for component in &components {
-        let wd = add_watch(inotify, &directory, IN_BINDING_MASK)?;
-        watches.insert(wd, Some(component.as_bytes().to_vec()));
-        directory.push(component);
-    }
-    let wd = add_watch(inotify, &directory, IN_SELF_MASK)?;
-    watches.insert(wd, None);
-    Ok(watches)
-}
-
-fn add_watch(fd: BorrowedFd<'_>, path: &Path, mask: u32) -> Result<i32, NamespaceError> {
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| NamespaceError::new("watch path contains NUL"))?;
-    // SAFETY: fd and NUL-terminated path are live for the syscall.
-    let wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), mask) };
-    if wd < 0 {
-        Err(NamespaceError::io("inotify_add_watch"))
-    } else {
-        Ok(wd)
-    }
-}
-
-fn mount_id(fd: BorrowedFd<'_>) -> Result<u64, NamespaceError> {
-    let mut statx: libc::statx = unsafe { std::mem::zeroed() };
-    let empty = c"";
-    // SAFETY: statx is writable, fd is live, and AT_EMPTY_PATH selects it.
-    let result = unsafe {
-        libc::statx(
-            fd.as_raw_fd(),
-            empty.as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT,
-            libc::STATX_MNT_ID,
-            &mut statx,
-        )
-    };
-    if result != 0 {
-        return Err(NamespaceError::io("statx mount ID"));
-    }
-    Ok(statx.stx_mnt_id)
 }
 
 #[derive(Debug)]

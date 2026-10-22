@@ -334,9 +334,9 @@ manager database, managed-snapshot directory, or arbitrary commands.
 | Privileged filesystem inspection | [`src/broker.rs`](src/broker.rs) | Validate expected fds/identities, execute bounded changed-object reads and batched endpoint path lookups, and fence sessions. |
 | Broker wire protocol | [`src/broker_protocol.rs`](src/broker_protocol.rs) | Authenticate broker sessions and encode fd-passing requests. |
 | Core orchestration | [`src/service.rs`](src/service.rs) | Initialize watches, create cuts, stage/apply comparisons, recover effects, and expose maintenance helpers. |
-| Namespace continuity | [`src/namespace.rs`](src/namespace.rs) | Bind the exact root and mount view, observe relevant topology changes, and reject continuity loss. |
+| Opened root identity | [`src/namespace.rs`](src/namespace.rs) | Open each request's source, record its identity and mount view, and retain the descriptor through snapshot creation. |
 | Cursor and path projection | [`src/compat.rs`](src/compat.rs) | Authenticate direct cursors and conservatively project semantic events. |
-| Snapshot facade | [`src/facade.rs`](src/facade.rs) | Verify continuity, request cuts, resolve baselines, mint cursors, and manage query leases. |
+| Snapshot facade | [`src/facade.rs`](src/facade.rs) | Check the opened root against its active view, request cuts, resolve baselines, issue cursors, and manage query leases. |
 | Public direct-scan API | [`src/scan.rs`](src/scan.rs) | Define Begin/Renew/Promote/Finish/ReleaseBaseline and carry one already-open snapshot fd. |
 | Embedded direct coordinator | [`src/scan_facade.rs`](src/scan_facade.rs) | Bind requests to initialized roots, retain prepared responses, renew/release leases, and remember completed sessions. |
 | Executable | [`src/main.rs`](src/main.rs) | Run initialization, broker, diagnostics, and the Git fsmonitor hook. |
@@ -349,14 +349,24 @@ Btrfs workspace commands.
 
 ## 5. Filesystem and namespace model
 
-A supported root is an exact Btrfs subvolume root. Snapshot identity includes
-filesystem UUID, subvolume UUID, root ID, parent/received UUID where relevant,
-transaction information, read-only status, and the caller's mount/root view.
-A reused pathname or replaced mount cannot substitute for the original root.
+A supported root is an exact Btrfs subvolume root. Each direct request opens
+its source and records the descriptor's identity and the caller's mount/root
+view. The service checks the opened filesystem and subvolume UUIDs against the
+registered watch before creating or joining a cut. Snapshot creation uses that
+same source descriptor. A later rename or replacement mount cannot redirect
+the cut to another subvolume. Each new request opens and checks its root again.
+
+These checks do not allocate inotify watches or poll for mount events. Existing
+stored binding fields and cursor formats are retained. The
+`monitor_session_id` field identifies an activation; it does not require a
+running monitor. Immutable snapshot identity still includes filesystem UUID,
+subvolume UUID, root ID, parent/received UUID where relevant, transaction
+information, and read-only status.
 
 Managed snapshots live outside the watched worktree and on the same Btrfs
-filesystem. Nested subvolumes and unsupported fscrypt views are outside the
-supported contract.
+filesystem. Each request rejects descendant mounts visible when it opens its
+root. Descendant mounts, nested subvolumes, and unsupported fscrypt views are
+outside the supported contract.
 
 Broker endpoint resolution returns raw-byte repository-relative paths.
 Hardlinks produce multiple visible names for one inode. Internal paths are
@@ -368,6 +378,9 @@ The semantic event kinds are `PathAdded`, `PathRemoved`, `PathChanged`,
 moves are inputs to conservative endpoint projection. A direct scan reads the
 opened immutable snapshot, so live mutations after Begin cannot change the
 tree being traversed.
+
+The Git hook returns a cursor and changed paths. Git then reads the live
+worktree; it does not traverse the immutable snapshot supplied to Jujutsu.
 
 ## 6. Durable state and deployment layout
 

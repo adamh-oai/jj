@@ -145,14 +145,19 @@ fn run_fixture(
 
     for (&count, paths) in DEFAULT_COUNTS.iter().zip(&cohorts.paths) {
         mutate_files(&fixture.source, count, paths)?;
+        let source = OpenedSubvolume::open(&fixture.source)
+            .map_err(|error| format!("open benchmark source: {error}"))?;
         let published = service
-            .changes(&ChangesOptions {
-                watch_id: initialized.watch_id,
-                authorization_id: initialized.grant_id,
-                requester_uid: uid,
-                requester_gid: gid,
-                now_ns: now_ns()?,
-            })
+            .changes(
+                &source,
+                &ChangesOptions {
+                    watch_id: initialized.watch_id,
+                    authorization_id: initialized.grant_id,
+                    requester_uid: uid,
+                    requester_gid: gid,
+                    now_ns: now_ns()?,
+                },
+            )
             .map_err(|error| format!("publish {count}-file benchmark cut: {error}"))?;
         let (parent_path, target_path) =
             comparison_paths(&benchmark_store, published.comparison_id)?;
