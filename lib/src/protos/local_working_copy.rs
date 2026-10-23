@@ -55,6 +55,10 @@ pub struct TreeState {
     pub watchman_clock: ::core::option::Option<WatchmanClock>,
     #[prost(message, optional, tag = "8")]
     pub fsmonitor_cursor: ::core::option::Option<FsmonitorCursor>,
+    /// External attribute rules and conversion policy used by the file-state cache.
+    /// Absent in older states; recheck tracked files before trusting their metadata.
+    #[prost(bytes = "vec", tag = "9")]
+    pub eol_fingerprint: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchmanClock {

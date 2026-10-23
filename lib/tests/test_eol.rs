@@ -16,10 +16,14 @@ use std::fs::File;
 use std::io::Write as _;
 
 use bstr::ByteSlice as _;
+use jj_lib::backend::MergedTreeValueExt as _;
+use jj_lib::backend::TreeValue;
 use jj_lib::config::ConfigLayer;
 use jj_lib::config::ConfigSource;
 use jj_lib::default_backend_factories::default_backend_factories;
 use jj_lib::default_backend_factories::default_working_copy_factories;
+use jj_lib::merge::Merge;
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
 use jj_lib::settings::UserSettings;
@@ -33,6 +37,7 @@ use testutils::TestWorkspace;
 use testutils::assert_tree_eq;
 use testutils::base_user_config;
 use testutils::commit_with_tree;
+use testutils::empty_snapshot_options;
 use testutils::repo_path;
 
 static LF_FILE_CONTENT: &[u8] = b"aaa\nbbbb\nccccc\n";
@@ -589,4 +594,290 @@ fn test_eol_conversion_checkout(
 
     assert!(std::fs::exists(&file_disk_path).unwrap());
     std::fs::read(&file_disk_path).unwrap()
+}
+
+fn assert_file_contents(tree: &MergedTree, path: &str, expected: &[u8]) {
+    let path = repo_path(path);
+    let value = tree.path_value(path).block_on().unwrap();
+    let Some(TreeValue::File { id, .. }) = value.as_resolved().unwrap() else {
+        panic!("Expected a regular file at {path:?}");
+    };
+    assert_eq!(testutils::read_file(tree.store(), path, id), expected);
+}
+
+#[test_case("none", CRLF_FILE_CONTENT)]
+#[test_case("input-output", LF_FILE_CONTENT)]
+fn test_git_attributes_snapshot(global_mode: &str, fallback_contents: &[u8]) -> TestResult {
+    let settings = base_user_settings_with_extra_configs(&format!(
+        "working-copy.eol-conversion = {global_mode:?}"
+    ));
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let root = test_workspace.workspace.workspace_root();
+    testutils::write_working_copy_file(
+        root,
+        repo_path(".gitattributes"),
+        "[attr]windows text eol=crlf\n*.cmd windows\n*.lf text eol=lf\n*.dat text=auto\n*.bin \
+         -text\nbinary-file binary\nlegacy crlf=input\n",
+    );
+    testutils::write_working_copy_file(root, repo_path("nested/.gitattributes"), "*.cmd -text\n");
+    testutils::write_working_copy_file(
+        root,
+        repo_path("nested/deeper/.gitattributes"),
+        "*.cmd text eol=lf\n",
+    );
+    for path in [
+        "script.cmd",
+        "script.lf",
+        "text.dat",
+        "raw.bin",
+        "binary-file",
+        "legacy",
+        "unspecified",
+        "nested/script.cmd",
+        "nested/deeper/script.cmd",
+    ] {
+        testutils::write_working_copy_file(root, repo_path(path), CRLF_FILE_CONTENT);
+    }
+    testutils::write_working_copy_file(root, repo_path("binary.dat"), b"before\0\r\nafter\r\n");
+
+    let tree = test_workspace.snapshot()?;
+    for path in [
+        "script.cmd",
+        "script.lf",
+        "text.dat",
+        "legacy",
+        "nested/deeper/script.cmd",
+    ] {
+        assert_file_contents(&tree, path, LF_FILE_CONTENT);
+    }
+    for path in ["raw.bin", "binary-file", "nested/script.cmd"] {
+        assert_file_contents(&tree, path, CRLF_FILE_CONTENT);
+    }
+    assert_file_contents(&tree, "binary.dat", b"before\0\r\nafter\r\n");
+    assert_file_contents(&tree, "unspecified", fallback_contents);
+    assert_tree_eq!(test_workspace.snapshot()?, tree);
+    Ok(())
+}
+
+#[test]
+fn test_git_attributes_auto_preserves_stored_crlf() -> TestResult {
+    let settings = base_user_settings_with_extra_configs("working-copy.eol-conversion = 'none'");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    // Git's text=auto does not renormalize a file that already has CRLF in its
+    // stored blob. The new file below must still be normalized.
+    let tree = testutils::create_tree(
+        &test_workspace.repo,
+        &[
+            (repo_path(".gitattributes"), "*.txt text=auto\n"),
+            (repo_path("existing.txt"), "old\r\n"),
+        ],
+    );
+    let commit = commit_with_tree(test_workspace.repo.store(), tree.clone());
+    test_workspace
+        .workspace
+        .check_out(test_workspace.repo.op_id().clone(), None, &commit)
+        .block_on()?;
+    assert_tree_eq!(test_workspace.snapshot()?, tree);
+    let root = test_workspace.workspace.workspace_root();
+    testutils::write_working_copy_file(root, repo_path("existing.txt"), "old\r\nedit\r\n");
+    testutils::write_working_copy_file(root, repo_path("new.txt"), "new\r\n");
+    let tree = test_workspace.snapshot()?;
+    assert_file_contents(&tree, "existing.txt", b"old\r\nedit\r\n");
+    assert_file_contents(&tree, "new.txt", b"new\n");
+    assert_tree_eq!(test_workspace.snapshot()?, tree);
+    Ok(())
+}
+
+#[test]
+fn test_git_attributes_auto_preserves_stored_crlf_conflict() -> TestResult {
+    let settings = base_user_settings_with_extra_configs("working-copy.eol-conversion = 'none'");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let file_path = repo_path("conflict.txt");
+    let attributes = (repo_path(".gitattributes"), "*.txt text=auto\n");
+    // Build the stored trees directly: text=auto must preserve CRLF that is
+    // already present in the repository, including unresolved conflict sides.
+    let left = testutils::create_tree(&test_workspace.repo, &[attributes, (file_path, "left\r\n")]);
+    let base = testutils::create_tree(&test_workspace.repo, &[attributes]);
+    let right = testutils::create_tree(
+        &test_workspace.repo,
+        &[attributes, (file_path, "right\r\n")],
+    );
+    let tree = MergedTree::merge(Merge::from_vec(vec![
+        (left, "left".into()),
+        (base, "base".into()),
+        (right, "right".into()),
+    ]))
+    .block_on()?;
+    let commit = commit_with_tree(test_workspace.repo.store(), tree.clone());
+    test_workspace
+        .workspace
+        .check_out(test_workspace.repo.op_id().clone(), None, &commit)
+        .block_on()?;
+    let disk_path = file_path.to_fs_path(test_workspace.workspace.workspace_root())?;
+    // Force a content read, so saved file metadata cannot hide an unwanted
+    // conversion of the unchanged conflict.
+    File::options()
+        .write(true)
+        .open(&disk_path)?
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(1))?;
+    assert_tree_eq!(test_workspace.snapshot()?, tree);
+
+    let mut file = File::options().append(true).open(&disk_path)?;
+    file.write_all(b"appended\r\n")?;
+    drop(file);
+    let edited_tree = test_workspace.snapshot()?;
+    let value = edited_tree.path_value(file_path).block_on()?;
+    let sides = value.to_file_merge().expect("The file is still conflicted");
+    let contents: Vec<_> = sides
+        .iter()
+        .map(|id| {
+            id.as_ref()
+                .map(|id| testutils::read_file(edited_tree.store(), file_path, id))
+        })
+        .collect();
+    assert_eq!(
+        contents,
+        vec![
+            Some(b"left\r\nappended\r\n".to_vec()),
+            Some(b"appended\r\n".to_vec()),
+            Some(b"right\r\nappended\r\n".to_vec()),
+        ]
+    );
+    assert_tree_eq!(test_workspace.snapshot()?, edited_tree);
+    Ok(())
+}
+
+#[test]
+fn test_git_attributes_checkout_uses_target_tree() -> TestResult {
+    let settings = base_user_settings_with_extra_configs("working-copy.eol-conversion = 'none'");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    for (attributes, stored, checked_out) in [
+        ("*.cmd text eol=crlf\n", "first\n", b"first\r\n".as_slice()),
+        ("*.cmd text eol=lf\n", "second\n", b"second\n".as_slice()),
+        // Only the attributes change here. The file still needs new line endings.
+        (
+            "*.cmd text eol=crlf\n",
+            "second\n",
+            b"second\r\n".as_slice(),
+        ),
+    ] {
+        let tree = testutils::create_tree(
+            &test_workspace.repo,
+            &[
+                (repo_path(".gitattributes"), attributes),
+                (repo_path("nested/script.cmd"), stored),
+            ],
+        );
+        let commit = commit_with_tree(test_workspace.repo.store(), tree.clone());
+        test_workspace
+            .workspace
+            .check_out(test_workspace.repo.op_id().clone(), None, &commit)
+            .block_on()?;
+        assert_eq!(
+            std::fs::read(
+                test_workspace
+                    .workspace
+                    .workspace_root()
+                    .join("nested/script.cmd")
+            )?,
+            checked_out
+        );
+        assert_tree_eq!(test_workspace.snapshot()?, tree);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_git_attributes_change_resnapshots_tracked_files() -> TestResult {
+    let settings = base_user_settings_with_extra_configs("working-copy.eol-conversion = 'none'");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let root = test_workspace.workspace.workspace_root();
+    testutils::write_working_copy_file(root, repo_path(".gitattributes"), "*.cmd -text\n");
+    testutils::write_working_copy_file(root, repo_path("script.cmd"), "old\r\n");
+    let tree = test_workspace.snapshot()?;
+    assert_file_contents(&tree, "script.cmd", b"old\r\n");
+
+    // The file's metadata did not change, but its conversion rule did.
+    testutils::write_working_copy_file(
+        test_workspace.workspace.workspace_root(),
+        repo_path(".gitattributes"),
+        "*.cmd text eol=crlf\n",
+    );
+    let tree = test_workspace.snapshot()?;
+    assert_file_contents(&tree, "script.cmd", b"old\n");
+    assert_tree_eq!(test_workspace.snapshot()?, tree);
+    Ok(())
+}
+
+#[test_case(false; "JJ sparse selection")]
+#[test_case(true; "JJ and external sparse selections")]
+fn test_git_attributes_snapshot_uses_sparse_attributes(external_sparse: bool) -> TestResult {
+    let settings = base_user_settings_with_extra_configs("working-copy.eol-conversion = 'none'");
+    let mut test_workspace =
+        TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
+    let tree = testutils::create_tree(
+        &test_workspace.repo,
+        &[
+            (repo_path(".gitattributes"), "*.cmd -text\n"),
+            (repo_path("nested/.gitattributes"), "*.cmd text eol=crlf\n"),
+            (repo_path("nested/script.cmd"), "first\n"),
+        ],
+    );
+    let commit = commit_with_tree(test_workspace.repo.store(), tree.clone());
+    test_workspace
+        .workspace
+        .check_out(test_workspace.repo.op_id().clone(), None, &commit)
+        .block_on()?;
+    let root = test_workspace.workspace.workspace_root().to_owned();
+    let mut locked_workspace = test_workspace
+        .workspace
+        .start_working_copy_mutation()
+        .block_on()?;
+    locked_workspace
+        .locked_wc()
+        .set_sparse_patterns(vec![
+            repo_path(if external_sparse {
+                "nested"
+            } else {
+                "nested/script.cmd"
+            })
+            .to_owned(),
+        ])
+        .block_on()?;
+    locked_workspace
+        .finish(test_workspace.repo.op_id().clone())
+        .block_on()?;
+    let mut snapshot_options = empty_snapshot_options();
+    if external_sparse {
+        // Git's sparse selection can omit more paths than JJ's selection.
+        // Simulate its removal of the nested attribute file from disk.
+        std::fs::remove_file(root.join("nested/.gitattributes"))?;
+        snapshot_options.external_sparse_patterns =
+            Some(vec![repo_path("nested/script.cmd").to_owned()]);
+    }
+    assert!(!root.join(".gitattributes").exists());
+    assert!(!root.join("nested/.gitattributes").exists());
+    assert_eq!(std::fs::read(root.join("nested/script.cmd"))?, b"first\r\n");
+    assert_tree_eq!(
+        test_workspace.snapshot_with_options(&snapshot_options)?.0,
+        tree
+    );
+
+    // The nested rule still overrides the root rule even though neither
+    // attribute file is present in this sparse working copy.
+    testutils::write_working_copy_file(&root, repo_path("nested/script.cmd"), "edited\r\n");
+    let (tree, _) = test_workspace.snapshot_with_options(&snapshot_options)?;
+    assert_file_contents(&tree, "nested/script.cmd", b"edited\n");
+    assert_file_contents(&tree, ".gitattributes", b"*.cmd -text\n");
+    assert_file_contents(&tree, "nested/.gitattributes", b"*.cmd text eol=crlf\n");
+    assert_tree_eq!(
+        test_workspace.snapshot_with_options(&snapshot_options)?.0,
+        tree
+    );
+    Ok(())
 }

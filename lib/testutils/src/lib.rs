@@ -169,6 +169,7 @@ pub fn empty_snapshot_options() -> SnapshotOptions<'static> {
         force_tracking_matcher: &NothingMatcher,
         max_new_file_size: u64::MAX,
         awacs_input_fingerprint: None,
+        awacs_eol_fingerprint: None,
         awacs_compatible_input_fingerprints: vec![],
     }
 }

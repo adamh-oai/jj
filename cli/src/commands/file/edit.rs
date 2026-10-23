@@ -159,6 +159,7 @@ pub(crate) async fn cmd_file_edit(
             force_tracking_matcher: &NothingMatcher,
             max_new_file_size: u64::MAX,
             awacs_input_fingerprint: None,
+            awacs_eol_fingerprint: None,
             awacs_compatible_input_fingerprints: vec![],
         })
         .await?;

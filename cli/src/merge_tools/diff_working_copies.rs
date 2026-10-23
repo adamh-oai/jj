@@ -309,6 +309,7 @@ diff editing in mind and be a little inaccurate.
                 force_tracking_matcher: &NothingMatcher,
                 max_new_file_size: u64::MAX,
                 awacs_input_fingerprint: None,
+                awacs_eol_fingerprint: None,
                 awacs_compatible_input_fingerprints: vec![],
             })
             .await?;

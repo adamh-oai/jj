@@ -129,6 +129,12 @@ workspace before running `jj workspace update-stale`. Preserve untracked and
 ignored files separately, since they may not be included in the snapshot. A
 stale rebuild does not refresh the Git fsmonitor baseline.
 
+Git line-ending rules are part of the baseline inputs. After upgrading from a
+version that did not apply `.gitattributes`, rebuild the baseline with the same
+command. Changes to external attribute files, such as `.git/info/attributes`,
+also require a rebuild. Edits to `.gitattributes` inside the workspace use the
+normal incremental scan and recheck affected tracked files.
+
 Changing sparse patterns in a snapshot-backed workspace also changes the
 inputs to its baseline. After changing patterns, including when creating a
 workspace with a different `--sparse-patterns` selection from its source,

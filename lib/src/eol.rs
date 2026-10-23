@@ -12,13 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use bstr::ByteSlice as _;
 use futures::AsyncRead;
 use futures::AsyncReadExt as _;
 use futures::io::Cursor;
 
 use crate::config::ConfigGetError;
+use crate::merged_tree::MergedTree;
+use crate::repo_path::RepoPath;
+use crate::repo_path::RepoPathBuf;
 use crate::settings::UserSettings;
+use crate::store::Store;
 
 fn is_binary(bytes: &[u8]) -> bool {
     // TODO(06393993): align the algorithm with git so that the git config autocrlf
@@ -47,6 +54,10 @@ impl TargetEolStrategy {
         Self {
             eol_conversion_mode,
         }
+    }
+
+    pub(crate) fn mode(&self) -> EolConversionMode {
+        self.eol_conversion_mode
     }
 
     /// The limit to probe for whether the file is binary is 8KB.
@@ -118,6 +129,183 @@ impl TargetEolStrategy {
                 convert_eol(contents, target_eol).await
             }
         }
+    }
+}
+
+/// Which version of the attributes describes the files being converted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EolSource {
+    Snapshot,
+    Checkout,
+}
+
+/// Per-operation line-ending rules, shared by files in one scan or checkout.
+pub(crate) struct WorkingCopyEol {
+    fallback: TargetEolStrategy,
+    #[cfg(feature = "git")]
+    git: Option<crate::git_eol::GitEol>,
+}
+
+impl WorkingCopyEol {
+    pub(crate) fn new(
+        store: Arc<Store>,
+        tree: MergedTree,
+        root: PathBuf,
+        mode: EolConversionMode,
+        source: EolSource,
+    ) -> std::io::Result<Self> {
+        #[cfg(not(feature = "git"))]
+        drop((store, tree, root, source));
+        Ok(Self {
+            fallback: TargetEolStrategy::new(mode),
+            #[cfg(feature = "git")]
+            git: crate::git_eol::GitEol::new(store, tree, root, mode, source)?,
+        })
+    }
+
+    pub(crate) fn external_attributes_fingerprint(&self) -> Vec<u8> {
+        #[cfg(feature = "git")]
+        if let Some(git) = &self.git {
+            return git.external_attributes_fingerprint().to_vec();
+        }
+        crate::content_hash::blake2b_hash(&format!(
+            "working-copy-eol-v1:{:?}",
+            self.fallback.mode()
+        ))
+        .to_vec()
+    }
+
+    /// Reads working-tree attributes from an immutable snapshot while keeping
+    /// the Git configuration and external attributes captured from the live root.
+    pub(crate) fn with_snapshot_root(self, root: PathBuf) -> Self {
+        #[cfg(feature = "git")]
+        {
+            let mut this = self;
+            if let Some(git) = &mut this.git {
+                git.set_snapshot_root(root);
+            }
+            this
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = root;
+            self
+        }
+    }
+
+    pub(crate) fn with_sparse_patterns(
+        self,
+        patterns: &[RepoPathBuf],
+        external_patterns: Option<&[RepoPathBuf]>,
+    ) -> Self {
+        #[cfg(feature = "git")]
+        {
+            let mut this = self;
+            if let Some(git) = &mut this.git {
+                if let Some(external_patterns) = external_patterns {
+                    // Both sparse selections must include a path. Each pair of
+                    // overlapping prefixes contributes its more specific path.
+                    let patterns = patterns
+                        .iter()
+                        .flat_map(|pattern| {
+                            external_patterns.iter().filter_map(move |external| {
+                                if pattern.starts_with(external) {
+                                    Some(pattern.clone())
+                                } else if external.starts_with(pattern) {
+                                    Some(external.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    git.set_sparse_patterns(&patterns);
+                } else {
+                    git.set_sparse_patterns(patterns);
+                }
+            }
+            this
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = (patterns, external_patterns);
+            self
+        }
+    }
+
+    pub(crate) async fn attributes_changed(&self, path: &RepoPath) -> std::io::Result<bool> {
+        #[cfg(feature = "git")]
+        if let Some(git) = &self.git {
+            return git.attributes_changed(path).await;
+        }
+        let _ = path;
+        Ok(false)
+    }
+
+    pub(crate) async fn attributes_match_tree(&self, tree: &MergedTree) -> std::io::Result<bool> {
+        #[cfg(feature = "git")]
+        if let Some(git) = &self.git {
+            return git.attributes_match_tree(tree).await;
+        }
+        let _ = tree;
+        Ok(true)
+    }
+
+    pub(crate) async fn equivalent_checkout_rules(
+        &self,
+        other: &Self,
+        path: &RepoPath,
+    ) -> std::io::Result<bool> {
+        if self.fallback.mode() != other.fallback.mode() {
+            return Ok(false);
+        }
+        #[cfg(feature = "git")]
+        {
+            let left = match &self.git {
+                Some(git) => git.rule(path).await?,
+                None => None,
+            };
+            let right = match &other.git {
+                Some(git) => git.rule(path).await?,
+                None => None,
+            };
+            return Ok(left == right);
+        }
+        #[cfg(not(feature = "git"))]
+        {
+            let _ = path;
+            Ok(true)
+        }
+    }
+
+    pub(crate) async fn convert_for_snapshot<'a>(
+        &self,
+        path: &RepoPath,
+        contents: impl AsyncRead + Send + Unpin + 'a,
+    ) -> std::io::Result<Box<dyn AsyncRead + Send + Unpin + 'a>> {
+        #[cfg(feature = "git")]
+        if let Some(git) = &self.git
+            && let Some(rule) = git.rule(path).await?
+        {
+            return git.convert_for_snapshot(path, contents, rule).await;
+        }
+        let _ = path;
+        self.fallback.convert_eol_for_snapshot(contents).await
+    }
+
+    pub(crate) async fn convert_for_checkout<'a>(
+        &self,
+        path: &RepoPath,
+        contents: impl AsyncRead + Send + Unpin + 'a,
+    ) -> std::io::Result<Box<dyn AsyncRead + Send + Unpin + 'a>> {
+        #[cfg(feature = "git")]
+        if let Some(git) = &self.git
+            && let Some(rule) = git.rule(path).await?
+        {
+            return git.convert_for_checkout(contents, rule).await;
+        }
+        let _ = path;
+        self.fallback.convert_eol_for_update(contents).await
     }
 }
 

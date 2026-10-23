@@ -56,6 +56,8 @@ pub mod git;
 #[cfg(feature = "git")]
 pub mod git_backend;
 #[cfg(feature = "git")]
+mod git_eol;
+#[cfg(feature = "git")]
 pub mod git_index_cache;
 #[cfg(feature = "git")]
 mod git_subprocess;

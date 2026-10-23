@@ -64,7 +64,7 @@ pub struct AwacsInputFingerprintV1 {
     pub fileset_aliases: Vec<(Vec<u8>, Vec<u8>)>,
     /// Effective new-file size limit.
     pub max_new_file_size: u64,
-    /// Effective EOL conversion mode.
+    /// Digest of the EOL policy, conversion mode, and external Git attributes.
     pub eol_conversion: Vec<u8>,
     /// Effective executable-bit policy.
     pub exec_bit_policy: Vec<u8>,
@@ -78,7 +78,7 @@ impl AwacsInputFingerprintV1 {
     /// reinterpret unchanged tracked paths.
     pub fn sha256(&self) -> [u8; 32] {
         let mut hasher = sha2::Sha256::new();
-        hasher.update(b"jj:awacs-semantic-input-fingerprint:v2\0");
+        hasher.update(b"jj:awacs-semantic-input-fingerprint:v3\0");
         put_bytes(&mut hasher, b"git-sparse", &self.git_sparse);
 
         let mut sparse_prefixes = self.jj_sparse_prefixes.clone();
@@ -89,9 +89,10 @@ impl AwacsInputFingerprintV1 {
         hasher.finalize().into()
     }
 
-    /// Computes the original v1 fingerprint so an existing committed baseline
-    /// can advance once onto the sticky-classification v2 model without a
-    /// replacement full scan.
+    /// Computes the original v1 fingerprint for compatibility tests.
+    ///
+    /// Baselines from before per-file Git attributes require an explicit rebuild;
+    /// the CLI must not accept this digest as compatible with the current policy.
     pub fn legacy_sha256(&self) -> [u8; 32] {
         let mut hasher = sha2::Sha256::new();
         hasher.update(b"jj:awacs-input-fingerprint:v1\0");

@@ -2731,28 +2731,27 @@ to the current parents may contain changes from multiple commits.
             max_new_file_size = u64::MAX;
         }
         #[cfg(all(target_os = "linux", feature = "awacs"))]
-        let (awacs_input_fingerprint, awacs_compatible_input_fingerprints) =
-            if cfg!(debug_assertions)
-                && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some()
-                && std::env::var_os("JJ_TEST_AWACS_REAL_FINGERPRINT").is_none()
-            {
-                (Some([0; 32]), vec![])
-            } else {
-                let fingerprints = self
-                    .workspace_root()
-                    .join(".jj/working_copy/subvolume_mode")
-                    .is_file()
-                    .then(|| self.awacs_input_fingerprints(max_new_file_size))
-                    .transpose()?;
-                match fingerprints {
-                    Some((current, legacy)) => (Some(current), vec![legacy]),
-                    None => (None, vec![]),
-                }
-            };
+        let (awacs_input_fingerprint, awacs_eol_fingerprint) = if cfg!(debug_assertions)
+            && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some()
+            && std::env::var_os("JJ_TEST_AWACS_REAL_FINGERPRINT").is_none()
+        {
+            (Some([0; 32]), None)
+        } else {
+            let fingerprint = self
+                .workspace_root()
+                .join(".jj/working_copy/subvolume_mode")
+                .is_file()
+                .then(|| self.awacs_input_fingerprints(max_new_file_size))
+                .transpose()?;
+            match fingerprint {
+                Some((current, eol)) => (Some(current), Some(eol)),
+                None => (None, None),
+            }
+        };
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
         let awacs_input_fingerprint = None;
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
-        let awacs_compatible_input_fingerprints = vec![];
+        let awacs_eol_fingerprint = None;
         #[cfg(feature = "git")]
         let scan_root_ignores = self.scan_root_git_excludes_path().into_iter().collect();
         #[cfg(not(feature = "git"))]
@@ -2776,7 +2775,8 @@ to the current parents may contain changes from multiple commits.
             force_tracking_matcher: &NothingMatcher,
             max_new_file_size,
             awacs_input_fingerprint,
-            awacs_compatible_input_fingerprints,
+            awacs_eol_fingerprint,
+            awacs_compatible_input_fingerprints: vec![],
         })
     }
 
@@ -2784,7 +2784,7 @@ to the current parents may contain changes from multiple commits.
     fn awacs_input_fingerprints(
         &self,
         max_new_file_size: u64,
-    ) -> Result<([u8; 32], [u8; 32]), CommandError> {
+    ) -> Result<([u8; 32], Vec<u8>), CommandError> {
         let config = self.settings().config();
         let sparse_patterns = self
             .working_copy()
@@ -2805,10 +2805,12 @@ to the current parents may contain changes from multiple commits.
                 ))
             })
             .collect::<Result<Vec<_>, ConfigGetError>>()?;
-        let eol_conversion = self
-            .settings()
-            .get_string("working-copy.eol-conversion")?
-            .into_bytes();
+        let eol_conversion = jj_lib::local_working_copy::eol_attributes_fingerprint(
+            self.repo().store().clone(),
+            self.workspace_root().to_owned(),
+            jj_lib::local_working_copy::EolConversionMode::try_from_settings(self.settings())?,
+        )
+        .map_err(internal_error)?;
         let exec_bit_policy = effective_exec_bit_policy_for_fingerprint(
             self.settings(),
             &self.workspace_root().join(".jj").join("working_copy"),
@@ -2855,10 +2857,10 @@ to the current parents may contain changes from multiple commits.
             snapshot_auto_track: snapshot_auto_track.into_bytes(),
             fileset_aliases,
             max_new_file_size,
-            eol_conversion,
+            eol_conversion: eol_conversion.clone(),
             exec_bit_policy,
         };
-        Ok((inputs.sha256(), inputs.legacy_sha256()))
+        Ok((inputs.sha256(), eol_conversion))
     }
 
     pub(crate) fn path_converter(&self) -> &RepoPathUiConverter {
@@ -3366,11 +3368,12 @@ to the current parents may contain changes from multiple commits.
         let mut options = options;
         #[cfg(all(target_os = "linux", feature = "awacs"))]
         if force_awacs_input_fingerprint && options.awacs_input_fingerprint.is_none() {
-            let (current, legacy) = self
+            let (current, eol) = self
                 .awacs_input_fingerprints(options.max_new_file_size)
                 .map_err(snapshot_command_error)?;
             options.awacs_input_fingerprint = Some(current);
-            options.awacs_compatible_input_fingerprints = vec![legacy];
+            options.awacs_eol_fingerprint = Some(eol);
+            options.awacs_compatible_input_fingerprints.clear();
         }
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
         let _ = force_awacs_input_fingerprint;

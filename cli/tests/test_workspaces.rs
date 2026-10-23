@@ -11273,3 +11273,163 @@ exit 1
     assert!(!sentinel.exists());
     assert!(!test_env.env_root().join("target").exists());
 }
+
+#[cfg(unix)]
+#[test_case(false; "ordinary Git worktree")]
+#[cfg_attr(
+    all(target_os = "linux", feature = "awacs"),
+    test_case(true; "AWACS snapshot Git worktree")
+)]
+fn test_workspaces_adopt_git_crlf_attributes(snapshot: bool) -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("working-copy.eol-conversion = 'none'");
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let worktree_dir = test_env.work_dir("worktree");
+    let binary = b"\0first\r\nsecond\n";
+    main_dir.write_file(".gitattributes", "*.cmd text eol=crlf\n*.bin -text\n");
+    main_dir.write_file("script.cmd", "first\nsecond\n");
+    std::fs::write(main_dir.root().join("payload.bin"), binary)?;
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    if snapshot {
+        main_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
+    }
+
+    let run_git = |dir: &TestWorkDir<'_>, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .current_dir(dir.root())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    run_git(
+        &main_dir,
+        &["worktree", "add", "--detach", "../worktree", "HEAD"],
+    );
+    // Git performs the CRLF checkout. These bytes are clean according to Git.
+    assert_eq!(
+        std::fs::read(worktree_dir.root().join("script.cmd"))?,
+        b"first\r\nsecond\r\n"
+    );
+    assert_eq!(
+        std::fs::read(worktree_dir.root().join("payload.bin"))?,
+        binary
+    );
+    assert!(run_git(&worktree_dir, &["status", "--porcelain"]).is_empty());
+
+    let btrfs_path = if snapshot {
+        let marker = run_git(
+            &worktree_dir,
+            &["rev-parse", "--git-path", "awacs-jj-pending-consumer"],
+        );
+        let marker_path = std::path::PathBuf::from(String::from_utf8(marker)?.trim_end());
+        let pending_state_path = marker_path
+            .parent()
+            .unwrap()
+            .join("awacs-jj-pending-working-copy");
+        std::fs::create_dir(&pending_state_path)?;
+        std::fs::write(pending_state_path.join("checkout"), b"pending")?;
+        std::fs::write(
+            pending_state_path.join("subvolume_mode"),
+            b"snapshot-backed\n",
+        )?;
+        std::fs::write(
+            &marker_path,
+            "awacs-jj-pending-v2:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:\
+             11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222\n",
+        )?;
+        Some(install_fake_btrfs(
+            &test_env,
+            r#"#!/bin/sh
+if [ "$1" = "inspect-internal" ] && [ "$2" = "rootid" ]; then
+    echo 5
+    exit 0
+fi
+if [ "$1" = "subvolume" ] && [ "$2" = "show" ]; then
+    exit 0
+fi
+exit 1
+"#,
+        ))
+    } else {
+        None
+    };
+    let run_jj = |args: &[&str]| {
+        worktree_dir.run_jj_with(|cmd| {
+            if let Some(path) = &btrfs_path {
+                cmd.env("PATH", path)
+                    .env("JJ_TEST_AWACS_SCAN_ROOT", worktree_dir.root());
+            }
+            cmd.args(args)
+        })
+    };
+    run_jj(&["workspace", "adopt", "--name", "adopted"]).success();
+    assert_eq!(
+        worktree_dir
+            .root()
+            .join(".jj/working_copy/subvolume_mode")
+            .is_file(),
+        snapshot
+    );
+    assert_eq!(run_jj(&["diff", "--summary"]).success().stdout.raw(), "");
+    assert_eq!(
+        run_jj(&["file", "show", "script.cmd"])
+            .success()
+            .stdout
+            .raw(),
+        "first\nsecond\n"
+    );
+
+    // A real edit must change only the text line, with LF bytes in the store.
+    worktree_dir.write_file("script.cmd", "first\r\nchanged\r\n");
+    if snapshot {
+        // This CLI test monitor reports an empty delta after adoption. Request
+        // this path explicitly; library tests cover changed-path deltas.
+        run_jj(&["file", "track", "script.cmd"]).success();
+    }
+    assert_eq!(
+        run_jj(&["diff", "--summary"]).success().stdout.raw(),
+        "M script.cmd\n"
+    );
+    assert_eq!(
+        run_jj(&["file", "show", "script.cmd"])
+            .success()
+            .stdout
+            .raw(),
+        "first\nchanged\n"
+    );
+    assert_eq!(
+        run_jj(&["file", "show", "payload.bin"])
+            .success()
+            .stdout
+            .raw()
+            .as_bytes(),
+        binary
+    );
+    assert_eq!(
+        std::fs::read(worktree_dir.root().join("script.cmd"))?,
+        b"first\r\nchanged\r\n"
+    );
+    assert_eq!(
+        std::fs::read(worktree_dir.root().join("payload.bin"))?,
+        binary
+    );
+
+    // A second scan must not rewrite the working-copy commit again.
+    let before = run_jj(&["log", "-r", "@", "--no-graph", "-T", "commit_id"]).success();
+    run_jj(&["status"]).success();
+    let after = run_jj(&["log", "-r", "@", "--no-graph", "-T", "commit_id"]).success();
+    assert_eq!(after.stdout.raw(), before.stdout.raw());
+    Ok(())
+}

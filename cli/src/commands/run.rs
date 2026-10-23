@@ -373,6 +373,7 @@ impl WorkspacePool {
             max_new_file_size: 64_000_u64, // 64 MB for now
             force_tracking_matcher: &NothingMatcher,
             awacs_input_fingerprint: None,
+            awacs_eol_fingerprint: None,
             awacs_compatible_input_fingerprints: vec![],
         }
     }

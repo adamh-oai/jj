@@ -290,6 +290,9 @@ pub struct SnapshotOptions<'a> {
     /// Canonical external-input fingerprint required when an immutable AWACS
     /// cursor is persisted. Other backends ignore it.
     pub awacs_input_fingerprint: Option<[u8; 32]>,
+    /// EOL policy and external attributes captured for `awacs_input_fingerprint`.
+    /// The snapshot must use these same inputs before it advances the baseline.
+    pub awacs_eol_fingerprint: Option<Vec<u8>>,
     /// Older fingerprints accepted only while advancing an already-committed
     /// AWACS baseline to the current interpretation model.
     pub awacs_compatible_input_fingerprints: Vec<[u8; 32]>,
