@@ -188,7 +188,7 @@ impl WorkingCopyEol {
         }
         #[cfg(not(feature = "git"))]
         {
-            let _ = root;
+            drop(root);
             self
         }
     }
