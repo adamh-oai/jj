@@ -81,7 +81,9 @@ use crate::conflicts::choose_materialized_conflict_marker_len;
 use crate::conflicts::materialize_merge_result_to_bytes;
 use crate::conflicts::materialize_tree_value;
 pub use crate::eol::EolConversionMode;
+use crate::eol::EolSource;
 use crate::eol::TargetEolStrategy;
+use crate::eol::WorkingCopyEol;
 use crate::file_util::FileIdentity;
 use crate::file_util::check_symlink_support;
 use crate::file_util::copy_async_to_sync;
@@ -97,6 +99,7 @@ use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
 use crate::matchers::EverythingMatcher;
 use crate::matchers::FilesMatcher;
+use crate::matchers::GlobsMatcher;
 use crate::matchers::IntersectionMatcher;
 use crate::matchers::Matcher;
 use crate::matchers::PrefixMatcher;
@@ -1008,6 +1011,7 @@ pub struct TreeState {
     exec_policy: ExecChangePolicy,
     fsmonitor_settings: FsmonitorSettings,
     target_eol_strategy: TargetEolStrategy,
+    eol_fingerprint: Vec<u8>,
 }
 
 #[derive(Debug, Error)]
@@ -1098,6 +1102,7 @@ impl TreeState {
             exec_policy,
             fsmonitor_settings: fsmonitor_settings.clone(),
             target_eol_strategy: TargetEolStrategy::new(*eol_conversion_mode),
+            eol_fingerprint: Vec::new(),
         }
     }
 
@@ -1172,6 +1177,7 @@ impl TreeState {
             FileStatesMap::from_proto(proto.file_states, proto.is_file_states_sorted);
         self.sparse_patterns = sparse_patterns_from_proto(proto.sparse_patterns.as_ref());
         self.watchman_clock = proto.watchman_clock;
+        self.eol_fingerprint = proto.eol_fingerprint;
         Ok(())
     }
 
@@ -1196,6 +1202,7 @@ impl TreeState {
         }
         proto.sparse_patterns = Some(sparse_patterns);
         proto.watchman_clock = self.watchman_clock.clone();
+        proto.eol_fingerprint = self.eol_fingerprint.clone();
 
         let wrap_write_err = |source| TreeStateError::WriteTreeState {
             path: self.state_path.clone(),
@@ -1303,8 +1310,23 @@ impl TreeState {
 
         let sparse_matcher = self.sparse_matcher();
 
+        let eol = WorkingCopyEol::new(
+            self.store.clone(),
+            self.tree.clone(),
+            self.working_copy_path.clone(),
+            self.target_eol_strategy.mode(),
+            EolSource::Snapshot,
+        )
+        .map_err(|err| SnapshotError::Other {
+            message: "Failed to read Git line-ending attributes".to_owned(),
+            err: err.into(),
+        })?
+        .with_sparse_patterns(&self.sparse_patterns);
+        let eol_fingerprint = eol.external_attributes_fingerprint();
+        let force_eol_rescan = self.eol_fingerprint != eol_fingerprint;
+
         let fsmonitor_clock_needs_save = self.fsmonitor_settings != FsmonitorSettings::None;
-        let mut is_dirty = fsmonitor_clock_needs_save;
+        let mut is_dirty = fsmonitor_clock_needs_save || force_eol_rescan;
         let FsmonitorMatcher {
             matcher: fsmonitor_matcher,
             watchman_clock,
@@ -1315,14 +1337,22 @@ impl TreeState {
             None => &EverythingMatcher,
             Some(fsmonitor_matcher) => fsmonitor_matcher.as_ref(),
         };
+        // A policy change invalidates tracked file metadata, not the monitor's
+        // knowledge of untracked paths. Revisit only the tracked files.
+        let eol_matcher =
+            FilesMatcher::new(self.file_states.all().paths().filter(|_| force_eol_rescan));
 
         let matcher = IntersectionMatcher::new(
             sparse_matcher.as_ref(),
-            UnionMatcher::new(fsmonitor_matcher, force_tracking_matcher),
+            UnionMatcher::new(
+                fsmonitor_matcher,
+                UnionMatcher::new(force_tracking_matcher, &eol_matcher),
+            ),
         );
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             self.watchman_clock = watchman_clock;
+            self.eol_fingerprint = eol_fingerprint;
             return Ok((is_dirty, SnapshotStats::default()));
         }
 
@@ -1336,6 +1366,8 @@ impl TreeState {
             let snapshotter = FileSnapshotter {
                 tree_state: self,
                 current_tree: &self.tree,
+                eol: &eol,
+                force_eol_rescan,
                 matcher: &matcher,
                 start_tracking_matcher,
                 force_tracking_matcher,
@@ -1419,6 +1451,23 @@ impl TreeState {
         } else {
             tracing::info!("not updating watchman clock because there are untracked files");
         }
+        // An ordinary filesystem can change while it is being scanned. If the
+        // attribute files saved in the tree differ from the rules used for this
+        // scan, recheck files next time instead of trusting their cached metadata.
+        self.eol_fingerprint =
+            if eol
+                .attributes_match_tree(&self.tree)
+                .await
+                .map_err(|err| SnapshotError::Other {
+                    message: "Failed to check saved Git line-ending attributes".to_owned(),
+                    err: err.into(),
+                })?
+            {
+                eol_fingerprint
+            } else {
+                is_dirty = true;
+                Vec::new()
+            };
         Ok((is_dirty, stats))
     }
 
@@ -1457,14 +1506,16 @@ impl TreeState {
                             .iter()
                             .filter_map(|path| RepoPathBuf::from_relative_path(path).ok())
                             .collect_vec();
-                        // .gitignore changes require rescanning parent directories to pick up newly
-                        // unignored files.
+                        // Ignore and attribute rules affect other files in the same directory.
                         let gitignore_prefixes = repo_paths
                             .iter()
                             .filter_map(|repo_path| {
                                 let (parent, basename) = repo_path.split()?;
-                                (basename.as_internal_str() == ".gitignore")
-                                    .then(|| parent.to_owned())
+                                matches!(
+                                    basename.as_internal_str(),
+                                    ".gitignore" | ".gitattributes"
+                                )
+                                .then(|| parent.to_owned())
                             })
                             .collect_vec();
                         (repo_paths, gitignore_prefixes)
@@ -1512,6 +1563,8 @@ struct PresentDirEntries {
 struct FileSnapshotter<'a> {
     tree_state: &'a TreeState,
     current_tree: &'a MergedTree,
+    eol: &'a WorkingCopyEol,
+    force_eol_rescan: bool,
     matcher: &'a dyn Matcher,
     start_tracking_matcher: &'a dyn Matcher,
     force_tracking_matcher: &'a dyn Matcher,
@@ -1837,6 +1890,16 @@ impl FileSnapshotter<'_> {
                     && current_file_state.mtime < self.tree_state.own_mtime
             }
         };
+        let clean = clean
+            && !self.force_eol_rescan
+            && !self
+                .eol
+                .attributes_changed(repo_path)
+                .await
+                .map_err(|err| SnapshotError::Other {
+                    message: "Failed to read Git line-ending attributes".to_owned(),
+                    err: err.into(),
+                })?;
         if clean {
             Ok(None)
         } else {
@@ -1935,9 +1998,8 @@ impl FileSnapshotter<'_> {
                 message: format!("Failed to open file {}", disk_path.display()),
                 err: err.into(),
             })?;
-            self.tree_state
-                .target_eol_strategy
-                .convert_eol_for_snapshot(AllowStdIo::new(file))
+            self.eol
+                .convert_for_snapshot(repo_path, AllowStdIo::new(file))
                 .await
                 .map_err(|err| SnapshotError::Other {
                     message: "Failed to convert the EOL".to_string(),
@@ -2000,9 +2062,8 @@ impl FileSnapshotter<'_> {
             err: err.into(),
         })?;
         let mut contents = self
-            .tree_state
-            .target_eol_strategy
-            .convert_eol_for_snapshot(AllowStdIo::new(file))
+            .eol
+            .convert_for_snapshot(path, AllowStdIo::new(file))
             .await
             .map_err(|err| SnapshotError::Other {
                 message: "Failed to convert the EOL".to_string(),
@@ -2052,6 +2113,8 @@ fn snapshot_error_for_mtime_out_of_range(err: MtimeOutOfRange, path: &Path) -> S
 impl TreeState {
     async fn write_file(
         &self,
+        eol: &WorkingCopyEol,
+        path: &RepoPath,
         disk_path: &Path,
         contents: impl AsyncRead + Send + Unpin,
         exec_bit: ExecBit,
@@ -2066,8 +2129,7 @@ impl TreeState {
                 err: err.into(),
             })?;
         let contents = if apply_eol_conversion {
-            self.target_eol_strategy
-                .convert_eol_for_update(contents)
+            eol.convert_for_checkout(path, contents)
                 .await
                 .map_err(|err| CheckoutError::Other {
                     message: "Failed to convert the EOL for the content".to_string(),
@@ -2137,13 +2199,14 @@ impl TreeState {
 
     async fn write_conflict(
         &self,
+        eol: &WorkingCopyEol,
+        path: &RepoPath,
         disk_path: &Path,
         contents: &[u8],
         exec_bit: ExecBit,
     ) -> Result<FileState, CheckoutError> {
-        let contents = self
-            .target_eol_strategy
-            .convert_eol_for_update(contents)
+        let contents = eol
+            .convert_for_checkout(path, contents)
             .await
             .map_err(|err| CheckoutError::Other {
                 message: "Failed to convert the EOL when writing a merge conflict".to_string(),
@@ -2215,6 +2278,60 @@ impl TreeState {
         new_tree: &MergedTree,
         matcher: &dyn Matcher,
     ) -> Result<CheckoutStats, CheckoutError> {
+        let eol = WorkingCopyEol::new(
+            self.store.clone(),
+            new_tree.clone(),
+            self.working_copy_path.clone(),
+            self.target_eol_strategy.mode(),
+            EolSource::Checkout,
+        )
+        .map_err(|err| CheckoutError::Other {
+            message: "Failed to read Git line-ending attributes".to_owned(),
+            err: err.into(),
+        })?;
+        // Attribute-only edits can change a file's on-disk representation even
+        // when its stored bytes did not change. Compare rules only below changed
+        // attribute files, and write only paths whose conversion rules differ.
+        let attribute_glob = globset::Glob::new("**/.gitattributes").unwrap();
+        let mut attribute_matcher = GlobsMatcher::builder();
+        attribute_matcher.add(RepoPath::root(), &attribute_glob);
+        let attribute_matcher = attribute_matcher.build();
+        let mut attribute_diff = old_tree.diff_stream(new_tree, &attribute_matcher);
+        let mut attribute_prefixes = Vec::new();
+        while let Some(TreeDiffEntry { path, values }) = attribute_diff.next().await {
+            values?;
+            attribute_prefixes.push(path.parent().unwrap().to_owned());
+        }
+        let mut attributes_to_rematerialize = HashMap::new();
+        if !attribute_prefixes.is_empty() {
+            let old_eol = WorkingCopyEol::new(
+                self.store.clone(),
+                old_tree.clone(),
+                self.working_copy_path.clone(),
+                self.target_eol_strategy.mode(),
+                EolSource::Checkout,
+            )
+            .map_err(|err| CheckoutError::Other {
+                message: "Failed to read Git line-ending attributes".to_owned(),
+                err: err.into(),
+            })?;
+            let attribute_matcher =
+                IntersectionMatcher::new(matcher, PrefixMatcher::new(attribute_prefixes));
+            for (path, value) in new_tree.entries_matching(&attribute_matcher) {
+                let value = value?;
+                if value.to_file_merge().is_some()
+                    && !eol
+                        .equivalent_checkout_rules(&old_eol, &path)
+                        .await
+                        .map_err(|err| CheckoutError::Other {
+                            message: "Failed to read Git line-ending attributes".to_owned(),
+                            err: err.into(),
+                        })?
+                {
+                    attributes_to_rematerialize.insert(path, value);
+                }
+            }
+        }
         // TODO: maybe it's better not include the skipped counts in the "intended"
         // counts
         let mut stats = CheckoutStats {
@@ -2362,7 +2479,7 @@ impl TreeState {
                 MaterializedTreeValue::File(file) => {
                     let exec_bit =
                         ExecBit::new_from_repo(file.executable, self.exec_policy, get_prev_exec);
-                    self.write_file(&disk_path, file.reader, exec_bit, true)
+                    self.write_file(&eol, &path, &disk_path, file.reader, exec_bit, true)
                         .await?
                 }
                 MaterializedTreeValue::Symlink { id: _, target } => {
@@ -2370,8 +2487,15 @@ impl TreeState {
                         self.write_symlink(&disk_path, target)?
                     } else {
                         // The fake symlink file shouldn't be executable.
-                        self.write_file(&disk_path, target.as_bytes(), ExecBit(false), false)
-                            .await?
+                        self.write_file(
+                            &eol,
+                            &path,
+                            &disk_path,
+                            target.as_bytes(),
+                            ExecBit(false),
+                            false,
+                        )
+                        .await?
                     }
                 }
                 MaterializedTreeValue::GitSubmodule(_) => {
@@ -2405,8 +2529,9 @@ impl TreeState {
                     );
                     let contents =
                         materialize_merge_result_to_bytes(&file.contents, &file.labels, &options);
-                    let mut file_state =
-                        self.write_conflict(&disk_path, &contents, exec_bit).await?;
+                    let mut file_state = self
+                        .write_conflict(&eol, &path, &disk_path, &contents, exec_bit)
+                        .await?;
                     file_state.materialized_conflict_data = Some(MaterializedConflictData {
                         conflict_marker_len: conflict_marker_len.try_into().unwrap_or(u32::MAX),
                     });
@@ -2417,8 +2542,14 @@ impl TreeState {
                     // better than trying to describe the merge.
                     let contents = id.describe(&labels);
                     // Since this is a dummy file, it shouldn't be executable.
-                    self.write_conflict(&disk_path, contents.as_bytes(), ExecBit(false))
-                        .await?
+                    self.write_conflict(
+                        &eol,
+                        &path,
+                        &disk_path,
+                        contents.as_bytes(),
+                        ExecBit(false),
+                    )
+                    .await?
                 }
             };
             changed_file_states.push((path, file_state));
@@ -2443,7 +2574,7 @@ impl TreeState {
         // need to do this if the conflicts have different numbers of sides though since
         // these conflicts are considered different, so they will be materialized by
         // `MergedTree::diff_stream_for_file_system` already.
-        let mut conflicts_to_rematerialize: HashMap<RepoPathBuf, MergedTreeValue> =
+        let mut files_to_rematerialize: HashMap<RepoPathBuf, MergedTreeValue> =
             if old_tree.tree_ids().num_sides() == new_tree.tree_ids().num_sides()
                 && old_tree.labels() != new_tree.labels()
             {
@@ -2457,23 +2588,23 @@ impl TreeState {
             } else {
                 HashMap::new()
             };
+        files_to_rematerialize.extend(attributes_to_rematerialize);
 
         while let Some((path, data)) = diff_stream.next().await {
             let (before, after) = data?;
-            conflicts_to_rematerialize.remove(&path);
+            files_to_rematerialize.remove(&path);
             process_diff_entry(path, before, after).await?;
         }
 
-        if !conflicts_to_rematerialize.is_empty() {
-            for (path, conflict) in conflicts_to_rematerialize {
+        if !files_to_rematerialize.is_empty() {
+            for (path, conflict) in files_to_rematerialize {
                 let materialized =
                     materialize_tree_value(&self.store, &path, conflict.clone(), new_tree.labels())
                         .await?;
                 process_diff_entry(path, conflict, materialized).await?;
             }
 
-            // We need to re-sort the changed file states since we may have inserted a
-            // conflicted file out of order.
+            // Attribute and conflict-label changes may be processed out of order.
             changed_file_states.sort_unstable_by(|(path1, _), (path2, _)| path1.cmp(path2));
         }
 

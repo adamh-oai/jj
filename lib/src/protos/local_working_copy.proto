@@ -57,6 +57,9 @@ message TreeState {
   bool is_file_states_sorted = 6;
   SparsePatterns sparse_patterns = 3;
   WatchmanClock watchman_clock = 4;
+  // External attribute rules and conversion policy used by the file-state cache.
+  // Absent in older states; recheck tracked files before trusting their metadata.
+  bytes eol_fingerprint = 9;
 }
 
 message WatchmanClock {

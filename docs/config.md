@@ -2129,14 +2129,19 @@ documentation](working-copy.md#stale-working-copy).
 ### EOL conversion setting
 
 This setting serves the same purpose as the [`core.autocrlf`][git-autocrlf] Git
-config.
+config. Jujutsu does not read `core.autocrlf`.
 
-Regardless of this setting, the line endings conversion is skipped on binary
-files based on a [heuristic](#binary-file-detection). This is similar to Git.
+Git-backed workspaces first apply the `text`, `eol`, and legacy `crlf` rules in
+`.gitattributes`. These per-file rules override this setting. For example,
+`*.cmd text eol=crlf` stores LF and writes CRLF on checkout, while `*.bin -text`
+preserves the original bytes. When no line-ending rule applies, Jujutsu uses
+the setting below and skips binary files based on a
+[heuristic](#binary-file-detection).
 
 ```toml
 [working-copy]
-# No EOL conversion. Similar to `core.autocrlf = false`.
+# No EOL conversion unless a file has line-ending attributes.
+# Similar to `core.autocrlf = false`.
 eol-conversion = "none"
 # Apply CRLF-to-LF EOL conversion when we check files in to the backend store
 # from the local file system, but do not apply LF-to-CRLF EOL conversion when we
@@ -2153,10 +2158,15 @@ eol-conversion = "input-output"
 
 #### Binary file detection
 
-To detect if a file is binary, Jujutsu currently checks if there is a NULL byte
-in the file, which is different from the algorithm of
-[`gitoxide`][gitoxide-is-binary] or [`Git`][git-is-binary]. Jujutsu doesn't plan
-to align the binary detection logic with Git.
+For the global `working-copy.eol-conversion` setting, Jujutsu checks the first
+8 KiB for a NUL byte or a carriage return that is not followed by a line feed.
+This differs from the algorithm used by [`gitoxide`][gitoxide-is-binary] and
+[`Git`][git-is-binary].
+
+For Git's `text=auto` attribute, Jujutsu uses Git's binary detection rules.
+Files that already contain CRLF in the stored version keep those bytes under
+`text=auto`. An explicit `text` attribute requests conversion without binary
+detection; `-text` disables conversion.
 
 [gitoxide-is-binary]: https://github.com/GitoxideLabs/gitoxide/blob/073487b38ed40bcd7eb45dc110ae1ce84f9275a9/gix-filter/src/eol/utils.rs#L98-L100
 [git-is-binary]: https://github.com/git/git/blob/f1ca98f609f9a730b9accf24e5558a10a0b41b6c/convert.c#L94-L103

@@ -893,6 +893,100 @@ fn test_git_init_colocated_dirty_working_copy() {
 }
 
 #[test]
+fn test_git_init_colocated_crlf_attributes() {
+    let test_env = TestEnvironment::default();
+    test_env.add_config("working-copy.eol-conversion = 'none'");
+    let work_dir = test_env.work_dir("repo");
+    let git_repo = git::init(work_dir.root());
+    let attributes_commit = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        ".gitattributes",
+        b"*.cmd text eol=crlf filter=never\n",
+        "Set script line endings",
+        &[],
+    );
+    let script_commit = git::add_commit(
+        &git_repo,
+        "refs/heads/main",
+        "script.cmd",
+        b"first\nsecond\n",
+        "Add script",
+        &[attributes_commit.commit_id],
+    );
+    git::set_head_to_id(&git_repo, script_commit.commit_id);
+    let run_git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(work_dir.root())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    run_git(&["reset", "--hard", "HEAD"]);
+    assert_eq!(&*work_dir.read_file("script.cmd"), b"first\r\nsecond\r\n");
+    assert!(run_git(&["status", "--porcelain"]).stdout.is_empty());
+
+    // JJ must read only the line-ending attributes. Running a configured clean
+    // or smudge command would make this otherwise clean import fail.
+    run_git(&["config", "filter.never.clean", "exit 77"]);
+    run_git(&["config", "filter.never.smudge", "exit 77"]);
+    run_git(&["config", "filter.never.required", "true"]);
+    work_dir.run_jj(["git", "init", "--colocate"]).success();
+    assert!(
+        work_dir
+            .run_jj(["diff", "--summary"])
+            .success()
+            .stdout
+            .is_empty()
+    );
+    assert_eq!(
+        work_dir
+            .run_jj(["file", "show", "script.cmd"])
+            .success()
+            .stdout
+            .raw(),
+        "first\nsecond\n"
+    );
+
+    work_dir.write_file("script.cmd", "first\r\nchanged\r\n");
+    let diff = work_dir.run_jj(["diff", "--summary"]).success();
+    assert_eq!(diff.stdout.raw(), "M script.cmd\n");
+    assert_eq!(
+        work_dir
+            .run_jj(["file", "show", "script.cmd"])
+            .success()
+            .stdout
+            .raw(),
+        "first\nchanged\n"
+    );
+    let commit_before = work_dir
+        .run_jj(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+        .success();
+    work_dir.run_jj(["status"]).success();
+    let commit_after = work_dir
+        .run_jj(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+        .success();
+    assert_eq!(commit_before.stdout, commit_after.stdout);
+
+    work_dir.run_jj(["new", "root()"]).success();
+    work_dir
+        .run_jj(["edit", commit_after.stdout.raw()])
+        .success();
+    assert_eq!(&*work_dir.read_file("script.cmd"), b"first\r\nchanged\r\n");
+}
+
+#[test]
 fn test_git_init_external_but_git_dir_exists() {
     let test_env = TestEnvironment::default();
     let git_repo_path = test_env.env_root().join("git-repo");
