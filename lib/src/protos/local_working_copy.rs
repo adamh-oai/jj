@@ -48,6 +48,10 @@ pub struct TreeState {
     pub sparse_patterns: ::core::option::Option<SparsePatterns>,
     #[prost(message, optional, tag = "4")]
     pub watchman_clock: ::core::option::Option<WatchmanClock>,
+    /// External attribute rules and conversion policy used by the file-state cache.
+    /// Absent in older states; recheck tracked files before trusting their metadata.
+    #[prost(bytes = "vec", tag = "9")]
+    pub eol_fingerprint: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatchmanClock {
