@@ -978,54 +978,27 @@ fn reject_jj_conflicted_git_target(
     Ok(())
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct SourceGitChanges {
-    tracked_paths: Vec<Vec<u8>>,
-    untracked_paths: Vec<Vec<u8>>,
-}
-
-fn source_git_changes(options: &GitWorktreeAdd<'_>) -> Result<SourceGitChanges, String> {
-    let status = git_capture(
-        options.git,
-        options.source,
+fn git_untracked_paths(git: &Path, worktree: &Path) -> Result<Vec<Vec<u8>>, String> {
+    // Match normal-mode status's directory grouping and ignore rules without
+    // refreshing tracked files, comparing HEAD, or detecting renames. ls-files
+    // does not reuse UNTR, so directory discovery still requires a walk.
+    let paths = git_capture(
+        git,
+        worktree,
         &[
-            "status",
-            "--porcelain=v1",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
             "-z",
-            "--untracked-files=normal",
-            "--ignore-submodules=none",
         ],
     )?;
-    parse_source_git_changes(&status)
-}
-
-fn parse_source_git_changes(status: &[u8]) -> Result<SourceGitChanges, String> {
-    let mut changes = SourceGitChanges::default();
-    let mut records = status
+    Ok(paths
         .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty());
-    while let Some(record) = records.next() {
-        if record.len() < 4 || record[2] != b' ' {
-            return Err("decode Git porcelain status record".to_owned());
-        }
-        let state = &record[..2];
-        let path = record[3..].to_vec();
-        if state == b"??" {
-            changes.untracked_paths.push(path);
-            continue;
-        }
-        if state == b"!!" {
-            continue;
-        }
-        changes.tracked_paths.push(path);
-        if state.iter().any(|state| matches!(state, b'R' | b'C')) {
-            let source_path = records
-                .next()
-                .ok_or_else(|| "decode Git porcelain rename source path".to_owned())?;
-            changes.tracked_paths.push(source_path.to_vec());
-        }
-    }
-    Ok(changes)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 fn validated_relative_git_path(path: &[u8]) -> Result<PathBuf, String> {
@@ -1100,13 +1073,13 @@ fn materialize_snapshot_checkout(
     git: &Path,
     destination: &Path,
     target: &str,
-    source_changes: &SourceGitChanges,
+    untracked_paths: &[Vec<u8>],
 ) -> Result<(), String> {
-    // Normal-mode status can report a whole untracked directory. Removing it
+    // The query can report a whole untracked directory. Removing it
     // also removes any ignored output it contains, while ignored-only paths
     // outside reported untracked directories remain available for reuse.
     timed_git_phase("remove_copied_untracked", || {
-        remove_copied_untracked_paths(destination, &source_changes.untracked_paths)
+        remove_copied_untracked_paths(destination, untracked_paths)
     })?;
     timed_git_phase("reset_destination", || {
         reset_checkout_to_target(git, destination, target)
@@ -1934,13 +1907,11 @@ fn run_git_worktree_add_inner(options: &GitWorktreeAdd<'_>) -> Result<(), String
         // index. Classify the actual child, including paths created between
         // the source cut and clone, before materializing the requested tree.
         drop(handoff);
-        let child_changes = timed_git_phase("destination_status", || {
-            source_git_changes(&GitWorktreeAdd {
-                source: &destination,
-                ..options
-            })
+        // Retain the timing phase name for readers of existing logs.
+        let untracked_paths = timed_git_phase("destination_status", || {
+            git_untracked_paths(options.git, &destination)
         })?;
-        materialize_snapshot_checkout(options.git, &destination, &target, &child_changes)?;
+        materialize_snapshot_checkout(options.git, &destination, &target, &untracked_paths)?;
         if timed_git_phase("inspect_materialized_fsmonitor", || {
             read_git_index_extension(&destination_index, hash_len, b"FSMN")
         })?
@@ -3393,6 +3364,7 @@ mod tests {
     use super::encode_git_fsmonitor_token;
     use super::format_changed_objects_stream;
     use super::git_fsmonitor_invalidations;
+    use super::git_untracked_paths;
     use super::is_uninitialized_awacs_root;
     use super::last_two_snapshots;
     use super::lock_jj_working_copy_for_snapshot;
@@ -3401,7 +3373,6 @@ mod tests {
     use super::manager_table_counts;
     use super::materialize_snapshot_checkout;
     use super::parse_git_fsmonitor_prior_token;
-    use super::parse_source_git_changes;
     use super::read_pending_jj_source_seed;
     use super::reject_jj_conflicted_git_target;
     use super::require_last_two_snapshots;
@@ -4125,24 +4096,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_dirty_git_paths_for_snapshot_reset() {
-        let changes = parse_source_git_changes(
-            b" M modified\0A  added\0R  renamed\0old-name\0?? untracked-dir/\0",
-        )
-        .unwrap();
-        assert_eq!(
-            changes.tracked_paths,
-            vec![
-                b"modified".to_vec(),
-                b"added".to_vec(),
-                b"renamed".to_vec(),
-                b"old-name".to_vec(),
-            ]
-        );
-        assert_eq!(changes.untracked_paths, vec![b"untracked-dir/".to_vec()]);
-    }
-
-    #[test]
     fn dirty_source_removes_untracked_directories_before_snapshot_reset() {
         fn run_git(cwd: &Path, arguments: &[&str]) -> Vec<u8> {
             let output = std::process::Command::new("git")
@@ -4169,12 +4122,19 @@ mod tests {
         run_git(&source, &["config", "user.email", "test@example.com"]);
         fs::write(
             source.join(".gitignore"),
-            b"ignored-untracked\nmixed/ignored-output\n",
+            b"ignored-untracked\nmixed/ignored-output\nignored-dir/\n",
         )
         .unwrap();
+        fs::write(source.join(".gitattributes"), b"file filter=check-reads\n").unwrap();
+        run_git(&source, &["config", "filter.check-reads.clean", "cat"]);
+        run_git(&source, &["config", "filter.check-reads.smudge", "cat"]);
+        run_git(&source, &["config", "filter.check-reads.required", "true"]);
         fs::write(source.join("file"), b"base\n").unwrap();
         fs::write(source.join("old-only"), b"old\n").unwrap();
-        run_git(&source, &["add", ".gitignore", "file", "old-only"]);
+        run_git(
+            &source,
+            &["add", ".gitignore", ".gitattributes", "file", "old-only"],
+        );
         run_git(&source, &["commit", "-m", "source"]);
         let source_target = String::from_utf8(run_git(&source, &["rev-parse", "HEAD"]))
             .unwrap()
@@ -4209,33 +4169,110 @@ mod tests {
                 &target,
             ],
         );
-        fs::write(destination.join("file"), b"unstaged\n").unwrap();
+        fs::copy(source.join(".gitignore"), destination.join(".gitignore")).unwrap();
+        fs::copy(
+            source.join(".gitattributes"),
+            destination.join(".gitattributes"),
+        )
+        .unwrap();
+        fs::write(destination.join("file"), b"dirty!\n").unwrap();
         fs::write(destination.join("old-only"), b"old\n").unwrap();
         fs::write(destination.join("source-untracked"), b"remove me\n").unwrap();
         fs::write(destination.join("ignored-untracked"), b"keep me\n").unwrap();
         fs::create_dir(destination.join("mixed")).unwrap();
         fs::write(destination.join("mixed/source-untracked"), b"remove me\n").unwrap();
         fs::write(destination.join("mixed/ignored-output"), b"keep me\n").unwrap();
+        fs::create_dir(destination.join("empty-dir")).unwrap();
+        fs::create_dir(destination.join("ignored-dir")).unwrap();
+        fs::write(destination.join("ignored-dir/output"), b"keep me\n").unwrap();
+        std::os::unix::fs::symlink("ignored-untracked", destination.join("untracked-link"))
+            .unwrap();
+        let unusual_names: &[&[u8]] = &[
+            b"line\nbreak",
+            b"tab\tname",
+            b"-leading-dash",
+            b"non-utf8-\xff",
+            b"?? name",
+        ];
+        for name in unusual_names {
+            fs::write(
+                destination.join(std::ffi::OsStr::from_bytes(name)),
+                b"remove me\n",
+            )
+            .unwrap();
+        }
         let source_index = super::git_path(Path::new("git"), &source, "index").unwrap();
         let destination_index = super::git_path(Path::new("git"), &destination, "index").unwrap();
 
-        let changes = parse_source_git_changes(&run_git(
-            &source,
-            &[
-                "status",
-                "--porcelain=v1",
-                "-z",
-                "--untracked-files=normal",
-                "--ignore-submodules=none",
-            ],
-        ))
-        .unwrap();
-        assert!(
-            changes.untracked_paths.contains(&b"mixed/".to_vec()),
-            "normal-mode status should collapse the untracked mixed directory"
-        );
         fs::copy(&source_index, &destination_index).unwrap();
-        materialize_snapshot_checkout(Path::new("git"), &destination, &target, &changes).unwrap();
+        let index_before = fs::read(&destination_index).unwrap();
+        // A tracked refresh would invoke this required clean filter for the
+        // modified file and fail. Untracked discovery must not read its contents.
+        run_git(
+            &destination,
+            &["config", "filter.check-reads.clean", "false"],
+        );
+        let untracked_paths = git_untracked_paths(Path::new("git"), &destination).unwrap();
+        assert_eq!(fs::read(&destination_index).unwrap(), index_before);
+        let tracked_status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&destination)
+            .args(["status", "--porcelain=v1", "-z", "--untracked-files=normal"])
+            .output()
+            .unwrap();
+        assert!(!tracked_status.status.success());
+        let status_error = String::from_utf8_lossy(&tracked_status.stderr);
+        assert!(
+            status_error.contains("clean filter") && status_error.contains("check-reads"),
+            "expected a tracked clean-filter failure: {status_error}"
+        );
+        run_git(&destination, &["config", "filter.check-reads.clean", "cat"]);
+        assert!(
+            untracked_paths.contains(&b"mixed/".to_vec()),
+            "discovery must collapse the mixed untracked directory"
+        );
+        assert!(!untracked_paths.contains(&b"file".to_vec()));
+        assert!(!untracked_paths.contains(&b"old-only".to_vec()));
+        assert!(!untracked_paths.contains(&b"empty-dir/".to_vec()));
+        assert!(!untracked_paths.contains(&b"ignored-dir/".to_vec()));
+        for name in unusual_names {
+            assert!(untracked_paths.iter().any(|path| path == name));
+        }
+
+        // Conflict stages are still tracked entries. Discovery must return
+        // the same untracked paths without inspecting the conflicted contents.
+        let blob = String::from_utf8(run_git(&source, &["rev-parse", ":file"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let conflict = format!(
+            "0 {}\tfile\n100644 {blob} 1\tfile\n100644 {blob} 2\tfile\n100644 {blob} 3\tfile\n",
+            "0".repeat(blob.len())
+        );
+        let mut update = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&destination)
+            .args(["update-index", "--index-info"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = update.stdin.take().unwrap();
+        std::io::Write::write_all(&mut input, conflict.as_bytes()).unwrap();
+        drop(input);
+        assert!(update.wait().unwrap().success());
+        let conflicted_index = fs::read(&destination_index).unwrap();
+        run_git(
+            &destination,
+            &["config", "filter.check-reads.clean", "false"],
+        );
+        assert_eq!(
+            git_untracked_paths(Path::new("git"), &destination).unwrap(),
+            untracked_paths
+        );
+        run_git(&destination, &["config", "filter.check-reads.clean", "cat"]);
+        assert_eq!(fs::read(&destination_index).unwrap(), conflicted_index);
+        materialize_snapshot_checkout(Path::new("git"), &destination, &target, &untracked_paths)
+            .unwrap();
 
         assert_eq!(fs::read(destination.join("file")).unwrap(), b"target\n");
         assert_eq!(
@@ -4244,6 +4281,15 @@ mod tests {
         );
         assert!(!destination.join("source-untracked").exists());
         assert!(!destination.join("mixed/source-untracked").exists());
+        assert!(!destination.join("untracked-link").exists());
+        for name in unusual_names {
+            assert!(!destination.join(std::ffi::OsStr::from_bytes(name)).exists());
+        }
+        assert!(destination.join("empty-dir").is_dir());
+        assert_eq!(
+            fs::read(destination.join("ignored-dir/output")).unwrap(),
+            b"keep me\n"
+        );
         assert_eq!(
             fs::read(destination.join("ignored-untracked")).unwrap(),
             b"keep me\n"
