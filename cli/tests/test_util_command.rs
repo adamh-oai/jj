@@ -121,6 +121,55 @@ fn test_gc_operation_log() {
     ");
 }
 
+#[test_case("simple_op_store_sync_v1", false; "shared events")]
+#[test_case("simple_op_store_sync_v2", true; "native operation parents")]
+fn test_pruning_in_former_sync_stores(store_type: &str, can_abandon: bool) {
+    let test_env = TestEnvironment::default();
+    test_env.run_jj_in(".", ["git", "init", "repo"]).success();
+    let work_dir = test_env.work_dir("repo");
+
+    // A transfer could retain an operation outside the active history.
+    work_dir.run_jj(["new", "-m", "first"]).success();
+    let detached_op = work_dir.current_operation_id();
+    work_dir.run_jj(["new", "-m", "second"]).success();
+    work_dir.run_jj(["op", "abandon", &detached_op]).success();
+    work_dir.write_file(".jj/repo/op_store/type", store_type);
+
+    let before_new = work_dir.current_operation_id();
+    work_dir.run_jj(["new", "-m", "third"]).success();
+    let after_new = work_dir.current_operation_id();
+    assert_ne!(before_new, after_new);
+    let output = work_dir.run_jj(["op", "abandon", &before_new]);
+    if can_abandon {
+        output.success();
+        assert_ne!(work_dir.current_operation_id(), after_new);
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{output}");
+        assert!(
+            output
+                .stderr
+                .raw()
+                .contains("Cannot abandon operations in a repository that used jj sync v1"),
+            "{output}"
+        );
+        assert_eq!(work_dir.current_operation_id(), after_new);
+    }
+
+    let output = work_dir.run_jj(["util", "gc", "--expire=now"]);
+    assert_eq!(output.status.code(), Some(1), "{output}");
+    assert!(
+        output
+            .stderr
+            .raw()
+            .contains("Cannot garbage collect a repository that used jj sync"),
+        "{output}"
+    );
+    work_dir
+        .run_jj(["debug", "object", "operation", &detached_op])
+        .success();
+    assert_eq!(work_dir.read_file(".jj/repo/op_store/type"), store_type);
+}
+
 #[test]
 fn test_shell_completions() {
     #[track_caller]

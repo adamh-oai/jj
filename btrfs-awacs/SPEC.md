@@ -567,8 +567,11 @@ Any changed path discards untracked-cache validity so Git rebuilds it against th
 child. Missing or expired source proof requires full copied-cache invalidation
 against a valid child cut, while retaining index entries and leaving fsmonitor
 enabled. Creation reads back and observes the published child cursor before
-finishing its lease and releasing the source lease. Git then classifies the actual
-child, removes copied untracked paths, and materializes the requested commit.
+finishing its lease and releasing the source lease. Git then resets tracked
+files directly to the requested commit without discovering all untracked paths.
+Copied untracked and ignored files remain unless they obstruct a tracked path
+that Git must check out. The child can therefore contain untracked files after
+creation; callers that need to remove them must request that cleanup separately.
 
 Native JJ adoption still uses its separately retained semantic baseline and
 consumer. Git's logical cursor never substitutes for that physical JJ seed; both

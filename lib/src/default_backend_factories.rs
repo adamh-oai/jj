@@ -64,26 +64,20 @@ pub fn default_backend_factories() -> StoreFactories {
     );
 
     // OpStores
-    factories.add_op_store(
+    for name in [
         SimpleOpStore::NAME,
-        Box::new(|_settings, store_path, root_data| {
-            Ok(Box::new(SimpleOpStore::load(store_path, root_data)))
-        }),
-    );
-    factories.add_op_store(
-        SimpleOpStore::SYNC_NAME,
-        Box::new(|_settings, store_path, root_data| {
-            Ok(Box::new(SimpleOpStore::load_sync(store_path, root_data)))
-        }),
-    );
-    factories.add_op_store(
-        SimpleOpStore::NATIVE_SYNC_NAME,
-        Box::new(|_settings, store_path, root_data| {
-            Ok(Box::new(SimpleOpStore::load_native_sync(
-                store_path, root_data,
-            )))
-        }),
-    );
+        SimpleOpStore::LEGACY_SYNC_V1,
+        SimpleOpStore::LEGACY_SYNC_V2,
+    ] {
+        factories.add_op_store(
+            name,
+            Box::new(move |_settings, store_path, root_data| {
+                Ok(Box::new(SimpleOpStore::load_with_name(
+                    store_path, root_data, name,
+                )))
+            }),
+        );
+    }
 
     // OpHeadsStores
     factories.add_op_heads_store(

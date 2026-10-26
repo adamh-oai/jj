@@ -21,7 +21,6 @@ use std::fmt::Debug;
 use std::fs;
 use std::io;
 use std::io::ErrorKind;
-use std::io::Read as _;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -94,14 +93,12 @@ pub struct SimpleOpStore {
 
 impl SimpleOpStore {
     pub const NAME: &str = "simple_op_store";
-    /// Identifies repositories whose operation writes participate in sync.
-    pub const SYNC_NAME: &str = "simple_op_store_sync_v1";
-    /// Identifies synchronized repositories whose history uses native parents.
-    pub const NATIVE_SYNC_NAME: &str = "simple_op_store_sync_v2";
+    /// Earlier versions used these store names for repositories that ran `jj sync`.
+    pub const LEGACY_SYNC_V1: &str = "simple_op_store_sync_v1";
+    pub const LEGACY_SYNC_V2: &str = "simple_op_store_sync_v2";
 
-    /// Whether this format participates in repository synchronization.
-    pub fn is_sync_name(name: &str) -> bool {
-        matches!(name, Self::SYNC_NAME | Self::NATIVE_SYNC_NAME)
+    pub fn is_legacy_sync_name(name: &str) -> bool {
+        matches!(name, Self::LEGACY_SYNC_V1 | Self::LEGACY_SYNC_V2)
     }
 
     /// Creates an empty OpStore. Returns error if it already exists.
@@ -109,36 +106,24 @@ impl SimpleOpStore {
         store_path: &Path,
         root_data: RootOperationData,
     ) -> Result<Self, SimpleOpStoreInitError> {
-        let store = Self::new(store_path, root_data);
+        let store = Self::load(store_path, root_data);
         store.init_base_dirs()?;
         Ok(store)
     }
 
     /// Load an existing OpStore
     pub fn load(store_path: &Path, root_data: RootOperationData) -> Self {
-        Self::new(store_path, root_data)
+        Self::load_with_name(store_path, root_data, Self::NAME)
     }
 
-    /// Loads a repository that has explicitly enabled operation synchronization.
-    pub fn load_sync(store_path: &Path, root_data: RootOperationData) -> Self {
-        Self {
-            name: Self::SYNC_NAME,
-            ..Self::new(store_path, root_data)
-        }
-    }
-
-    /// Loads synchronized history retained by ordinary operation ancestry.
-    pub fn load_native_sync(store_path: &Path, root_data: RootOperationData) -> Self {
-        Self {
-            name: Self::NATIVE_SYNC_NAME,
-            ..Self::new(store_path, root_data)
-        }
-    }
-
-    fn new(store_path: &Path, root_data: RootOperationData) -> Self {
+    pub(crate) fn load_with_name(
+        store_path: &Path,
+        root_data: RootOperationData,
+        name: &'static str,
+    ) -> Self {
         Self {
             path: store_path.to_path_buf(),
-            name: Self::NAME,
+            name,
             root_data,
             root_operation_id: OperationId::from_bytes(&[0; OPERATION_ID_LENGTH]),
             root_view_id: ViewId::from_bytes(&[0; VIEW_ID_LENGTH]),
@@ -158,215 +143,6 @@ impl SimpleOpStore {
 
     fn operations_dir(&self) -> PathBuf {
         self.path.join("operations")
-    }
-
-    pub(crate) fn store_path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Exports the stored bytes without re-encoding the operation or changing its ID.
-    /// Synthetic root objects have no stored representation and must be skipped.
-    pub fn export_operation(&self, id: &OperationId) -> OpStoreResult<Vec<u8>> {
-        self.export_operation_with_limit(id, None)
-    }
-
-    pub(crate) fn export_operation_bounded(
-        &self,
-        id: &OperationId,
-        limit: usize,
-    ) -> OpStoreResult<Vec<u8>> {
-        self.export_operation_with_limit(id, Some(limit))
-    }
-
-    fn export_operation_with_limit(
-        &self,
-        id: &OperationId,
-        limit: Option<usize>,
-    ) -> OpStoreResult<Vec<u8>> {
-        self.check_raw_id(id, OPERATION_ID_LENGTH)?;
-        let path = self.operations_dir().join(id.hex());
-        let bytes = read_raw_export(&path, id, limit)?;
-        self.decode_raw_operation(id, &bytes)?;
-        Ok(bytes)
-    }
-
-    /// Validates and imports original operation bytes under their original ID.
-    /// This does not publish an operation head or import referenced objects.
-    ///
-    /// In addition to current hashes, this authenticates historical layouts
-    /// without workspace metadata or predecessor records. Unknown historical
-    /// hash layouts are rejected rather than accepted under an unverified ID.
-    pub fn import_operation(&self, id: &OperationId, bytes: &[u8]) -> OpStoreResult<Operation> {
-        self.check_raw_id(id, OPERATION_ID_LENGTH)?;
-        import_raw_object(&self.operations_dir(), id, bytes, |bytes| {
-            self.decode_raw_operation(id, bytes)
-        })
-    }
-
-    /// Exports the stored bytes without applying view migrations to those bytes.
-    /// Synthetic root objects have no stored representation and must be skipped.
-    pub fn export_view(&self, id: &ViewId) -> OpStoreResult<Vec<u8>> {
-        self.export_view_with_limit(id, None)
-    }
-
-    pub(crate) fn export_view_bounded(&self, id: &ViewId, limit: usize) -> OpStoreResult<Vec<u8>> {
-        self.export_view_with_limit(id, Some(limit))
-    }
-
-    fn export_view_with_limit(&self, id: &ViewId, limit: Option<usize>) -> OpStoreResult<Vec<u8>> {
-        self.check_raw_id(id, VIEW_ID_LENGTH)?;
-        let path = self.views_dir().join(id.hex());
-        let bytes = read_raw_export(&path, id, limit)?;
-        self.decode_raw_view(id, &bytes)?;
-        Ok(bytes)
-    }
-
-    /// Validates and imports original view bytes, returning the migrated view.
-    /// The stored bytes and ID remain those of the original, unmigrated object.
-    ///
-    /// Supported historical hashes include single Git HEAD targets and remote
-    /// views without tags. Earlier layouts, such as views with the removed
-    /// public-heads field, are rejected if their identity cannot be verified.
-    pub fn import_view(&self, id: &ViewId, bytes: &[u8]) -> OpStoreResult<View> {
-        self.check_raw_id(id, VIEW_ID_LENGTH)?;
-        import_raw_object(&self.views_dir(), id, bytes, |bytes| {
-            self.decode_raw_view(id, bytes)
-        })
-    }
-
-    fn check_raw_id(&self, id: &impl ObjectId, length: usize) -> OpStoreResult<()> {
-        if id.as_bytes().len() != length {
-            return Err(to_read_error(
-                PostDecodeError::InvalidHashLength {
-                    expected: length,
-                    actual: id.as_bytes().len(),
-                }
-                .into(),
-                id,
-            ));
-        }
-        if id.as_bytes().iter().all(|&byte| byte == 0) {
-            return Err(to_read_error(RawObjectError::SyntheticRoot.into(), id));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn decode_raw_operation(
-        &self,
-        id: &OperationId,
-        bytes: &[u8],
-    ) -> OpStoreResult<Operation> {
-        self.check_raw_id(id, OPERATION_ID_LENGTH)?;
-        let proto = crate::protos::simple_op_store::Operation::decode(bytes)
-            .map_err(|err| to_read_error(err.into(), id))?;
-        let mut operation =
-            operation_from_proto(proto).map_err(|err| to_read_error(err.into(), id))?;
-        if let Some(predecessors) = &operation.commit_predecessors {
-            for (commit, previous) in predecessors {
-                for commit in std::iter::once(commit).chain(previous) {
-                    self.validate_commit_id(commit)
-                        .map_err(|err| to_read_error(err.into(), id))?;
-                }
-            }
-        }
-
-        // Verify before inserting the synthetic root parent. Older operations
-        // were named using their original empty parent list.
-        let hash = blake2b_hash(&operation);
-        let matches = hash.as_slice() == id.as_bytes()
-            || (operation.metadata.workspace_name.is_none()
-                && (blake2b_hash(&LegacyOperationHash {
-                    operation: &operation,
-                    include_predecessors: true,
-                })
-                .as_slice()
-                    == id.as_bytes()
-                    || (operation.commit_predecessors.is_none()
-                        && blake2b_hash(&LegacyOperationHash {
-                            operation: &operation,
-                            include_predecessors: false,
-                        })
-                        .as_slice()
-                            == id.as_bytes())));
-        if !matches {
-            return Err(to_read_error(RawObjectError::HashMismatch.into(), id));
-        }
-        if operation.parents.is_empty() {
-            operation.parents.push(self.root_operation_id.clone());
-        }
-        Ok(operation)
-    }
-
-    pub(crate) fn decode_raw_view(&self, id: &ViewId, bytes: &[u8]) -> OpStoreResult<View> {
-        self.check_raw_id(id, VIEW_ID_LENGTH)?;
-        let proto = crate::protos::simple_op_store::View::decode(bytes)
-            .map_err(|err| to_read_error(err.into(), id))?;
-        let has_legacy_git_head = proto.git_heads.is_empty();
-        // Git-tracking tag migration adds data to the in-memory view. Its ID
-        // belongs to the original data, not to the result of that migration.
-        let original = view_from_proto_with_migration(proto.clone(), false)
-            .map_err(|err| to_read_error(err.into(), id))?;
-        self.validate_view_commit_ids(&original)
-            .map_err(|err| to_read_error(err.into(), id))?;
-        let has_legacy_remote_views = proto.remote_views.is_empty()
-            && original
-                .remote_views
-                .values()
-                .all(|remote| remote.tags.is_empty());
-        let matches = blake2b_hash(&original).as_slice() == id.as_bytes()
-            || (has_legacy_git_head
-                && (blake2b_hash(&LegacyViewHash {
-                    view: &original,
-                    include_remote_tags: true,
-                })
-                .as_slice()
-                    == id.as_bytes()
-                    || (has_legacy_remote_views
-                        && blake2b_hash(&LegacyViewHash {
-                            view: &original,
-                            include_remote_tags: false,
-                        })
-                        .as_slice()
-                            == id.as_bytes())));
-        if !matches {
-            return Err(to_read_error(RawObjectError::HashMismatch.into(), id));
-        }
-        view_from_proto(proto).map_err(|err| to_read_error(err.into(), id))
-    }
-
-    fn validate_commit_id(&self, id: &CommitId) -> Result<(), PostDecodeError> {
-        let expected = self.root_data.root_commit_id.as_bytes().len();
-        let actual = id.as_bytes().len();
-        if actual == expected {
-            Ok(())
-        } else {
-            Err(PostDecodeError::InvalidHashLength { expected, actual })
-        }
-    }
-
-    fn validate_view_commit_ids(&self, view: &View) -> Result<(), PostDecodeError> {
-        let targets = view
-            .local_bookmarks
-            .values()
-            .chain(view.local_tags.values())
-            .chain(view.git_refs.values())
-            .chain(view.git_heads.values())
-            .chain(view.remote_views.values().flat_map(|remote| {
-                remote
-                    .bookmarks
-                    .values()
-                    .chain(remote.tags.values())
-                    .map(|r| &r.target)
-            }));
-        for id in view
-            .head_ids
-            .iter()
-            .chain(view.wc_commit_ids.values())
-            .chain(targets.flat_map(|target| target.iter().flatten()))
-        {
-            self.validate_commit_id(id)?;
-        }
-        Ok(())
     }
 }
 
@@ -390,7 +166,9 @@ impl OpStore for SimpleOpStore {
             .context(&path)
             .map_err(|err| io_to_read_error(err, id))?;
 
-        decode_view(&buf).map_err(|err| to_read_error(err, id))
+        let proto = crate::protos::simple_op_store::View::decode(&*buf)
+            .map_err(|err| to_read_error(err.into(), id))?;
+        view_from_proto(proto).map_err(|err| to_read_error(err.into(), id))
     }
 
     async fn write_view(&self, view: &View) -> OpStoreResult<ViewId> {
@@ -399,9 +177,10 @@ impl OpStore for SimpleOpStore {
             .context(&dir)
             .map_err(|err| io_to_write_error(err, "view"))?;
 
+        let proto = view_to_proto(view);
         temp_file
             .as_file()
-            .write_all(&encode_view(view))
+            .write_all(&proto.encode_to_vec())
             .context(temp_file.path())
             .map_err(|err| io_to_write_error(err, "view"))?;
 
@@ -623,174 +402,6 @@ fn io_to_write_error(err: PathError, object_type: &'static str) -> OpStoreError 
 }
 
 #[derive(Debug, Error)]
-enum RawObjectError {
-    #[error("Synthetic root objects have no stored representation")]
-    SyntheticRoot,
-    #[error(
-        "Content hash does not match the object ID; unsupported historical hash layouts cannot be \
-         imported"
-    )]
-    HashMismatch,
-    #[error("Existing object with this ID has different content")]
-    ExistingObjectMismatch,
-    #[error("Operation-store metadata exceeds the {limit}-byte export limit")]
-    ExportLimit { limit: usize },
-}
-
-fn read_raw_export(
-    path: &Path,
-    id: &impl ObjectId,
-    limit: Option<usize>,
-) -> OpStoreResult<Vec<u8>> {
-    let file = fs::File::open(path)
-        .context(path)
-        .map_err(|err| io_to_read_error(err, id))?;
-    if let Some(limit) = limit {
-        let size = file
-            .metadata()
-            .context(path)
-            .map_err(|err| io_to_read_error(err, id))?
-            .len();
-        if size > limit as u64 {
-            return Err(to_read_error(
-                RawObjectError::ExportLimit { limit }.into(),
-                id,
-            ));
-        }
-    }
-    let mut bytes = Vec::new();
-    file.take(limit.map_or(u64::MAX, |limit| (limit as u64).saturating_add(1)))
-        .read_to_end(&mut bytes)
-        .context(path)
-        .map_err(|err| io_to_read_error(err, id))?;
-    if let Some(limit) = limit
-        && bytes.len() > limit
-    {
-        return Err(to_read_error(
-            RawObjectError::ExportLimit { limit }.into(),
-            id,
-        ));
-    }
-    Ok(bytes)
-}
-
-fn import_raw_object<T: PartialEq>(
-    dir: &Path,
-    id: &impl ObjectId,
-    bytes: &[u8],
-    decode: impl Fn(&[u8]) -> OpStoreResult<T>,
-) -> OpStoreResult<T> {
-    let object = decode(bytes)?;
-    let temp_file = NamedTempFile::new_in(dir)
-        .context(dir)
-        .map_err(|err| io_to_write_error(err, "raw operation-store object"))?;
-    temp_file
-        .as_file()
-        .write_all(bytes)
-        .context(temp_file.path())
-        .map_err(|err| io_to_write_error(err, "raw operation-store object"))?;
-    temp_file
-        .as_file()
-        .sync_data()
-        .context(temp_file.path())
-        .map_err(|err| io_to_write_error(err, "raw operation-store object"))?;
-    let path = dir.join(id.hex());
-    match temp_file.persist_noclobber(&path) {
-        Ok(_) => Ok(object),
-        Err(err) if err.error.kind() == ErrorKind::AlreadyExists => {
-            // Different protobuf encodings can name the same semantic object.
-            // Keep the existing bytes, but verify them rather than trusting the
-            // filename. This also handles racing importers without overwrites.
-            let existing_bytes = fs::read(&path)
-                .context(&path)
-                .map_err(|err| io_to_read_error(err, id))?;
-            let existing = decode(&existing_bytes)?;
-            if existing == object {
-                Ok(object)
-            } else {
-                Err(to_read_error(
-                    RawObjectError::ExistingObjectMismatch.into(),
-                    id,
-                ))
-            }
-        }
-        Err(err) => Err(io_to_write_error(
-            PathError {
-                path,
-                source: err.error,
-            },
-            "raw operation-store object",
-        )),
-    }
-}
-
-/// Encodes a view using the operation store's current protobuf representation.
-pub(crate) fn encode_view(view: &View) -> Vec<u8> {
-    view_to_proto(view).encode_to_vec()
-}
-
-/// Decodes a view using the same compatibility migrations as repository reads.
-pub(crate) fn decode_view(bytes: &[u8]) -> Result<View, Box<dyn std::error::Error + Send + Sync>> {
-    let proto = crate::protos::simple_op_store::View::decode(bytes)?;
-    Ok(view_from_proto(proto)?)
-}
-
-// These layouts are retained only to authenticate objects that can exist in
-// pre-sync repositories. The protobuf bytes are never rewritten to these forms.
-struct LegacyOperationHash<'a> {
-    operation: &'a Operation,
-    include_predecessors: bool,
-}
-
-impl crate::content_hash::ContentHash for LegacyOperationHash<'_> {
-    fn hash(&self, state: &mut impl crate::content_hash::DigestUpdate) {
-        let operation = self.operation;
-        operation.view_id.hash(state);
-        operation.parents.hash(state);
-        // Before workspace_name was recorded, metadata's tags (now attributes)
-        // immediately followed is_snapshot. TimestampRange is hash-transparent.
-        operation.metadata.time.hash(state);
-        operation.metadata.description.hash(state);
-        operation.metadata.hostname.hash(state);
-        operation.metadata.username.hash(state);
-        operation.metadata.is_snapshot.hash(state);
-        operation.metadata.attributes.hash(state);
-        if self.include_predecessors {
-            operation.commit_predecessors.hash(state);
-        }
-    }
-}
-
-struct LegacyViewHash<'a> {
-    view: &'a View,
-    include_remote_tags: bool,
-}
-
-impl crate::content_hash::ContentHash for LegacyViewHash<'_> {
-    fn hash(&self, state: &mut impl crate::content_hash::DigestUpdate) {
-        let view = self.view;
-        view.head_ids.hash(state);
-        view.local_bookmarks.hash(state);
-        view.local_tags.hash(state);
-        // Before jj 0.34, each remote view contained bookmarks only.
-        (view.remote_views.len() as u64).hash(state);
-        for (name, remote) in &view.remote_views {
-            name.hash(state);
-            remote.bookmarks.hash(state);
-            if self.include_remote_tags {
-                remote.tags.hash(state);
-            }
-        }
-        view.git_refs.hash(state);
-        view.git_heads
-            .get(WorkspaceName::DEFAULT)
-            .unwrap_or(&op_store::ABSENT_REF_TARGET)
-            .hash(state);
-        view.wc_commit_ids.hash(state);
-    }
-}
-
-#[derive(Debug, Error)]
 enum PostDecodeError {
     #[error("Invalid hash length (expected {expected} bytes, got {actual} bytes)")]
     InvalidHashLength { expected: usize, actual: usize },
@@ -802,6 +413,7 @@ enum PostDecodeError {
     MissingRefTargetValue,
     #[error("Invalid ref conflict: {removes} removes and {adds} adds")]
     InvalidRefConflict { removes: usize, adds: usize },
+    #[cfg(feature = "git")]
     #[error("Invalid Git-tracking tag migration data")]
     InvalidGitTagMigration,
 }
@@ -1017,15 +629,6 @@ fn view_to_proto(view: &View) -> crate::protos::simple_op_store::View {
 }
 
 fn view_from_proto(proto: crate::protos::simple_op_store::View) -> Result<View, PostDecodeError> {
-    view_from_proto_with_migration(proto, true)
-}
-
-fn view_from_proto_with_migration(
-    proto: crate::protos::simple_op_store::View,
-    migrate: bool,
-) -> Result<View, PostDecodeError> {
-    #[cfg(not(feature = "git"))]
-    let _ = migrate;
     validate_view_proto(&proto)?;
     // TODO: validate commit id length?
     // For compatibility with old repos before we had support for multiple working
@@ -1076,7 +679,7 @@ fn view_from_proto_with_migration(
     }
 
     #[cfg(feature = "git")]
-    if migrate && !proto.has_git_refs_migrated_to_remote_tags {
+    if !proto.has_git_refs_migrated_to_remote_tags {
         tracing::info!("migrating Git-tracking tags");
         let git_tags: BTreeMap<_, _> = git_refs
             .iter()
@@ -1439,9 +1042,6 @@ mod tests {
 
     use super::*;
     use crate::hex_util;
-    use crate::ref_name::GitRefName;
-    use crate::ref_name::RefName;
-    use crate::ref_name::RemoteName;
     use crate::tests::TestResult;
     use crate::tests::new_temp_dir;
 
@@ -1592,299 +1192,6 @@ mod tests {
         Ok(())
     }
 
-    fn create_store(path: &Path) -> SimpleOpStore {
-        SimpleOpStore::init(
-            path,
-            RootOperationData {
-                root_commit_id: CommitId::from_hex("000000"),
-            },
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn test_raw_objects_preserve_bytes_and_ids() -> TestResult {
-        let source_dir = new_temp_dir();
-        let destination_dir = new_temp_dir();
-        let source = create_store(source_dir.path());
-        let destination = create_store(destination_dir.path());
-        let view = create_view();
-        let view_id = source.write_view(&view).block_on()?;
-        let view_bytes = source.export_view(&view_id)?;
-        assert_eq!(
-            source.export_view_bounded(&view_id, view_bytes.len())?,
-            view_bytes
-        );
-        assert!(
-            source
-                .export_view_bounded(&view_id, view_bytes.len() - 1)
-                .is_err()
-        );
-        assert_eq!(destination.import_view(&view_id, &view_bytes)?, view);
-        assert_eq!(destination.export_view(&view_id)?, view_bytes);
-        assert_eq!(destination.import_view(&view_id, &view_bytes)?, view);
-
-        let mut operation = create_operation();
-        operation.view_id = view_id;
-        let operation_id = source.write_operation(&operation).block_on()?;
-        let operation_bytes = source.export_operation(&operation_id)?;
-        assert_eq!(
-            source.export_operation_bounded(&operation_id, operation_bytes.len())?,
-            operation_bytes
-        );
-        assert!(
-            source
-                .export_operation_bounded(&operation_id, operation_bytes.len() - 1)
-                .is_err()
-        );
-        assert_eq!(
-            destination.import_operation(&operation_id, &operation_bytes)?,
-            operation
-        );
-        assert_eq!(
-            destination.export_operation(&operation_id)?,
-            operation_bytes
-        );
-        assert_eq!(
-            destination.import_operation(&operation_id, &operation_bytes)?,
-            operation
-        );
-        assert_eq!(
-            destination.read_operation(&operation_id).block_on()?,
-            operation
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_raw_import_keeps_existing_equivalent_encoding() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let view = create_view();
-        let view_id = store.write_view(&view).block_on()?;
-        let original = store.export_view(&view_id)?;
-        let mut alternative = original.clone();
-        // A valid unknown protobuf field does not affect the semantic hash.
-        alternative.extend([0xf8, 0x7f, 1]);
-        assert_eq!(store.import_view(&view_id, &alternative)?, view);
-        assert_eq!(store.export_view(&view_id)?, original);
-        Ok(())
-    }
-
-    #[test]
-    fn test_raw_import_validates_before_writing() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let operation = create_operation();
-        let operation_id = OperationId::new(blake2b_hash(&operation).to_vec());
-        let mut changed = operation.clone();
-        changed.metadata.description.push_str(" tampered");
-        let wrong_bytes = operation_to_proto(&changed).encode_to_vec();
-        assert!(store.import_operation(&operation_id, &wrong_bytes).is_err());
-        assert!(!store.operations_dir().join(operation_id.hex()).exists());
-        assert!(store.import_operation(&operation_id, &[0xff]).is_err());
-        assert!(
-            store
-                .import_operation(store.root_operation_id(), &[])
-                .is_err()
-        );
-        assert!(store.import_view(&store.root_view_id, &[]).is_err());
-        assert!(store.export_operation(store.root_operation_id()).is_err());
-        assert!(store.export_view(&store.root_view_id).is_err());
-        assert!(
-            store
-                .import_operation(&OperationId::from_hex("ab"), &wrong_bytes)
-                .is_err()
-        );
-
-        let mut view = create_view();
-        let view_id = ViewId::new(blake2b_hash(&view).to_vec());
-        view.head_ids.insert(CommitId::from_hex("123456"));
-        assert!(store.import_view(&view_id, &encode_view(&view)).is_err());
-        assert!(!store.views_dir().join(view_id.hex()).exists());
-
-        view.head_ids.insert(CommitId::from_hex("12"));
-        let view_id = ViewId::new(blake2b_hash(&view).to_vec());
-        assert!(store.import_view(&view_id, &encode_view(&view)).is_err());
-        assert!(!store.views_dir().join(view_id.hex()).exists());
-
-        let mut proto = operation_to_proto(&operation);
-        proto.parents = vec![vec![1]];
-        assert!(
-            store
-                .import_operation(&operation_id, &proto.encode_to_vec())
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_raw_parentless_operation_keeps_original_identity() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let mut operation = create_operation();
-        operation.parents.clear();
-        let operation_id = OperationId::new(blake2b_hash(&operation).to_vec());
-        let original = operation_to_proto(&operation).encode_to_vec();
-        let imported = store.import_operation(&operation_id, &original)?;
-        assert_eq!(imported.parents, vec![store.root_operation_id.clone()]);
-        assert_ne!(blake2b_hash(&imported).as_slice(), operation_id.as_bytes());
-        assert_eq!(store.export_operation(&operation_id)?, original);
-        assert_eq!(store.read_operation(&operation_id).block_on()?, imported);
-        Ok(())
-    }
-
-    #[test]
-    fn test_raw_legacy_operation_metadata_and_predecessors() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let mut operation = create_operation();
-        operation.metadata.workspace_name = None;
-        for include_predecessors in [false, true] {
-            operation.commit_predecessors = create_operation().commit_predecessors;
-            if !include_predecessors {
-                operation.commit_predecessors = None;
-            }
-            let operation_id = OperationId::new(
-                blake2b_hash(&LegacyOperationHash {
-                    operation: &operation,
-                    include_predecessors,
-                })
-                .to_vec(),
-            );
-            let bytes = operation_to_proto(&operation).encode_to_vec();
-            assert_eq!(store.import_operation(&operation_id, &bytes)?, operation);
-            assert_eq!(store.export_operation(&operation_id)?, bytes);
-        }
-        // An old hash layout must not hide fields that have actually been set.
-        operation.metadata.workspace_name = Some("new".into());
-        let operation_id = OperationId::new(
-            blake2b_hash(&LegacyOperationHash {
-                operation: &operation,
-                include_predecessors: true,
-            })
-            .to_vec(),
-        );
-        assert!(
-            store
-                .import_operation(
-                    &operation_id,
-                    &operation_to_proto(&operation).encode_to_vec()
-                )
-                .is_err()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_raw_legacy_operation_golden_identity() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let mut operation = Operation::make_root(ViewId::new(vec![1; VIEW_ID_LENGTH]));
-        operation.metadata.description = "legacy".to_owned();
-        operation.commit_predecessors = None;
-        // jj 0.29's ContentHash layout: no workspace_name or predecessors slot.
-        let operation_id = OperationId::from_hex(
-            "bf8e499fa491b457def3abf95722b582432f58bfa0caf0d0ad4ccf5dcad63f87d0b9f73af59f52e68fb9e30080cfee50d97661551c3b08ede146ba2041bfec7b",
-        );
-        let original = operation_to_proto(&operation).encode_to_vec();
-        let imported = store.import_operation(&operation_id, &original)?;
-        assert_eq!(imported.metadata, operation.metadata);
-        assert_eq!(imported.parents, vec![store.root_operation_id.clone()]);
-        assert_eq!(store.export_operation(&operation_id)?, original);
-        Ok(())
-    }
-
-    #[test]
-    fn test_raw_legacy_view_preserves_identity_across_migration() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let mut view = View::make_root(CommitId::from_hex("000000"));
-        view.git_refs.insert(
-            "refs/tags/v1".into(),
-            RefTarget::normal(CommitId::from_hex("010203")),
-        );
-        let mut proto = view_to_proto(&view);
-        proto.has_git_refs_migrated_to_remote_tags = false;
-        proto.git_heads.clear();
-        let original = proto.encode_to_vec();
-        // jj 0.34's original single-Git-HEAD layout, before tag migration.
-        let view_id = ViewId::from_hex(
-            "c6d47179a4ae4d34cc7777d953389afedf1a40439baec8916f376efda538b1cbd5dd98b98fe0e3fe8dead39c4e69686d7b273ab5d5e445a5bd515e6a83400d09",
-        );
-        let migrated = store.import_view(&view_id, &original)?;
-        if cfg!(feature = "git") {
-            assert_eq!(
-                migrated.remote_views[RemoteName::new("git")].tags[RefName::new("v1")].target,
-                view.git_refs[GitRefName::new("refs/tags/v1")]
-            );
-        }
-        assert_eq!(store.export_view(&view_id)?, original);
-        assert_eq!(store.read_view(&view_id).block_on()?, migrated);
-        Ok(())
-    }
-
-    #[test]
-    #[expect(deprecated)]
-    fn test_raw_legacy_view_encodings_and_remote_hash() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let target = RefTarget::normal(CommitId::from_hex("111111"));
-        let proto = crate::protos::simple_op_store::View {
-            head_ids: vec![CommitId::from_hex("000000").to_bytes()],
-            wc_commit_id: CommitId::from_hex("333333").to_bytes(),
-            git_head_legacy: CommitId::from_hex("222222").to_bytes(),
-            bookmarks: vec![crate::protos::simple_op_store::Bookmark {
-                name: "main".to_owned(),
-                local_target: None,
-                remote_bookmarks: vec![crate::protos::simple_op_store::RemoteBookmark {
-                    remote_name: "origin".to_owned(),
-                    target: ref_target_to_proto_legacy(&target),
-                    state: None,
-                }],
-            }],
-            ..Default::default()
-        };
-        // jj 0.29 hashed remote bookmarks without the later remote-tags slot.
-        let view_id = ViewId::from_hex(
-            "69fdd79e71d7b28eae6319e156224c2e570961b2a4afc4bb174aef9c4ecd6b65f4e78eeb30446079adc10b231746a82e33e0399cb6d8af906c85201ecfb68de8",
-        );
-        let bytes = proto.encode_to_vec();
-        let imported = store.import_view(&view_id, &bytes)?;
-        assert_eq!(
-            imported.remote_views[RemoteName::new("origin")].bookmarks[RefName::new("main")].target,
-            target
-        );
-        assert_eq!(
-            imported.remote_views[RemoteName::new("origin")].bookmarks[RefName::new("main")].state,
-            RemoteRefState::New
-        );
-        assert_eq!(
-            imported.git_heads[WorkspaceName::DEFAULT],
-            RefTarget::normal(CommitId::from_hex("222222"))
-        );
-        assert_eq!(
-            imported.wc_commit_ids[WorkspaceName::DEFAULT],
-            CommitId::from_hex("333333")
-        );
-        assert_eq!(store.export_view(&view_id)?, bytes);
-        Ok(())
-    }
-
-    #[test]
-    fn test_raw_export_detects_existing_corruption() -> TestResult {
-        let dir = new_temp_dir();
-        let store = create_store(dir.path());
-        let view = create_view();
-        let view_id = store.write_view(&view).block_on()?;
-        let bytes = store.export_view(&view_id)?;
-        fs::write(store.views_dir().join(view_id.hex()), [0xff])?;
-        assert!(store.export_view(&view_id).is_err());
-        assert!(store.import_view(&view_id, &bytes).is_err());
-        assert_eq!(fs::read(store.views_dir().join(view_id.hex()))?, [0xff]);
-        Ok(())
-    }
-
     #[test]
     fn test_view_codec_rejects_malformed_ref_targets() {
         let mut proto = view_to_proto(&create_view());
@@ -1892,14 +1199,23 @@ mod tests {
             name: "invalid".to_owned(),
             target: Some(crate::protos::simple_op_store::RefTarget { value: None }),
         });
-        assert!(decode_view(&proto.encode_to_vec()).is_err());
+        assert!(matches!(
+            view_from_proto(proto.clone()),
+            Err(PostDecodeError::MissingRefTargetValue)
+        ));
         proto.local_tags.last_mut().unwrap().target =
             Some(crate::protos::simple_op_store::RefTarget {
                 value: Some(crate::protos::simple_op_store::ref_target::Value::Conflict(
                     crate::protos::simple_op_store::RefConflict::default(),
                 )),
             });
-        assert!(decode_view(&proto.encode_to_vec()).is_err());
+        assert!(matches!(
+            view_from_proto(proto),
+            Err(PostDecodeError::InvalidRefConflict {
+                removes: 0,
+                adds: 0
+            })
+        ));
     }
 
     #[test]

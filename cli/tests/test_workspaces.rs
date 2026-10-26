@@ -1071,9 +1071,10 @@ fi
         assert_eq!(std::fs::read_to_string(root.join("one"))?, "after\n");
         assert_eq!(std::fs::read_to_string(root.join("two"))?, "before\n");
         assert!(root.join("after-cut").is_file());
-        assert!(
-            !child.join("after-cut").exists(),
-            "materialization must classify and remove untracked files from the actual child cut"
+        assert_eq!(
+            std::fs::read_to_string(child.join("after-cut"))?,
+            "new after source cut\n",
+            "snapshot creation must retain untracked files from the actual child cut"
         );
     }
     if scenario == GitSnapshotHandoffScenario::MissingCursor {
@@ -1082,13 +1083,33 @@ fi
             "unobserved edit\n"
         );
         assert!(root.join("without-cursor").is_file());
-        assert!(!child.join("without-cursor").exists());
+        assert_eq!(
+            std::fs::read_to_string(child.join("without-cursor"))?,
+            "unobserved new file\n"
+        );
+    }
+    let events = std::fs::read_to_string(&creation_trace)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        !events.iter().any(|event| {
+            event["event"] == "cmd_name"
+                && matches!(event["name"].as_str(), Some("ls-files" | "status"))
+        }),
+        "snapshot creation must reset tracked files without discovering untracked files"
+    );
+    if !colocated_jj {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "cmd_name" && event["name"] == "reset")
+                .count(),
+            1,
+            "snapshot creation must record its reset in the trace"
+        );
     }
     if scenario == GitSnapshotHandoffScenario::RetainedCursor {
-        let events = std::fs::read_to_string(&creation_trace)?
-            .lines()
-            .map(serde_json::from_str::<serde_json::Value>)
-            .collect::<Result<Vec<_>, _>>()?;
         let lstats = events
             .iter()
             .filter(|event| {
@@ -1101,10 +1122,12 @@ fi
             })
             .map(|event| event["value"].as_str().unwrap().parse::<u64>())
             .collect::<Result<Vec<_>, _>>()?;
-        assert!(
-            !lstats.is_empty() && lstats.iter().sum::<u64>() == 0,
-            "a clean logical replay must preserve the copied index's clean bits, not move a full \
-             tracked refresh into creation: {lstats:?}"
+        // Reset can skip preload and refresh entirely. Their statistics may
+        // therefore be absent when the copied index is already clean.
+        assert_eq!(
+            lstats.iter().sum::<u64>(),
+            0,
+            "a clean logical replay must preserve the copied index's clean bits: {lstats:?}"
         );
         assert!(!events.iter().any(|event| matches!(
             event["key"].as_str(),
@@ -1212,10 +1235,14 @@ fi
         return Ok(());
     }
     let child_status = run(git_command(&child).args(["status", "--porcelain=v1"]))?;
-    assert!(
-        child_status.stdout.is_empty(),
-        "snapshot child must be clean before further Git/JJ activity:\n{}",
-        String::from_utf8_lossy(&child_status.stdout)
+    let expected_status = match scenario {
+        GitSnapshotHandoffScenario::ConcurrentChanges => b"?? after-cut\n".as_slice(),
+        GitSnapshotHandoffScenario::MissingCursor => b"?? without-cursor\n".as_slice(),
+        _ => b"".as_slice(),
+    };
+    assert_eq!(
+        child_status.stdout, expected_status,
+        "snapshot child must retain untracked files and reset all tracked changes"
     );
     let GitFsmonitorStatus::Baseline(child_baseline) =
         inspect_git_index(&gix::open(&child)?.git_dir().join("index"))?.fsmonitor
@@ -4386,8 +4413,8 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         "resetting the source JJ workspace must preserve its Git cache-tree extension"
     );
 
-    // The Btrfs clone is only a transfer mechanism. Git must discard every
-    // non-ignored source-side state before exposing the requested target.
+    // Git must reset tracked source changes to the requested target while
+    // retaining copied untracked and ignored files.
     main_dir.write_file("file", "staged source change\n");
     let stage_source = Command::new("git")
         .env("PATH", &path)
@@ -4403,7 +4430,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         String::from_utf8_lossy(&stage_source.stderr)
     );
     main_dir.write_file("file", "unstaged source change\n");
-    main_dir.write_file("source-untracked", "discard me\n");
+    main_dir.write_file("source-untracked", "keep me untracked\n");
     let source_journal = std::fs::read(repo_root.join(".jj/working_copy/checkout"))?;
     assert!(source_journal.starts_with(b"\0JJ-WORKING-COPY-STATE\0v1\n"));
 
@@ -4469,9 +4496,10 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         1024 * 1024 + 1,
         "Git must materialize target-only tracked files above JJ's new-file size limit"
     );
-    assert!(
-        !adopted_root.join("source-untracked").exists(),
-        "source untracked files must not leak into the target worktree"
+    assert_eq!(
+        std::fs::read_to_string(adopted_root.join("source-untracked"))?,
+        "keep me untracked\n",
+        "snapshot creation must retain copied untracked files"
     );
     assert_eq!(
         std::fs::read_to_string(repo_root.join("file"))?,
@@ -4762,10 +4790,9 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         "inspect target Git status: {}",
         String::from_utf8_lossy(&adopted_git_status.stderr)
     );
-    assert!(
-        adopted_git_status.stdout.is_empty(),
-        "the target Git worktree must be clean: {}",
-        String::from_utf8_lossy(&adopted_git_status.stdout)
+    assert_eq!(
+        adopted_git_status.stdout, b"?? source-untracked\n",
+        "the target Git worktree must retain copied untracked files and reset tracked changes"
     );
     let adopted_index = Command::new("git")
         .env("PATH", &path)
@@ -4874,6 +4901,11 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     assert!(
         adopted_status.stdout.raw().contains("A adopted-untracked"),
         "adoption should preserve destination untracked files: {adopted_status}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(adopted_root.join("source-untracked"))?,
+        "keep me untracked\n",
+        "adoption must retain copied source untracked files on disk"
     );
     assert!(
         !adopted_status.stdout.raw().contains("D target-only-large"),

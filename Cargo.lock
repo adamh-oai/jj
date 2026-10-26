@@ -3084,7 +3084,6 @@ dependencies = [
  "unicode-width 0.2.2",
  "urlencoding",
  "whoami",
- "windows-sys",
 ]
 
 [[package]]

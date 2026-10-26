@@ -17,10 +17,6 @@ revert a specific one which isn't the most recent operation (`jj op revert`). It
 also lets you restore the entire repo to the way it looked at an earlier point
 (`jj op restore`).
 
-To exchange original operations and views with another repository, use
-[`jj sync`](repository-sync.md). Workspaces remain local while shared repository
-history is reconciled.
-
 When referring to operations, you can use `@` to represent the current
 operation.
 
@@ -67,3 +63,18 @@ will typically only want to run read-only commands. For example, `jj log`,
 and then let it run until now (which can be done for that particular command by
 not closing the editor). There's practically no good reason to do that other
 than to simulate concurrent commands.
+
+## Repositories that used `jj sync`
+
+Ordinary commands such as `jj log`, `jj new`, and `jj op log` continue to work
+in repositories that used the former `jj sync` command.
+
+Both operation-store formats used by `jj sync` can retain objects outside the
+current operation history. `jj util gc` refuses to collect either format so
+that it cannot delete those objects.
+
+In `simple_op_store_sync_v1`, a separate graph records the history shared
+with other repositories. `jj op abandon` refuses to prune this format because
+pruning would require updating that graph. In `simple_op_store_sync_v2`,
+completed exchanges linked the histories through operation parents, so
+`jj op abandon` can prune operations as usual.
