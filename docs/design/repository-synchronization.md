@@ -1,558 +1,269 @@
-# Native Jujutsu Repository Synchronization
+# Native Jujutsu repository synchronization
 
-Source: [RFC in
-Pages](https://chatgpt.com/space/page_5d42524a317c819181b2914566d74923)
+A laptop and a build machine can each have a workspace called `default` and
+point `@` at different commits. Suppose the laptop rewrites a commit while the
+build machine adds a child to the old version. `jj sync` lets the two machines
+exchange those changes, including the operations that produced them. Each machine
+keeps its own checkout. Git fetch and push alone cannot carry this history.
 
-**Status:** Draft for review. This document describes the original design, which
-uses a separate shared causal graph. The current implementation uses native
-operation merges and `jj op restore` for recovery. This revision changes the
-writing; the design below still needs an update.
+This RFC describes the native operation graph on `dev/adamh/repo-sync`. The
+first design used a second graph and supported `jj undo` after a sync. The
+migration section explains how jj reads repositories that used that design.
 
-**Related material:** [Original
-plan](https://chatgpt.com/space/page_3047a1fac6088191960dd9ece015c993),
-[implementation
-plan](https://app.chatgpt.com/space/page_6e3b022b95908191b982d9d75c79392f),
-[decision
-log](https://app.chatgpt.com/space/page_69026b9d1a9881919e400e5fea6ac6c5).
+## What a sync does
 
-## Summary
+Choose one direction. The path identifies a workspace and, through it, the
+repository. An SSH peer needs a compatible `jj` on its command search path.
 
-Add `jj sync` to exchange Jujutsu repository state over local filesystem paths
-or SSH. Each repository can change independently. Support receiving, sending,
-and exchange in both directions. Keep the original operation and view records,
-commit and change IDs, and all data that the transferred histories need.
+| Command | Who receives the history |
+| --- | --- |
+| `jj sync --receive ../build` | The invoking repository receives from `../build`. |
+| `jj sync --send ../build` | The repository at `../build` receives from the invoking repository. |
+| `jj sync --bidi ssh://user@host/home/user/project` | Both repositories apply one result for the histories they captured. |
 
-Each repository keeps its own workspaces. A separate shared causal graph records
-how changes to shared repository fields relate to each other. Each receiver then
-records a local integration operation with one parent. This design lets users
-undo synchronization with `jj undo`. It does not install the peer's workspace
-mappings or require both repositories to have the same native operation tip.
+Both endpoints first recover and snapshot the selected workspace using their own
+settings. Even a send can record a new operation at the source. Each endpoint
+snapshots and updates only the selected working directory.
+If sync rebases a commit in another local workspace, that workspace's recorded
+commit can move while its files stay in place. Use `--ignore-working-copy` to
+skip snapshots and checkout updates at both ends throughout the exchange. Sync needs current operation
+heads and rejects `--at-operation` and `--no-integrate-operation`.
 
-Each exchange captures the source history at a fixed point. Each endpoint saves
-its result independently and records enough state to recover after a failure.
-Repeating a completed step has no additional effect. The exchange is not an
-atomic transaction across machines.
+At least one repository must exist. A missing destination can be initialized as
+a colocated, Git-backed repository if its parent directory exists. For example,
+`jj -R ../new-build sync --receive ../laptop` creates the receiver and uses
+the source's Git object hash format. A new workspace has its own `@`. Files
+already in the directory participate in its normal snapshot. A missing source
+or a broken repository marker is an error.
 
-## Motivation and scope
+## What the peer can see
 
-Git fetch and push transfer Git objects and refs. They do not carry Jujutsu's
-operation history, original views, or all jj-specific commit metadata. Copying a
-repository directory can preserve more state. But it does not define how to
-merge changes made independently in both repositories.
+| Data | What jj does |
+| --- | --- |
+| Visible commit heads, local bookmarks and tags, and remote reference state | Merge them with the corresponding fields from the other repository. |
+| Operations, views, commits and their dependencies | Transfer original IDs and bytes, including change IDs, predecessor metadata, conflict trees, and hidden or abandoned work still in retained history. |
+| Active workspace names and checkout pointers, per-workspace Git HEAD, and observations of physical Git refs | Use the receiver's local values when building its new view. |
+| Workspace registrations, physical working files, repository settings, remote URLs, hooks, and credentials in local configuration | Leave them on the machine that owns them. |
 
-The intended user works in independent clones on multiple machines. They can
-continue work on either machine and exchange both the work and its Jujutsu
-history. The design must support concurrent commands that change a repository.
-It must also support exchanges through a third repository.
+A file saved in a working-copy snapshot travels as commit content. A historical
+view can contain workspace names and working-copy commit IDs even though sync
+never assigns the peer's `@` to a local workspace. Choose a peer that can see
+the entire retained history. Native Git transfer gives the peer the same access
+to Git object data as an ordinary Git push or fetch. Temporary transfer refs do
+not restrict a malicious peer to the listed heads.
 
-The first version supports existing Git-backed repositories that use the
-built-in operation store. It accepts compatible independent clones and unrelated
-repositories. It does not check for common ancestry to decide whether an
-exchange is allowed. There is no warning or override flag for unrelated
-histories. Sync still checks ancestry when it merges histories and validates
-data.
+Physical Git refs need separate handling. If sync changes a shared remote tag
+while the physical ref stays put, the next Git import must recognize that the
+physical ref has not moved. Each endpoint keeps its own last observation and
+compares it with the actual ref. It initializes remote-tag observations before
+applying incoming state. Later fetches, deletions, and remote renames can then
+detect real local Git changes.
 
-This version does not create destinations, support other storage backends, or
-run in the background. It also does not coordinate history deletion across
-repositories or copy machine configuration.
+## How the two histories merge
 
-## Command interface and endpoint behavior
+In the laptop example, let `P` be the original commit. The laptop rewrites it
+as `P′`. The build machine creates child `C` on `P`. Sync can rebase `C`
+onto `P′`, producing `C′`. Both endpoints can now refer to the same `C′`.
+The original `P`, `C`, and their operations are still available in the
+received history.
+
+1. Each endpoint captures a fixed operation and protects the objects reachable
+   from it. If the loaded operation is no longer the only active head, jj
+   reloads it and resolves concurrent heads through the ordinary operation log.
+   It makes at most eight capture attempts before asking the user to retry.
+   The sender's first offer must match the history it advertised.
+2. The receiver finds the common operation ancestors. It merges multiple bases
+   recursively and uses the empty shared view when there is no base. At each
+   merge it extracts the shared fields from the base and both inputs, builds
+   the required commit index, then applies jj's reference and rewrite rules.
+   This keeps a peer workspace move from being interpreted as a local rewrite.
+3. For `--bidi`, the initiator chooses one result and sends that operation
+   and any commits created by the merge. The peer checks that it covers both
+   captured histories and confirms the exact operation ID before either end
+   applies it. Computing `C′` separately could give the machines different IDs.
+4. Each receiver checks its current operation again. If another command ran
+   during transfer, jj merges that work with the selected result. When there
+   is new history to apply, the receiver records an ordinary merge operation.
+   Its first parent is the previous local operation. Its other parents connect
+   the received history to the local operation log.
+
+Independent clones and unrelated repositories can exchange history. Unrelated
+projects keep their separate commit roots. Concurrent moves of the same
+bookmark can produce a reference conflict. Two rewrites of the same change can
+remain divergent. Rebasing a child can produce a file conflict, just as it can
+outside sync.
+
+### Why a second sync can do nothing
+
+The two machines can write different operation IDs when they apply the same
+result. Their local workspace fields and parent order can differ. To decide
+whether it has already received the peer's work, jj compares the operations
+that actually contributed to the shared history.
+
+jj can look through a local integration operation only when its recorded
+digest matches its actual parents and shared view. One actual parent must also
+have the same shared view and contain the verified history of every other
+parent. An operation that passes these checks represents work already present
+in that parent. A merge that rebased a commit, an ordinary empty operation, a
+workspace rename, and a restore can each contribute new history. Equal shared
+views alone cannot establish that two operations represent the same work.
+
+This rule also works when a third machine joins the exchange. A successful
+sync covers the advertised histories. Work created after capture can require
+another exchange. In a two-repository check of the `P′` and `C′` example,
+the first repeat recorded one more operation merge without changing the
+commits. Two further exchanges with `--ignore-working-copy` changed neither
+operation tip.
+
+## How data reaches the receiver
+
+Local paths and SSH both run `jj util sync-server` over a framed connection.
+SSH uses its normal authentication and host checks. The remote helper command
+is fixed. The workspace path travels in the protocol, so spaces and shell
+characters in a path stay data. SSH URLs use an absolute path and can specify a
+port. The helper reserves stdout for protocol frames and drains stderr
+separately. On Unix, cancellation can stop the whole helper process group.
+
+Before initialization or format changes, the endpoints check protocol
+capabilities, backend, operation-store format, object hash, and working-copy
+policy. They can choose different transfer methods for three kinds of data.
+
+| Data | Transfer and verification |
+| --- | --- |
+| Git commits, trees, and blobs | On compatible Unix peers, Git negotiates compressed packs over the existing connection. Temporary refs in disposable bare repositories cover retained heads, disconnected history, and legacy conflicts. Received objects stay packed. The fallback sends object records and streams large bodies in chunks. |
+| Original operations and views | With rsync 3.1 or newer on both Unix peers, the sender exposes only the captured immutable files. The receiver compares them with its pinned history, checks the list of missing files, then copies those files with compression into a private directory. Other peers exchange known IDs and send missing records. |
+| Jujutsu commit metadata | Peers that support it compare hashes of exact metadata over successively smaller ranges of commit IDs. Matching ranges need no payload. Other peers send all required metadata. Identical Git commit IDs alone cannot establish that change IDs, predecessors, or legacy conflict data match. |
+
+A checksum can detect damage in transit. The receiver also checks record
+identities, historical encodings and dependencies, including objects referenced
+only by old operations or predecessor metadata. An operation ID need not equal
+the hash of its serialized protobuf bytes. The receiver validates the supported
+identity and keeps the original bytes. It checks for conflicting immutable
+commit metadata again under the writer lock. It installs objects and saves the
+roots that GC must protect before making an incoming view active. The command
+exchanges jj tag targets and does not promise a mirror of physical annotated
+Git tags.
+
+## If the exchange stops
+
+One machine can finish before the other loses its connection. Retrying the
+same command is safe. The receiver may download a record again or recompute a
+merge. It checks the history before applying it.
+
+| Where it stopped | What happens on recovery |
+| --- | --- |
+| Transfer or validation | Incoming files stay separate until they pass the checks. The active view still refers to the earlier state. |
+| The receiver installed objects but has not made the operation active | Saved roots protect the objects. Recovery can retire the incomplete session after its owner exits and retry against the current local operation. |
+| The operation became active, but the acknowledgment was lost | Recovery checks active operation ancestry, including newer heads. The receiver may already have applied the result. |
+| One end of `--bidi` finished | That end keeps its result. Retrying lets the other end complete. |
+| Checkout stopped after the operation became active | The operation stays in history. Normal checkout recovery preserves physical files as working-copy edits, including files edited after the interruption. |
+
+A transfer pins outgoing history before waiting on the network. A receiver
+takes a separate process lease before it records a pending integration and
+holds it until the publishing process finishes. During finalization, jj uses
+its ordinary workspace and Git locks. Under the sync/GC lock it records the
+exact final operation in a write-ahead journal before making that head active.
+It releases the sync/GC lock before waiting on the network or acquiring a
+workspace lock. A lost response or an old timestamp cannot establish that a
+session owner has exited.
+
+To restore the view from before a completed sync, find its first parent with
+`jj op log` and inspect it with `jj --at-op=<operation-id> log`. Then run
 
 ```sh
-jj sync --receive ../other-workspace
-jj sync --send 'ssh://user@host/home/user/project'
-jj sync --bidi 'ssh://user@host:2222/home/user/project'
-jj --ignore-working-copy sync --bidi ../other-workspace
+jj op restore <previous-local-operation-id>
 ```
 
-Choose exactly one direction. `PEER` must be an existing workspace path or an
-explicit `ssh://[user@]host[:port]/absolute/path` URL. The peer machine needs a
-compatible `jj` executable on its command search path. Sync uses current heads.
-It rejects `--at-operation` and `--no-integrate-operation`.
+This records a new local operation. The merge and its objects stay in history.
+A later exchange can share the restore, and receiving the same peer again
+does not reapply the changes the restore reversed. `jj undo` and `jj op revert` stop
+at merge operations. Ordinary undo and redo still work on later single-parent
+operations.
 
-| Mode | Incoming peer history is integrated at | Integration can be undone at |
-| --- | --- | --- |
-| `--receive` | Invoking repository | Invoking repository |
-| `--send` | Peer repository | Peer repository |
-| `--bidi` | Both repositories | Each endpoint independently |
+## Storage, pruning, and migration
 
-The direction determines which endpoints apply incoming history. Both endpoints
-first run normal working-copy recovery and snapshotting. That includes the
-source of a one-way exchange. This preparation can itself write an operation.
-Each endpoint uses its own repository and workspace settings, including settings
-for specific paths.
+In the native format, `simple_op_store_sync_v2`, received operations become
+ordinary ancestors. GC follows operation parents, views, commits, predecessors,
+and legacy conflicts. Incomplete sessions and transfers have additional roots.
+After a session finishes, the operation graph keeps the accepted history alive.
+Missing or invalid tracking in an enabled store is an error. Recreating empty
+tracking could let GC delete protected history.
 
-The global `--ignore-working-copy` flag suppresses snapshots and working-copy
-updates at both endpoints. Every preparation, retry, refresh, and finalization
-step must preserve that choice. Creating a new helper with default settings must
-not reset it.
+`jj op abandon` can remove ancestry locally. It can make objects eligible for
+GC and erase the evidence that a repository already received an operation.
+A later sync may receive that operation again. Pruning the local log does not
+tell other machines to prune theirs.
 
-Only the workspace selected by each endpoint path participates. For a linked
-workspace, find its actual shared repository. Do not automatically snapshot
-other workspaces. Updates to the physical Git HEAD and index must also respect
-`--ignore-working-copy`.
+The first implementation (`simple_op_store_sync_v1`) kept original operations
+and a second graph of shared events. Each event recorded a projected view,
+sorted parent IDs, and, where applicable, its original operation ID. An
+ordinary operation still produced an event if the shared view stayed the
+same. In a two-way exchange the initiator chose one shared result. Each
+receiver wrote a single-parent local operation so ordinary undo could restore
+its earlier view. It could reuse the shared result only if the normalized
+baseline was its ancestor and the final shared view matched. Finalization
+that added a shared change produced a new descendant.
 
-## Shared state and local state
+That second graph needed its own GC roots and pruning checkpoints. Before
+pruning, v1 saved the shared history of every active native head. At the next
+safe single-head capture it joined that history to the actual current view.
+Imported raw tips stayed reachable through separate roots. Format v2 records
+these relationships in the native graph and uses operation restore for recovery.
 
-A shared view contains only the fields of a native repository view that sync
-exchanges.
+Both machines need a binary that understands native sync. On first use,
+jj waits for commands that hold the format lock. Finish commands running older
+binaries before the first sync. An older process that already opened the store
+can race with the upgrade because it never took that lock. Older binaries
+reject the new format on subsequent opens. For an
+existing v1 store, migration preserves the current view and all retained
+original operation and view IDs. It converts additional views from shared
+events into ordinary operations and joins the retained histories in a merge.
+Only after saving that merge can jj retire completed v1 roots. Unfinished
+transfers and journals keep their protection.
 
-| Surface | Synchronization behavior |
+## Receiver limits and cost
+
+The receiver sets its own limits. By default it reserves the smaller of 1 GiB
+or 10 percent of available disk space, then allows staging to use half of
+what is left. A positive `sync.max-quarantine-bytes` overrides that budget.
+Checks include per-file overhead and room for installation. Git and rsync can
+decompress data before jj checks its actual size. A hard limit on disk use
+during decompression requires an operating-system quota.
+
+| Limit | What it covers |
 | --- | --- |
-| Visible commit heads, local bookmarks and tags, remote reference state | Merge as shared repository state |
-| Original operations and views | Transfer with their original IDs and bytes |
-| Referenced commits, trees, files, conflicts, snapshots, hidden work, and predecessor metadata | Transfer these objects and all objects they require |
-| Workspace names, working-copy commit maps, per-workspace Git HEAD observations | Keep the receiver's local values in its active view |
-| Observations of physical Git refs | Keep local; use them to detect actual Git changes |
-| Workspace registrations, paths, checkout journals, physical working-copy files | Keep local |
-| Configuration, remote URLs, credentials, hooks, caches | Do not copy as repository settings |
-
-Historical raw views contain the workspace fields recorded when they were
-created. Preserve those bytes and names. Sync excludes these fields when it
-merges live state. It does not remove them from historical records.
-
-Two repositories can both have a workspace named `default` and have different
-`@` commits. Keep these names as they are. Sync does not convert them to UUIDs,
-rename or remap them, add namespaces, or adopt workspaces.
-
-A snapshotted file arrives as commit content. Sync does not copy the working
-directory. Normal local rewrite and checkout handling can update the receiver's
-working-copy commit. Sync never assigns the peer's `@` to a local workspace.
-
-Before merging, select the shared fields from each view, including the merge
-base and the incoming view. Do not install the full peer view and repair
-workspace maps afterward. By then, the merge might already have treated the
-peer's workspace changes as local commit rewrites.
-
-## History model
-
-Maintain two graphs.
-
-1. **Original operation graph:** the immutable native operations and views from each repository, with their original identities and metadata.
-
-2. **Shared causal graph:** content-addressed events that record shared views and the earlier events whose effects they include.
-
-A shared event contains a set of shared parent IDs in a fixed canonical order, a
-projected view, and an optional originating raw operation ID. Compute its
-content hash with a versioned domain separator. This encoding gives the same
-event the same ID. It does not guarantee identical commit IDs when repositories
-with different settings independently rewrite commits.
-
-Retain imported raw tips as garbage-collection roots. Importing them does not
-make them active local operation heads.
-
-```mermaid
-flowchart LR
-  subgraph A["Original operations in A"]
-    LA["Local baseline L_A"] --> IA["Integration I_A"] --> UA["Undo U_A"]
-  end
-  subgraph B["Original operations in B"]
-    LB["Local baseline L_B"] --> IB["Integration I_B"]
-  end
-  subgraph G["Shared causal history"]
-    FA["F(L_A)"] --> S["Selected result S"]
-    FB["F(L_B)"] --> S
-    S --> FU["F(U_A): restored A state"]
-  end
-```
-
-If the final shared views of I_A and I_B equal S, both operations normalize to
-S. Their original IDs and local workspace fields can differ. The undo creates a
-new descendant of S.
-
-### Normalization rules
-
-For an ordinary raw operation, first normalize its parents recursively. Then
-create a shared event from its actual projected view and original operation ID.
-Keep the event even if its shared view equals its parent's view. An unchanged
-view can still record a new no-op, workspace-only operation, undo, or redo. View
-equality alone does not show that sync has already applied that event.
-
-A sync integration may refer directly to its recorded applied anchor S only
-after these checks:
-
-- It has the expected single local baseline.
-
-- The normalized baseline is an ancestor of S.
-
-- Its final projected view equals S's projected view.
-
-If valid finalization adds a shared change, record that change as a new child of
-S. Do not treat the changed final view as another name for S.
-
-An integration attribute alone does not prove ancestry. During normal
-normalization, reject an invalid baseline ancestry claim. If pruning invalidates
-parent relationships, the rewritten operation can instead be treated as a new
-event with its actual raw parents and view. Do not reuse an anchor whose claimed
-ancestry failed the check. Verified local checkpoints separately retain
-knowledge of history that pruning removed.
-
-After normal recovery and snapshotting, normalize the actual current operation.
-Do not use a cached advertisement in place of the current head. Before reusing
-an immutable normalization boundary, check that it represents the referenced raw
-operation and projected view.
-
-## Reconciliation, local integration, and undo
-
-Merge the shared histories using their ancestry and jj's existing rules for
-reference merging and commit rewriting. Find their shared merge bases. If
-necessary, merge multiple bases recursively. If there is no shared base, use the
-empty shared root view. Build the required commit index before interpreting
-imported views.
-
-Unrelated histories keep separate commit roots. Sync does not create a
-file-content merge that joins unrelated projects. Concurrent edits to the same
-bookmark or tag can create ordinary reference conflicts. Remote names remain
-reference names; sync does not transfer their machine-local URLs.
-
-For an exchange in both directions, the initiator selects one shared result S
-for the two captured histories. It sends S and its required objects to the peer.
-The peer must check that S includes both advertised histories. Both endpoints
-apply that result. They must not independently compute rewrites and assume that
-the commit IDs will match.
-
-Before saving its result as an active operation, each receiver refreshes its
-local baseline. If the baseline changed during transfer, preserve that newer
-work while applying S. Native finalization can also add shared changes. Record
-these as causal descendants. A later exchange may be needed to transfer them.
-
-Record integration I with the receiver's current baseline L as its only native
-parent. Do not add peer raw operation tips as parents. This keeps I compatible
-with ordinary `jj undo`.
-
-Undo restores the receiver's prior view and creates a new causal event that
-descends from the applied result. It does not contact the peer, erase downloaded
-objects, or reverse the storage-format upgrade. A later exchange can carry the
-reversal to another repository. If the peer is still at S, another exchange must
-not restore the state that the receiver already undid.
-
-Sync may learn about new history without changing the projected view. In that
-case, it may need an empty local integration operation. Undo and redo must
-retain their place in causal history even when their resulting views are equal.
-After the receiver records that history, repeating the same exchange must not
-create another integration for it.
-
-## Protocol and transports
-
-Use a framed stdio protocol served by the hidden `jj util sync-server` helper. A
-local path starts a local helper. SSH starts a fixed remote helper command. Send
-the repository path as protocol data; do not insert it into shell syntax. Use
-normal SSH authentication and host verification.
-
-Use stdout only for protocol frames. Use stderr for diagnostics, including
-successful peer warnings, and limit how much diagnostic data the receiver
-retains. Read stderr concurrently. Inherited stderr pipes must not prevent
-completion. Cancel the helper if the transport fails. On Unix, cancel its
-process group to terminate helper descendants too.
-
-| Phase | Required behavior |
-| --- | --- |
-| Negotiate | Check protocol version, required capabilities, backend, object-hash and operation-store formats, and working-copy policy before preparation can change state |
-| Prepare | Recover and snapshot both selected workspaces with their own settings; enable supported sync storage where needed |
-| Capture | Fix the original and shared history tips for this exchange; save roots that protect all data they require |
-| Inventory and transfer | Exchange known-ID batches within the stated limits; stage missing immutable records and stream physical Git bodies |
-| Validate and retain | Check identities, encodings, metadata, and all dependencies; install incoming data and durably retain its roots before making it active |
-| Select | Choose the receiving result; in bidi, transfer the one selected S and confirm that the peer is ready for that exact result |
-| Publish | Refresh each receiver, finalize through the normal native path, save its intended operation, then make that operation active locally |
-| Complete | Recover or finish local state and acknowledge the captured result; report newer local state separately |
-
-Before capture, the endpoint must have exactly one active native operation head:
-the operation it loaded. If it has concurrent heads, refresh and resolve them
-through normal jj loading before retrying. Do not capture an unresolved set of
-heads. The reference command retries stale capture up to eight times. If the
-repository keeps changing, it asks the user to retry.
-
-The first transfer offer must match the history tips advertised at capture. A
-sender cannot replace that captured history during an exchange.
-
-Success means that the requested receivers incorporated the captured histories.
-Their native tips and checkout files can still differ. Concurrent edits can
-remain for a later exchange. The command does not complete atomically across
-machines. Do not keep snapshotting and merging until live tips match: continuous
-edits could prevent the command from finishing.
-
-A retry may send records again and recompute the merge. It does not need to
-resume an interrupted byte stream at a specific offset.
-
-## Immutable transfer and validation
-
-Transfer the retained original and shared histories and all their dependencies.
-These include original operations and views; shared events and their origins;
-operation predecessor references; Git commits, trees, and blobs; exact jj commit
-extras; and legacy conflict trees referenced only by extras.
-
-The backend can also transfer Git tag objects when they are explicit roots. The
-standard command exchanges jj tag targets. It does not mirror physical Git refs
-or guarantee that it preserves their annotated-tag objects.
-
-Preserve commit IDs, change IDs, raw operation and view IDs, and supported
-historical encodings. Operation IDs are not always hashes of serialized protobuf
-bytes. Validate them with the supported identity rules and retain the original
-bytes. Reject unsupported identities or inconsistent immutable extras with an
-explicit error. Do not decode historical records and silently serialize them
-again under a different identity.
-
-Stage incoming data in a quarantine directory on disk. Check framing, record
-identity, all dependencies, and compatibility with existing immutable metadata
-before allowing the data to become active. During installation, check metadata
-conflicts again while holding the relevant writer lock. Staging and installing
-immutable data do not activate the incoming live view.
-
-A framing checksum detects corruption; it does not authenticate the sender.
-Content-addressed identities do not prove authorship. SSH authenticates and
-encrypts the transport. Both transports still require checks of repository
-semantics and object identities.
-
-## Durable state, publication, and failure recovery
-
-Store sync metadata locally alongside the receiving repository. This includes
-immutable shared events, an atomically replaced state file, peer roots, transfer
-pins, and a verified local normalization boundary. Also store knowledge that
-must survive operation-history pruning and records of operations being made
-active.
-
-Use an opaque repository ID for tracking. It does not prove that repositories
-are related. Do not reject independent copies just because their IDs match.
-Reject a self-exchange only when, for example, a local path can be shown to
-address the same shared store.
-
-Each receiving session records its local baseline, incoming raw and shared
-roots, selected applied anchor, intended result operation, and progress toward
-making it active. Before waiting on the network, save pins that protect the
-outgoing objects already present locally. Keep incoming data in quarantine until
-all checks pass. Under the local sync/GC lock, install the incoming objects and
-save their accepted roots. Garbage collection must not be able to remove an
-accepted object between installation and saving its roots.
-
-Make the receiving operation active in this order:
-
-1. Finalize the prepared transaction through normal jj behavior. This includes rewriting descendants and any permitted local Git and working-copy work.
-
-2. Hold the local sync/GC lock and write the exact final operation object.
-
-3. Save a write-ahead record that names that exact operation and the applied anchor.
-
-4. Make the native operation head active while the same lock still protects the record and retained objects.
-
-5. Finish ordinary checkout or recovery, then record that tracking is complete.
-
-Acquire the ordinary Git and working-copy locks before the short-lived lock that
-protects sync state changes. Release the sync/GC lock before waiting on the
-network or acquiring a working-copy lock.
-
-Acquire a separate process lease before preparing a pending operation. Hold it
-until the publishing process finishes. Recovery must not remove a pending
-session while a live process still owns it.
-
-| Interruption | Recovery contract |
-| --- | --- |
-| Incomplete transfer or invalid data | Do not activate the incoming view; a retry can transfer missing data |
-| Write-ahead record saved, operation not active | Retain installed roots; once no live process owns the session, retry from a fresh safe baseline |
-| Operation active, acknowledgment lost | Inspect durable active ancestry, including ancestors of newer heads; a missing acknowledgment does not mean rollback occurred |
-| One bidi endpoint completed, the other failed | Keep the completed result and retry the exchange independently |
-| Checkout fails after the operation becomes active | Keep the active operation and use ordinary jj checkout recovery |
-| Process exits after making the operation active but before final sync capture | Preserve causal knowledge before any later pruning of native operation history |
-
-After an interrupted checkout, recovery preserves physical files as working-copy
-edits against the saved intended state. This includes edits made after the
-interruption. A retry must not overwrite those files with the old intended
-checkout.
-
-The design does not use a distributed lock or two-phase commit. When the command
-reports an error, one or both receivers may already have made their result
-active. The diagnostic must say that this is possible.
-
-## Operation pruning and garbage collection
-
-`jj op abandon` maintains the local operation log. It does not ask peers to
-forget transferred history. Abandoning a commit or deleting a bookmark still
-changes shared repository state.
-
-Before a sync-enabled repository changes operation parents to prune history,
-normalize all actual current raw heads. Save their shared frontier. This step
-must use the operation and view stores without requiring the commit backend to
-load. That preserves the ordinary command's use for recovery.
-
-Hold the sync/GC lock while creating the operations with new parents and making
-their native heads active. Release it before taking a working-copy lock. At the
-next safe capture with one head, join the retained frontier with the actual
-current shared history. Use the actual current projected view. Save the new
-local boundary and clear the pending frontier in one atomic change. If pruning
-starts with multiple heads, retain every branch's knowledge. Do not select one
-branch's view as the repository result.
-
-This order preserves knowledge when a process makes an operation active, exits
-early, and is followed by undo and pruning before the next sync capture. The
-knowledge of the original applied result must survive. This also applies when
-the previous cached boundary is still an ancestor of the rewritten raw graph.
-
-Garbage-collection roots include active local operation heads, retained raw peer
-heads, shared anchors and event origins, and integration cross-links. They also
-include live transfers, pending sessions, local normalization boundaries, and
-frontiers saved before pruning. Follow every dependency from these roots.
-Include operation and view history, commit ancestry, predecessors, and legacy
-tree terms referenced only by extras.
-
-Protect every retained object throughout collection, including `jj util gc
---expire now`. Build a private retention index when imported histories are
-outside the active index. Retain peer raw roots as GC roots without making them
-active operation heads.
-
-If sync tracking is missing or invalid in an enabled repository, stop garbage
-collection. Do not recreate empty tracking and collect history that the missing
-state may have protected.
-
-The reference implementation does not expire durable transfer pins based on
-time. A killed process can therefore leave extra data retained. A separate
-policy must define when cleanup is safe and how much data to retain. A timeout
-does not prove that the process failed to make its operation active.
-
-## Physical Git observations
-
-Shared remote-reference targets differ from observations of physical Git refs.
-After sync, a shared target can differ from a physical ref that has not changed.
-If the next ordinary command treats that ref as a new Git edit, it would reverse
-the synchronized state.
-
-Keep physical observations local. Compare current Git refs with those
-observations to identify actual changes. Initialize observations of remote tags
-before applying the first incoming shared state. Scoped fetch, deletion, remote
-rename, and remote removal must continue to work correctly.
-
-Normal Git import, export, and working-copy finalization continue to run. Sync
-does not copy a peer's Git observations or remote URLs into local configuration.
-
-## Resource limits, disclosure, and performance
-
-An exchange gives the receiver access to all retained content being transferred.
-This includes hidden or abandoned commits, snapshots, historical workspace
-names, and operation metadata. Use it with a peer intended to receive that full
-history. It does not filter or redact content. Sync need not copy unreachable
-garbage, and it cannot recover data that garbage collection has already removed.
-
-The receiver sets resource limits and checks them before expensive decoding or
-allocation. The sender cannot override them.
-
-| Setting or bound | Initial behavior |
-| --- | --- |
-| `sync.max-quarantine-bytes` | Optional positive byte count or human-readable size; default derives from available disk space with reserve and installation room |
-| `sync.max-records` | Positive count; default 1,000,000; bounds staging reservations and validated closure, including already-known receiver records |
-| `sync.max-dependencies` | Positive count; default 1,000,000; also bounds wire fields in each protobuf metadata record, including nested messages |
-| Known-ID cache | At most 65,536 IDs; omissions cause safe retransmission |
-| Inventory batches | At most 512 IDs and 96 KiB of JSON |
-| Phase controls | At most 64 KiB before JSON decoding |
-| Physical Git streaming chunks | At most 1 MiB per chunk; no permanent 64 MiB limit on a physical Git object |
-| Protocol frame | At most 128 MiB; metadata records have separate byte and complexity bounds |
-
-For the default quarantine byte limit, reserve the smaller of 1 GiB or ten
-percent of available disk space. Use at most half the remaining space, leaving
-room for installation. Count metadata and per-file allocation overhead. Limit
-active streams and dependency work, and check free space again during staging.
-Check protobuf field and depth limits before allocating decoded collections.
-Limit Git commit header parsing separately from opaque message bodies.
-
-The first exchange can walk all retained operation and shared graphs and their
-referenced objects. Later captures can reuse verified immutable boundaries. But
-the reference implementation can still enumerate retained inventories. Graph and
-inventory memory can grow with retained history. Streaming limits the memory
-used to buffer physical objects. It does not make the whole sync use constant
-memory for repositories of any size.
-
-The known-ID cache improves transfer efficiency. Its size limit does not
-restrict repository size. Operators can raise local staging and complexity
-limits for larger histories. Limits on retained history across peers, and
-deletion of peer history, need a separate design.
-
-## Compatibility and first enablement
-
-Use the existing operation-store type dispatch to prevent older binaries from
-opening an enabled store. On first use, initialize and durably save sync
-tracking and shared-event storage. Then enable the `simple_op_store_sync_v1`
-type. Keep supported historical operation and view bytes unchanged.
-
-Older binaries must reject the enabled store when they open it. Otherwise, they
-could run GC without the new roots. Missing enabled-state files must not cause a
-repository to be treated as new.
-
-The type marker cannot stop an old process that has already opened the store.
-Finish older repository commands before enabling sync, then use compatible
-binaries. The marker does not exclude old clients that are already running.
-
-Before preparation can change endpoint state, negotiate the protocol, required
-capabilities, backend, object hash, and operation-store formats. Preserve
-supported legacy identity rules. Reject unsupported or inconsistent data. This
-version does not downgrade automatically. Undoing an integration does not
-downgrade the store.
-
-## Alternatives considered
-
-| Alternative | Reason for this design |
-| --- | --- |
-| Use only Git fetch/push | Omits operation and view history and required jj metadata |
-| Copy or rsync repository directories | Does not define how to merge independent changes or when a native operation becomes active |
-| Activate peer raw operation tips directly | Imports peer workspace fields and produces native operation merges without the required single-parent undo behavior |
-| Share only the latest projected view | Loses causal distinctions, including operations with the same view and undo/redo history |
-| Rewrite historical workspace names or use UUID names | Changes historical identity and adds an unnecessary workspace protocol |
-| Recompute bidi reconciliation independently at both ends | Receiver settings can produce different rewritten commits; choosing one result avoids that ambiguity |
-| Require common Git ancestry | Excludes compatible unrelated repositories and is unnecessary for the chosen merge rules |
-| Wait for equal live tips | May never finish if concurrent edits or finalization keep changing state |
-| Coordinate deletion across peers now | Adds a distributed contract for retaining and deleting history beyond local operation pruning |
-
-## Reference implementation and validation
-
-The original local reference implementation was recorded on
-`dev/adamh/repo-sync` at tip `73fbf6e0`. Its review commits separate
-immutable-store primitives, the shared causal model, transfer and quarantine,
-and durable retention and recovery. Other commits cover physical Git
-observations, the native command, and generated files. The validation below
-refers to that saved version.
-
-Focused validation of that saved implementation passed 59 library sync unit
-tests, 19 matching library integration tests, 20 command/transport unit tests,
-and 28 command integration tests. The tests covered:
-
-- Independent and unrelated repositories, all three directions, exact raw records, and local workspace maps.
-
-- Snapshot defaults and ignore behavior at both ends, endpoint-specific settings, and selected linked workspaces.
-
-- Causal events with the same view, undo and redo, repeated exchanges, and three-peer cycles.
-
-- Concurrent edits, crossed sessions, GC during transfer, and failures injected before and after operations became active.
-
-- Interrupted-checkout recovery preserving later physical edits.
-
-- Interrupted saves followed by undo, operation pruning, immediate GC, and retry with one or multiple native heads.
-
-- Valid pruning checkpoints and rejection of unverified integration-anchor ancestry.
-
-- Large physical Git objects beyond 64 MiB, including a packed blob through the command.
-
-- Limits set by the receiver, decoding limits, inventory fallback, helper diagnostics, and process cleanup.
-
-A stand-in helper tested SSH arguments and paths. These tests did not exercise a
-live remote SSH connection. Windows-specific APIs were checked in source but
-were not run. Failure injection covered the identified steps for making an
-operation active. It did not cover every network interruption or filesystem
-failure.
-
-Generated help checks, formatting of changed files, and focused Clippy checks
-passed. Broader tests found four failures in untouched working-copy and ignore
-tests. Whole-workspace lint and format checks found other existing issues. These
-results do not establish a fully passing workspace-wide CI run.
-
-Reviewers should check causal normalization and the validity of checkpoints.
-They should also check that GC reaches every retained object, locks are acquired
-in the required order, native recovery works, and first enablement enforces the
-stated compatibility rules.
-
-## Deferred work
-
-Future proposals can cover other backends, destination creation or cloning
-through sync, named peers, and background exchange. They can also improve
-inventory negotiation, coordinate retention and deletion, or add a user-selected
-ancestry policy.
-
-This draft's first version requires an explicit direction and uses ordinary
-snapshots. Repositories can be independent, and workspaces and operation-log
-pruning stay local. It proposes native undo and recovery of results saved
-independently at each endpoint.
+| `sync.max-records`, default 1,000,000 | Staged records and records visited when checking dependencies, including records the receiver already has. |
+| `sync.max-dependencies`, default 1,000,000 | Dependency work and protobuf fields per metadata record, including nested fields, before decoding. |
+| Fallback inventory | Up to 65,536 known IDs. Each batch holds at most 512 IDs and 96 KiB of JSON. An omitted ID can cause a retransmission. |
+| Wire data | A phase-control message can use 64 KiB, a protocol frame 128 MiB, and a streamed Git chunk 1 MiB. Large Git objects span chunks. |
+| Immutable file transfer | jj checks file names, counts, uncompressed sizes, and installation space before copying. File-list and protocol overhead may use up to 16 MiB beyond the applicable payload budget. |
+
+A first exchange may visit all retained history. A later exchange can send
+only missing payloads and still spend time listing files, comparing metadata,
+and validating dependencies. Graph and inventory memory can grow with history.
+Other backends, background exchange, named peers, and deletion coordinated
+across repositories would need separate designs.
+
+## Implementation and evidence
+
+The command and transport live in `cli/src/sync_endpoint.rs`. The merge and
+repeat-sync checks live in `lib/src/sync/native.rs`. The branch tests cover
+three-peer exchanges, descendant rebases, restore and pruning, v1 migration,
+and interrupted transfers and checkouts. See `lib/tests/test_native_sync.rs`
+and `cli/tests/test_sync_command.rs`.
+
+The saved v1 prototype at `73fbf6e0` passed 59 library unit tests, 19 library
+integration tests, 20 command and transport unit tests, and 28 command
+integration tests. Its SSH tests used a stand-in helper. Windows APIs received
+source review only. Failure injection exercised the identified steps for making
+an operation active. Four broader working-copy and ignore tests failed, and
+workspace-wide formatting and lint checks had existing issues. These results
+belong to that prototype.
+
+The original plans and decision log record the design as it evolved.
+[Original plan](https://chatgpt.com/space/page_3047a1fac6088191960dd9ece015c993) ·
+[Implementation plan](https://app.chatgpt.com/space/page_6e3b022b95908191b982d9d75c79392f) ·
+[Decision log](https://app.chatgpt.com/space/page_69026b9d1a9881919e400e5fea6ac6c5)
+
+[Command guide](../repository-sync.md) ·
+[RFC in Pages](https://chatgpt.com/space/page_5d42524a317c819181b2914566d74923)
