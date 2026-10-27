@@ -64,9 +64,10 @@ pub(crate) struct GitEol {
     case: Case,
     config: eol::Configuration,
     globals: DirectoryRules,
+    info_path: PathBuf,
     info_contents: Option<Vec<u8>>,
     directories: Mutex<HashMap<RepoPathBuf, Arc<DirectoryRules>>>,
-    external_fingerprint: Vec<u8>,
+    global_attributes_hasher: Blake2b512,
     sparse_matcher: PrefixMatcher,
 }
 
@@ -168,7 +169,6 @@ impl GitEol {
         // Normalize the directory, since the optional attributes file may be absent.
         let info_path = dunce::canonicalize(repo.common_dir())?.join("info/attributes");
         let info_contents = read_optional(&info_path)?;
-        hash_input(&mut hasher, &info_path, info_contents.as_deref());
         let config = eol::Configuration {
             // Git configuration does not override JJ's existing global setting.
             // Explicit text/eol attributes take precedence over that setting.
@@ -187,9 +187,10 @@ impl GitEol {
             case,
             config,
             globals,
+            info_path,
             info_contents,
             directories: Mutex::new(HashMap::new()),
-            external_fingerprint: hasher.finalize().to_vec(),
+            global_attributes_hasher: hasher,
             sparse_matcher: PrefixMatcher::new([RepoPath::root()]),
         }))
     }
@@ -205,8 +206,25 @@ impl GitEol {
         self.directories.get_mut().unwrap().clear();
     }
 
-    pub(crate) fn external_attributes_fingerprint(&self) -> &[u8] {
-        &self.external_fingerprint
+    pub(crate) fn external_attributes_fingerprint(
+        &self,
+        activation_root: Option<&Path>,
+    ) -> Vec<u8> {
+        // During subvolume enable, the main workspace's Git directory moves
+        // with it. A linked worktree's shared Git directory stays in place.
+        let activated_path = activation_root.and_then(|root| {
+            self.info_path
+                .strip_prefix(&self.root)
+                .ok()
+                .map(|path| root.join(path))
+        });
+        let mut hasher = self.global_attributes_hasher.clone();
+        hash_input(
+            &mut hasher,
+            activated_path.as_deref().unwrap_or(&self.info_path),
+            self.info_contents.as_deref(),
+        );
+        hasher.finalize().to_vec()
     }
 
     async fn stored_attributes(
@@ -513,24 +531,44 @@ mod tests {
     use crate::tests::TestResult;
     use crate::tests::new_temp_dir;
 
+    fn init_store(root: &Path) -> TestResult<Arc<Store>> {
+        fs::create_dir(root)?;
+        let store_path = root.with_extension("store");
+        fs::create_dir(&store_path)?;
+        let settings =
+            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
+        let backend =
+            GitBackend::init_colocated(&settings, &store_path, root, gix::hash::Kind::Sha1)?;
+        Ok(Store::new(
+            Box::new(backend),
+            Signer::new(None, vec![]),
+            settings.merge_options()?,
+        ))
+    }
+
+    fn eol_fingerprint(
+        store: &Arc<Store>,
+        root: &Path,
+        activation_root: Option<&Path>,
+    ) -> TestResult<Vec<u8>> {
+        let eol = GitEol::new(
+            store.clone(),
+            store.empty_merged_tree(),
+            root.to_owned(),
+            EolConversionMode::None,
+            EolSource::Snapshot,
+        )?
+        .unwrap();
+        Ok(eol.external_attributes_fingerprint(activation_root))
+    }
+
     #[test]
     fn linked_worktree_has_same_external_attributes_fingerprint() -> TestResult {
         let temp_dir = new_temp_dir();
         let main_root = temp_dir.path().join("main");
         let child_root = temp_dir.path().join("child");
-        let store_path = temp_dir.path().join("store");
-        for path in [&main_root, &child_root, &store_path] {
-            fs::create_dir(path)?;
-        }
-        let settings =
-            UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)?;
-        let backend =
-            GitBackend::init_colocated(&settings, &store_path, &main_root, gix::hash::Kind::Sha1)?;
-        let store = Store::new(
-            Box::new(backend),
-            Signer::new(None, vec![]),
-            settings.merge_options()?,
-        );
+        let store = init_store(&main_root)?;
+        fs::create_dir(&child_root)?;
 
         // Keep the relative commondir spelling used by Git linked worktrees.
         let git_dir = main_root.join(".git");
@@ -547,17 +585,7 @@ mod tests {
             format!("gitdir: {}\n", child_git_dir.display()),
         )?;
 
-        let fingerprint = |root: &Path| -> TestResult<Vec<u8>> {
-            let eol = GitEol::new(
-                store.clone(),
-                store.empty_merged_tree(),
-                root.to_owned(),
-                EolConversionMode::None,
-                EolSource::Snapshot,
-            )?
-            .unwrap();
-            Ok(eol.external_attributes_fingerprint().to_vec())
-        };
+        let fingerprint = |root: &Path| eol_fingerprint(&store, root, None);
         let absent = fingerprint(&main_root)?;
         assert_eq!(fingerprint(&child_root)?, absent);
 
@@ -568,6 +596,11 @@ mod tests {
         let present = fingerprint(&main_root)?;
         assert_eq!(fingerprint(&child_root)?, present);
         assert_ne!(present, absent);
+        let moved_child = temp_dir.path().join("moved-child");
+        assert_eq!(
+            eol_fingerprint(&store, &child_root, Some(&moved_child))?,
+            present
+        );
 
         fs::write(&attributes_path, "* text eol=crlf\n")?;
         let changed = fingerprint(&main_root)?;
@@ -577,6 +610,35 @@ mod tests {
         fs::remove_file(attributes_path)?;
         assert_eq!(fingerprint(&main_root)?, absent);
         assert_eq!(fingerprint(&child_root)?, absent);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_worktree_hashes_its_attributes_at_the_activation_path() -> TestResult {
+        let temp_dir = new_temp_dir();
+        let parent = dunce::canonicalize(temp_dir.path())?;
+        let staged = parent.join("staged");
+        let activated = parent.join("main");
+        let staged_store = init_store(&staged)?;
+        let main_store = init_store(&activated)?;
+        let persisted = || eol_fingerprint(&staged_store, &staged, Some(&activated));
+        let current = || eol_fingerprint(&main_store, &activated, None);
+        let absent = current()?;
+        assert_eq!(persisted()?, absent);
+        assert_ne!(eol_fingerprint(&staged_store, &staged, None)?, absent);
+
+        let staged_info = staged.join(".git/info");
+        let main_info = activated.join(".git/info");
+        fs::create_dir_all(&staged_info)?;
+        fs::create_dir_all(&main_info)?;
+        for rules in ["*.txt text eol=lf\n", "*.txt text eol=crlf\n"] {
+            fs::write(staged_info.join("attributes"), rules)?;
+            // Enabling must read the staged file before it replaces the original.
+            let with_staged_rules = persisted()?;
+            assert_ne!(with_staged_rules, current()?);
+            fs::write(main_info.join("attributes"), rules)?;
+            assert_eq!(with_staged_rules, current()?);
+        }
         Ok(())
     }
 

@@ -766,6 +766,7 @@ async fn init_subvolume_at_inner(
     let mut destination_command = command
         .workspace_helper_no_snapshot_at(ui, &destination)
         .await?;
+    destination_command.subvolume_activation_root = Some(source_root.to_owned());
     writeln!(ui.status(), "Seeding snapshot-backed working-copy tree...")?;
     tracing::info!("seeding snapshot-backed working-copy tree");
     seed_snapshot_working_copy_tree(&mut destination_command).await?;

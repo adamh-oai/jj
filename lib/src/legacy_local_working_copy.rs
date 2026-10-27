@@ -1422,7 +1422,7 @@ impl TreeState {
             err: err.into(),
         })?
         .with_sparse_patterns(&self.sparse_patterns, external_sparse_patterns.as_deref());
-        let eol_fingerprint = eol.external_attributes_fingerprint();
+        let eol_fingerprint = eol.external_attributes_fingerprint(None);
         let force_eol_rescan = self.eol_fingerprint != eol_fingerprint;
 
         // An empty file cache has no metadata to invalidate. Keep an empty

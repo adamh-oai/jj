@@ -1558,6 +1558,9 @@ pub struct WorkspaceCommandHelper {
     op_summary_template_text: String,
     may_snapshot_working_copy: bool,
     may_update_working_copy: bool,
+    /// Final path of the staged workspace being initialized by `subvolume enable`.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    pub(crate) subvolume_activation_root: Option<PathBuf>,
 }
 
 /// The journal and checkout that `workspace adopt` expects to scan.
@@ -1740,6 +1743,8 @@ impl WorkspaceCommandHelper {
             op_summary_template_text,
             may_snapshot_working_copy,
             may_update_working_copy,
+            #[cfg(all(target_os = "linux", feature = "awacs"))]
+            subvolume_activation_root: None,
         };
         // Parse commit_summary template early to report error before starting
         // mutable operation.
@@ -2816,10 +2821,11 @@ to the current parents may contain changes from multiple commits.
                 ))
             })
             .collect::<Result<Vec<_>, ConfigGetError>>()?;
-        let eol_conversion = jj_lib::local_working_copy::eol_attributes_fingerprint(
+        let (eol_conversion, scan_eol) = jj_lib::local_working_copy::eol_attributes_fingerprints(
             self.repo().store().clone(),
             self.workspace_root().to_owned(),
             jj_lib::local_working_copy::EolConversionMode::try_from_settings(self.settings())?,
+            self.subvolume_activation_root.as_deref(),
         )
         .map_err(internal_error)?;
         let exec_bit_policy = effective_exec_bit_policy_for_fingerprint(
@@ -2860,10 +2866,10 @@ to the current parents may contain changes from multiple commits.
             snapshot_auto_track: snapshot_auto_track.into_bytes(),
             fileset_aliases,
             max_new_file_size,
-            eol_conversion: eol_conversion.clone(),
+            eol_conversion,
             exec_bit_policy,
         };
-        Ok((inputs.sha256(), eol_conversion))
+        Ok((inputs.sha256(), scan_eol))
     }
 
     pub(crate) fn path_converter(&self) -> &RepoPathUiConverter {

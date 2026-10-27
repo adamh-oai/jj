@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -163,11 +164,16 @@ impl WorkingCopyEol {
         })
     }
 
-    pub(crate) fn external_attributes_fingerprint(&self) -> Vec<u8> {
+    pub(crate) fn external_attributes_fingerprint(
+        &self,
+        activation_root: Option<&Path>,
+    ) -> Vec<u8> {
         #[cfg(feature = "git")]
         if let Some(git) = &self.git {
-            return git.external_attributes_fingerprint().to_vec();
+            return git.external_attributes_fingerprint(activation_root);
         }
+        #[cfg(not(feature = "git"))]
+        let _ = activation_root;
         crate::content_hash::blake2b_hash(&format!(
             "working-copy-eol-v1:{:?}",
             self.fallback.mode()

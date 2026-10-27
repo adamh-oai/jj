@@ -1063,18 +1063,25 @@ fn synthetic_test_awacs_baseline(
     }
 }
 
-/// Returns the line-ending policy and external Git attributes used by snapshots.
+/// Returns EOL fingerprints for the saved baseline and the files used by this scan.
 ///
-/// The digest excludes working-tree `.gitattributes` files. AWACS reports changes
-/// to those files through its snapshot delta.
-pub fn eol_attributes_fingerprint(
+/// Both use the same external attribute files. When a staged checkout will move,
+/// the first uses the path where it will be activated. AWACS reports changes to
+/// working-tree `.gitattributes` through its snapshot delta.
+pub fn eol_attributes_fingerprints(
     store: Arc<Store>,
     root: PathBuf,
     mode: EolConversionMode,
-) -> io::Result<Vec<u8>> {
+    activation_root: Option<&Path>,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let tree = store.empty_merged_tree();
-    WorkingCopyEol::new(store, tree, root, mode, EolSource::Snapshot)
-        .map(|eol| eol.external_attributes_fingerprint())
+    let eol = WorkingCopyEol::new(store, tree, root, mode, EolSource::Snapshot)?;
+    let scan = eol.external_attributes_fingerprint(None);
+    let baseline = match activation_root {
+        Some(root) => eol.external_attributes_fingerprint(Some(root)),
+        None => scan.clone(),
+    };
+    Ok((baseline, scan))
 }
 
 /// Settings specific to the tree state of the [`LocalWorkingCopy`] backend.
@@ -2800,7 +2807,7 @@ impl TreeState {
         .with_sparse_patterns(&self.sparse_patterns, external_sparse_patterns.as_deref());
         if awacs_eol_fingerprint
             .as_ref()
-            .is_some_and(|expected| *expected != eol.external_attributes_fingerprint())
+            .is_some_and(|expected| *expected != eol.external_attributes_fingerprint(None))
         {
             // The helper keeps the external rules it read at construction, so
             // all conversions below use exactly the inputs checked here.
@@ -6194,10 +6201,11 @@ mod tests {
             fs::write(scan_root.join(".gitattributes"), before)?;
         }
         fs::write(scan_root.join("file.txt"), b"contents\r\n")?;
-        let eol_fingerprint = eol_attributes_fingerprint(
+        let (_, eol_fingerprint) = eol_attributes_fingerprints(
             store.clone(),
             workspace_root.clone(),
             EolConversionMode::None,
+            None,
         )?;
         let options = SnapshotOptions {
             base_ignores: GitIgnoreFile::empty(),
@@ -6389,10 +6397,11 @@ mod tests {
             user_settings.merge_options()?,
         );
         let fingerprint = || -> io::Result<([u8; 32], Vec<u8>)> {
-            let input = eol_attributes_fingerprint(
+            let (_, input) = eol_attributes_fingerprints(
                 store.clone(),
                 workspace_root.clone(),
                 EolConversionMode::None,
+                None,
             )?;
             Ok((sha2::Sha256::digest(&input).into(), input))
         };

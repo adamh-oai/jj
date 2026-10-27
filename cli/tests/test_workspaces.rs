@@ -4169,9 +4169,15 @@ fn test_workspace_adopt_after_concurrent_operations_real_btrfs() -> TestResult {
             .args(["util", "subvolume", "enable"])
     })
     .success();
-    // Start with a source baseline that was saved at the final checkout path.
-    main.run_jj(["util", "subvolume", "enable", "--rebuild-baseline"])
-        .success();
+    // The first status must reuse the baseline that enable saved before activation.
+    let status = main.run_jj(["status"]).success();
+    assert!(
+        status
+            .stdout
+            .raw()
+            .contains("The working copy has no changes."),
+        "{status}"
+    );
     assert_eq!(main.read_file("tracked"), "source\n");
     assert!(!source.join("target-only-large").exists());
 
@@ -7720,7 +7726,8 @@ fn test_util_subvolume_enable_linked_requires_enabled_main() {
 #[cfg(feature = "awacs")]
 #[test]
 fn test_util_subvolume_enable_is_workspace_local() -> TestResult {
-    let test_env = TestEnvironment::default();
+    let mut test_env = TestEnvironment::default();
+    test_env.add_env_var("JJ_TEST_AWACS_REAL_FINGERPRINT", "1");
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
         .success();
@@ -7780,6 +7787,13 @@ exit 1
             cmd.env("PATH", &path)
                 .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
                 .args(["util", "subvolume", "enable"])
+        })
+        .success();
+    main_dir
+        .run_jj_with(|cmd| {
+            cmd.env("PATH", &path)
+                .env("JJ_TEST_AWACS_SCAN_ROOT", main_dir.root())
+                .arg("status")
         })
         .success();
     assert!(
