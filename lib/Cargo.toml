@@ -52,7 +52,6 @@ rayon = { workspace = true }
 ref-cast = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
-sha2 = { workspace = true }
 smallvec = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -65,7 +64,7 @@ watchman_client = { workspace = true, optional = true }
 rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 eyre = { workspace = true }

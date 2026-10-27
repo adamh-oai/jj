@@ -20,14 +20,12 @@ use clap_complete::ArgValueCandidates;
 use itertools::Itertools as _;
 use jj_lib::op_walk;
 use jj_lib::simple_op_store::SimpleOpStore;
-use jj_lib::sync::endpoint::Endpoint;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::short_operation_hash;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
 use crate::command_error::user_error;
-use crate::command_error::user_error_with_message;
 use crate::complete;
 use crate::ui::Ui;
 
@@ -66,6 +64,13 @@ pub async fn cmd_op_abandon(
     // with the current head.
     if command.global_args().at_operation.is_some() {
         return Err(cli_error("--at-op is not respected"));
+    }
+    if op_store.name() == SimpleOpStore::LEGACY_SYNC_V1 {
+        // This format records extra history outside the operation graph.
+        return Err(
+            user_error("Cannot abandon operations in a repository that used jj sync v1")
+                .hinted("Use a version of jj that supports this repository's sync format."),
+        );
     }
     let current_head_ops = op_walk::get_current_head_ops(op_store, op_heads_store.as_ref()).await?;
     let resolve_op = |op_str| op_walk::resolve_op_at(op_store, &current_head_ops, op_str);
@@ -107,32 +112,6 @@ pub async fn cmd_op_abandon(
         return Err(err);
     }
 
-    // Only the legacy format keeps causal history outside operation parents.
-    // Native synchronization follows ordinary operation-pruning semantics.
-    // Hold the legacy GC guard through publication, then release it before
-    // acquiring a working-copy lock.
-    let sync_endpoint = (op_store.name() == SimpleOpStore::SYNC_NAME)
-        .then(|| Endpoint::load(workspace.repo_path()));
-    let sync_history_guard = if let Some(endpoint) = &sync_endpoint {
-        let head_ids = current_head_ops
-            .iter()
-            .map(|op| op.id().clone())
-            .collect_vec();
-        Some(
-            endpoint
-                .preserve_pruned_heads(op_store.as_ref(), &head_ids)
-                .await
-                .map_err(|err| {
-                    user_error_with_message(
-                        "Cannot preserve synchronization history before abandoning operations",
-                        err,
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-
     // Reparent descendants, count the number of abandoned operations.
     let stats = op_walk::reparent_range(
         op_store.as_ref(),
@@ -162,7 +141,6 @@ pub async fn cmd_op_abandon(
             .update_op_heads(slice::from_ref(old.id()), new_id)
             .await?;
     }
-    drop(sync_history_guard);
     // Remap the operation id of the current workspace. If there were any
     // divergent operations, user will need to re-abandon their ancestors.
     if !command.global_args().ignore_working_copy {

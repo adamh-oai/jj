@@ -1,4 +1,9 @@
-# Native Jujutsu repository synchronization
+# Native Jujutsu repository synchronization (historical RFC)
+
+This RFC describes the former `jj sync` command at commit `d21d567d2972`.
+The examples and source paths below refer to that revision. See the operation
+log guide for how current versions handle repositories that used the command.
+[Operation log](../operation-log.md#repositories-that-used-jj-sync)
 
 A laptop and a build machine can each have a workspace called `default` and
 point `@` at different commits. Suppose the laptop rewrites a commit while the
@@ -6,8 +11,7 @@ build machine adds a child to the old version. `jj sync` lets the two machines
 exchange those changes, including the operations that produced them. Each machine
 keeps its own checkout. Git fetch and push alone cannot carry this history.
 
-This RFC describes the native operation graph on `dev/adamh/repo-sync`. The
-first design used a second graph and supported `jj undo` after a sync. The
+The first design used a second graph and supported `jj undo` after a sync. The
 migration section explains how jj reads repositories that used that design.
 
 ## What a sync does
@@ -265,5 +269,4 @@ The original plans and decision log record the design as it evolved.
 [Implementation plan](https://app.chatgpt.com/space/page_6e3b022b95908191b982d9d75c79392f) ·
 [Decision log](https://app.chatgpt.com/space/page_69026b9d1a9881919e400e5fea6ac6c5)
 
-[Command guide](../repository-sync.md) ·
 [RFC in Pages](https://chatgpt.com/space/page_5d42524a317c819181b2914566d74923)

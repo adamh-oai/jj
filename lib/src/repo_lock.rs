@@ -12,60 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Coordinates the one-way operation-store transition for synchronization.
+//! Protects a plain operation store while older jj versions can change its format.
 
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::path::Path;
 
 use crate::lock::FileLockError;
 
-/// Shared while a plain-format repository is open, exclusive while enabling
-/// synchronization. The backend marker is never rewritten by this transition,
-/// so every holder locks the same inode without creating additional files.
+/// Older versions take an exclusive lock on this same backend marker before
+/// changing the operation-store format.
 pub(crate) struct RepoFormatLock {
     _file: File,
 }
 
 impl RepoFormatLock {
     pub(crate) fn shared(repo_path: &Path) -> Result<Self, FileLockError> {
-        Self::acquire(repo_path, true)
-    }
-
-    pub(crate) fn exclusive(repo_path: &Path) -> Result<Self, FileLockError> {
-        Self::acquire(repo_path, false)
-    }
-
-    fn acquire(repo_path: &Path, shared: bool) -> Result<Self, FileLockError> {
         let path = repo_path.join("store/type");
-        let file = if shared {
-            File::open(&path)
-        } else {
-            // NFS can require write access for exclusive locks. Filesystems
-            // such as Btrfs, ext4, and Windows also support a read-only handle.
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .or_else(|_| File::open(&path))
-        }
-        .map_err(|err| FileLockError {
+        let file = File::open(&path).map_err(|err| FileLockError {
             message: "Failed to open repository format lock",
             path: path.clone(),
             err,
         })?;
-        tracing::debug!(?path, shared, "Waiting for repository format lock");
-        if shared {
-            file.lock_shared()
-        } else {
-            file.lock()
-        }
-        .map_err(|err| FileLockError {
+        tracing::debug!(?path, "Waiting for shared repository format lock");
+        file.lock_shared().map_err(|err| FileLockError {
             message: "Failed to lock repository format",
             path: path.clone(),
             err,
         })?;
-        tracing::debug!(?path, shared, "Acquired repository format lock");
+        tracing::debug!(?path, "Acquired shared repository format lock");
         Ok(Self { _file: file })
     }
 }
@@ -108,8 +82,6 @@ mod tests {
         drop(second);
         probe.try_lock()?;
         drop(probe);
-        drop(RepoFormatLock::exclusive(directory.path())?);
-        drop(RepoFormatLock::shared(directory.path())?);
         assert_eq!(fs::read(&path)?, b"git");
         #[cfg(unix)]
         {
@@ -148,7 +120,8 @@ mod tests {
     fn exclusive_access_blocks_new_readers() -> TestResult {
         let directory = new_temp_dir();
         let path = make_backend_marker(directory.path())?;
-        let exclusive = RepoFormatLock::exclusive(directory.path())?;
+        let exclusive = File::open(&path)?;
+        exclusive.lock()?;
         let probe = File::open(&path)?;
         assert!(matches!(
             probe.try_lock_shared(),
@@ -169,31 +142,6 @@ mod tests {
                 Err(mpsc::RecvTimeoutError::Timeout)
             ));
             drop(exclusive);
-            acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        });
-        Ok(())
-    }
-
-    #[test]
-    fn exclusive_access_waits_for_existing_readers() -> TestResult {
-        let directory = new_temp_dir();
-        make_backend_marker(directory.path())?;
-        let reader = RepoFormatLock::shared(directory.path())?;
-        let (started_tx, started_rx) = mpsc::channel();
-        let (acquired_tx, acquired_rx) = mpsc::channel();
-        thread::scope(|scope| {
-            scope.spawn(|| {
-                started_tx.send(()).unwrap();
-                let exclusive = RepoFormatLock::exclusive(directory.path()).unwrap();
-                acquired_tx.send(()).unwrap();
-                drop(exclusive);
-            });
-            started_rx.recv().unwrap();
-            assert!(matches!(
-                acquired_rx.recv_timeout(Duration::from_millis(100)),
-                Err(mpsc::RecvTimeoutError::Timeout)
-            ));
-            drop(reader);
             acquired_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         });
         Ok(())

@@ -235,8 +235,8 @@ impl ReadonlyRepo {
         let backend = backend_initializer(settings, &store_path)?;
         let backend_path = store_path.join("type");
         fs::write(&backend_path, backend.name()).context(&backend_path)?;
-        // No operation-store marker exists yet, so synchronization cannot be
-        // enabled before this initializer has taken shared access.
+        // Take the lock before writing op_store/type. Older versions can
+        // change the format as soon as that marker exists.
         let format_lock = RepoFormatLock::shared(&repo_path)?;
         let merge_options = settings
             .merge_options()
@@ -715,9 +715,8 @@ pub struct RepoLoader {
     op_heads_store: Arc<dyn OpHeadsStore>,
     index_store: Arc<dyn IndexStore>,
     submodule_store: Arc<dyn SubmoduleStore>,
-    // A plain operation-store handle must finish before synchronization changes
-    // the format. Enabled stores already understand the retained history and do
-    // not need to exclude this one-way transition. Drop the guard after stores.
+    // Older binaries can still change a plain store's format. Keep their
+    // exclusive lock from crossing an operation that uses the plain format.
     _format_lock: Option<Arc<RepoFormatLock>>,
 }
 
@@ -2091,25 +2090,6 @@ impl MutableRepo {
 
     pub fn merge_index(&mut self, other_repo: &ReadonlyRepo) -> IndexResult<()> {
         self.index.merge_in(other_repo.readonly_index())
-    }
-
-    /// Reconciles repository fields while keeping this receiver's local maps.
-    ///
-    /// Mask both the base and incoming side before computing any differences.
-    /// Installing a foreign full view and repairing workspace maps afterward
-    /// would already have applied its workspace rewrites.
-    pub(crate) async fn merge_shared_view(
-        &mut self,
-        base: &op_store::View,
-        other: &op_store::View,
-    ) -> Result<(), RepoLoaderError> {
-        let base = crate::sync::shared::SharedView::from_view(base);
-        let other = crate::sync::shared::SharedView::from_view(other);
-        self.merge_view(
-            &View::new(base.as_view().clone(), true),
-            &View::new(other.as_view().clone(), true),
-        )
-        .await
     }
 
     async fn merge_view(&mut self, base: &View, other: &View) -> Result<(), RepoLoaderError> {

@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use test_case::test_case;
+
 use crate::common::TestEnvironment;
 
-#[test]
-fn test_undo_redo_records_sync_causality_when_view_is_unchanged() {
+#[test_case("simple_op_store_sync_v1"; "version 1")]
+#[test_case("simple_op_store_sync_v2"; "version 2")]
+fn test_undo_redo_traverses_same_view_operation_in_legacy_store(store_type: &str) {
     use jj_lib::backend::CommitId;
     use jj_lib::op_heads_store::OpHeadsStore as _;
     use jj_lib::op_store::OpStore as _;
@@ -23,7 +26,6 @@ fn test_undo_redo_records_sync_causality_when_view_is_unchanged() {
     use jj_lib::ref_name::WorkspaceName;
     use jj_lib::simple_op_heads_store::SimpleOpHeadsStore;
     use jj_lib::simple_op_store::SimpleOpStore;
-    use jj_lib::sync::state::SyncStateStore;
     use pollster::FutureExt as _;
 
     let test_env = TestEnvironment::default();
@@ -47,8 +49,7 @@ fn test_undo_redo_records_sync_causality_when_view_is_unchanged() {
         .update_op_heads(&[baseline], &integrated)
         .block_on()
         .unwrap();
-    SyncStateStore::init(&repo_path).unwrap();
-    work_dir.write_file(".jj/repo/op_store/type", SimpleOpStore::SYNC_NAME);
+    work_dir.write_file(".jj/repo/op_store/type", store_type);
 
     work_dir.run_jj(["undo"]).success();
     let undo = heads.get_op_heads().block_on().unwrap().pop().unwrap();

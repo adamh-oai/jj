@@ -178,8 +178,12 @@ fn get_git_repo(repo: &Arc<ReadonlyRepo>) -> gix::Repository {
     get_git_backend(repo).git_repo()
 }
 
-fn enable_sync_git_repo(repo: &ReadonlyRepo, repo_path: &Path) -> TestResult<Arc<ReadonlyRepo>> {
-    fs::write(repo_path.join("op_store/type"), SimpleOpStore::SYNC_NAME)?;
+fn reload_with_op_store_type(
+    repo: &ReadonlyRepo,
+    repo_path: &Path,
+    op_store_type: &str,
+) -> TestResult<Arc<ReadonlyRepo>> {
+    fs::write(repo_path.join("op_store/type"), op_store_type)?;
     let loader = RepoLoader::init_from_file_system(
         repo.settings(),
         repo_path,
@@ -1359,18 +1363,19 @@ fn test_import_refs_reimport_remote_tags_deleted() -> TestResult {
     Ok(())
 }
 
-#[test_case(false, false; "ordinary_absent")]
-#[test_case(false, true; "ordinary_present")]
-#[test_case(true, false; "sync_absent")]
-#[test_case(true, true; "sync_present")]
-fn test_import_refs_sync_observations(sync_enabled: bool, physically_present: bool) -> TestResult {
+#[test_case(SimpleOpStore::NAME, false; "ordinary_absent")]
+#[test_case(SimpleOpStore::NAME, true; "ordinary_present")]
+#[test_case(SimpleOpStore::LEGACY_SYNC_V1, false; "legacy_v1_absent")]
+#[test_case(SimpleOpStore::LEGACY_SYNC_V1, true; "legacy_v1_present")]
+#[test_case(SimpleOpStore::LEGACY_SYNC_V2, false; "legacy_v2_absent")]
+#[test_case(SimpleOpStore::LEGACY_SYNC_V2, true; "legacy_v2_present")]
+fn test_import_refs_with_saved_git_observations(
+    op_store_type: &str,
+    physically_present: bool,
+) -> TestResult {
     let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
-    let repo = if sync_enabled {
-        enable_sync_git_repo(&test_repo.repo, test_repo.repo_path())?
-    } else {
-        test_repo.repo.clone()
-    };
-    let git_repo = get_git_repo(&repo);
+    let repo = &test_repo.repo;
+    let git_repo = get_git_repo(repo);
     let mut options = auto_track_import_options();
     options.abandon_unreachable_commits = false;
     let mut tx = repo.start_transaction();
@@ -1392,8 +1397,8 @@ fn test_import_refs_sync_observations(sync_enabled: bool, physically_present: bo
     }
     git::import_refs(tx.repo_mut(), &options).block_on()?;
 
-    // Simulate a sync that changes the shared targets while preserving this
-    // machine's observations of its own physical refs.
+    // Older sync versions could save targets from a peer while keeping this
+    // machine's last observed Git refs.
     let synchronized_ref = RemoteRef {
         target: shared_target.clone(),
         state: RemoteRefState::Tracked,
@@ -1409,6 +1414,7 @@ fn test_import_refs_sync_observations(sync_enabled: bool, physically_present: bo
     tx.repo_mut()
         .set_local_tag_target("tag".as_ref(), shared_target.clone());
     let repo = tx.commit("shared target changes").block_on()?;
+    let repo = reload_with_op_store_type(&repo, test_repo.repo_path(), op_store_type)?;
 
     let assert_targets = |repo: &MutableRepo, expected: &RefTarget| {
         for (name, remote) in [("local", "git"), ("remote", "origin")] {
@@ -1432,7 +1438,7 @@ fn test_import_refs_sync_observations(sync_enabled: bool, physically_present: bo
     };
     let mut tx = repo.start_transaction();
     let stats = git::import_refs(tx.repo_mut(), &options).block_on()?;
-    let expected = if sync_enabled {
+    let expected = if op_store_type != SimpleOpStore::NAME {
         &shared_target
     } else if physically_present {
         &physical_target
@@ -1440,7 +1446,7 @@ fn test_import_refs_sync_observations(sync_enabled: bool, physically_present: bo
         &ABSENT_REF_TARGET
     };
     assert_targets(tx.repo_mut(), expected);
-    if sync_enabled {
+    if op_store_type != SimpleOpStore::NAME {
         assert!(stats.changed_remote_bookmarks.is_empty());
         assert!(stats.changed_remote_tags.is_empty());
     }
@@ -5057,9 +5063,10 @@ fn test_fetch_local_remote_conflicts() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn test_fetch_sync_remote_tag_observations() -> TestResult {
-    let mut test_data = GitRepoData::create();
+#[test_case(SimpleOpStore::LEGACY_SYNC_V1; "v1")]
+#[test_case(SimpleOpStore::LEGACY_SYNC_V2; "v2")]
+fn test_fetch_legacy_sync_remote_tag_observations(op_store_type: &str) -> TestResult {
+    let test_data = GitRepoData::create();
     let subprocess_options = GitSubprocessOptions::from_settings(test_data.repo.settings())?;
     let mut options = auto_track_import_options();
     options.abandon_unreachable_commits = false;
@@ -5086,40 +5093,11 @@ fn test_fetch_sync_remote_tag_observations() -> TestResult {
         StringExpression::all(),
         StringExpression::all(),
     )?;
-    // Ordinary repositories have remote tags, but no separate Git observations
-    // for the reserved tag namespace.
+    // Old sync stores saved the local Git value separately from each remote tag.
     for name in ["one", "outside"] {
-        assert!(
-            tx.repo()
-                .view()
-                .get_git_ref(format!("refs/jj/remote-tags/origin/{name}").as_ref())
-                .is_absent(),
-        );
-    }
-    let repo = tx.commit("fetch before sync enablement").block_on()?;
-    test_data.repo = enable_sync_git_repo(&repo, &test_data._temp_dir.path().join("jj"))?;
-    let mut tx = test_data.repo.start_transaction();
-    let shared_before = tx
-        .repo()
-        .view()
-        .all_remote_tags()
-        .map(|(symbol, value)| (symbol.to_owned(), value.clone()))
-        .collect_vec();
-    git::record_remote_tag_observations(tx.repo_mut())?;
-    assert_eq!(
-        tx.repo()
-            .view()
-            .all_remote_tags()
-            .map(|(symbol, value)| (symbol.to_owned(), value.clone()))
-            .collect_vec(),
-        shared_before,
-    );
-    for name in ["one", "outside"] {
-        assert_eq!(
-            tx.repo()
-                .view()
-                .get_git_ref(format!("refs/jj/remote-tags/origin/{name}").as_ref()),
-            &first_target,
+        tx.repo_mut().set_git_ref_target(
+            format!("refs/jj/remote-tags/origin/{name}").as_ref(),
+            first_target.clone(),
         );
     }
 
@@ -5139,7 +5117,9 @@ fn test_fetch_sync_remote_tag_observations() -> TestResult {
         tx.repo_mut()
             .set_local_tag_target(name.as_ref(), shared_target.clone());
     }
-    let repo = tx.commit("synchronized targets").block_on()?;
+    let repo = tx.commit("save targets from a peer").block_on()?;
+    let repo =
+        reload_with_op_store_type(&repo, &test_data._temp_dir.path().join("jj"), op_store_type)?;
     let mut tx = repo.start_transaction();
 
     // The ordinary automatic import must not prune reserved observations or
@@ -7323,10 +7303,10 @@ fn test_remote_remove_refs() -> TestResult {
 }
 
 #[test]
-fn test_sync_remote_tag_observations_follow_remote_management() -> TestResult {
+fn test_legacy_sync_remote_tag_observations_follow_remote_management() -> TestResult {
     let test_repo = TestRepo::init_with_backend(TestRepoBackend::Git);
-    let repo = enable_sync_git_repo(&test_repo.repo, test_repo.repo_path())?;
-    let git_repo = get_git_repo(&repo);
+    let repo = &test_repo.repo;
+    let git_repo = get_git_repo(repo);
     let mut tx = repo.start_transaction();
     git::add_remote(tx.repo_mut(), "foo".as_ref(), "https://example.com/", None)?;
     let commit = write_random_commit(tx.repo_mut());
@@ -7344,9 +7324,8 @@ fn test_sync_remote_tag_observations_follow_remote_management() -> TestResult {
             .set_remote_tag(remote_symbol(name, remote), remote_ref.clone());
     }
     let repo = tx.commit("add remote observations").block_on()?;
-    let repo = test_repo
-        .env
-        .load_repo_at_head(repo.settings(), test_repo.repo_path());
+    let repo =
+        reload_with_op_store_type(&repo, test_repo.repo_path(), SimpleOpStore::LEGACY_SYNC_V2)?;
     let mut tx = repo.start_transaction();
     // Observations are never requested exports or implicit tag deletions.
     let stats = git::export_refs(tx.repo_mut())?;

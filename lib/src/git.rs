@@ -603,53 +603,6 @@ pub async fn import_refs(
     import_some_refs(mut_repo, options, |_, _| true).await
 }
 
-/// Records this repository's current fetched remote-tag observations.
-///
-/// Enabling sync must call this once before applying an incoming shared view.
-/// Ordinary repositories use the shared remote-tag target as their observation,
-/// so older views have no separate baseline for the reserved Git namespace.
-/// This changes only receiver-local Git observations, without importing commits
-/// or changing local or remote tags. Calling it after shared state has been
-/// applied could hide a genuine Git update from the next scoped fetch.
-pub fn record_remote_tag_observations(mut_repo: &mut MutableRepo) -> Result<(), GitImportError> {
-    let git_repo = get_git_repo(mut_repo.store())?;
-    let references = git_repo.references().map_err(GitImportError::from_git)?;
-    let mut observations = Vec::new();
-    for git_ref in references
-        .prefixed(REMOTE_TAG_REF_NAMESPACE)
-        .map_err(GitImportError::from_git)?
-    {
-        let git_ref = git_ref.map_err(GitImportError::from_git)?;
-        let Ok(full_name) = str::from_utf8(git_ref.name().as_bstr()) else {
-            continue;
-        };
-        let full_name = GitRefName::new(full_name);
-        if parse_remote_tag_ref(full_name).is_none() {
-            continue;
-        }
-        if let Some(id) = resolve_git_ref_to_commit_id(&git_ref, None) {
-            observations.push((
-                full_name.to_owned(),
-                RefTarget::normal(CommitId::from_bytes(id.as_bytes())),
-            ));
-        }
-    }
-    let previous_observations = mut_repo
-        .view()
-        .git_refs()
-        .keys()
-        .filter(|name| parse_remote_tag_ref(name).is_some())
-        .cloned()
-        .collect_vec();
-    for name in previous_observations {
-        mut_repo.set_git_ref_target(&name, RefTarget::absent());
-    }
-    for (name, target) in observations {
-        mut_repo.set_git_ref_target(&name, target);
-    }
-    Ok(())
-}
-
 /// Reflect changes made in the underlying Git repo in the Jujutsu repo.
 ///
 /// Only bookmarks and tags whose remote symbol pass the filter will be
@@ -670,7 +623,7 @@ pub async fn import_some_refs(
 
     // Exclude real remote tags, which should never be updated by Git.
     let all_remote_tags = false;
-    let only_changed_git_refs = SimpleOpStore::is_sync_name(mut_repo.op_store().name());
+    let only_changed_git_refs = SimpleOpStore::is_legacy_sync_name(mut_repo.op_store().name());
     let refs_to_import = diff_refs_to_import(
         mut_repo.view(),
         &git_repo,
@@ -970,8 +923,8 @@ fn diff_refs_to_import(
             let (kind, symbol) = if let Some(parsed) = parse_git_ref(full_name) {
                 parsed
             } else if let Some(parsed) = parse_remote_tag_ref(full_name) {
-                // Remote-tag observations are local to a sync-enabled repo.
-                // Automatic imports must leave them for a scoped fetch.
+                // Legacy sync stores keep the last fetched value of each tag.
+                // Only a fetch for that tag can update it.
                 if !all_remote_tags || !only_changed_git_refs {
                     return None;
                 }
@@ -1146,8 +1099,8 @@ fn collect_changed_refs_to_import(
         let old_remote_ref = known_remote_refs
             .remove(&symbol)
             .unwrap_or(&ABSENT_REMOTE_REF);
-        // Synchronized remote targets may differ from this machine's Git
-        // observations. Only a new physical change can replace those targets.
+        // Legacy sync stores can have a remote target from another machine.
+        // Keep it until the local Git ref changes.
         if (!observations.only_changed || git_ref_changed) && new_target != old_remote_ref.target {
             changed_remote_refs.push(GitImportRefUpdate::new(
                 symbol.to_owned(),
@@ -1160,8 +1113,8 @@ fn collect_changed_refs_to_import(
 }
 
 /// Similar to [`collect_changed_refs_to_import()`], but scans the reserved
-/// namespace for fetched remote tags. Sync repos record local observations;
-/// other repos use the remote target itself as their previous observation.
+/// namespace for fetched remote tags. Legacy sync stores track the local Git
+/// value separately. Other stores use the remote target as the previous value.
 fn collect_changed_remote_tags_to_import(
     actual_git_refs: gix::reference::iter::Iter,
     observations: &mut GitRefImportObservations<'_, '_>,
@@ -3475,7 +3428,8 @@ impl<'a> GitFetch<'a> {
     pub async fn import_refs(&mut self) -> Result<GitImportStats, GitImportError> {
         tracing::debug!("import_refs");
         let all_remote_tags = true;
-        let only_changed_git_refs = SimpleOpStore::is_sync_name(self.mut_repo.op_store().name());
+        let only_changed_git_refs =
+            SimpleOpStore::is_legacy_sync_name(self.mut_repo.op_store().name());
         let refs_to_import = diff_refs_to_import(
             self.mut_repo.view(),
             &self.git_repo,
