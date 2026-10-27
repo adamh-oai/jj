@@ -3979,6 +3979,168 @@ fn test_util_subvolume_enable_rejects_state_inside_checkout_before_changes() {
     );
 }
 
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+#[test]
+#[ignore = "requires JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
+fn test_workspace_adopt_after_concurrent_operations_real_btrfs() -> TestResult {
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    let root = tempfile::tempdir_in(std::env::var_os("JJ_TEST_BTRFS_ROOT").unwrap())?;
+    let runtime = tempfile::tempdir()?;
+    let source = root.path().join("source");
+    let child = root.path().join("child");
+    let state = root.path().join("state");
+    std::fs::create_dir(&source)?;
+    std::fs::create_dir(&state)?;
+    let mut cleanup =
+        RealBtrfsFixtureCleanup::new(source.clone(), state.clone(), runtime.path().to_owned());
+    cleanup.track_subvolume_root(child.clone());
+    let awacs = PathBuf::from(std::env::var_os("BTRFS_AWACS_COMMAND").unwrap());
+    let broker = std::env::var_os("BTRFS_AWACS_BROKER_SOCKET").unwrap();
+    let installed_tools = awacs.parent().unwrap().to_owned();
+    let path = std::env::join_paths(std::iter::once(installed_tools).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))?;
+    let mut test_env = TestEnvironment::default();
+    test_env.add_env_var("PATH", &path);
+    test_env.add_env_var("BTRFS_AWACS_COMMAND", &awacs);
+    test_env.add_env_var("BTRFS_AWACS_BROKER_SOCKET", &broker);
+    test_env.add_env_var("XDG_RUNTIME_DIR", runtime.path());
+    let main = test_env.work_dir(&source);
+    main.run_jj(["git", "init", "--colocate", "."]).success();
+    main.write_file("tracked", "source\n");
+    main.run_jj(["commit", "-m", "source"]).success();
+    main.write_file("tracked", "target\n");
+    main.write_file("target-only-large", "x".repeat(1024 * 1024 + 1));
+    main.run_jj([
+        "--config",
+        "snapshot.max-new-file-size=0",
+        "commit",
+        "-m",
+        "target",
+    ])
+    .success();
+    main.run_jj(["bookmark", "create", "target", "-r", "@-"])
+        .success();
+    let target = main
+        .run_jj(["log", "-r", "target", "--no-graph", "-T", "commit_id"])
+        .success();
+    main.run_jj(["new", "@--"]).success();
+    main.run_jj_with(|cmd| {
+        cmd.env("BTRFS_AWACS_STATE_DIR", state.join("managed"))
+            .args(["util", "subvolume", "enable"])
+    })
+    .success();
+    // Start with a source baseline that was saved at the final checkout path.
+    main.run_jj(["util", "subvolume", "enable", "--rebuild-baseline"])
+        .success();
+    assert_eq!(main.read_file("tracked"), "source\n");
+    assert!(!source.join("target-only-large").exists());
+
+    let fixture_env = test_env.new_jj_cmd();
+    assert_cmd::Command::new(&awacs)
+        .env_clear()
+        .envs(
+            fixture_env
+                .get_envs()
+                .filter_map(|(key, val)| val.map(|val| (key, val))),
+        )
+        .args(["git", "worktree-add", "--source"])
+        .arg(&source)
+        .arg("--destination")
+        .arg(&child)
+        .args([
+            "--ref",
+            "refs/heads/target",
+            "--git",
+            "git",
+            "--required",
+            "--detach",
+        ])
+        .assert()
+        .success();
+    let adopted = test_env.work_dir(&child);
+    assert_eq!(adopted.read_file("tracked"), "target\n");
+    adopted.write_file("tracked", "local edit\n");
+    adopted.write_file("new", "local file\n");
+
+    let pauses = [
+        ("JJ_TEST_SNAPSHOT_PAUSE_DIR", "during-scan"),
+        ("JJ_TEST_SNAPSHOT_AFTER_FINISH_PAUSE_DIR", "after-finish"),
+    ];
+    let mut adopt = test_env.new_jj_cmd();
+    adopt
+        .current_dir(&child)
+        .args(["workspace", "adopt", "--name", "adopted"]);
+    for (variable, name) in pauses {
+        let dir = runtime.path().join(name);
+        std::fs::create_dir(&dir)?;
+        adopt.env(variable, dir);
+    }
+    std::thread::scope(|scope| -> TestResult {
+        let running = scope.spawn(move || adopt.output());
+        let mut bookmarks = Vec::new();
+        for (_, name) in pauses {
+            let dir = runtime.path().join(name);
+            let ready = dir.join("ready");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !ready.is_file() && !running.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if ready.is_file() {
+                bookmarks.push(main.run_jj_with(|cmd| {
+                    cmd.timeout(Duration::from_secs(10)).args([
+                        "--ignore-working-copy",
+                        "bookmark",
+                        "create",
+                        name,
+                        "-r",
+                        "target",
+                    ])
+                }));
+            }
+            std::fs::write(dir.join("release"), b"release\n")?;
+        }
+        let result = running.join().unwrap()?;
+        assert!(
+            result.status.success(),
+            "adoption failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(bookmarks.len(), 2, "adoption must reach both pauses");
+        for bookmark in bookmarks {
+            bookmark.success();
+        }
+        Ok(())
+    })?;
+
+    // Inspect what adoption saved before another command can snapshot the edits.
+    let parent = adopted
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@- & during-scan & after-finish",
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ])
+        .success();
+    assert_eq!(parent.stdout.raw(), target.stdout.raw());
+    let diff = adopted
+        .run_jj(["--ignore-working-copy", "diff", "--summary"])
+        .success();
+    assert_eq!(diff.stdout.raw(), "A new\nM tracked\n");
+    let edit = adopted
+        .run_jj(["--ignore-working-copy", "file", "show", "tracked"])
+        .success();
+    assert_eq!(edit.stdout.raw(), "local edit\n");
+    cleanup.cleanup()?;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[cfg(feature = "awacs")]
 #[test]

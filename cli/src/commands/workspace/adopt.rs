@@ -43,6 +43,8 @@ use jj_lib::workspace_store::WorkspaceStore;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use crate::cli_util::SnapshotAdoption;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error_with_message;
 use crate::command_error::user_error;
@@ -309,14 +311,10 @@ pub async fn cmd_workspace_adopt(
         // checked out a different HEAD into the live worktree after A was
         // created; in that case the final snapshot below reconciles A -> B
         // against the working-copy commit already based on that Git HEAD.
-        let synthetic_seed_tree = wc_commit.tree();
-        let snapshot_seed_tree = snapshot_seed.as_ref().map(|(tree, _)| tree);
+        let target_tree = wc_commit.tree();
+        let seed_tree = snapshot_seed.as_ref().map_or(&target_tree, |(tree, _)| tree);
         adoption_try!(
-            seed_snapshot_adopt_tree(
-                &mut workspace_command,
-                snapshot_seed_tree.unwrap_or(&synthetic_seed_tree),
-            )
-            .await
+            seed_snapshot_adopt_tree(&mut workspace_command, wc_commit.id(), seed_tree).await
         );
         adoption_try!(
             workspace_command
@@ -332,13 +330,6 @@ pub async fn cmd_workspace_adopt(
         // Preserve the inherited A -> live-worktree scan so edits made after
         // Git's checkout remain visible. Files tracked only by target B must
         // bypass new-file limits and ignores during that reconciliation.
-        let target_tracking_matcher = adoption_try!(
-            snapshot_adopt_tracking_matcher(
-                snapshot_seed_tree.unwrap_or(&synthetic_seed_tree),
-                &synthetic_seed_tree,
-            )
-            .await
-        );
         if snapshot_seed.is_none() {
             // Synthetic snapshot tests have no source journal to inherit, so
             // establish a complete baseline by scanning their test root.
@@ -348,9 +339,18 @@ pub async fn cmd_workspace_adopt(
                     .await
             );
         } else {
+            let matcher =
+                adoption_try!(snapshot_adopt_tracking_matcher(seed_tree, &target_tree).await);
+            let adoption = SnapshotAdoption {
+                seed_operation: workspace_command.repo().op_id().clone(),
+                seed_tree: seed_tree.clone(),
+                working_copy_commit: wc_commit.id().clone(),
+                git_head: RefTarget::normal(worktree.head_id.clone()),
+                target_tracking_matcher: &matcher,
+            };
             adoption_try!(
                 workspace_command
-                    .maybe_snapshot_with_force_tracking(ui, &target_tracking_matcher)
+                    .maybe_snapshot_with_adoption(ui, Some(adoption))
                     .await
             );
         }
@@ -481,10 +481,18 @@ async fn snapshot_adopt_tracking_matcher(
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 async fn seed_snapshot_adopt_tree(
     workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
+    expected_commit: &CommitId,
     tree: &MergedTree,
 ) -> Result<(), CommandError> {
     let operation_id = workspace_command.repo().op_id().clone();
-    let (mut locked_workspace, _commit) = workspace_command.unchecked_start_working_copy_mutation().await?;
+    let (mut locked_workspace, commit) = workspace_command
+        .unchecked_start_working_copy_mutation()
+        .await?;
+    if commit.id() != expected_commit {
+        return Err(user_error(
+            "The workspace commit changed during adoption. Retry adoption.",
+        ));
+    }
     if !seed_local_working_copy_tree(locked_workspace.locked_wc(), tree)
         .await
         .map_err(|err| internal_error_with_message("Failed to seed adopted snapshot tree", err))?

@@ -567,13 +567,15 @@ impl CommandHelper {
 
         let old_repo = workspace_command.repo().clone();
         let (workspace_command, stats) = match workspace_command
-            .snapshot_impl(ui, &git_import_export_lock, &NothingMatcher)
+            .snapshot_impl(ui, &git_import_export_lock, None)
             .await
         {
             Ok(stats) => (workspace_command, stats),
             Err(SnapshotWorkingCopyError::Command(err)) => return Err(err),
             Err(
-                SnapshotWorkingCopyError::Retry | SnapshotWorkingCopyError::RetryWithWarnings(_),
+                SnapshotWorkingCopyError::Retry
+                | SnapshotWorkingCopyError::RetryWithWarnings(_)
+                | SnapshotWorkingCopyError::RetryAfterSave(_),
             ) => {
                 unreachable!("snapshot_impl retries internally")
             }
@@ -772,7 +774,7 @@ impl CommandHelper {
                         ui,
                         git_import_export_lock,
                         false,
-                        &NothingMatcher,
+                        None,
                         None,
                         None,
                         false,
@@ -859,7 +861,7 @@ impl CommandHelper {
                 // copy became stale. The result wouldn't be ideal, but there
                 // should be no data loss at least.
                 let fresh_stats = workspace_command
-                    .snapshot_impl(ui, git_import_export_lock, &NothingMatcher)
+                    .snapshot_impl(ui, git_import_export_lock, None)
                     .await
                     .map_err(|err| err.into_command_error())?;
                 let merged_stats = {
@@ -921,7 +923,7 @@ impl CommandHelper {
                 ui,
                 git_import_export_lock,
                 true,
-                &NothingMatcher,
+                None,
                 Some(expected_published_operation),
                 Some(expected_working_copy_operation),
                 false,
@@ -1512,6 +1514,41 @@ pub struct WorkspaceCommandHelper {
     may_update_working_copy: bool,
 }
 
+/// The journal and checkout that `workspace adopt` expects to scan.
+pub(crate) struct SnapshotAdoption<'a> {
+    pub seed_operation: OperationId,
+    pub seed_tree: MergedTree,
+    pub working_copy_commit: CommitId,
+    pub git_head: RefTarget,
+    pub target_tracking_matcher: &'a dyn Matcher,
+}
+
+impl SnapshotAdoption<'_> {
+    async fn can_scan(
+        &self,
+        locked_wc: &dyn LockedWorkingCopy,
+        repo: &ReadonlyRepo,
+        workspace_name: &WorkspaceName,
+    ) -> Result<bool, OpStoreError> {
+        if locked_wc.old_operation_id() != &self.seed_operation
+            || locked_wc.old_tree().tree_ids_and_labels() != self.seed_tree.tree_ids_and_labels()
+            || repo.view().get_wc_commit_id(workspace_name) != Some(&self.working_copy_commit)
+            || repo.view().git_head(workspace_name) != &self.git_head
+        {
+            return Ok(false);
+        }
+        // Git checked out HEAD after copying the source tree, so those trees
+        // can differ. Accept a newer operation only if it descends from the seed.
+        if repo.op_id() == &self.seed_operation {
+            return Ok(true);
+        }
+        let seed = repo.loader().load_operation(&self.seed_operation).await?;
+        let ancestors =
+            op_walk::closest_common_ancestors([seed], [repo.operation().clone()]).await?;
+        Ok(ancestors.iter().any(|op| op.id() == &self.seed_operation))
+    }
+}
+
 enum SnapshotWorkingCopyError {
     Command(CommandError),
     StaleWorkingCopy(CommandError),
@@ -1521,6 +1558,8 @@ enum SnapshotWorkingCopyError {
     /// A scan produced warnings before it needed to be retried. Preserve
     /// them because a subsequent monitor query may succeed.
     RetryWithWarnings(Vec<SnapshotWarning>),
+    /// The journal was saved. A retry starts from that snapshot.
+    RetryAfterSave(Vec<SnapshotWarning>),
 }
 
 impl SnapshotWorkingCopyError {
@@ -1528,7 +1567,7 @@ impl SnapshotWorkingCopyError {
         match self {
             Self::Command(err) => err,
             Self::StaleWorkingCopy(err) => err,
-            Self::Retry | Self::RetryWithWarnings(_) => {
+            Self::Retry | Self::RetryWithWarnings(_) | Self::RetryAfterSave(_) => {
                 unreachable!("snapshot retries are handled by snapshot_impl")
             }
         }
@@ -1721,7 +1760,7 @@ impl WorkspaceCommandHelper {
         &mut self,
         ui: &Ui,
         git_import_export_lock: &GitImportExportLock,
-        force_tracking_matcher: &dyn Matcher,
+        mut adoption: Option<SnapshotAdoption<'_>>,
     ) -> Result<SnapshotStats, SnapshotWorkingCopyError> {
         assert!(self.may_snapshot_working_copy);
         // A non-integrated operation may be intentionally unpublished, so it
@@ -1834,7 +1873,22 @@ impl WorkspaceCommandHelper {
             let result = if preflight_ready {
                 async {
                     #[cfg(feature = "git")]
-                    let journal_ahead = if self.env.working_copy_shared_with_git {
+                    let journal_ahead = if adoption.is_some() {
+                        // Adoption already registered this Git HEAD. Importing a
+                        // different HEAD would replace the checkout being adopted.
+                        if !snapshot_git_head_is_current(
+                            &self.env,
+                            self.repo(),
+                            self.workspace_name(),
+                        )
+                        .await?
+                        {
+                            return Err(snapshot_command_error(user_error(
+                                "Git HEAD changed during adoption. Retry adoption.",
+                            )));
+                        }
+                        false
+                    } else if self.env.working_copy_shared_with_git {
                         self.import_git_head(ui, git_import_export_lock, true)
                             .await?
                     } else {
@@ -1848,7 +1902,7 @@ impl WorkspaceCommandHelper {
                         ui,
                         git_import_export_lock,
                         false,
-                        force_tracking_matcher,
+                        adoption.as_ref(),
                         None,
                         None,
                         can_release_lock && !journal_ahead,
@@ -1866,6 +1920,22 @@ impl WorkspaceCommandHelper {
                     break stats;
                 }
                 Err(SnapshotWorkingCopyError::RetryWithWarnings(warnings)) => warnings,
+                Err(SnapshotWorkingCopyError::RetryAfterSave(warnings)) => {
+                    if let Some(adoption) = &mut adoption {
+                        // We saved the checkout and its local edits. Validate
+                        // our own new journal and commit on the next attempt.
+                        let commit = self
+                            .prepare_working_copy_mutation()
+                            .await
+                            .map_err(snapshot_command_error)?;
+                        adoption.seed_operation = self.repo().op_id().clone();
+                        adoption.seed_tree = commit.tree();
+                        adoption.working_copy_commit = commit.id().clone();
+                        let view = self.repo().view();
+                        adoption.git_head = view.git_head(self.workspace_name()).clone();
+                    }
+                    warnings
+                }
                 Err(SnapshotWorkingCopyError::Retry) => Vec::new(),
                 Err(err) => return Err(err),
             };
@@ -1900,23 +1970,22 @@ impl WorkspaceCommandHelper {
     /// working copy is colocated with Git.
     #[instrument(skip_all)]
     pub async fn maybe_snapshot(&mut self, ui: &Ui) -> Result<(), CommandError> {
-        self.maybe_snapshot_with_force_tracking(ui, &NothingMatcher)
-            .await
+        self.maybe_snapshot_with_adoption(ui, None).await
     }
 
-    /// Snapshots while preserving paths an external checkout already tracks.
+    /// During adoption, reconcile the copied journal with the Git checkout.
     #[instrument(skip_all)]
-    pub(crate) async fn maybe_snapshot_with_force_tracking(
+    pub(crate) async fn maybe_snapshot_with_adoption(
         &mut self,
         ui: &Ui,
-        force_tracking_matcher: &dyn Matcher,
+        adoption: Option<SnapshotAdoption<'_>>,
     ) -> Result<(), CommandError> {
         if !self.may_snapshot_working_copy {
             return Ok(());
         }
         let git_import_export_lock = self.lock_git_import_export()?;
         let stats = self
-            .snapshot_impl(ui, &git_import_export_lock, force_tracking_matcher)
+            .snapshot_impl(ui, &git_import_export_lock, adoption)
             .await
             .map_err(|err| err.into_command_error())?;
         print_snapshot_stats(ui, &stats, self.env().path_converter())?;
@@ -1965,7 +2034,7 @@ impl WorkspaceCommandHelper {
                 ui,
                 &git_import_export_lock,
                 true,
-                &NothingMatcher,
+                None,
                 expected_published_operation,
                 None,
                 false,
@@ -2518,7 +2587,7 @@ to the current parents may contain changes from multiple commits.
         locked_ws.finish(repo.op_id().clone()).await?;
         self.user_repo = ReadonlyUserRepo::new(repo);
 
-        self.snapshot_impl(ui, git_import_export_lock, &NothingMatcher)
+        self.snapshot_impl(ui, git_import_export_lock, None)
             .await
             .map_err(|err| err.into_command_error())
     }
@@ -3215,7 +3284,7 @@ to the current parents may contain changes from multiple commits.
         ui: &Ui,
         git_import_export_lock: &GitImportExportLock,
         force_awacs_input_fingerprint: bool,
-        force_tracking_matcher: &dyn Matcher,
+        adoption: Option<&SnapshotAdoption<'_>>,
         expected_published_operation: Option<&OperationId>,
         expected_working_copy_operation: Option<&OperationId>,
         can_release_lock: bool,
@@ -3238,6 +3307,9 @@ to the current parents may contain changes from multiple commits.
         let auto_tracking_matcher = self
             .auto_tracking_matcher(ui)
             .map_err(snapshot_command_error)?;
+        let force_tracking_matcher = adoption.map_or(&NothingMatcher as &dyn Matcher, |adoption| {
+            adoption.target_tracking_matcher
+        });
         let start_tracking_matcher =
             UnionMatcher::new(auto_tracking_matcher.as_ref(), force_tracking_matcher);
         let mut options = self
@@ -3320,19 +3392,38 @@ to the current parents may contain changes from multiple commits.
         }
 
         // Compare working-copy tree and operation with repo's, and reload as needed.
-        let published_repo = repo.clone();
-        let Some((repo, wc_commit)) =
-            handle_stale_working_copy(locked_ws.locked_wc(), repo, &workspace_name).await?
-        else {
-            // If the workspace has been deleted, it's unclear what to do, so we just skip
-            // committing the working copy.
-            return Ok(SnapshotStats::default());
+        let (repo, wc_commit) = if let Some(adoption) = adoption {
+            if !adoption
+                .can_scan(locked_ws.locked_wc(), &repo, &workspace_name)
+                .await
+                .map_err(snapshot_command_error)?
+            {
+                return Err(snapshot_command_error(user_error(
+                    "The workspace changed during adoption. Retry adoption.",
+                )));
+            }
+            // The source workspace registered this commit. Load it through the
+            // adopted workspace so its tree and the scanned tree share a store.
+            let commit = repo
+                .store()
+                .get_commit_async(&adoption.working_copy_commit)
+                .await
+                .map_err(snapshot_command_error)?;
+            (repo, commit)
+        } else {
+            let Some(result) =
+                handle_stale_working_copy(locked_ws.locked_wc(), repo, &workspace_name).await?
+            else {
+                // The workspace has been deleted. Skip committing its working copy.
+                return Ok(SnapshotStats::default());
+            };
+            result
         };
 
         // A journal can point to an operation ahead of the published head.
         // Preserve that operation's recovery semantics by keeping the shared
         // lock for this uncommon case.
-        if repo.op_id() != published_repo.op_id() {
+        if repo.op_id() != self.user_repo.repo.op_id() {
             can_release_lock = false;
         }
         if let Some(initial_sparse_patterns) = initial_sparse_patterns
@@ -3399,11 +3490,11 @@ to the current parents may contain changes from multiple commits.
             let scan_repo = snapshot_repo_after_scan(
                 ui,
                 &self.env,
-                &published_repo,
                 &self.user_repo.repo,
                 &workspace_name,
                 &wc_commit,
                 locked_ws.locked_wc(),
+                adoption,
             )
             .await;
             let repo = match scan_repo {
@@ -3695,7 +3786,7 @@ to the current parents may contain changes from multiple commits.
                     git_import_export_lock
                         .reacquire_for_retry()
                         .map_err(saved_snapshot_error)?;
-                    return Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings));
+                    return Err(SnapshotWorkingCopyError::RetryAfterSave(stats.warnings));
                 }
                 let locked_wc = verify_ws.locked_wc();
                 let journal_operation = locked_wc.old_operation_id().clone();
@@ -3726,7 +3817,7 @@ to the current parents may contain changes from multiple commits.
                     )));
                 }
                 if journal_changed || !is_current {
-                    return Err(SnapshotWorkingCopyError::RetryWithWarnings(stats.warnings));
+                    return Err(SnapshotWorkingCopyError::RetryAfterSave(stats.warnings));
                 }
             } else {
                 finish_result.map_err(snapshot_command_error)?;
@@ -4746,20 +4837,20 @@ async fn snapshot_repo_is_current(
 async fn snapshot_repo_after_scan(
     ui: &Ui,
     env: &WorkspaceCommandEnvironment,
-    published_repo: &Arc<ReadonlyRepo>,
     scan_repo: &Arc<ReadonlyRepo>,
     workspace_name: &WorkspaceName,
     wc_commit: &Commit,
     locked_wc: &dyn LockedWorkingCopy,
+    adoption: Option<&SnapshotAdoption<'_>>,
 ) -> Result<Option<Arc<ReadonlyRepo>>, SnapshotWorkingCopyError> {
     let op = env
         .command
-        .resolve_operation(ui, published_repo.loader(), workspace_name)
+        .resolve_operation(ui, scan_repo.loader(), workspace_name)
         .map_err(snapshot_command_error)?;
-    let repo = if op.id() == published_repo.op_id() {
+    let repo = if op.id() == scan_repo.op_id() {
         scan_repo.clone()
     } else {
-        let repo = published_repo
+        let repo = scan_repo
             .loader()
             .load_at(&op)
             .await
@@ -4770,11 +4861,14 @@ async fn snapshot_repo_after_scan(
         // A matching tree and commit ID are insufficient if the journal's
         // operation is now ahead of, or a sibling of, the published head.
         // Retry so the usual stale-working-copy handling can resolve it.
-        if WorkingCopyFreshness::check_stale(locked_wc, wc_commit, &repo)
-            .await
-            .map_err(snapshot_command_error)?
-            != WorkingCopyFreshness::Fresh
-        {
+        let can_scan = if let Some(adoption) = adoption {
+            adoption.can_scan(locked_wc, &repo, workspace_name).await
+        } else {
+            WorkingCopyFreshness::check_stale(locked_wc, wc_commit, &repo)
+                .await
+                .map(|freshness| freshness == WorkingCopyFreshness::Fresh)
+        };
+        if !can_scan.map_err(snapshot_command_error)? {
             return Ok(None);
         }
         #[cfg(feature = "git")]
@@ -6735,8 +6829,90 @@ pub fn shell_quote(s: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory as _;
+    use testutils::TestResult;
+    use testutils::TestWorkspace;
 
     use super::*;
+
+    #[test]
+    fn test_snapshot_adoption_after_concurrent_operation() -> TestResult {
+        let mut ws = TestWorkspace::init();
+        let name = ws.workspace.workspace_name().to_owned();
+        let head = ws
+            .repo
+            .store()
+            .get_commit(ws.repo.view().get_wc_commit_id(&name).unwrap())?;
+        let mut tx = ws.repo.start_transaction();
+        let target = tx.repo_mut().check_out(name.clone(), &head).block_on()?;
+        tx.repo_mut()
+            .set_git_head_target(&name, RefTarget::normal(head.id().clone()));
+        let checkout = tx.commit("record checkout").block_on()?;
+        ws.repo = checkout
+            .start_transaction()
+            .commit("seed adoption")
+            .block_on()?;
+
+        // The copied source contains a file absent from the checkout target.
+        std::fs::write(ws.workspace.workspace_root().join("source"), "copied")?;
+        let seed_tree = ws.snapshot()?;
+        assert_ne!(
+            seed_tree.tree_ids_and_labels(),
+            target.tree().tree_ids_and_labels()
+        );
+        let adoption = SnapshotAdoption {
+            seed_operation: ws.repo.op_id().clone(),
+            seed_tree,
+            working_copy_commit: target.id().clone(),
+            git_head: RefTarget::normal(head.id().clone()),
+            target_tracking_matcher: &NothingMatcher,
+        };
+        let mut locked = ws.workspace.start_working_copy_mutation().block_on()?;
+        let mut can_scan = |repo: &ReadonlyRepo| {
+            adoption
+                .can_scan(locked.locked_wc(), repo, &name)
+                .block_on()
+        };
+        assert!(can_scan(&ws.repo)?);
+
+        let mut tx = ws.repo.start_transaction();
+        tx.repo_mut()
+            .set_local_bookmark_target("other".as_ref(), RefTarget::normal(head.id().clone()));
+        let unrelated = tx.commit("add unrelated bookmark").block_on()?;
+        assert!(can_scan(&unrelated)?);
+
+        let mut tx = unrelated.start_transaction();
+        tx.repo_mut()
+            .rewrite_commit(&target)
+            .set_description("new description")
+            .write()
+            .block_on()?;
+        tx.repo_mut().rebase_descendants().block_on()?;
+        let rewritten = tx.commit("rewrite working-copy commit").block_on()?;
+        assert!(!can_scan(&rewritten)?);
+
+        let mut tx = unrelated.start_transaction();
+        tx.repo_mut()
+            .set_git_head_target(&name, RefTarget::normal(target.id().clone()));
+        let changed_head = tx.commit("move Git HEAD").block_on()?;
+        assert!(!can_scan(&changed_head)?);
+
+        let sibling = checkout
+            .start_transaction()
+            .commit("sibling of adoption")
+            .block_on()?;
+        assert!(!can_scan(&sibling)?);
+        assert!(!can_scan(&checkout)?);
+        let wrong_seed = SnapshotAdoption {
+            seed_tree: target.tree(),
+            ..adoption
+        };
+        assert!(
+            !wrong_seed
+                .can_scan(locked.locked_wc(), &ws.repo, &name)
+                .block_on()?
+        );
+        Ok(())
+    }
 
     #[derive(clap::Parser, Clone, Debug)]
     pub struct TestArgs {
