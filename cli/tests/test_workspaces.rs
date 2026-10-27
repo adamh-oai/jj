@@ -1067,6 +1067,16 @@ fi
         }),
         "snapshot creation must reset tracked files without discovering untracked files"
     );
+    if !colocated_jj {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "cmd_name" && event["name"] == "reset")
+                .count(),
+            1,
+            "snapshot creation must record its reset in the trace"
+        );
+    }
     if scenario == GitSnapshotHandoffScenario::RetainedCursor {
         let lstats = events
             .iter()
@@ -1080,10 +1090,12 @@ fi
             })
             .map(|event| event["value"].as_str().unwrap().parse::<u64>())
             .collect::<Result<Vec<_>, _>>()?;
-        assert!(
-            !lstats.is_empty() && lstats.iter().sum::<u64>() == 0,
-            "a clean logical replay must preserve the copied index's clean bits, not move a full \
-             tracked refresh into creation: {lstats:?}"
+        // Reset can skip preload and refresh entirely. Their statistics may
+        // therefore be absent when the copied index is already clean.
+        assert_eq!(
+            lstats.iter().sum::<u64>(),
+            0,
+            "a clean logical replay must preserve the copied index's clean bits: {lstats:?}"
         );
         assert!(!events.iter().any(|event| matches!(
             event["key"].as_str(),
