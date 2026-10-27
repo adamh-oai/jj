@@ -3905,8 +3905,8 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         "resetting the source JJ workspace must preserve its Git cache-tree extension"
     );
 
-    // The Btrfs clone is only a transfer mechanism. Git must discard every
-    // non-ignored source-side state before exposing the requested target.
+    // Git must reset tracked source changes to the requested target while
+    // retaining copied untracked and ignored files.
     main_dir.write_file("file", "staged source change\n");
     let stage_source = Command::new("git")
         .env("PATH", &path)
@@ -3922,7 +3922,7 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         String::from_utf8_lossy(&stage_source.stderr)
     );
     main_dir.write_file("file", "unstaged source change\n");
-    main_dir.write_file("source-untracked", "discard me\n");
+    main_dir.write_file("source-untracked", "keep me untracked\n");
     let source_journal = std::fs::read(repo_root.join(".jj/working_copy/checkout"))?;
     assert!(source_journal.starts_with(b"\0JJ-WORKING-COPY-STATE\0v1\n"));
 
@@ -3988,9 +3988,10 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         1024 * 1024 + 1,
         "Git must materialize target-only tracked files above JJ's new-file size limit"
     );
-    assert!(
-        !adopted_root.join("source-untracked").exists(),
-        "source untracked files must not leak into the target worktree"
+    assert_eq!(
+        std::fs::read_to_string(adopted_root.join("source-untracked"))?,
+        "keep me untracked\n",
+        "snapshot creation must retain copied untracked files"
     );
     assert_eq!(
         std::fs::read_to_string(repo_root.join("file"))?,
@@ -4281,10 +4282,9 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         "inspect target Git status: {}",
         String::from_utf8_lossy(&adopted_git_status.stderr)
     );
-    assert!(
-        adopted_git_status.stdout.is_empty(),
-        "the target Git worktree must be clean: {}",
-        String::from_utf8_lossy(&adopted_git_status.stdout)
+    assert_eq!(
+        adopted_git_status.stdout, b"?? source-untracked\n",
+        "the target Git worktree must retain copied untracked files and reset tracked changes"
     );
     let adopted_index = Command::new("git")
         .env("PATH", &path)
@@ -4400,6 +4400,10 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
     assert!(
         adopted_status.stdout.raw().contains("A adopted-untracked"),
         "adoption should preserve destination untracked files: {adopted_status}"
+    );
+    assert!(
+        adopted_status.stdout.raw().contains("A source-untracked"),
+        "adoption should preserve copied source untracked files: {adopted_status}"
     );
     assert!(
         !adopted_status.stdout.raw().contains("D target-only-large"),
