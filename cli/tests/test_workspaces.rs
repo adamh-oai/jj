@@ -1039,9 +1039,10 @@ fi
         assert_eq!(std::fs::read_to_string(root.join("one"))?, "after\n");
         assert_eq!(std::fs::read_to_string(root.join("two"))?, "before\n");
         assert!(root.join("after-cut").is_file());
-        assert!(
-            !child.join("after-cut").exists(),
-            "materialization must classify and remove untracked files from the actual child cut"
+        assert_eq!(
+            std::fs::read_to_string(child.join("after-cut"))?,
+            "new after source cut\n",
+            "snapshot creation must retain untracked files from the actual child cut"
         );
     }
     if scenario == GitSnapshotHandoffScenario::MissingCursor {
@@ -1050,13 +1051,23 @@ fi
             "unobserved edit\n"
         );
         assert!(root.join("without-cursor").is_file());
-        assert!(!child.join("without-cursor").exists());
+        assert_eq!(
+            std::fs::read_to_string(child.join("without-cursor"))?,
+            "unobserved new file\n"
+        );
     }
+    let events = std::fs::read_to_string(&creation_trace)?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        !events.iter().any(|event| {
+            event["event"] == "cmd_name"
+                && matches!(event["name"].as_str(), Some("ls-files" | "status"))
+        }),
+        "snapshot creation must reset tracked files without discovering untracked files"
+    );
     if scenario == GitSnapshotHandoffScenario::RetainedCursor {
-        let events = std::fs::read_to_string(&creation_trace)?
-            .lines()
-            .map(serde_json::from_str::<serde_json::Value>)
-            .collect::<Result<Vec<_>, _>>()?;
         let lstats = events
             .iter()
             .filter(|event| {
@@ -1180,10 +1191,14 @@ fi
         return Ok(());
     }
     let child_status = run(git_command(&child).args(["status", "--porcelain=v1"]))?;
-    assert!(
-        child_status.stdout.is_empty(),
-        "snapshot child must be clean before further Git/JJ activity:\n{}",
-        String::from_utf8_lossy(&child_status.stdout)
+    let expected_status = match scenario {
+        GitSnapshotHandoffScenario::ConcurrentChanges => b"?? after-cut\n".as_slice(),
+        GitSnapshotHandoffScenario::MissingCursor => b"?? without-cursor\n".as_slice(),
+        _ => b"".as_slice(),
+    };
+    assert_eq!(
+        child_status.stdout, expected_status,
+        "snapshot child must retain untracked files and reset all tracked changes"
     );
     let GitFsmonitorStatus::Baseline(child_baseline) =
         inspect_git_index(&gix::open(&child)?.git_dir().join("index"))?.fsmonitor
