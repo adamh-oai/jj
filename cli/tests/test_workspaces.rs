@@ -4401,9 +4401,10 @@ fn test_util_subvolume_enable_disable_real_btrfs_awacs() -> TestResult {
         adopted_status.stdout.raw().contains("A adopted-untracked"),
         "adoption should preserve destination untracked files: {adopted_status}"
     );
-    assert!(
-        adopted_status.stdout.raw().contains("A source-untracked"),
-        "adoption should preserve copied source untracked files: {adopted_status}"
+    assert_eq!(
+        std::fs::read_to_string(adopted_root.join("source-untracked"))?,
+        "keep me untracked\n",
+        "adoption must retain copied source untracked files on disk"
     );
     assert!(
         !adopted_status.stdout.raw().contains("D target-only-large"),
