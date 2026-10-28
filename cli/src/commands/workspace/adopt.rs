@@ -77,6 +77,7 @@ struct ExistingGitWorktree {
     git_dir: PathBuf,
     common_dir: PathBuf,
     head_id: CommitId,
+    git_repo: gix::Repository,
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
@@ -119,7 +120,7 @@ pub async fn cmd_workspace_adopt(
     command: &CommandHelper,
     args: &WorkspaceAdoptArgs,
 ) -> Result<(), CommandError> {
-    let worktree = adoption_phase!(
+    let mut worktree = adoption_phase!(
         "discover_git_worktree",
         discover_linked_git_worktree(command.cwd())
     )?;
@@ -289,11 +290,20 @@ pub async fn cmd_workspace_adopt(
         "lookup_git_head",
         repo.index().has_id(&worktree.head_id).await
     )? {
-        adoption_phase!(
-            "import_git_head",
-            git_backend.import_head_commits([&worktree.head_id])
-        )
-        .map_err(|err| user_error(format!("Failed to import Git HEAD: {err}")))?;
+        // Known JJ commits need only a reference read. Unknown targets can be
+        // annotated tags, so retain Git's existing peeling and import behavior.
+        worktree.head_id = adoption_phase!("resolve_git_head", worktree.git_repo.head_id())
+            .map(|id| CommitId::from_bytes(id.as_bytes()))
+            .map_err(|err| {
+                user_error(format!("Cannot adopt a Git worktree without HEAD: {err}"))
+            })?;
+        if !repo.index().has_id(&worktree.head_id).await? {
+            adoption_phase!(
+                "import_git_head",
+                git_backend.import_head_commits([&worktree.head_id])
+            )
+            .map_err(|err| user_error(format!("Failed to import Git HEAD: {err}")))?;
+        }
     }
     let head_commit = adoption_phase!(
         "load_git_head_commit",
@@ -531,15 +541,20 @@ fn discover_linked_git_worktree(cwd: &Path) -> Result<ExistingGitWorktree, Comma
             "Cannot adopt the main Git worktree; run this from a linked Git worktree",
         ));
     }
-    let head_id = repo
-        .head_id()
-        .map(|id| CommitId::from_bytes(id.as_bytes()))
-        .map_err(|err| user_error(format!("Cannot adopt a Git worktree without HEAD: {err}")))?;
+    let head_id = if let Some(id) = repo.head().ok().and_then(|head| head.id()) {
+        CommitId::from_bytes(id.as_bytes())
+    } else {
+        // Keep the existing diagnostics for unreadable or unborn HEAD.
+        repo.head_id()
+            .map(|id| CommitId::from_bytes(id.as_bytes()))
+            .map_err(|err| user_error(format!("Cannot adopt a Git worktree without HEAD: {err}")))?
+    };
     Ok(ExistingGitWorktree {
         root,
         git_dir,
         common_dir,
         head_id,
+        git_repo: repo,
     })
 }
 

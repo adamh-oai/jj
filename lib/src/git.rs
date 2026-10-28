@@ -1249,6 +1249,17 @@ pub async fn import_head(
         .map_err(GitImportError::from_git)?;
 
     let old_git_head = mut_repo.view().git_head(workspace_name);
+    // A previously imported commit needs no object lookup when HEAD still
+    // points directly to it. Peeling even a commit can open every pack index.
+    // Keep peeling other targets, including annotated tags and symbolic chains.
+    if let Some(old_head_id) = old_git_head.as_normal()
+        && let Ok(head) = git_repo.head()
+        && head
+            .id()
+            .is_some_and(|id| id.as_bytes() == old_head_id.as_bytes())
+    {
+        return Ok(());
+    }
     let new_git_head_id = if let Ok(oid) = git_repo.head_id() {
         Some(CommitId::from_bytes(oid.as_bytes()))
     } else {

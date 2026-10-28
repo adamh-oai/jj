@@ -2930,6 +2930,74 @@ fn test_workspaces_adopt_existing_colocated_git_worktree() -> TestResult {
     Ok(())
 }
 
+#[test_case::test_case(false; "symbolic_tag")]
+#[test_case::test_case(true; "detached_tag")]
+fn test_workspaces_adopt_peels_annotated_git_head(detached: bool) -> TestResult {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main_dir = test_env.work_dir("main");
+    let worktree_dir = test_env.work_dir("worktree");
+    main_dir.write_file("file", "contents\n");
+    main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "tag",
+            "-a",
+            "adoption-tag",
+            "-m",
+            "annotated target",
+            "HEAD",
+        ])
+        .current_dir(main_dir.root())
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-path", "HEAD"])
+        .current_dir(worktree_dir.root())
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    let head_path = std::path::PathBuf::from(String::from_utf8(output.stdout)?.trim_end());
+    let head_contents = if detached {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "refs/tags/adoption-tag"])
+            .current_dir(main_dir.root())
+            .output()?;
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    } else {
+        b"ref: refs/tags/adoption-tag\n".to_vec()
+    };
+    std::fs::write(&head_path, &head_contents)?;
+    worktree_dir
+        .run_jj(["workspace", "adopt", "--name", "adopted"])
+        .success();
+    let parent = worktree_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@-",
+            "--no-graph",
+            "-Tdescription",
+        ])
+        .success();
+    assert_eq!(parent.stdout.raw(), "initial\n");
+    assert_eq!(worktree_dir.read_file("file"), "contents\n");
+    assert_eq!(std::fs::read(&head_path)?, head_contents);
+    Ok(())
+}
+
 #[test]
 fn test_workspaces_adopt_rejects_main_git_worktree() {
     let test_env = TestEnvironment::default();

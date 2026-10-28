@@ -2671,6 +2671,209 @@ fn test_import_refs_missing_git_commit() -> TestResult {
     Ok(())
 }
 
+#[test_case(false; "symbolic_head")]
+#[test_case(true; "detached_head")]
+fn test_import_head_unchanged_and_changed(detached: bool) -> TestResult {
+    let test_workspace = TestWorkspace::init_colocated_git();
+    let repo = &test_workspace.repo;
+    let git_repo = get_git_repo(repo);
+    let workspace = &test_workspace.workspace;
+    let workspace_name = workspace.workspace_name();
+    let commit1 = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    if detached {
+        testutils::git::set_head_to_id(&git_repo, commit1);
+    } else {
+        testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/main");
+    }
+
+    let mut tx = repo.start_transaction();
+    import_head(tx.repo_mut(), workspace)?;
+    let repo = tx.commit("import initial HEAD").block_on()?;
+    let mut tx = repo.start_transaction();
+    import_head(tx.repo_mut(), workspace)?;
+    assert!(!tx.repo().has_changes());
+    assert_eq!(
+        tx.repo().view().git_head(workspace_name),
+        &RefTarget::normal(jj_id(commit1))
+    );
+
+    // A changed direct ID must still import the new commit.
+    let commit2 = empty_git_commit(&git_repo, "refs/heads/main", &[commit1]);
+    if detached {
+        testutils::git::set_head_to_id(&git_repo, commit2);
+    }
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(
+        tx.repo().view().git_head(workspace_name),
+        &RefTarget::normal(jj_id(commit2))
+    );
+    assert!(tx.repo().index().has_id(&jj_id(commit2)).block_on()?);
+    assert!(tx.repo().view().heads().contains(&jj_id(commit2)));
+    let view = tx.repo().view().clone();
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(tx.repo().view(), &view);
+    Ok(())
+}
+
+#[test_case(false; "symbolic_head")]
+#[test_case(true; "detached_head")]
+fn test_import_head_peels_annotated_tags(detached: bool) -> TestResult {
+    let test_workspace = TestWorkspace::init_colocated_git();
+    let repo = &test_workspace.repo;
+    let git_repo = get_git_repo(repo);
+    let workspace = &test_workspace.workspace;
+    let workspace_name = workspace.workspace_name();
+    let commit1 = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    testutils::git::set_head_to_id(&git_repo, commit1);
+    let mut tx = repo.start_transaction();
+    import_head(tx.repo_mut(), workspace)?;
+
+    let commit2 = empty_git_commit(&git_repo, "refs/heads/main", &[commit1]);
+    let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
+    let tag1 = git_repo
+        .tag(
+            "inner",
+            commit2,
+            gix::object::Kind::Commit,
+            None,
+            "",
+            constraint.clone(),
+        )?
+        .id()
+        .detach();
+    let tag2 = git_repo
+        .tag("outer", tag1, gix::object::Kind::Tag, None, "", constraint)?
+        .id()
+        .detach();
+    if detached {
+        testutils::git::set_head_to_id(&git_repo, tag2);
+    } else {
+        testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/tags/outer");
+    }
+    assert_eq!(git_repo.head()?.id().unwrap(), tag2);
+
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(
+        tx.repo().view().git_head(workspace_name),
+        &RefTarget::normal(jj_id(commit2))
+    );
+    assert!(tx.repo().index().has_id(&jj_id(commit2)).block_on()?);
+    let view = tx.repo().view().clone();
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(tx.repo().view(), &view);
+    Ok(())
+}
+
+#[test]
+fn test_import_head_unborn() -> TestResult {
+    let test_workspace = TestWorkspace::init_colocated_git();
+    let repo = &test_workspace.repo;
+    let git_repo = get_git_repo(repo);
+    let workspace = &test_workspace.workspace;
+    let workspace_name = workspace.workspace_name();
+    testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/unborn");
+    let mut tx = repo.start_transaction();
+    import_head(tx.repo_mut(), workspace)?;
+    assert!(!tx.repo().has_changes());
+    assert!(tx.repo().view().git_head(workspace_name).is_absent());
+
+    let commit = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    testutils::git::set_head_to_id(&git_repo, commit);
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(
+        tx.repo().view().git_head(workspace_name),
+        &RefTarget::normal(jj_id(commit))
+    );
+
+    testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/unborn");
+    import_head(tx.repo_mut(), workspace)?;
+    assert!(tx.repo().view().git_head(workspace_name).is_absent());
+    assert!(tx.repo().view().heads().contains(&jj_id(commit)));
+    let view = tx.repo().view().clone();
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(tx.repo().view(), &view);
+    Ok(())
+}
+
+#[test]
+fn test_import_head_resolves_conflicted_recorded_target() -> TestResult {
+    let test_workspace = TestWorkspace::init_colocated_git();
+    let repo = &test_workspace.repo;
+    let git_repo = get_git_repo(repo);
+    let workspace = &test_workspace.workspace;
+    let workspace_name = workspace.workspace_name();
+    let commit1 = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    let commit2 = empty_git_commit(&git_repo, "refs/heads/main", &[commit1]);
+    testutils::git::set_head_to_id(&git_repo, commit1);
+    let mut tx = repo.start_transaction();
+    tx.repo_mut().set_git_head_target(
+        workspace_name,
+        RefTarget::from_legacy_form([], [jj_id(commit1), jj_id(commit2)]),
+    );
+
+    // Matching one side of an unresolved target must not take the shortcut.
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(
+        tx.repo().view().git_head(workspace_name),
+        &RefTarget::normal(jj_id(commit1))
+    );
+    Ok(())
+}
+
+#[test]
+fn test_import_head_trusts_unchanged_id_with_missing_object() -> TestResult {
+    let test_workspace = TestWorkspace::init_colocated_git();
+    let repo = &test_workspace.repo;
+    let git_repo = get_git_repo(repo);
+    let workspace = &test_workspace.workspace;
+    let commit = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    testutils::git::set_head_to_id(&git_repo, commit);
+    let mut tx = repo.start_transaction();
+    import_head(tx.repo_mut(), workspace)?;
+    let view = tx.repo().view().clone();
+
+    let shard = hex_util::encode_hex(&commit.as_bytes()[..1]);
+    let basename = hex_util::encode_hex(&commit.as_bytes()[1..]);
+    fs::remove_file(git_repo.path().join("objects").join(shard).join(basename))?;
+    // A fresh object-dependent lookup fails. Importing an unchanged reference
+    // intentionally trusts the already-recorded commit without that lookup.
+    assert!(testutils::git::open(git_repo.path()).head_id().is_err());
+    import_head(tx.repo_mut(), workspace)?;
+    assert_eq!(tx.repo().view(), &view);
+    assert_eq!(
+        tx.repo().view().git_head(workspace.workspace_name()),
+        &RefTarget::normal(jj_id(commit))
+    );
+    Ok(())
+}
+
+#[test_case(false; "malformed_head")]
+#[test_case(true; "missing_head_object")]
+fn test_import_head_unreadable_target(missing_object: bool) -> TestResult {
+    let test_workspace = TestWorkspace::init_colocated_git();
+    let repo = &test_workspace.repo;
+    let git_repo = get_git_repo(repo);
+    let workspace = &test_workspace.workspace;
+    let workspace_name = workspace.workspace_name();
+    let commit = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    testutils::git::set_head_to_id(&git_repo, commit);
+    let mut tx = repo.start_transaction();
+    import_head(tx.repo_mut(), workspace)?;
+
+    if missing_object {
+        let missing_id = gix::ObjectId::from_hex(b"1111111111111111111111111111111111111111")?;
+        testutils::git::set_head_to_id(&git_repo, missing_id);
+    } else {
+        fs::write(git_repo.path().join("HEAD"), b"not a reference\n")?;
+    }
+    // Keep the existing treatment of a HEAD that cannot be resolved.
+    assert!(git_repo.head_id().is_err());
+    import_head(tx.repo_mut(), workspace)?;
+    assert!(tx.repo().view().git_head(workspace_name).is_absent());
+    assert!(tx.repo().view().heads().contains(&jj_id(commit)));
+    Ok(())
+}
+
 #[test]
 fn test_import_refs_detached_head() -> TestResult {
     let test_workspace = TestWorkspace::init_colocated_git();
