@@ -599,7 +599,7 @@ impl CommandHelper {
             .is_working_copy_writable()
             .then(|| env.lock_git_import_export(&workspace))
             .transpose()?;
-        let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
+        let mut workspace_command = self.load_from_workspace(ui, workspace, env, false).await?;
         let Some(git_import_export_lock) = git_import_export_lock else {
             return Ok((workspace_command, SnapshotStats::default(), false));
         };
@@ -647,7 +647,7 @@ impl CommandHelper {
     ) -> Result<WorkspaceCommandHelper, CommandError> {
         let workspace = self.load_workspace()?;
         let env = self.workspace_environment(ui, &workspace)?;
-        self.load_from_workspace(ui, workspace, env).await
+        self.load_from_workspace(ui, workspace, env, false).await
     }
 
     /// Loads a workspace at another root without snapshotting it.
@@ -668,20 +668,76 @@ impl CommandHelper {
         let env = self.workspace_environment(ui, &workspace)?;
         phase.finish(true);
         let phase = WorkspaceAdoptionPhase::start(true, "reload workspace repository");
-        let result = self.load_from_workspace(ui, workspace, env).await;
+        let result = self.load_from_workspace(ui, workspace, env, true).await;
         phase.finish(result.is_ok());
         result
+    }
+
+    /// Reuses the workspace and repository created by adoption when their
+    /// settings match the command. Otherwise, reloads with the command settings.
+    /// Neither path snapshots the working copy.
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    pub(crate) async fn workspace_helper_no_snapshot_from_repo(
+        &self,
+        ui: &Ui,
+        workspace: Workspace,
+        repo: Arc<ReadonlyRepo>,
+    ) -> Result<WorkspaceCommandHelper, CommandError> {
+        let reuse_initialized_workspace = workspace
+            .settings()
+            .config()
+            .get::<toml::Value>(ConfigNamePathBuf::root())?
+            == self
+                .settings()
+                .config()
+                .get::<toml::Value>(ConfigNamePathBuf::root())?;
+        tracing::info!(
+            phase = "reuse_initialized_workspace",
+            reuse_initialized_workspace,
+            "Checked initialized workspace settings"
+        );
+        if !reuse_initialized_workspace {
+            // Store and working-copy settings came from the source workspace.
+            // Reload all of them with the settings the child used before reuse.
+            let workspace_root = workspace.workspace_root().to_owned();
+            drop(workspace);
+            drop(repo);
+            return self
+                .workspace_helper_no_snapshot_at(ui, &workspace_root)
+                .await;
+        }
+        let phase = WorkspaceAdoptionPhase::start(true, "reload workspace environment");
+        let env = self.workspace_environment(ui, &workspace)?;
+        phase.finish(true);
+        self.helper_from_loaded_repo(ui, workspace, repo, env, true)
     }
 
     async fn load_from_workspace(
         &self,
         ui: &Ui,
         workspace: Workspace,
-        mut env: WorkspaceCommandEnvironment,
+        env: WorkspaceCommandEnvironment,
+        profile_reload: bool,
     ) -> Result<WorkspaceCommandHelper, CommandError> {
+        let phase = WorkspaceAdoptionPhase::start(profile_reload, "resolve reload operation");
         let op_head =
             self.resolve_operation(ui, workspace.repo_loader(), workspace.workspace_name())?;
+        phase.finish(true);
+        let phase = WorkspaceAdoptionPhase::start(profile_reload, "load reload repository");
         let repo = workspace.repo_loader().load_at(&op_head).await?;
+        phase.finish(true);
+        self.helper_from_loaded_repo(ui, workspace, repo, env, profile_reload)
+    }
+
+    fn helper_from_loaded_repo(
+        &self,
+        ui: &Ui,
+        workspace: Workspace,
+        repo: Arc<ReadonlyRepo>,
+        mut env: WorkspaceCommandEnvironment,
+        profile_reload: bool,
+    ) -> Result<WorkspaceCommandHelper, CommandError> {
+        let phase = WorkspaceAdoptionPhase::start(profile_reload, "resolve reload trunk");
         if let Err(err) =
             revset_util::try_resolve_trunk_alias(repo.as_ref(), &env.revset_parse_context())
         {
@@ -705,8 +761,16 @@ impl CommandHelper {
                 .expect("valid syntax");
             env.reload_revset_expressions(ui)?;
         }
+        phase.finish(true);
         let may_snapshot_working_copy = self.is_working_copy_writable();
-        WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy)
+        WorkspaceCommandHelper::new(
+            ui,
+            workspace,
+            repo,
+            env,
+            may_snapshot_working_copy,
+            profile_reload,
+        )
     }
 
     pub fn get_working_copy_factory(&self) -> Result<&dyn WorkingCopyFactory, CommandError> {
@@ -808,6 +872,7 @@ impl CommandHelper {
                     repo,
                     env,
                     may_snapshot_working_copy,
+                    false,
                 )?;
                 workspace_command.check_working_copy_writable()?;
 
@@ -831,7 +896,8 @@ impl CommandHelper {
                 let stale_wc_commit = workspace_command.get_wc_commit().await?.unwrap();
 
                 let WorkspaceCommandHelper { workspace, env, .. } = workspace_command;
-                let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
+                let mut workspace_command =
+                    self.load_from_workspace(ui, workspace, env, false).await?;
                 let repo = &workspace_command.user_repo.repo;
                 let desired_wc_commit = workspace_command.prepare_working_copy_mutation().await?;
                 let mut locked_ws = workspace_command
@@ -934,7 +1000,8 @@ impl CommandHelper {
                      message from read attempt: {e}"
                 )?;
 
-                let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
+                let mut workspace_command =
+                    self.load_from_workspace(ui, workspace, env, false).await?;
                 let stats = workspace_command
                     .create_and_check_out_recovery_commit(ui, git_import_export_lock)
                     .await?;
@@ -962,7 +1029,7 @@ impl CommandHelper {
             .load_operation(expected_working_copy_operation)
             .await?;
         let repo = workspace.repo_loader().load_at(&op).await?;
-        let mut helper = WorkspaceCommandHelper::new(ui, workspace, repo, env, true)?;
+        let mut helper = WorkspaceCommandHelper::new(ui, workspace, repo, env, true, false)?;
         helper.check_working_copy_writable()?;
         let stats = helper
             .snapshot_working_copy(
@@ -1057,7 +1124,7 @@ impl CommandHelper {
         // No is_at_head_operation() check here because the repo isn't loaded at
         // the specified operation.
         let may_snapshot_working_copy = !self.global_args().ignore_working_copy;
-        WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy)
+        WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy, false)
     }
 }
 
@@ -1185,13 +1252,13 @@ impl WorkspaceCommandEnvironment {
             base: workspace.workspace_root().to_owned(),
         };
         #[cfg(feature = "git")]
-        let working_copy_shared_with_git = crate::git_util::is_colocated_git_workspace(workspace)?;
+        let git_repo = crate::git_util::open_workspace_git_repo(workspace)?;
+        #[cfg(feature = "git")]
+        let working_copy_shared_with_git = git_repo.is_some();
         #[cfg(not(feature = "git"))]
         let working_copy_shared_with_git = false;
         #[cfg(feature = "git")]
-        let git_dir = working_copy_shared_with_git
-            .then(|| crate::git_util::workspace_git_dir(workspace))
-            .flatten();
+        let git_dir = git_repo.and_then(|repo| dunce::canonicalize(repo.path()).ok());
         let mut env = Self {
             command: command.clone(),
             settings: settings.clone(),
@@ -1694,7 +1761,7 @@ fn awacs_external_input(path: Option<PathBuf>) -> Result<AwacsExternalInput, Com
 }
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
-fn encode_sparse_state(patterns: Option<Vec<RepoPathBuf>>) -> Vec<u8> {
+fn encode_sparse_state(patterns: Option<&[RepoPathBuf]>) -> Vec<u8> {
     let Some(patterns) = patterns else {
         return b"disabled".to_vec();
     };
@@ -1725,6 +1792,7 @@ impl WorkspaceCommandHelper {
         repo: Arc<ReadonlyRepo>,
         env: WorkspaceCommandEnvironment,
         may_snapshot_working_copy: bool,
+        profile_reload: bool,
     ) -> Result<Self, CommandError> {
         let settings = workspace.settings();
         let commit_summary_template_text = settings.get_string("templates.commit_summary")?;
@@ -1743,9 +1811,22 @@ impl WorkspaceCommandHelper {
         };
         // Parse commit_summary template early to report error before starting
         // mutable operation.
+        let phase =
+            WorkspaceAdoptionPhase::start(profile_reload, "validate reload operation template");
         helper.parse_operation_template(ui, &helper.op_summary_template_text)?;
-        helper.parse_commit_template(ui, &helper.commit_summary_template_text)?;
-        helper.parse_commit_template(ui, SHORT_CHANGE_ID_TEMPLATE_TEXT)?;
+        phase.finish(true);
+        let phase =
+            WorkspaceAdoptionPhase::start(profile_reload, "validate reload commit template");
+        // Both templates use the same view and aliases. Reuse their keyword
+        // cache, but rebuild the language when a new helper loads another view.
+        let language = helper.commit_template_language();
+        helper.parse_template::<Commit, _>(ui, &language, &helper.commit_summary_template_text)?;
+        phase.finish(true);
+        let phase =
+            WorkspaceAdoptionPhase::start(profile_reload, "validate reload change ID template");
+        helper.parse_template::<Commit, _>(ui, &language, SHORT_CHANGE_ID_TEMPLATE_TEXT)?;
+        phase.finish(true);
+        drop(language);
         Ok(helper)
     }
 
@@ -1818,8 +1899,7 @@ impl WorkspaceCommandHelper {
             // Check the baseline before Git HEAD import, which can update the
             // repository and journal. Never wait for the journal while holding
             // the shared lock: another process may be scanning this worktree.
-            let phase =
-                WorkspaceAdoptionPhase::start(adoption.is_some(), "snapshot preflight");
+            let phase = WorkspaceAdoptionPhase::start(adoption.is_some(), "snapshot preflight");
             let preflight_ready = if self
                 .workspace_root()
                 .join(".jj/working_copy/subvolume_mode")
@@ -1925,8 +2005,7 @@ impl WorkspaceCommandHelper {
                     let journal_ahead = if adoption.is_some() {
                         // Adoption already registered this Git HEAD. Importing a
                         // different HEAD would replace the checkout being adopted.
-                        let phase =
-                            WorkspaceAdoptionPhase::start(true, "verify adopted Git HEAD");
+                        let phase = WorkspaceAdoptionPhase::start(true, "verify adopted Git HEAD");
                         if !snapshot_git_head_is_current(
                             &self.env,
                             self.repo(),
@@ -2731,6 +2810,18 @@ to the current parents may contain changes from multiple commits.
         if max_new_file_size == 0 {
             max_new_file_size = u64::MAX;
         }
+        // Use one read for both the scan and its fingerprint. Each options
+        // build reads again, including after a wait or snapshot retry.
+        #[cfg(feature = "git")]
+        let external_sparse_patterns = if let Some(git_dir) = &self.env.git_dir {
+            jj_lib::git::sparse_patterns_in_git_dir(self.repo().as_ref(), git_dir)?
+        } else if self.working_copy_shared_with_git() {
+            jj_lib::git::sparse_patterns_in_workdir(self.repo().as_ref(), self.workspace_root())?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "git"))]
+        let external_sparse_patterns = None;
         #[cfg(all(target_os = "linux", feature = "awacs"))]
         let (awacs_input_fingerprint, awacs_eol_fingerprint) = if cfg!(debug_assertions)
             && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_some()
@@ -2742,7 +2833,12 @@ to the current parents may contain changes from multiple commits.
                 .workspace_root()
                 .join(".jj/working_copy/subvolume_mode")
                 .is_file()
-                .then(|| self.awacs_input_fingerprints(max_new_file_size))
+                .then(|| {
+                    self.awacs_input_fingerprints(
+                        max_new_file_size,
+                        external_sparse_patterns.as_deref(),
+                    )
+                })
                 .transpose()?;
             match fingerprint {
                 Some((current, eol)) => (Some(current), Some(eol)),
@@ -2757,16 +2853,6 @@ to the current parents may contain changes from multiple commits.
         let scan_root_ignores = self.scan_root_git_excludes_path().into_iter().collect();
         #[cfg(not(feature = "git"))]
         let scan_root_ignores = vec![];
-        #[cfg(feature = "git")]
-        let external_sparse_patterns = if let Some(git_dir) = &self.env.git_dir {
-            jj_lib::git::sparse_patterns_in_git_dir(self.repo().as_ref(), git_dir)?
-        } else if self.working_copy_shared_with_git() {
-            jj_lib::git::sparse_patterns_in_workdir(self.repo().as_ref(), self.workspace_root())?
-        } else {
-            None
-        };
-        #[cfg(not(feature = "git"))]
-        let external_sparse_patterns = None;
         Ok(SnapshotOptions {
             base_ignores,
             scan_root_ignores,
@@ -2785,6 +2871,7 @@ to the current parents may contain changes from multiple commits.
     fn awacs_input_fingerprints(
         &self,
         max_new_file_size: u64,
+        external_sparse_patterns: Option<&[RepoPathBuf]>,
     ) -> Result<([u8; 32], Vec<u8>), CommandError> {
         let config = self.settings().config();
         let sparse_patterns = self
@@ -2827,22 +2914,14 @@ to the current parents may contain changes from multiple commits.
                 awacs_external_input(self.selected_git_excludes_path())?
             };
             let git_info_exclude = awacs_external_input(self.git_info_exclude_path())?;
-            let git_sparse = if let Some(git_dir) = &self.env.git_dir {
-                jj_lib::git::sparse_patterns_in_git_dir(self.repo().as_ref(), git_dir)?
-            } else if self.working_copy_shared_with_git() {
-                jj_lib::git::sparse_patterns_in_workdir(
-                    self.repo().as_ref(),
-                    self.workspace_root(),
-                )?
-            } else {
-                None
-            };
             (
                 core_excludes,
                 git_info_exclude,
-                encode_sparse_state(git_sparse),
+                encode_sparse_state(external_sparse_patterns),
             )
         };
+        #[cfg(not(feature = "git"))]
+        let _ = external_sparse_patterns;
         #[cfg(not(feature = "git"))]
         let (core_excludes, git_info_exclude, git_sparse) = (
             awacs_external_input(None)?,
@@ -3345,8 +3424,7 @@ to the current parents may contain changes from multiple commits.
         let working_copy_type = self.working_copy().name().to_owned();
         let repo = self.repo().clone();
         let mut can_release_lock = can_release_lock && git_import_export_lock.path.is_some();
-        let phase =
-            WorkspaceAdoptionPhase::start(adoption.is_some(), "prepare snapshot options");
+        let phase = WorkspaceAdoptionPhase::start(adoption.is_some(), "prepare snapshot options");
         // Snapshot options can depend on cached sparse patterns. Check them
         // against the locked journal before scanning, including after a retry.
         // Some custom working copies do not support sparse patterns; retain
@@ -3375,7 +3453,10 @@ to the current parents may contain changes from multiple commits.
         #[cfg(all(target_os = "linux", feature = "awacs"))]
         if force_awacs_input_fingerprint && options.awacs_input_fingerprint.is_none() {
             let (current, eol) = self
-                .awacs_input_fingerprints(options.max_new_file_size)
+                .awacs_input_fingerprints(
+                    options.max_new_file_size,
+                    options.external_sparse_patterns.as_deref(),
+                )
                 .map_err(snapshot_command_error)?;
             options.awacs_input_fingerprint = Some(current);
             options.awacs_eol_fingerprint = Some(eol);

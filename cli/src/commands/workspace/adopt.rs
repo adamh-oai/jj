@@ -165,6 +165,20 @@ pub async fn cmd_workspace_adopt(
         ));
     }
     let snapshot = is_subvolume_mode_enabled(main_workspace_root);
+    // Reject read-only operation modes before registering this name. A past
+    // operation can predate a workspace that is registered in the current head.
+    if snapshot && (!command.is_working_copy_writable() || !command.should_commit_transaction()) {
+        let hint = if command.global_args().ignore_working_copy {
+            "Don't use --ignore-working-copy."
+        } else if command.global_args().no_integrate_operation {
+            "Don't use --no-integrate-operation."
+        } else {
+            "Don't use --at-op."
+        };
+        return Err(
+            user_error("This command must be able to update the working copy.").hinted(hint),
+        );
+    }
     if snapshot && !is_btrfs_subvolume(&worktree.root)? {
         return Err(user_error(
             "Cannot adopt a plain Git worktree while Btrfs subvolume mode is enabled",
@@ -286,17 +300,7 @@ pub async fn cmd_workspace_adopt(
         repo.store().get_commit_async(&worktree.head_id).await
     )?;
     let working_copy_factory = command.get_working_copy_factory_at(main_workspace_root)?;
-    let (mut workspace, repo) = adoption_phase!(
-        "initialize_workspace",
-        Workspace::init_workspace_with_existing_repo(
-            &worktree.root,
-            main_workspace.repo_path(),
-            &repo,
-            working_copy_factory,
-            workspace_name.clone(),
-        )
-        .await
-    )?;
+    let mut workspace_metadata_owned = false;
 
     macro_rules! adoption_try {
         ($result:expr) => {
@@ -310,6 +314,7 @@ pub async fn cmd_workspace_adopt(
                         workspace_store.as_ref(),
                         &worktree.root,
                         &workspace_name,
+                        workspace_metadata_owned,
                     )
                     .await
                     {
@@ -324,20 +329,9 @@ pub async fn cmd_workspace_adopt(
         };
     }
 
-    if snapshot {
-        #[cfg(all(target_os = "linux", feature = "awacs"))]
-        adoption_try!(adoption_phase!(
-            "begin_snapshot_mode",
-            begin_subvolume_mode(&worktree.root)
-        ));
-        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
-        adoption_try!(set_subvolume_mode(&worktree.root, true));
-    }
-
-    // `init_workspace_with_existing_repo()` starts at the root commit. Replace
-    // that placeholder with an empty working-copy commit on the existing Git
-    // HEAD, then reset only jj's working-copy metadata. The files and Git index
-    // are already materialized by Git and must not be checked out again.
+    // Register the final working-copy commit before initializing its metadata.
+    // Git already materialized the files and index, so adoption needs no
+    // placeholder commit or filesystem checkout.
     let mut tx = repo.start_transaction();
     let wc_commit = adoption_try!(adoption_phase!(
         "checkout_adopted_commit",
@@ -368,17 +362,38 @@ pub async fn cmd_workspace_adopt(
         unpublished.leave_unpublished()
     };
 
+    let mut workspace = adoption_try!(adoption_phase!(
+        "initialize_workspace",
+        Workspace::init_workspace_with_registered_working_copy(
+            &worktree.root,
+            main_workspace.repo_path(),
+            &repo,
+            working_copy_factory,
+            workspace_name.clone(),
+        )
+    ));
+    workspace_metadata_owned = true;
+
+    if snapshot {
+        #[cfg(all(target_os = "linux", feature = "awacs"))]
+        adoption_try!(adoption_phase!(
+            "begin_snapshot_mode",
+            begin_subvolume_mode(&worktree.root)
+        ));
+        #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+        adoption_try!(set_subvolume_mode(&worktree.root, true));
+    }
+
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     if snapshot {
         let pending_jj_seed = pending_jj_seed.expect("snapshot adoption validated pending seed");
-        // Workspace initialization happened before the marker existed and
-        // therefore owns the ordinary working-copy implementation. Reload
-        // after the marker is durable so the compact journal is selected.
-        drop(workspace);
+        // The first working-copy mutation reloads the compact journal after
+        // seeing the marker. Reuse the workspace and repository already loaded
+        // by adoption instead of reopening their stores and operation history.
         let mut workspace_command = adoption_try!(adoption_phase!(
-            "reload_snapshot_workspace",
+            "prepare_snapshot_workspace",
             command
-                .workspace_helper_no_snapshot_at(ui, &worktree.root)
+                .workspace_helper_no_snapshot_from_repo(ui, workspace, repo)
                 .await
         ));
         // The pending tree describes immutable child snapshot A. Git may have
@@ -464,6 +479,7 @@ async fn rollback_failed_adoption(
     workspace_store: &dyn WorkspaceStore,
     worktree_root: &Path,
     workspace_name: &WorkspaceNameBuf,
+    remove_workspace_metadata: bool,
 ) -> Result<(), CommandError> {
     let repo = main_workspace.repo_loader().load_at_head().await?;
     if repo.view().get_wc_commit_id(workspace_name).is_some() {
@@ -483,6 +499,9 @@ async fn rollback_failed_adoption(
         }
     }
     workspace_store.forget(&[workspace_name.as_ref()])?;
+    if !remove_workspace_metadata {
+        return Ok(());
+    }
     let jj_dir = worktree_root.join(".jj");
     match remove_directory_tree(&jj_dir) {
         Ok(()) => {}

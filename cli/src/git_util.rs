@@ -67,21 +67,24 @@ use crate::ui::ProgressOutput;
 use crate::ui::Ui;
 
 pub fn workspace_git_dir(workspace: &Workspace) -> Option<PathBuf> {
-    let git_backend = git::get_git_backend(workspace.repo_loader().store()).ok()?;
-    let git_repo = git_backend
-        .open_git_repo_at_workdir(workspace.workspace_root())
-        .ok()?;
+    let git_repo = open_workspace_git_repo(workspace).ok()??;
     dunce::canonicalize(git_repo.path()).ok()
 }
 
 pub fn is_colocated_git_workspace(workspace: &Workspace) -> Result<bool, CommandError> {
+    Ok(open_workspace_git_repo(workspace)?.is_some())
+}
+
+pub(crate) fn open_workspace_git_repo(
+    workspace: &Workspace,
+) -> Result<Option<gix::Repository>, CommandError> {
     let Ok(git_backend) = git::get_git_backend(workspace.repo_loader().store()) else {
-        return Ok(false);
+        return Ok(None);
     };
     match git_backend.open_git_repo_at_workdir(workspace.workspace_root()) {
-        Ok(_) => Ok(true),
-        Err(GitRepoAtWorkdirError::NotFound { .. }) => Ok(false),
-        Err(GitRepoAtWorkdirError::Unrelated { .. }) => Ok(false),
+        Ok(repo) => Ok(Some(repo)),
+        Err(GitRepoAtWorkdirError::NotFound { .. }) => Ok(None),
+        Err(GitRepoAtWorkdirError::Unrelated { .. }) => Ok(None),
         Err(err @ GitRepoAtWorkdirError::Other(_)) => Err(user_error(err)),
     }
 }

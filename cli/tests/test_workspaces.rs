@@ -2909,6 +2909,23 @@ fn test_workspaces_adopt_existing_colocated_git_worktree() -> TestResult {
 
     let output = main_dir.run_jj(["workspace", "list"]).success();
     assert!(output.stdout.raw().contains("adopted:"));
+    let operations = main_dir
+        .run_jj([
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--no-graph",
+            "-T",
+            "description ++ \"\\n\"",
+        ])
+        .success();
+    assert!(
+        operations
+            .stdout
+            .raw()
+            .contains("adopt existing Git worktree as workspace 'adopted'")
+    );
+    assert!(!operations.stdout.raw().contains("add workspace 'adopted'"));
 
     Ok(())
 }
@@ -2931,8 +2948,9 @@ fn test_workspaces_adopt_rejects_main_git_worktree() {
 }
 
 #[cfg(unix)]
-#[test]
-fn test_workspaces_adopt_existing_snapshot_git_worktree() -> TestResult {
+#[test_case::test_case(false; "same_settings")]
+#[test_case::test_case(true; "source_workspace_settings")]
+fn test_workspaces_adopt_existing_snapshot_git_worktree(source_settings: bool) -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
@@ -2941,6 +2959,19 @@ fn test_workspaces_adopt_existing_snapshot_git_worktree() -> TestResult {
     let worktree_dir = test_env.work_dir("worktree");
     main_dir.write_file("file", "contents");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
+    if source_settings {
+        // This is valid configuration for the source, but an invalid template.
+        // The child must keep its own effective settings when adopting.
+        main_dir
+            .run_jj([
+                "config",
+                "set",
+                "--workspace",
+                "templates.commit_summary",
+                "missing_keyword",
+            ])
+            .success();
+    }
     main_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
     let add_output = std::process::Command::new("git")
         .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
@@ -3036,8 +3067,15 @@ exit 1
 }
 
 #[cfg(unix)]
-#[test]
-fn test_workspaces_adopt_snapshot_rolls_back_after_initialization_failure() -> TestResult {
+#[test_case::test_case("fileset"; "invalid_fileset")]
+#[test_case::test_case("template"; "invalid_template")]
+#[test_case::test_case("ignore"; "ignore_working_copy")]
+#[test_case::test_case("operation"; "old_operation")]
+#[test_case::test_case("operation_collision"; "old_operation_with_existing_name")]
+#[test_case::test_case("no_integrate"; "unpublished_operation")]
+fn test_workspaces_adopt_snapshot_rolls_back_after_initialization_failure(
+    failure: &str,
+) -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
@@ -3046,6 +3084,31 @@ fn test_workspaces_adopt_snapshot_rolls_back_after_initialization_failure() -> T
     let worktree_dir = test_env.work_dir("worktree");
     main_dir.write_file("file", "contents");
     main_dir.run_jj(["commit", "-m", "initial"]).success();
+    let old_operation = if failure == "operation_collision" {
+        let operation = main_dir
+            .run_jj([
+                "--ignore-working-copy",
+                "op",
+                "log",
+                "--no-graph",
+                "--limit",
+                "1",
+                "-Tid",
+            ])
+            .success()
+            .stdout
+            .raw()
+            .trim()
+            .to_owned();
+        main_dir
+            .run_jj(["workspace", "add", "../existing", "--name", "adopted"])
+            .success();
+        operation
+    } else {
+        "@-".to_owned()
+    };
+    let workspace_store_path = main_dir.root().join(".jj/repo/workspace_store/index");
+    let workspace_store_before = std::fs::read(&workspace_store_path)?;
     main_dir.write_file(".jj/working_copy/subvolume_mode", "snapshot-backed\n");
     let add_output = std::process::Command::new("git")
         .args(["worktree", "add", "--detach", "../worktree", "HEAD"])
@@ -3091,25 +3154,39 @@ fi
 exit 1
 "#,
     );
-    // Fail after workspace initialization but before the first snapshot can
-    // complete. The pending AWACS seed must remain available for a real retry,
-    // while both the JJ registration and partial .jj directory are removed.
+    // Reject unsafe modes or fail before the first snapshot completes. The
+    // pending seed and any existing workspace must remain available for retry.
+    let (failure_args, expected_error) = match failure {
+        "fileset" => (
+            vec!["--config=snapshot.auto-track='glob:['"],
+            "Failed to parse fileset",
+        ),
+        "template" => (
+            vec!["--config=templates.commit_summary=missing_keyword"],
+            "Failed to parse template",
+        ),
+        "ignore" => (
+            vec!["--ignore-working-copy"],
+            "This command must be able to update the working copy",
+        ),
+        "operation" | "operation_collision" => (
+            vec!["--at-op", old_operation.as_str()],
+            "This command must be able to update the working copy",
+        ),
+        "no_integrate" => (
+            vec!["--no-integrate-operation"],
+            "This command must be able to update the working copy",
+        ),
+        _ => unreachable!(),
+    };
     let output = worktree_dir.run_jj_with(|cmd| {
         cmd.env("PATH", &path)
             .env("JJ_TEST_AWACS_SCAN_ROOT", worktree_dir.root())
-            .args([
-                "workspace",
-                "adopt",
-                "--name",
-                "adopted",
-                "--config=snapshot.auto-track='glob:['",
-            ])
+            .args(["workspace", "adopt", "--name", "adopted"])
+            .args(&failure_args)
     });
     assert!(!output.status.success(), "{output}");
-    assert!(
-        output.stderr.raw().contains("Failed to parse fileset"),
-        "{output}"
-    );
+    assert!(output.stderr.raw().contains(expected_error), "{output}");
     assert!(
         !worktree_dir.root().join(".jj").exists(),
         "failed adoption should remove partial .jj metadata"
@@ -3119,10 +3196,18 @@ exit 1
     let output = main_dir
         .run_jj(["--ignore-working-copy", "workspace", "list"])
         .success();
-    assert!(
-        !output.stdout.raw().contains("adopted:"),
-        "failed adoption should remove the workspace registration: {output}"
+    assert_eq!(
+        output.stdout.raw().contains("adopted:"),
+        failure == "operation_collision",
+        "failed adoption should preserve the existing registrations: {output}"
     );
+    assert_eq!(
+        std::fs::read(&workspace_store_path)?,
+        workspace_store_before
+    );
+    if failure == "operation_collision" {
+        test_env.work_dir("existing").run_jj(["status"]).success();
+    }
     Ok(())
 }
 
