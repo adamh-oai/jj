@@ -75,6 +75,47 @@ pub struct GitIndexHandoff {
     nested_paths: Vec<Vec<u8>>,
 }
 
+/// An index written and atomically published by the fsmonitor seeder.
+/// The open file prevents inode reuse while its identity is checked.
+pub struct PublishedGitIndex {
+    index_path: PathBuf,
+    index: File,
+    metadata: fs::Metadata,
+    baseline: SnapshotBaseline,
+}
+
+impl std::fmt::Debug for PublishedGitIndex {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishedGitIndex")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublishedGitIndex {
+    pub(crate) fn baseline(&self) -> &SnapshotBaseline {
+        &self.baseline
+    }
+
+    pub(crate) fn validate(&self, index_path: &Path) -> Result<(), String> {
+        if index_path != self.index_path.as_path() {
+            return Err("published Git index belongs to a different path".to_owned());
+        }
+        let opened = self
+            .index
+            .metadata()
+            .map_err(|error| format!("inspect published Git index: {error}"))?;
+        let current = fs::symlink_metadata(index_path)
+            .map_err(|error| format!("recheck published Git index: {error}"))?;
+        if !git_index_metadata_matches(&self.metadata, &opened)
+            || !git_index_metadata_matches(&self.metadata, &current)
+        {
+            return Err("published Git index changed before observation".to_owned());
+        }
+        Ok(())
+    }
+}
+
 fn capture_index_error(phase: &'static str, error: io::Error) -> String {
     // The optimization may fall back to a cold index. Report enough to
     // distinguish unsupported filesystems, permissions, and I/O failures
@@ -302,9 +343,35 @@ pub fn seed_git_fsmonitor_index(
     hash_len: usize,
     baseline: &SnapshotBaseline,
     invalidation: &Invalidation,
-) -> Result<(), String> {
+) -> Result<PublishedGitIndex, String> {
     let token = encode_git_fsmonitor_token(baseline)?;
-    rewrite_git_fsmonitor_index(index_path, Some(worktree), hash_len, &token, invalidation)
+    let payload = git_fsmonitor_extension_payload(&token, None, 0);
+    if git_fsmonitor_baseline(&payload)? != *baseline {
+        return Err("encoded Git fsmonitor cursor does not match its baseline".to_owned());
+    }
+    let (index, written) =
+        rewrite_git_fsmonitor_index(index_path, Some(worktree), hash_len, &token, invalidation)?;
+    // Rename can change ctime. Check the known written size and mtime before
+    // capturing the final metadata used by the observer.
+    let metadata = index
+        .metadata()
+        .map_err(|error| format!("inspect published Git index: {error}"))?;
+    if written.dev() != metadata.dev()
+        || written.ino() != metadata.ino()
+        || written.len() != metadata.len()
+        || written.mtime() != metadata.mtime()
+        || written.mtime_nsec() != metadata.mtime_nsec()
+    {
+        return Err("published Git index changed during publication".to_owned());
+    }
+    let published = PublishedGitIndex {
+        index_path: index_path.to_owned(),
+        index,
+        metadata,
+        baseline: baseline.clone(),
+    };
+    published.validate(index_path)?;
+    Ok(published)
 }
 
 /// Prepares an existing index for an explicitly requested AWACS bootstrap.
@@ -317,7 +384,7 @@ pub fn write_git_fsmonitor_bootstrap_placeholder(
     index_path: &Path,
     hash_len: usize,
 ) -> Result<(), String> {
-    rewrite_git_fsmonitor_index(index_path, None, hash_len, "0", &Invalidation::Full)
+    rewrite_git_fsmonitor_index(index_path, None, hash_len, "0", &Invalidation::Full).map(|_| ())
 }
 
 fn rewrite_git_fsmonitor_index(
@@ -326,7 +393,7 @@ fn rewrite_git_fsmonitor_index(
     hash_len: usize,
     token: &str,
     invalidation: &Invalidation,
-) -> Result<(), String> {
+) -> Result<(File, fs::Metadata), String> {
     // Keep this exact file open through publication. Cloning a path reopened
     // after parsing could combine another writer's entries with our checksum.
     let (source, source_metadata, bytes) = timed_git_phase("index_seed_read", || {
@@ -669,7 +736,7 @@ fn write_git_index_atomically(
     source_metadata: &fs::Metadata,
     slices: &[&[u8]],
     unchanged_prefix_len: usize,
-) -> Result<(), String> {
+) -> Result<(File, fs::Metadata), String> {
     write_git_index_with_clone(
         index_path,
         source,
@@ -740,7 +807,7 @@ fn write_git_index_with_clone(
     slices: &[&[u8]],
     unchanged_prefix_len: usize,
     clone_index: impl FnOnce(&File, &File) -> io::Result<bool>,
-) -> Result<(), String> {
+) -> Result<(File, fs::Metadata), String> {
     let mut lock_path = index_path.as_os_str().to_os_string();
     lock_path.push(".lock");
     let lock_path = PathBuf::from(lock_path);
@@ -804,6 +871,12 @@ fn write_git_index_with_clone(
             lock.set_len(new_len)
                 .map_err(|error| format!("resize destination Git index: {error}"))
         })?;
+        let copied_source = source
+            .metadata()
+            .map_err(|error| format!("recheck copied Git index: {error}"))?;
+        if !git_index_metadata_matches(source_metadata, &copied_source) {
+            return Err("destination Git index changed while copying its entries".to_owned());
+        }
         // Only extensions changed; the original timestamp must continue to
         // protect stat entries which Git considers racily clean. Set it
         // after the last write and before syncing and publishing the file.
@@ -817,6 +890,15 @@ fn write_git_index_with_clone(
                 index_path.display()
             )
         })?;
+        let written = lock
+            .metadata()
+            .map_err(|error| format!("inspect written Git index: {error}"))?;
+        if written.len() != new_len
+            || written.mtime() != source_metadata.mtime()
+            || written.mtime_nsec() != source_metadata.mtime_nsec()
+        {
+            return Err("written Git index changed before publication".to_owned());
+        }
         timed_git_phase("index_seed_publish", || fs::rename(&lock_path, index_path)).map_err(
             |error| {
                 format!(
@@ -837,12 +919,12 @@ fn write_git_index_with_clone(
                 },
             "seeded Git index committed"
         );
-        Ok(())
+        Ok(written)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&lock_path);
     }
-    result
+    result.map(|written| (lock, written))
 }
 
 #[cfg(test)]
@@ -876,6 +958,131 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn published_index_fixture(
+        hash_len: usize,
+    ) -> (TestDir, PathBuf, SnapshotBaseline, PublishedGitIndex) {
+        let root = TestDir::new("published-index");
+        let index = root.path.join("index");
+        let baseline = SnapshotBaseline {
+            identity: crate::scan::SnapshotIdentity {
+                filesystem_uuid: [1; 16],
+                subvolume_uuid: [2; 16],
+                read_only: true,
+            },
+            continuity_token: b"c:btrfs-awacs:scan:1:destination".to_vec(),
+            retention_token: vec![3; 16],
+        };
+        let mut bytes = b"DIRC".to_vec();
+        bytes.extend_from_slice(&2_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.resize(bytes.len() + hash_len, 0);
+        fs::write(&index, bytes).unwrap();
+        let published = seed_git_fsmonitor_index(
+            &index,
+            &root.path,
+            hash_len,
+            &baseline,
+            &Invalidation::ExactPaths(Vec::new()),
+        )
+        .unwrap();
+        (root, index, baseline, published)
+    }
+
+    #[test]
+    fn published_index_validates_the_written_file_and_cursor() {
+        for hash_len in [20, 32] {
+            let (_root, index, baseline, published) = published_index_fixture(hash_len);
+            published.validate(&index).unwrap();
+            assert_eq!(published.baseline(), &baseline);
+            let inspected = crate::status::inspect_git_index(&index).unwrap();
+            assert_eq!(inspected.checksum, crate::status::IndexChecksum::Valid);
+            assert_eq!(
+                inspected.fsmonitor,
+                crate::status::GitFsmonitorStatus::Baseline(baseline)
+            );
+        }
+    }
+
+    #[test]
+    fn published_index_rejects_replacement_with_the_same_size_and_mtime() {
+        for hash_len in [20, 32] {
+            let (root, index, _baseline, published) = published_index_fixture(hash_len);
+            let replacement = root.path.join("replacement");
+            let contents = fs::read(&index).unwrap();
+            fs::write(&replacement, &contents).unwrap();
+            File::open(&replacement)
+                .unwrap()
+                .set_modified(published.metadata.modified().unwrap())
+                .unwrap();
+            fs::rename(&replacement, &index).unwrap();
+            let current = fs::metadata(&index).unwrap();
+            assert_eq!(current.len(), published.metadata.len());
+            assert_eq!(
+                current.modified().unwrap(),
+                published.metadata.modified().unwrap()
+            );
+            assert_ne!(current.ino(), published.metadata.ino());
+            let lock = root.path.join("index.lock");
+            fs::write(&lock, b"another writer").unwrap();
+            assert!(published.validate(&index).is_err());
+            drop(published);
+            assert_eq!(fs::read(&index).unwrap(), contents);
+            assert_eq!(fs::read(&lock).unwrap(), b"another writer");
+        }
+    }
+
+    #[test]
+    fn published_index_rejects_in_place_changes_with_restored_mtime() {
+        for hash_len in [20, 32] {
+            let (_root, index, _baseline, published) = published_index_fixture(hash_len);
+            // Separate the later write from the saved ctime on filesystems
+            // that update timestamps once per clock tick.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let mut changed = OpenOptions::new().write(true).open(&index).unwrap();
+            changed.write_all(b"EDIT").unwrap();
+            changed
+                .set_modified(published.metadata.modified().unwrap())
+                .unwrap();
+            let current = changed.metadata().unwrap();
+            assert_eq!(current.ino(), published.metadata.ino());
+            assert_eq!(current.len(), published.metadata.len());
+            assert_eq!(
+                current.modified().unwrap(),
+                published.metadata.modified().unwrap()
+            );
+            assert!(published.validate(&index).is_err());
+        }
+    }
+
+    #[test]
+    fn published_index_rejects_another_path_to_the_same_file() {
+        let (root, index, _baseline, published) = published_index_fixture(20);
+        let other = root.path.join("another-index");
+        fs::hard_link(&index, &other).unwrap();
+        let error = published.validate(&other).unwrap_err();
+        assert!(error.contains("different path"));
+    }
+
+    #[test]
+    fn seeding_rejects_a_cursor_that_does_not_round_trip() {
+        for embedded_nul in [false, true] {
+            let (root, index, mut baseline, published) = published_index_fixture(20);
+            drop(published);
+            let original = fs::read(&index).unwrap();
+            if embedded_nul {
+                baseline.continuity_token.extend_from_slice(b"\0extra");
+            } else {
+                baseline.identity.read_only = false;
+            }
+            let error =
+                seed_git_fsmonitor_index(&index, &root.path, 20, &baseline, &Invalidation::Full)
+                    .unwrap_err();
+            assert!(error.contains("does not match its baseline"));
+            assert_eq!(fs::read(&index).unwrap(), original);
+            assert!(!root.path.join("index.lock").exists());
         }
     }
 
@@ -1276,6 +1483,37 @@ mod tests {
         assert!(error.contains("changed while preparing"));
         assert_eq!(fs::read(&index).unwrap(), b"new writer's index");
         assert!(!lock.exists());
+    }
+
+    #[test]
+    fn index_writer_rejects_a_source_changed_during_cloning() {
+        let root = TestDir::new("index-writer-changed-source");
+        let index = root.path.join("index");
+        fs::write(&index, b"original").unwrap();
+        let source = File::open(&index).unwrap();
+        let metadata = source.metadata().unwrap();
+        let slices = [b"original".as_slice()];
+        let error = write_git_index_with_clone(
+            &index,
+            &source,
+            &metadata,
+            &slices,
+            8,
+            |source, destination| {
+                let mut source = source;
+                let mut destination = destination;
+                source.rewind()?;
+                io::copy(&mut source, &mut destination)?;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                fs::write(&index, b"modified")?;
+                File::open(&index)?.set_modified(metadata.modified()?)?;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("changed while copying"));
+        assert_eq!(fs::read(&index).unwrap(), b"modified");
+        assert!(!root.path.join("index.lock").exists());
     }
 
     #[test]

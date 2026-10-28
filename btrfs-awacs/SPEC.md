@@ -243,8 +243,13 @@ Git lane. Issuing a response is not evidence of persistence:
 `GIT_OPTIONAL_LOCKS=0` can leave the same token in the index across arbitrarily
 many queries and newer cuts. Bootstrap requests without a cursor, internal
 index seeding alone, and scan completion do not advance this observed state.
-Creation may separately observe a cursor read back from its validated, published
-child index before releasing the scan lease.
+Creation may separately observe a cursor from its validated, published child
+index before releasing the scan lease. The seeder checks the encoded cursor and
+computes the checksum before writing. It keeps the published file open.
+Observation can then check that the child index still has the same inode,
+size, mtime, and ctime, including nanoseconds. This avoids reading and hashing
+that index again. An index from an independent writer still requires cursor
+and checksum readback.
 
 Let N be the highest valid cursor actually queried. N remains protected
 until a query with a higher cursor supersedes it. Supersession starts a grace

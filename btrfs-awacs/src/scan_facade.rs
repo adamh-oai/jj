@@ -1,26 +1,49 @@
 //! Direct scan sessions backed by the synchronized snapshot facade.
 
-use crate::bootstrap::{RootInitPaths, git_admin_directory, open_initialized_root_service};
-use crate::btrfs::{filesystem_info, subvolume_info};
-use crate::facade::{FacadeService, PreparedQueryResult};
-use crate::git_retention::GitPublisher;
-use crate::manager::{PERMISSION_CUT, PERMISSION_READ};
-use crate::namespace::RootView;
-use crate::scan::{
-    BeginScanRequest, Invalidation, ScanClient, ScanError, ScanErrorKind, ScanOutcome, ScanSession,
-    SnapshotBaseline, SnapshotIdentity, SnapshotLease,
-};
-use crate::status::{GitFsmonitorStatus, IndexChecksum, inspect_git_index};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::os::fd::{AsFd, AsRawFd};
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(debug_assertions)]
 use std::path::Component;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
 use uuid::Uuid;
+
+use crate::bootstrap::RootInitPaths;
+use crate::bootstrap::git_admin_directory;
+use crate::bootstrap::open_initialized_root_service;
+use crate::btrfs::filesystem_info;
+use crate::btrfs::subvolume_info;
+use crate::facade::FacadeService;
+use crate::facade::PreparedQueryResult;
+use crate::git_index_handoff::PublishedGitIndex;
+use crate::git_retention::GitPublisher;
+use crate::manager::PERMISSION_CUT;
+use crate::manager::PERMISSION_READ;
+use crate::namespace::RootView;
+use crate::scan::BeginScanRequest;
+use crate::scan::Invalidation;
+use crate::scan::ScanClient;
+use crate::scan::ScanError;
+use crate::scan::ScanErrorKind;
+use crate::scan::ScanOutcome;
+use crate::scan::ScanSession;
+use crate::scan::SnapshotBaseline;
+use crate::scan::SnapshotIdentity;
+use crate::scan::SnapshotLease;
+use crate::status::GitFsmonitorStatus;
+use crate::status::IndexChecksum;
+use crate::status::inspect_git_index;
 
 const SCAN_TTL_NS: i64 = 300_000_000_000;
 #[cfg(debug_assertions)]
@@ -182,6 +205,22 @@ impl DirectScanClient {
             .lock()
             .map_err(|_| other("AWACS direct scan handler lock poisoned"))?
             .observe_persisted_git_index(live_root, expected_baseline)
+    }
+
+    /// Retains the cursor in an index just written by AWACS.
+    ///
+    /// The consumed proof checks that this worktree still has that exact file.
+    /// Call before finishing the scan lease that protects its cursor.
+    pub fn observe_seeded_git_index(
+        &mut self,
+        live_root: &Path,
+        seed: PublishedGitIndex,
+    ) -> Result<(), ScanError> {
+        let _root_lock = self.lock_root()?;
+        self.handler
+            .lock()
+            .map_err(|_| other("AWACS direct scan handler lock poisoned"))?
+            .observe_seeded_git_index(live_root, seed)
     }
 }
 
@@ -587,22 +626,21 @@ impl DirectScanHandler {
             .map_err(|_| other("AWACS facade lock poisoned"))?;
         let (root, watch_id) = self.ensure_registered_root(&mut facade, live_root)?;
         validate_persisted_git_index(root.path(), expected_baseline)?;
-        if !facade
-            .observe_logical_git_baseline(watch_id, expected_baseline, unix_time_ns()?)
-            .map_err(|err| other(format!("observe published AWACS Git index: {err}")))?
-        {
-            return Err(ScanError::new(
-                ScanErrorKind::InvalidPreviousBaseline,
-                "published AWACS Git index cursor is no longer retained",
-            ));
-        }
-        let boot_id = facade.service().boot_id();
-        facade
-            .service_mut()
-            .store_mut()
-            .refresh_git_index_roots(boot_id)
-            .map_err(|error| other(format!("retain published Git index: {error}")))?;
-        Ok(())
+        observe_git_index_baseline(&mut facade, watch_id, expected_baseline)
+    }
+
+    fn observe_seeded_git_index(
+        &mut self,
+        live_root: &Path,
+        seed: PublishedGitIndex,
+    ) -> Result<(), ScanError> {
+        let mut facade = self
+            .facade
+            .lock()
+            .map_err(|_| other("AWACS facade lock poisoned"))?;
+        let (root, watch_id) = self.ensure_registered_root(&mut facade, live_root)?;
+        validate_seeded_git_index(root.path(), &seed)?;
+        observe_git_index_baseline(&mut facade, watch_id, seed.baseline())
     }
 
     fn begin_scan(
@@ -973,6 +1011,39 @@ impl DirectScanHandler {
     }
 }
 
+fn observe_git_index_baseline(
+    facade: &mut FacadeService,
+    watch_id: [u8; 16],
+    baseline: &SnapshotBaseline,
+) -> Result<(), ScanError> {
+    if !facade
+        .observe_logical_git_baseline(watch_id, baseline, unix_time_ns()?)
+        .map_err(|err| other(format!("observe published AWACS Git index: {err}")))?
+    {
+        return Err(ScanError::new(
+            ScanErrorKind::InvalidPreviousBaseline,
+            "published AWACS Git index cursor is no longer retained",
+        ));
+    }
+    let boot_id = facade.service().boot_id();
+    facade
+        .service_mut()
+        .store_mut()
+        .refresh_git_index_roots(boot_id)
+        .map_err(|error| other(format!("retain published Git index: {error}")))?;
+    Ok(())
+}
+
+fn validate_seeded_git_index(live_root: &Path, seed: &PublishedGitIndex) -> Result<(), ScanError> {
+    let git_dir = git_admin_directory(live_root)
+        .map_err(|err| other(format!("resolve published Git index: {err}")))?
+        .ok_or_else(|| other("AWACS root has no Git administrative directory"))?;
+    seed.validate(&git_dir.join("index"))
+        .map_err(|err| other(format!("validate seeded Git index: {err}")))?;
+    tracing::info!("validated seeded Git index with file identity checks");
+    Ok(())
+}
+
 fn validate_persisted_git_index(
     live_root: &Path,
     expected_baseline: &SnapshotBaseline,
@@ -1298,6 +1369,90 @@ mod tests {
         validate_persisted_git_index(&root, &expected).unwrap();
         std::fs::write(git_dir.join("index"), persisted_index_bytes(None, 20)).unwrap();
         assert!(validate_persisted_git_index(&root, &expected).is_err());
+    }
+
+    #[test]
+    fn seeded_git_index_validation_keeps_exact_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        let index = root.join(".git/index");
+        let expected = persisted_index_baseline();
+        for hash_len in [20, 32] {
+            std::fs::write(&index, persisted_index_bytes(None, hash_len)).unwrap();
+            let seed = crate::git_index_handoff::seed_git_fsmonitor_index(
+                &index,
+                root,
+                hash_len,
+                &expected,
+                &Invalidation::Full,
+            )
+            .unwrap();
+            validate_seeded_git_index(root, &seed).unwrap();
+            assert_eq!(seed.baseline(), &expected);
+            validate_persisted_git_index(root, &expected).unwrap();
+            let mut different = expected.clone();
+            different.retention_token[0] ^= 1;
+            assert!(validate_persisted_git_index(root, &different).is_err());
+        }
+    }
+
+    #[test]
+    fn seeded_git_index_validation_rejects_edits_and_replacements() {
+        for replace_file in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::create_dir(root.join(".git")).unwrap();
+            let index = root.join(".git/index");
+            std::fs::write(&index, persisted_index_bytes(None, 20)).unwrap();
+            let seed = crate::git_index_handoff::seed_git_fsmonitor_index(
+                &index,
+                root,
+                20,
+                &persisted_index_baseline(),
+                &Invalidation::Full,
+            )
+            .unwrap();
+            validate_seeded_git_index(root, &seed).unwrap();
+            let mut bytes = std::fs::read(&index).unwrap();
+            if replace_file {
+                let replacement = root.join(".git/replacement");
+                std::fs::write(&replacement, bytes).unwrap();
+                std::fs::rename(replacement, &index).unwrap();
+            } else {
+                // Keep the length while changing the file after it was seeded.
+                *bytes.last_mut().unwrap() ^= 1;
+                std::fs::write(&index, bytes).unwrap();
+            }
+            assert!(validate_seeded_git_index(root, &seed).is_err());
+        }
+    }
+
+    #[test]
+    fn seeded_git_index_validation_requires_this_worktree_admin_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("child");
+        let common_dir = directory.path().join("repo/.git");
+        let git_dir = common_dir.join("worktrees/child");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(root.join(".git"), b"gitdir: ../repo/.git/worktrees/child\n").unwrap();
+        let main_index = common_dir.join("index");
+        let child_index = git_dir.join("index");
+        let expected = persisted_index_baseline();
+        for index in [&main_index, &child_index] {
+            std::fs::write(index, persisted_index_bytes(None, 20)).unwrap();
+            let seed = crate::git_index_handoff::seed_git_fsmonitor_index(
+                index,
+                &root,
+                20,
+                &expected,
+                &Invalidation::Full,
+            )
+            .unwrap();
+            let result = validate_seeded_git_index(&root, &seed);
+            assert_eq!(result.is_ok(), index == &child_index);
+        }
     }
 
     #[test]

@@ -1859,7 +1859,7 @@ fn run_git_worktree_add_inner(options: &GitWorktreeAdd<'_>) -> Result<(), String
             let invalidation = timed_git_phase("reconcile_copied_index", || {
                 handoff.reconcile(&mut git_client, &mut git_lease, &destination)
             })?;
-            timed_git_phase("seed_destination_index", || {
+            let seeded_index = timed_git_phase("seed_destination_index", || {
                 seed_git_fsmonitor_index(
                     &destination_index,
                     &destination,
@@ -1870,7 +1870,7 @@ fn run_git_worktree_add_inner(options: &GitWorktreeAdd<'_>) -> Result<(), String
             })?;
             timed_git_phase("observe_destination_index", || {
                 git_client
-                    .observe_persisted_git_index(&destination, &git_baseline)
+                    .observe_seeded_git_index(&destination, seeded_index)
                     .map_err(|error| format!("retain published child Git cursor: {error}"))
             })?;
             timed_git_phase("promote_destination_baseline", || {
