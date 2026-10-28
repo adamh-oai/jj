@@ -20,6 +20,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use thiserror::Error;
 
@@ -144,21 +145,59 @@ async fn init_working_copy(
     std::fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
 
     let mut tx = repo.start_transaction();
-    tx.repo_mut()
+    tracing::info!(
+        phase = "working_copy_root_checkout",
+        "Workspace initialization phase started"
+    );
+    let started = Instant::now();
+    let result = tx
+        .repo_mut()
         .check_out(workspace_name.clone(), &repo.store().root_commit())
-        .await?;
-    let repo = tx
-        .commit(format!("add workspace '{}'", workspace_name.as_symbol()))
-        .await?;
+        .await;
+    tracing::info!(
+        phase = "working_copy_root_checkout",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        success = result.is_ok(),
+        "Workspace initialization phase completed"
+    );
+    result?;
 
-    let working_copy = working_copy_factory.init_working_copy(
+    tracing::info!(
+        phase = "working_copy_initial_commit",
+        "Workspace initialization phase started"
+    );
+    let started = Instant::now();
+    let result = tx
+        .commit(format!("add workspace '{}'", workspace_name.as_symbol()))
+        .await;
+    tracing::info!(
+        phase = "working_copy_initial_commit",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        success = result.is_ok(),
+        "Workspace initialization phase completed"
+    );
+    let repo = result?;
+
+    tracing::info!(
+        phase = "working_copy_factory_init",
+        "Workspace initialization phase started"
+    );
+    let started = Instant::now();
+    let result = working_copy_factory.init_working_copy(
         repo.store().clone(),
         workspace_root.to_path_buf(),
         working_copy_state_path.clone(),
         repo.op_id().clone(),
         workspace_name,
         repo.settings(),
-    )?;
+    );
+    tracing::info!(
+        phase = "working_copy_factory_init",
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        success = result.is_ok(),
+        "Workspace initialization phase completed"
+    );
+    let working_copy = result?;
     let working_copy_type_path = working_copy_state_path.join("type");
     fs::write(&working_copy_type_path, working_copy.name()).context(&working_copy_type_path)?;
     Ok((working_copy, repo))

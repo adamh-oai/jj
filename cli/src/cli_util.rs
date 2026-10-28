@@ -222,6 +222,45 @@ use crate::ui::Ui;
 
 const SHORT_CHANGE_ID_TEMPLATE_TEXT: &str = "format_short_change_id_with_change_offset(self)";
 
+// A phase completes with success only after its caller reaches finish(). An
+// early error still records elapsed time without logging the error or inputs.
+struct WorkspaceAdoptionPhase {
+    phase: &'static str,
+    started: Option<Instant>,
+    success: bool,
+}
+
+impl WorkspaceAdoptionPhase {
+    fn start(enabled: bool, phase: &'static str) -> Self {
+        let started = enabled.then(|| {
+            tracing::info!(phase, "Workspace adoption phase started");
+            Instant::now()
+        });
+        Self {
+            phase,
+            started,
+            success: false,
+        }
+    }
+
+    fn finish(mut self, success: bool) {
+        self.success = success;
+    }
+}
+
+impl Drop for WorkspaceAdoptionPhase {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            tracing::info!(
+                phase = self.phase,
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                success = self.success,
+                "Workspace adoption phase completed"
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChromeTracingFlushGuard {
     _inner: Option<Rc<tracing_chrome::FlushGuard>>,
@@ -622,9 +661,16 @@ impl CommandHelper {
         ui: &Ui,
         workspace_root: &Path,
     ) -> Result<WorkspaceCommandHelper, CommandError> {
+        let phase = WorkspaceAdoptionPhase::start(true, "reload workspace");
         let workspace = self.load_workspace_at(workspace_root, self.settings())?;
+        phase.finish(true);
+        let phase = WorkspaceAdoptionPhase::start(true, "reload workspace environment");
         let env = self.workspace_environment(ui, &workspace)?;
-        self.load_from_workspace(ui, workspace, env).await
+        phase.finish(true);
+        let phase = WorkspaceAdoptionPhase::start(true, "reload workspace repository");
+        let result = self.load_from_workspace(ui, workspace, env).await;
+        phase.finish(result.is_ok());
+        result
     }
 
     async fn load_from_workspace(
@@ -1772,6 +1818,8 @@ impl WorkspaceCommandHelper {
             // Check the baseline before Git HEAD import, which can update the
             // repository and journal. Never wait for the journal while holding
             // the shared lock: another process may be scanning this worktree.
+            let phase =
+                WorkspaceAdoptionPhase::start(adoption.is_some(), "snapshot preflight");
             let preflight_ready = if self
                 .workspace_root()
                 .join(".jj/working_copy/subvolume_mode")
@@ -1869,6 +1917,7 @@ impl WorkspaceCommandHelper {
             } else {
                 true
             };
+            phase.finish(preflight_ready);
 
             let result = if preflight_ready {
                 async {
@@ -1876,6 +1925,8 @@ impl WorkspaceCommandHelper {
                     let journal_ahead = if adoption.is_some() {
                         // Adoption already registered this Git HEAD. Importing a
                         // different HEAD would replace the checkout being adopted.
+                        let phase =
+                            WorkspaceAdoptionPhase::start(true, "verify adopted Git HEAD");
                         if !snapshot_git_head_is_current(
                             &self.env,
                             self.repo(),
@@ -1887,6 +1938,7 @@ impl WorkspaceCommandHelper {
                                 "Git HEAD changed during adoption. Retry adoption.",
                             )));
                         }
+                        phase.finish(true);
                         false
                     } else if self.env.working_copy_shared_with_git {
                         self.import_git_head(ui, git_import_export_lock, true)
@@ -3293,6 +3345,8 @@ to the current parents may contain changes from multiple commits.
         let working_copy_type = self.working_copy().name().to_owned();
         let repo = self.repo().clone();
         let mut can_release_lock = can_release_lock && git_import_export_lock.path.is_some();
+        let phase =
+            WorkspaceAdoptionPhase::start(adoption.is_some(), "prepare snapshot options");
         // Snapshot options can depend on cached sparse patterns. Check them
         // against the locked journal before scanning, including after a retry.
         // Some custom working copies do not support sparse patterns; retain
@@ -3329,6 +3383,7 @@ to the current parents may contain changes from multiple commits.
         }
         #[cfg(not(all(target_os = "linux", feature = "awacs")))]
         let _ = force_awacs_input_fingerprint;
+        phase.finish(true);
 
         // Do not hold the shared Git lock while waiting for a busy working
         // copy. Another workspace can synchronize its own Git state meanwhile.
