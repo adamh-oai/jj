@@ -72,11 +72,6 @@ pub enum WorkspaceInitError {
     RepositoryLock(#[from] FileLockError),
     #[error("The destination repo ({0}) already exists")]
     DestinationExists(PathBuf),
-    #[error(
-        "The repository has no working-copy commit for workspace '{name}'",
-        name = .0.as_symbol()
-    )]
-    MissingWorkingCopyCommit(WorkspaceNameBuf),
     #[error("Repo path could not be encoded")]
     EncodeRepoPath(#[source] BadPathEncoding),
     #[error(transparent)]
@@ -139,22 +134,6 @@ fn create_jj_dir(workspace_root: &Path) -> Result<PathBuf, WorkspaceInitError> {
     }
 }
 
-fn write_repo_pointer(jj_dir: &Path, repo_path: &Path) -> Result<PathBuf, WorkspaceInitError> {
-    let repo_dir = dunce::canonicalize(repo_path).context(repo_path)?;
-    let jj_dir_abs = dunce::canonicalize(jj_dir).context(jj_dir)?;
-    let path_to_store = file_util::relative_path(&jj_dir_abs, &repo_dir);
-    let path_to_store = if path_to_store.is_relative() {
-        file_util::slash_path(&path_to_store).into_owned()
-    } else {
-        path_to_store
-    };
-    let repo_dir_bytes =
-        file_util::path_to_bytes(&path_to_store).map_err(WorkspaceInitError::EncodeRepoPath)?;
-    let repo_file_path = jj_dir.join("repo");
-    fs::write(&repo_file_path, repo_dir_bytes).context(&repo_file_path)?;
-    Ok(repo_dir)
-}
-
 async fn init_working_copy(
     repo: &Arc<ReadonlyRepo>,
     workspace_root: &Path,
@@ -199,23 +178,6 @@ async fn init_working_copy(
     );
     let repo = result?;
 
-    let working_copy = init_working_copy_state(
-        &repo,
-        workspace_root,
-        working_copy_state_path,
-        working_copy_factory,
-        workspace_name,
-    )?;
-    Ok((working_copy, repo))
-}
-
-fn init_working_copy_state(
-    repo: &Arc<ReadonlyRepo>,
-    workspace_root: &Path,
-    working_copy_state_path: PathBuf,
-    working_copy_factory: &dyn WorkingCopyFactory,
-    workspace_name: WorkspaceNameBuf,
-) -> Result<Box<dyn WorkingCopy>, WorkspaceInitError> {
     tracing::info!(
         phase = "working_copy_factory_init",
         "Workspace initialization phase started"
@@ -238,7 +200,7 @@ fn init_working_copy_state(
     let working_copy = result?;
     let working_copy_type_path = working_copy_state_path.join("type");
     fs::write(&working_copy_type_path, working_copy.name()).context(&working_copy_type_path)?;
-    Ok(working_copy)
+    Ok((working_copy, repo))
 }
 
 impl Workspace {
@@ -460,7 +422,19 @@ impl Workspace {
         workspace_name: WorkspaceNameBuf,
     ) -> Result<(Self, Arc<ReadonlyRepo>), WorkspaceInitError> {
         let jj_dir = create_jj_dir(workspace_root)?;
-        let repo_dir = write_repo_pointer(&jj_dir, repo_path)?;
+
+        let repo_dir = dunce::canonicalize(repo_path).context(repo_path)?;
+        let jj_dir_abs = dunce::canonicalize(&jj_dir).context(&jj_dir)?;
+        let path_to_store = file_util::relative_path(&jj_dir_abs, &repo_dir);
+        let path_to_store = if path_to_store.is_relative() {
+            file_util::slash_path(&path_to_store).into_owned()
+        } else {
+            path_to_store
+        };
+        let repo_dir_bytes =
+            file_util::path_to_bytes(&path_to_store).map_err(WorkspaceInitError::EncodeRepoPath)?;
+        let repo_file_path = jj_dir.join("repo");
+        fs::write(&repo_file_path, repo_dir_bytes).context(&repo_file_path)?;
 
         let workspace_store = repo.loader().workspace_store();
         let (working_copy, repo) = init_working_copy(
@@ -479,52 +453,6 @@ impl Workspace {
         )?;
         workspace_store.add(workspace.workspace_name(), workspace.workspace_root())?;
         Ok((workspace, repo))
-    }
-
-    /// Initializes metadata for a workspace whose working-copy commit is already
-    /// registered in `repo`, without creating a commit or repository operation.
-    ///
-    /// The factory starts with an empty working-copy tree. The caller must reset
-    /// that metadata to its chosen tree without checking out the existing files.
-    /// On error, this removes only the `.jj` directory created by this call. The
-    /// caller remains responsible for rolling back repository and workspace-store
-    /// registration.
-    pub fn init_workspace_with_registered_working_copy(
-        workspace_root: &Path,
-        repo_path: &Path,
-        repo: &Arc<ReadonlyRepo>,
-        working_copy_factory: &dyn WorkingCopyFactory,
-        workspace_name: WorkspaceNameBuf,
-    ) -> Result<Self, WorkspaceInitError> {
-        if repo.view().get_wc_commit_id(&workspace_name).is_none() {
-            return Err(WorkspaceInitError::MissingWorkingCopyCommit(workspace_name));
-        }
-        let jj_dir = create_jj_dir(workspace_root)?;
-        (|| {
-            let repo_dir = write_repo_pointer(&jj_dir, repo_path)?;
-            let working_copy_state_path = jj_dir.join("working_copy");
-            fs::create_dir(&working_copy_state_path).context(&working_copy_state_path)?;
-            let working_copy = init_working_copy_state(
-                repo,
-                workspace_root,
-                working_copy_state_path,
-                working_copy_factory,
-                workspace_name,
-            )?;
-            let workspace = Self::new(
-                workspace_root,
-                repo_dir,
-                working_copy,
-                repo.loader().clone(),
-            )?;
-            repo.loader()
-                .workspace_store()
-                .add(workspace.workspace_name(), workspace.workspace_root())?;
-            Ok(workspace)
-        })()
-        .inspect_err(|_err| {
-            fs::remove_dir_all(&jj_dir).ok();
-        })
     }
 
     pub fn load(

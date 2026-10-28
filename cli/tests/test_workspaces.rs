@@ -2909,23 +2909,6 @@ fn test_workspaces_adopt_existing_colocated_git_worktree() -> TestResult {
 
     let output = main_dir.run_jj(["workspace", "list"]).success();
     assert!(output.stdout.raw().contains("adopted:"));
-    let operations = main_dir
-        .run_jj([
-            "--ignore-working-copy",
-            "op",
-            "log",
-            "--no-graph",
-            "-T",
-            "description ++ \"\\n\"",
-        ])
-        .success();
-    assert!(
-        operations
-            .stdout
-            .raw()
-            .contains("adopt existing Git worktree as workspace 'adopted'")
-    );
-    assert!(!operations.stdout.raw().contains("add workspace 'adopted'"));
 
     Ok(())
 }

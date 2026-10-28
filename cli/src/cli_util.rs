@@ -599,7 +599,7 @@ impl CommandHelper {
             .is_working_copy_writable()
             .then(|| env.lock_git_import_export(&workspace))
             .transpose()?;
-        let mut workspace_command = self.load_from_workspace(ui, workspace, env, false).await?;
+        let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
         let Some(git_import_export_lock) = git_import_export_lock else {
             return Ok((workspace_command, SnapshotStats::default(), false));
         };
@@ -647,7 +647,7 @@ impl CommandHelper {
     ) -> Result<WorkspaceCommandHelper, CommandError> {
         let workspace = self.load_workspace()?;
         let env = self.workspace_environment(ui, &workspace)?;
-        self.load_from_workspace(ui, workspace, env, false).await
+        self.load_from_workspace(ui, workspace, env).await
     }
 
     /// Loads a workspace at another root without snapshotting it.
@@ -668,76 +668,20 @@ impl CommandHelper {
         let env = self.workspace_environment(ui, &workspace)?;
         phase.finish(true);
         let phase = WorkspaceAdoptionPhase::start(true, "reload workspace repository");
-        let result = self.load_from_workspace(ui, workspace, env, true).await;
+        let result = self.load_from_workspace(ui, workspace, env).await;
         phase.finish(result.is_ok());
         result
-    }
-
-    /// Reuses the workspace and repository created by adoption when their
-    /// settings match the command. Otherwise, reloads with the command settings.
-    /// Neither path snapshots the working copy.
-    #[cfg(all(target_os = "linux", feature = "awacs"))]
-    pub(crate) async fn workspace_helper_no_snapshot_from_repo(
-        &self,
-        ui: &Ui,
-        workspace: Workspace,
-        repo: Arc<ReadonlyRepo>,
-    ) -> Result<WorkspaceCommandHelper, CommandError> {
-        let reuse_initialized_workspace = workspace
-            .settings()
-            .config()
-            .get::<toml::Value>(ConfigNamePathBuf::root())?
-            == self
-                .settings()
-                .config()
-                .get::<toml::Value>(ConfigNamePathBuf::root())?;
-        tracing::info!(
-            phase = "reuse_initialized_workspace",
-            reuse_initialized_workspace,
-            "Checked initialized workspace settings"
-        );
-        if !reuse_initialized_workspace {
-            // Store and working-copy settings came from the source workspace.
-            // Reload all of them with the settings the child used before reuse.
-            let workspace_root = workspace.workspace_root().to_owned();
-            drop(workspace);
-            drop(repo);
-            return self
-                .workspace_helper_no_snapshot_at(ui, &workspace_root)
-                .await;
-        }
-        let phase = WorkspaceAdoptionPhase::start(true, "reload workspace environment");
-        let env = self.workspace_environment(ui, &workspace)?;
-        phase.finish(true);
-        self.helper_from_loaded_repo(ui, workspace, repo, env, true)
     }
 
     async fn load_from_workspace(
         &self,
         ui: &Ui,
         workspace: Workspace,
-        env: WorkspaceCommandEnvironment,
-        profile_reload: bool,
+        mut env: WorkspaceCommandEnvironment,
     ) -> Result<WorkspaceCommandHelper, CommandError> {
-        let phase = WorkspaceAdoptionPhase::start(profile_reload, "resolve reload operation");
         let op_head =
             self.resolve_operation(ui, workspace.repo_loader(), workspace.workspace_name())?;
-        phase.finish(true);
-        let phase = WorkspaceAdoptionPhase::start(profile_reload, "load reload repository");
         let repo = workspace.repo_loader().load_at(&op_head).await?;
-        phase.finish(true);
-        self.helper_from_loaded_repo(ui, workspace, repo, env, profile_reload)
-    }
-
-    fn helper_from_loaded_repo(
-        &self,
-        ui: &Ui,
-        workspace: Workspace,
-        repo: Arc<ReadonlyRepo>,
-        mut env: WorkspaceCommandEnvironment,
-        profile_reload: bool,
-    ) -> Result<WorkspaceCommandHelper, CommandError> {
-        let phase = WorkspaceAdoptionPhase::start(profile_reload, "resolve reload trunk");
         if let Err(err) =
             revset_util::try_resolve_trunk_alias(repo.as_ref(), &env.revset_parse_context())
         {
@@ -761,16 +705,8 @@ impl CommandHelper {
                 .expect("valid syntax");
             env.reload_revset_expressions(ui)?;
         }
-        phase.finish(true);
         let may_snapshot_working_copy = self.is_working_copy_writable();
-        WorkspaceCommandHelper::new(
-            ui,
-            workspace,
-            repo,
-            env,
-            may_snapshot_working_copy,
-            profile_reload,
-        )
+        WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy)
     }
 
     pub fn get_working_copy_factory(&self) -> Result<&dyn WorkingCopyFactory, CommandError> {
@@ -872,7 +808,6 @@ impl CommandHelper {
                     repo,
                     env,
                     may_snapshot_working_copy,
-                    false,
                 )?;
                 workspace_command.check_working_copy_writable()?;
 
@@ -896,8 +831,7 @@ impl CommandHelper {
                 let stale_wc_commit = workspace_command.get_wc_commit().await?.unwrap();
 
                 let WorkspaceCommandHelper { workspace, env, .. } = workspace_command;
-                let mut workspace_command =
-                    self.load_from_workspace(ui, workspace, env, false).await?;
+                let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
                 let repo = &workspace_command.user_repo.repo;
                 let desired_wc_commit = workspace_command.prepare_working_copy_mutation().await?;
                 let mut locked_ws = workspace_command
@@ -1000,8 +934,7 @@ impl CommandHelper {
                      message from read attempt: {e}"
                 )?;
 
-                let mut workspace_command =
-                    self.load_from_workspace(ui, workspace, env, false).await?;
+                let mut workspace_command = self.load_from_workspace(ui, workspace, env).await?;
                 let stats = workspace_command
                     .create_and_check_out_recovery_commit(ui, git_import_export_lock)
                     .await?;
@@ -1029,7 +962,7 @@ impl CommandHelper {
             .load_operation(expected_working_copy_operation)
             .await?;
         let repo = workspace.repo_loader().load_at(&op).await?;
-        let mut helper = WorkspaceCommandHelper::new(ui, workspace, repo, env, true, false)?;
+        let mut helper = WorkspaceCommandHelper::new(ui, workspace, repo, env, true)?;
         helper.check_working_copy_writable()?;
         let stats = helper
             .snapshot_working_copy(
@@ -1124,7 +1057,7 @@ impl CommandHelper {
         // No is_at_head_operation() check here because the repo isn't loaded at
         // the specified operation.
         let may_snapshot_working_copy = !self.global_args().ignore_working_copy;
-        WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy, false)
+        WorkspaceCommandHelper::new(ui, workspace, repo, env, may_snapshot_working_copy)
     }
 }
 
@@ -1792,7 +1725,6 @@ impl WorkspaceCommandHelper {
         repo: Arc<ReadonlyRepo>,
         env: WorkspaceCommandEnvironment,
         may_snapshot_working_copy: bool,
-        profile_reload: bool,
     ) -> Result<Self, CommandError> {
         let settings = workspace.settings();
         let commit_summary_template_text = settings.get_string("templates.commit_summary")?;
@@ -1811,21 +1743,12 @@ impl WorkspaceCommandHelper {
         };
         // Parse commit_summary template early to report error before starting
         // mutable operation.
-        let phase =
-            WorkspaceAdoptionPhase::start(profile_reload, "validate reload operation template");
         helper.parse_operation_template(ui, &helper.op_summary_template_text)?;
-        phase.finish(true);
-        let phase =
-            WorkspaceAdoptionPhase::start(profile_reload, "validate reload commit template");
         // Both templates use the same view and aliases. Reuse their keyword
         // cache, but rebuild the language when a new helper loads another view.
         let language = helper.commit_template_language();
         helper.parse_template::<Commit, _>(ui, &language, &helper.commit_summary_template_text)?;
-        phase.finish(true);
-        let phase =
-            WorkspaceAdoptionPhase::start(profile_reload, "validate reload change ID template");
         helper.parse_template::<Commit, _>(ui, &language, SHORT_CHANGE_ID_TEMPLATE_TEXT)?;
-        phase.finish(true);
         drop(language);
         Ok(helper)
     }
