@@ -1092,9 +1092,10 @@ impl CommitTemplateBuildFnTable<'_> {
 
 #[derive(Default)]
 pub struct CommitKeywordCache {
-    // Build index lazily, and Rc to get away from &self lifetime.
-    bookmarks_index: OnceCell<Rc<CommitRefsIndex>>,
-    tags_index: OnceCell<Rc<CommitRefsIndex>>,
+    // Share the cells with compiled templates so validation does not build
+    // reference indexes. The first evaluation fills each cell for this view.
+    bookmarks_index: Rc<OnceCell<Rc<CommitRefsIndex>>>,
+    tags_index: Rc<OnceCell<Rc<CommitRefsIndex>>>,
     git_refs_index: OnceCell<Rc<CommitRefsIndex>>,
     is_immutable_fn: OnceCell<Rc<RevsetContainingFn<'static>>>,
 }
@@ -1317,12 +1318,13 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
         "bookmarks",
         |language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
-            let index = language
-                .keyword_cache
-                .bookmarks_index(language.repo)
-                .clone();
-            let out_property =
-                self_property.map(move |commit| collect_distinct_refs(index.get(commit.id())));
+            let view = language.repo.view();
+            let index = language.keyword_cache.bookmarks_index.clone();
+            let out_property = self_property.map(move |commit| {
+                let index =
+                    index.get_or_init(|| Rc::new(build_local_remote_refs_index(view.bookmarks())));
+                collect_distinct_refs(index.get(commit.id()))
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -1330,12 +1332,13 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
         "local_bookmarks",
         |language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
-            let index = language
-                .keyword_cache
-                .bookmarks_index(language.repo)
-                .clone();
-            let out_property =
-                self_property.map(move |commit| collect_local_refs(index.get(commit.id())));
+            let view = language.repo.view();
+            let index = language.keyword_cache.bookmarks_index.clone();
+            let out_property = self_property.map(move |commit| {
+                let index =
+                    index.get_or_init(|| Rc::new(build_local_remote_refs_index(view.bookmarks())));
+                collect_local_refs(index.get(commit.id()))
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -1343,12 +1346,13 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
         "remote_bookmarks",
         |language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
-            let index = language
-                .keyword_cache
-                .bookmarks_index(language.repo)
-                .clone();
-            let out_property =
-                self_property.map(move |commit| collect_remote_refs(index.get(commit.id())));
+            let view = language.repo.view();
+            let index = language.keyword_cache.bookmarks_index.clone();
+            let out_property = self_property.map(move |commit| {
+                let index =
+                    index.get_or_init(|| Rc::new(build_local_remote_refs_index(view.bookmarks())));
+                collect_remote_refs(index.get(commit.id()))
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -1356,9 +1360,13 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
         "tags",
         |language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
-            let index = language.keyword_cache.tags_index(language.repo).clone();
-            let out_property =
-                self_property.map(move |commit| collect_distinct_refs(index.get(commit.id())));
+            let view = language.repo.view();
+            let index = language.keyword_cache.tags_index.clone();
+            let out_property = self_property.map(move |commit| {
+                let index =
+                    index.get_or_init(|| Rc::new(build_local_remote_refs_index(view.tags())));
+                collect_distinct_refs(index.get(commit.id()))
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -1366,9 +1374,13 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
         "local_tags",
         |language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
-            let index = language.keyword_cache.tags_index(language.repo).clone();
-            let out_property =
-                self_property.map(move |commit| collect_local_refs(index.get(commit.id())));
+            let view = language.repo.view();
+            let index = language.keyword_cache.tags_index.clone();
+            let out_property = self_property.map(move |commit| {
+                let index =
+                    index.get_or_init(|| Rc::new(build_local_remote_refs_index(view.tags())));
+                collect_local_refs(index.get(commit.id()))
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -1376,9 +1388,13 @@ fn builtin_commit_methods<'repo>() -> CommitTemplateBuildMethodFnMap<'repo, Comm
         "remote_tags",
         |language, _diagnostics, _build_ctx, self_property, function| {
             function.expect_no_arguments()?;
-            let index = language.keyword_cache.tags_index(language.repo).clone();
-            let out_property =
-                self_property.map(move |commit| collect_remote_refs(index.get(commit.id())));
+            let view = language.repo.view();
+            let index = language.keyword_cache.tags_index.clone();
+            let out_property = self_property.map(move |commit| {
+                let index =
+                    index.get_or_init(|| Rc::new(build_local_remote_refs_index(view.tags())));
+                collect_remote_refs(index.get(commit.id()))
+            });
             Ok(out_property.into_dyn_wrapped())
         },
     );
@@ -3238,12 +3254,15 @@ mod tests {
     use jj_lib::config::ConfigLayer;
     use jj_lib::config::ConfigSource;
     use jj_lib::fileset::FilesetAliasesMap;
+    use jj_lib::op_store::RemoteRefState;
+    use jj_lib::ref_name::RemoteRefSymbol;
     use jj_lib::revset::RevsetAliasesMap;
     use jj_lib::revset::RevsetExpression;
     use jj_lib::revset::RevsetExtensions;
     use jj_lib::revset::RevsetWorkspaceContext;
     use jj_lib::template_parser::TemplateAliasesMap;
     use testutils::TestRepoBackend;
+    use testutils::TestResult;
     use testutils::TestWorkspace;
     use testutils::repo_path_buf;
 
@@ -3361,6 +3380,110 @@ mod tests {
             let template = self.parse(text).unwrap();
             template.format_plain_text(context).into()
         }
+    }
+
+    fn ref_index_test_env() -> TestResult<(CommitTemplateTestEnv, Commit)> {
+        let mut env = CommitTemplateTestEnv::init();
+        let repo = &env.test_workspace.repo;
+        let workspace_name = env.test_workspace.workspace.workspace_name();
+        let commit = repo
+            .store()
+            .get_commit(repo.view().get_wc_commit_id(workspace_name).unwrap())?;
+        let target = RefTarget::normal(commit.id().clone());
+        let mut tx = repo.start_transaction();
+        for name in ["local", "synced"] {
+            tx.repo_mut()
+                .set_local_bookmark_target(name.as_ref(), target.clone());
+            tx.repo_mut()
+                .set_local_tag_target(name.as_ref(), target.clone());
+        }
+        for (name, state) in [
+            ("remote", RemoteRefState::New),
+            ("synced", RemoteRefState::Tracked),
+        ] {
+            let symbol = RemoteRefSymbol {
+                name: name.as_ref(),
+                remote: "origin".as_ref(),
+            };
+            let remote_ref = RemoteRef {
+                target: target.clone(),
+                state,
+            };
+            tx.repo_mut()
+                .set_remote_bookmark(symbol, remote_ref.clone());
+            tx.repo_mut().set_remote_tag(symbol, remote_ref);
+        }
+        env.test_workspace.repo = tx.commit("populate template refs").block_on()?;
+        Ok((env, commit))
+    }
+
+    #[test]
+    fn test_ref_indexes_are_lazy_and_outlive_language() -> TestResult {
+        let (env, commit) = ref_index_test_env()?;
+        for (method, expected, tags) in [
+            ("bookmarks", "local,remote@origin,synced", false),
+            ("local_bookmarks", "local,synced", false),
+            ("remote_bookmarks", "remote@origin,synced@origin", false),
+            ("tags", "local,remote@origin,synced", true),
+            ("local_tags", "local,synced", true),
+            ("remote_tags", "remote@origin,synced@origin", true),
+        ] {
+            let language = env.new_language();
+            let index = if tags {
+                language.keyword_cache.tags_index.clone()
+            } else {
+                language.keyword_cache.bookmarks_index.clone()
+            };
+            let text = format!(
+                "{method}.map(|r| r.name() ++ if(r.remote(), \"@\" ++ r.remote())).join(\",\")"
+            );
+            let template: TemplateRenderer<'_, Commit> = template_builder::parse(
+                &language,
+                &mut TemplateDiagnostics::new(),
+                &text,
+                &env.template_aliases_map,
+            )?;
+            assert!(index.get().is_none(), "{method} was built during parsing");
+            drop(language);
+
+            assert_eq!(template.format_plain_text(&commit), expected.as_bytes());
+            let initialized = index.get().unwrap().clone();
+            assert_eq!(template.format_plain_text(&commit), expected.as_bytes());
+            assert!(Rc::ptr_eq(&initialized, index.get().unwrap()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_unused_ref_template_branches_do_not_build_indexes() -> TestResult {
+        let (env, commit) = ref_index_test_env()?;
+        let language = env.new_language();
+        let bookmarks = language.keyword_cache.bookmarks_index.clone();
+        let tags = language.keyword_cache.tags_index.clone();
+        let template: TemplateRenderer<'_, Commit> = template_builder::parse(
+            &language,
+            &mut TemplateDiagnostics::new(),
+            r#"if(false, bookmarks, "") ++ if(false, tags, "")"#,
+            &env.template_aliases_map,
+        )?;
+        assert!(bookmarks.get().is_none());
+        assert!(tags.get().is_none());
+        // Argument validation must still fail before any template evaluation.
+        assert!(
+            template_builder::parse::<Commit, _>(
+                &language,
+                &mut TemplateDiagnostics::new(),
+                "self.bookmarks(1)",
+                &env.template_aliases_map,
+            )
+            .is_err()
+        );
+        drop(language);
+
+        assert!(template.format_plain_text(&commit).is_empty());
+        assert!(bookmarks.get().is_none());
+        assert!(tags.get().is_none());
+        Ok(())
     }
 
     fn stable_settings() -> UserSettings {
