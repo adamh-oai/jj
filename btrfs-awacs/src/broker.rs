@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, BufReader, Read, Seek};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -365,7 +365,6 @@ pub fn execute_inode_paths(
         }
         ordered_inodes.push(ino);
     }
-    let paths_by_inode = resolve_paths_from_stock_ioctl(broker_target.as_fd(), &ordered_inodes)?;
     let mut output = BufferedBrokerOutput::new(output_fd, request.max_output_bytes);
     let mut header = Vec::with_capacity(usize::from(INODE_PATH_OUTPUT_HEADER_SIZE));
     header.extend_from_slice(INODE_PATH_OUTPUT_MAGIC);
@@ -377,22 +376,28 @@ pub fn execute_inode_paths(
 
     let mut path_count = 0_u64;
     for ino in ordered_inodes {
-        let paths = paths_by_inode.get(&ino).cloned().unwrap_or_default();
-        let record_path_count = u32::try_from(paths.len())
+        let mut paths = match inode_paths(broker_target.as_fd(), ino) {
+            Ok(paths) => paths,
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Vec::new(),
+            Err(error) => {
+                return Err(BrokerError::new(format!(
+                    "resolve inode {ino} relative to target root: {error}"
+                )));
+            }
+        };
+        paths.sort();
+        paths.dedup();
+        let count = u32::try_from(paths.len())
             .map_err(|_| BrokerError::new("inode has too many reverse paths"))?;
-        let mut record = Vec::new();
-        record.extend_from_slice(&ino.to_be_bytes());
-        record.extend_from_slice(&record_path_count.to_be_bytes());
+        output.append(&ino.to_be_bytes(), "write inode number")?;
+        output.append(&count.to_be_bytes(), "write inode path count")?;
         for path in paths {
             let length = u32::try_from(path.len())
                 .map_err(|_| BrokerError::new("inode reverse path exceeds u32 length"))?;
-            record.extend_from_slice(&length.to_be_bytes());
-            record.extend_from_slice(&path);
-            path_count = path_count
-                .checked_add(1)
-                .ok_or_else(|| BrokerError::new("inode-path output count overflow"))?;
+            output.append(&length.to_be_bytes(), "write inode path length")?;
+            output.append(&path, "write inode path")?;
         }
-        output.append(&record, "write inode-path output record")?;
+        path_count += u64::from(count);
     }
     output.flush("flush inode-path output records")?;
     let output_offset = output.offset;
@@ -429,33 +434,80 @@ pub fn execute_inode_paths(
     })
 }
 
-/// Resolves requested inodes using the stock Linux BTRFS_IOC_INO_PATHS ioctl.
-/// Manifest-derived children and their shared parent paths are already
-/// deduplicated and cached by the service before reaching the broker.
-fn resolve_paths_from_stock_ioctl(
-    target_fd: BorrowedFd<'_>,
-    inodes: &[u64],
-) -> Result<BTreeMap<u64, Vec<Vec<u8>>>, BrokerError> {
-    let mut paths_by_inode = BTreeMap::new();
-    for &ino in inodes {
-        if ino == ROOT_INODE {
-            paths_by_inode.insert(ino, vec![Vec::new()]);
-            continue;
-        }
-        let mut paths = match inode_paths(target_fd, ino) {
-            Ok(paths) => paths,
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Vec::new(),
-            Err(error) => {
-                return Err(BrokerError::new(format!(
-                    "resolve inode {ino} relative to target root: {error}"
-                )));
-            }
-        };
-        paths.sort();
-        paths.dedup();
-        paths_by_inode.insert(ino, paths);
+/// Reads the broker's version 1 spool into the path map used by the comparison.
+pub fn read_inode_path_output(
+    mut file: &fs::File,
+    result: &InodePathsResult,
+    requested_inodes: u64,
+) -> io::Result<BTreeMap<u64, Vec<Vec<u8>>>> {
+    fn invalid(message: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
     }
-    Ok(paths_by_inode)
+
+    fn read_array<const N: usize>(reader: &mut impl Read) -> io::Result<[u8; N]> {
+        let mut bytes = [0; N];
+        reader.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    if result.output_bytes > MAX_INODE_PATH_OUTPUT || file.metadata()?.len() != result.output_bytes
+    {
+        return Err(invalid(
+            "inode-path output differs from broker length or exceeds limit",
+        ));
+    }
+    file.rewind()?;
+    let mut reader =
+        BufReader::with_capacity(INODE_PATH_OUTPUT_BUFFER_SIZE, file).take(result.output_bytes);
+    if &read_array(&mut reader)? != INODE_PATH_OUTPUT_MAGIC
+        || u16::from_be_bytes(read_array(&mut reader)?) != INODE_PATH_OUTPUT_VERSION
+        || u16::from_be_bytes(read_array(&mut reader)?) != INODE_PATH_OUTPUT_HEADER_SIZE
+    {
+        return Err(invalid("inode-path output has an invalid header"));
+    }
+    let inode_count = u64::from_be_bytes(read_array(&mut reader)?);
+    let path_count = u64::from_be_bytes(read_array(&mut reader)?);
+    if inode_count != requested_inodes
+        || inode_count != result.inode_count
+        || path_count != result.path_count
+    {
+        return Err(invalid(
+            "inode-path output counts differ from request or broker result",
+        ));
+    }
+
+    let mut paths = BTreeMap::new();
+    let mut paths_left = path_count;
+    for _ in 0..inode_count {
+        let ino = u64::from_be_bytes(read_array(&mut reader)?);
+        let count = u32::from_be_bytes(read_array(&mut reader)?);
+        paths_left = paths_left
+            .checked_sub(u64::from(count))
+            .ok_or_else(|| invalid("inode-path record exceeds reported path count"))?;
+        let mut names = Vec::new();
+        for _ in 0..count {
+            let length = u32::from_be_bytes(read_array(&mut reader)?);
+            if u64::from(length) > reader.limit() {
+                return Err(invalid("inode-path length exceeds remaining output"));
+            }
+            let mut path = vec![0; length as usize];
+            for chunk in path.chunks_mut(INODE_PATH_OUTPUT_BUFFER_SIZE) {
+                reader.read_exact(chunk)?;
+            }
+            names.push(path);
+        }
+        if ino == 0 || paths.insert(ino, names).is_some() {
+            return Err(invalid(
+                "inode-path output contains an invalid or duplicate inode",
+            ));
+        }
+    }
+    if reader.limit() != 0 || paths_left != 0 {
+        return Err(invalid(
+            "inode-path output has trailing bytes or mismatched path count",
+        ));
+    }
+    Ok(paths)
 }
 
 /// Answers the nested-subvolume question from Btrfs root refs while keeping
@@ -1078,7 +1130,7 @@ impl<'fd> BufferedBrokerOutput<'fd> {
         }
     }
 
-    fn append(&mut self, bytes: &[u8], context: &str) -> Result<(), BrokerError> {
+    fn append(&mut self, mut bytes: &[u8], context: &str) -> Result<(), BrokerError> {
         let buffered = u64::try_from(self.pending.len())
             .map_err(|_| BrokerError::new("broker buffered output length exceeds u64"))?;
         let length = u64::try_from(bytes.len())
@@ -1095,15 +1147,14 @@ impl<'fd> BufferedBrokerOutput<'fd> {
             )));
         }
 
-        if bytes.len() >= INODE_PATH_OUTPUT_BUFFER_SIZE {
-            self.flush(context)?;
-            write_all_at(self.fd, self.offset, bytes, context)?;
-            self.offset = next;
-        } else {
-            if self.pending.len() + bytes.len() > INODE_PATH_OUTPUT_BUFFER_SIZE {
+        while !bytes.is_empty() {
+            let available = INODE_PATH_OUTPUT_BUFFER_SIZE - self.pending.len();
+            let (chunk, rest) = bytes.split_at(available.min(bytes.len()));
+            self.pending.extend_from_slice(chunk);
+            if self.pending.len() == INODE_PATH_OUTPUT_BUFFER_SIZE {
                 self.flush(context)?;
             }
-            self.pending.extend_from_slice(bytes);
+            bytes = rest;
         }
         Ok(())
     }
@@ -1821,6 +1872,11 @@ mod tests {
         output.append(b"a", "buffer first record").unwrap();
         assert_eq!(file.metadata().unwrap().len(), 0);
         output.append(&large, "write oversized record").unwrap();
+        assert_eq!(
+            file.metadata().unwrap().len(),
+            INODE_PATH_OUTPUT_BUFFER_SIZE as u64
+        );
+        assert_eq!(output.pending.len(), 2);
         output.append(b"c", "buffer final record").unwrap();
         output.flush("flush final record").unwrap();
 
@@ -1830,6 +1886,53 @@ mod tests {
         expected.push(b'c');
         assert_eq!(fs::read(path).unwrap(), expected);
         assert_eq!(output.offset, expected.len() as u64);
+    }
+
+    #[test]
+    fn reads_version_one_inode_paths_across_chunks() {
+        use std::io::Write;
+        let mut file = tempfile::tempfile().unwrap();
+        let names: Vec<_> = (0..4000)
+            .map(|i| format!("directory/file-{i}").into_bytes())
+            .collect();
+        let mut result = InodePathsResult {
+            inode_count: 2,
+            path_count: names.len() as u64,
+            output_bytes: 0,
+        };
+        file.write_all(b"BAWP\x00\x01\x00\x18").unwrap();
+        file.write_all(&result.inode_count.to_be_bytes()).unwrap();
+        file.write_all(&result.path_count.to_be_bytes()).unwrap();
+        file.write_all(&300_u64.to_be_bytes()).unwrap();
+        file.write_all(&(names.len() as u32).to_be_bytes()).unwrap();
+        for name in &names {
+            file.write_all(&(name.len() as u32).to_be_bytes()).unwrap();
+            file.write_all(name).unwrap();
+        }
+        // A deleted inode still has a record with zero paths.
+        file.write_all(&301_u64.to_be_bytes()).unwrap();
+        file.write_all(&0_u32.to_be_bytes()).unwrap();
+        result.output_bytes = file.metadata().unwrap().len();
+        assert!(result.output_bytes > INODE_PATH_OUTPUT_BUFFER_SIZE as u64);
+        assert_eq!(
+            read_inode_path_output(&file, &result, 2).unwrap(),
+            BTreeMap::from([(300, names), (301, vec![])])
+        );
+
+        // A declared path length must fit the bytes left in the spool.
+        write_all_at(
+            file.as_fd(),
+            36,
+            &u32::MAX.to_be_bytes(),
+            "overwrite length",
+        )
+        .unwrap();
+        assert_eq!(
+            read_inode_path_output(&file, &result, 2)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

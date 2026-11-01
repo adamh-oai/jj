@@ -4,10 +4,9 @@
 //! tests can still use an embedded seqpacket broker.
 
 use crate::broker::{
-    ChangedObjectsExecution, ChangedObjectsResult, ExpectedSubvolume,
-    INODE_PATH_OUTPUT_HEADER_SIZE, INODE_PATH_OUTPUT_MAGIC, INODE_PATH_OUTPUT_VERSION,
-    InodePathsExecution, MAX_CHANGED_OBJECT_OUTPUT, MAX_INODE_PATH_OUTPUT,
-    NestedSubvolumesExecution, SeqPacket, SnapshotTrashExecution,
+    ChangedObjectsExecution, ChangedObjectsResult, ExpectedSubvolume, InodePathsExecution,
+    MAX_CHANGED_OBJECT_OUTPUT, MAX_INODE_PATH_OUTPUT, NestedSubvolumesExecution, SeqPacket,
+    SnapshotTrashExecution, read_inode_path_output,
 };
 use crate::broker_protocol::{BrokerClient, BrokerDispatcher};
 use crate::btrfs::{
@@ -2496,7 +2495,7 @@ impl Service {
                     .flush()
                     .map_err(|error| ServiceError::context("flush inode-path input", error))?;
             }
-            let mut output = create_private_spool(&output_path)?;
+            let output = create_private_spool(&output_path)?;
             let inode_count = u64::try_from(inodes.len())
                 .map_err(|_| ServiceError::new("inode-path input count exceeds u64"))?;
             let lookup = self
@@ -2518,23 +2517,8 @@ impl Service {
                         error,
                     )
                 })?;
-            output
-                .seek(SeekFrom::Start(0))
-                .map_err(|error| ServiceError::context("rewind inode-path output", error))?;
-            let mut bytes = Vec::with_capacity(
-                usize::try_from(lookup.output_bytes)
-                    .map_err(|_| ServiceError::new("inode-path output exceeds usize"))?,
-            );
-            (&mut output)
-                .take(lookup.output_bytes + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|error| ServiceError::context("read inode-path output", error))?;
-            if bytes.len() as u64 != lookup.output_bytes {
-                return Err(ServiceError::new(
-                    "inode-path output differs from broker length",
-                ));
-            }
-            parse_inode_path_output(&bytes, inode_count)
+            read_inode_path_output(&output, &lookup, inode_count)
+                .map_err(|error| ServiceError::context("read inode-path output", error))
         })();
         let _ = fs::remove_file(&input_path);
         let _ = fs::remove_file(&output_path);
@@ -3321,13 +3305,12 @@ impl EndpointPathPlan {
         mut looked_up_paths: BTreeMap<u64, Vec<Vec<u8>>>,
     ) -> Result<BTreeMap<u64, Vec<Vec<u8>>>, ServiceError> {
         looked_up_paths.insert(ROOT_INODE, vec![Vec::new()]);
-        let mut paths = BTreeMap::new();
         let mut resolving = BTreeSet::new();
         for &ino in &self.changed_inodes {
-            let resolved = self.resolve_inode(ino, &mut looked_up_paths, &mut resolving)?;
-            paths.insert(ino, resolved);
+            self.resolve_inode(ino, &mut looked_up_paths, &mut resolving)?;
         }
-        Ok(paths)
+        looked_up_paths.retain(|ino, _| self.changed_inodes.contains(ino));
+        Ok(looked_up_paths)
     }
 
     fn resolve_inode(
@@ -3335,9 +3318,9 @@ impl EndpointPathPlan {
         ino: u64,
         cached_paths: &mut BTreeMap<u64, Vec<Vec<u8>>>,
         resolving: &mut BTreeSet<u64>,
-    ) -> Result<Vec<Vec<u8>>, ServiceError> {
-        if let Some(paths) = cached_paths.get(&ino) {
-            return Ok(paths.clone());
+    ) -> Result<(), ServiceError> {
+        if cached_paths.contains_key(&ino) {
+            return Ok(());
         }
         let references = self.manifest_references.get(&ino).ok_or_else(|| {
             ServiceError::new(format!("endpoint path lookup omitted required inode {ino}"))
@@ -3350,91 +3333,22 @@ impl EndpointPathPlan {
 
         let mut paths = Vec::new();
         for reference in references {
-            for mut parent_path in
-                self.resolve_inode(reference.parent_ino, cached_paths, resolving)?
-            {
-                if !parent_path.is_empty() {
-                    parent_path.push(b'/');
+            self.resolve_inode(reference.parent_ino, cached_paths, resolving)?;
+            for parent_path in &cached_paths[&reference.parent_ino] {
+                let mut path = parent_path.clone();
+                if !path.is_empty() {
+                    path.push(b'/');
                 }
-                parent_path.extend_from_slice(&reference.name);
-                paths.push(parent_path);
+                path.extend_from_slice(&reference.name);
+                paths.push(path);
             }
         }
         resolving.remove(&ino);
         paths.sort();
         paths.dedup();
-        cached_paths.insert(ino, paths.clone());
-        Ok(paths)
+        cached_paths.insert(ino, paths);
+        Ok(())
     }
-}
-
-fn parse_inode_path_output(
-    bytes: &[u8],
-    expected_inode_count: u64,
-) -> Result<BTreeMap<u64, Vec<Vec<u8>>>, ServiceError> {
-    let header_len = usize::from(INODE_PATH_OUTPUT_HEADER_SIZE);
-    if bytes.len() < header_len || bytes.get(..4) != Some(INODE_PATH_OUTPUT_MAGIC.as_slice()) {
-        return Err(ServiceError::new("inode-path output has invalid header"));
-    }
-    if take_output_u16(bytes, 4)? != INODE_PATH_OUTPUT_VERSION
-        || usize::from(take_output_u16(bytes, 6)?) != header_len
-    {
-        return Err(ServiceError::new(
-            "inode-path output has unsupported version or header length",
-        ));
-    }
-    let inode_count = take_output_u64(bytes, 8)?;
-    if inode_count != expected_inode_count {
-        return Err(ServiceError::new(
-            "inode-path output count differs from requested input",
-        ));
-    }
-    let expected_paths = take_output_u64(bytes, 16)?;
-    let mut cursor = header_len;
-    let mut paths = BTreeMap::new();
-    let mut actual_paths = 0_u64;
-    for _ in 0..inode_count {
-        let ino = take_output_u64(bytes, cursor)?;
-        cursor = cursor
-            .checked_add(8)
-            .ok_or_else(|| ServiceError::new("inode-path cursor overflow"))?;
-        let count = usize::try_from(take_output_u32(bytes, cursor)?)
-            .map_err(|_| ServiceError::new("inode-path record count exceeds usize"))?;
-        cursor = cursor
-            .checked_add(4)
-            .ok_or_else(|| ServiceError::new("inode-path cursor overflow"))?;
-        let mut inode_paths = Vec::with_capacity(count);
-        for _ in 0..count {
-            let length = usize::try_from(take_output_u32(bytes, cursor)?)
-                .map_err(|_| ServiceError::new("inode-path length exceeds usize"))?;
-            cursor = cursor
-                .checked_add(4)
-                .ok_or_else(|| ServiceError::new("inode-path cursor overflow"))?;
-            let end = cursor
-                .checked_add(length)
-                .ok_or_else(|| ServiceError::new("inode-path range overflow"))?;
-            let path = bytes
-                .get(cursor..end)
-                .ok_or_else(|| ServiceError::new("inode-path output is truncated"))?
-                .to_vec();
-            cursor = end;
-            inode_paths.push(path);
-            actual_paths = actual_paths
-                .checked_add(1)
-                .ok_or_else(|| ServiceError::new("inode-path result count overflow"))?;
-        }
-        if ino == 0 || paths.insert(ino, inode_paths).is_some() {
-            return Err(ServiceError::new(
-                "inode-path output contains an invalid or duplicate inode",
-            ));
-        }
-    }
-    if cursor != bytes.len() || actual_paths != expected_paths {
-        return Err(ServiceError::new(
-            "inode-path output has trailing bytes or mismatched path count",
-        ));
-    }
-    Ok(paths)
 }
 
 /// Changed-objects v2 carries the exact target security xattrs for changed
@@ -3466,33 +3380,6 @@ fn reject_changed_fscrypt(
         )));
     }
     Ok(())
-}
-
-fn take_output_u16(bytes: &[u8], offset: usize) -> Result<u16, ServiceError> {
-    let value = bytes
-        .get(offset..offset.saturating_add(2))
-        .ok_or_else(|| ServiceError::new("inode-path output is truncated"))?;
-    Ok(u16::from_be_bytes(
-        value.try_into().expect("fixed u16 slice"),
-    ))
-}
-
-fn take_output_u32(bytes: &[u8], offset: usize) -> Result<u32, ServiceError> {
-    let value = bytes
-        .get(offset..offset.saturating_add(4))
-        .ok_or_else(|| ServiceError::new("inode-path output is truncated"))?;
-    Ok(u32::from_be_bytes(
-        value.try_into().expect("fixed u32 slice"),
-    ))
-}
-
-fn take_output_u64(bytes: &[u8], offset: usize) -> Result<u64, ServiceError> {
-    let value = bytes
-        .get(offset..offset.saturating_add(8))
-        .ok_or_else(|| ServiceError::new("inode-path output is truncated"))?;
-    Ok(u64::from_be_bytes(
-        value.try_into().expect("fixed u64 slice"),
-    ))
 }
 
 fn validate_changed_objects_proof(
