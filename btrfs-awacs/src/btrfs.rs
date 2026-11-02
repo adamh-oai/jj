@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io;
+use std::ops::ControlFlow;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
@@ -1054,14 +1055,33 @@ fn open_directory_at(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<File> {
     }
 }
 
+pub(crate) struct MoveWalkBudget {
+    pub(crate) steps_left: usize,
+    pub(crate) path_bytes_left: usize,
+}
+
+impl MoveWalkBudget {
+    /// Charge one root, directory-component open, or child entry. Path bytes
+    /// count the full relative name before we copy it into the queue or journal.
+    pub(crate) fn take_step(&mut self, path_bytes: usize) -> bool {
+        if self.steps_left == 0 || path_bytes > self.path_bytes_left {
+            return false;
+        }
+        self.steps_left -= 1;
+        self.path_bytes_left -= path_bytes;
+        true
+    }
+}
+
 /// Visits children of a directory in an immutable snapshot. Keep the walk
 /// relative to open directories so symlinks, mount points, and long paths
 /// cannot redirect it to another tree.
 pub(crate) fn visit_snapshot_descendants(
     snapshot: BorrowedFd<'_>,
     path: &Path,
+    budget: &mut MoveWalkBudget,
     mut visit: impl FnMut(&Path, u64),
-) -> io::Result<()> {
+) -> io::Result<ControlFlow<()>> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::other(
             "cannot expand a move of the snapshot root",
@@ -1074,6 +1094,9 @@ pub(crate) fn visit_snapshot_descendants(
     while let Some(path) = pending.pop() {
         let mut dir = File::from(snapshot.try_clone_to_owned()?);
         for component in path.components() {
+            if !budget.take_step(0) {
+                return Ok(ControlFlow::Break(()));
+            }
             let Component::Normal(name) = component else {
                 return Err(io::Error::other("invalid directory path in snapshot"));
             };
@@ -1084,14 +1107,18 @@ pub(crate) fn visit_snapshot_descendants(
         }
         for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
             let entry = entry?;
-            let child = path.join(entry.file_name());
+            let name = entry.file_name();
+            if !budget.take_step(path.as_os_str().len().saturating_add(1 + name.len())) {
+                return Ok(ControlFlow::Break(()));
+            }
+            let child = path.join(name);
             visit(&child, entry.ino());
             if entry.file_type()?.is_dir() {
                 pending.push(child);
             }
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 fn directory_stat(directory: BorrowedFd<'_>) -> io::Result<libc::stat> {

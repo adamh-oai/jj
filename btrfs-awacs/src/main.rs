@@ -2039,8 +2039,8 @@ fn git_fsmonitor_invalidations(
         Invalidation::Full => Err("AWACS cannot replay this Git cursor incrementally; use an \
                                    explicit baseline rebuild"
             .to_owned()),
-        // Older cuts and unreadable directories can have only the directory
-        // names. Git needs child paths to refresh its untracked cache.
+        // Compact moves have only the directory names. Git needs child
+        // paths to refresh its untracked cache.
         Invalidation::Prefixes(_) => Err(
             "AWACS has only directory names for this Git cursor. To rebuild its baseline, run \
              `git --no-optional-locks -c core.fsmonitorHookFallback=true update-index --no-fsmonitor` \

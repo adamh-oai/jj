@@ -1,7 +1,9 @@
+use crate::btrfs::MoveWalkBudget;
 use crate::manifest::{CHANGE_INODE, CHANGE_REF, ChangedObjectsManifest, ObjectChange};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io;
+use std::ops::ControlFlow;
 use std::os::fd::BorrowedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -100,22 +102,23 @@ pub fn derive_events_from_endpoint_paths(
                 old_set.first().cloned(),
                 new_set.first().cloned(),
             ));
-        }
-        for path in old_set.difference(&new_set) {
-            events.push(event(
-                change,
-                EventKind::PathRemoved,
-                Some(path.clone()),
-                None,
-            ));
-        }
-        for path in new_set.difference(&old_set) {
-            events.push(event(
-                change,
-                EventKind::PathAdded,
-                None,
-                Some(path.clone()),
-            ));
+        } else {
+            for path in old_set.difference(&new_set) {
+                events.push(event(
+                    change,
+                    EventKind::PathRemoved,
+                    Some(path.clone()),
+                    None,
+                ));
+            }
+            for path in new_set.difference(&old_set) {
+                events.push(event(
+                    change,
+                    EventKind::PathAdded,
+                    None,
+                    Some(path.clone()),
+                ));
+            }
         }
 
         if change.change_mask & !CHANGE_REF != 0 {
@@ -139,43 +142,77 @@ pub fn derive_events_from_endpoint_paths(
             }
         }
     }
-    for (snapshot, kind) in [
-        (base, EventKind::PathRemoved),
-        (target, EventKind::PathAdded),
-    ] {
-        append_moved_descendants(&mut events, &moves, manifest, snapshot, kind)?;
-    }
+    expand_directory_moves(
+        &mut events,
+        moves,
+        manifest,
+        base,
+        target,
+        MoveWalkBudget {
+            steps_left: 32_768,
+            path_bytes_left: 4 * 1024 * 1024,
+        },
+    )?;
     events.sort_by(|left, right| event_key(left).cmp(&event_key(right)));
     events.dedup();
     Ok(events)
 }
 
-fn append_moved_descendants(
+fn expand_directory_moves(
+    events: &mut Vec<Event>,
+    moves: Vec<Event>,
+    manifest: &ChangedObjectsManifest,
+    base: BorrowedFd<'_>,
+    target: BorrowedFd<'_>,
+    mut budget: MoveWalkBudget,
+) -> io::Result<()> {
+    let start = events.len();
+    for (snapshot, kind) in [
+        (base, EventKind::PathRemoved),
+        (target, EventKind::PathAdded),
+    ] {
+        if append_moved_paths(events, &moves, manifest, snapshot, kind, &mut budget)?.is_break() {
+            // Discard both sides, regardless of the order we encountered the
+            // children. The original move covers even names we did not visit.
+            events.truncate(start);
+            events.extend(moves);
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn append_moved_paths(
     events: &mut Vec<Event>,
     moves: &[Event],
     manifest: &ChangedObjectsManifest,
     snapshot: BorrowedFd<'_>,
     kind: EventKind,
-) -> io::Result<()> {
+    budget: &mut MoveWalkBudget,
+) -> io::Result<ControlFlow<()>> {
     let removed = kind == EventKind::PathRemoved;
-    let roots: BTreeMap<_, _> = moves
-        .iter()
-        .filter_map(|moved| {
-            let name = if removed {
-                &moved.old_path
-            } else {
-                &moved.new_path
-            };
-            Some((Path::new(OsStr::from_bytes(name.as_deref()?)), moved))
-        })
-        .collect();
-    for (&root, moved) in &roots {
-        // Nested moves can overlap on just one side of the comparison.
-        if root.ancestors().skip(1).any(|p| roots.contains_key(p)) {
+    let mut roots = BTreeMap::new();
+    for moved in moves {
+        let name = if removed {
+            &moved.old_path
+        } else {
+            &moved.new_path
+        };
+        if let Some(name) = name {
+            if !budget.take_step(name.len()) {
+                return Ok(ControlFlow::Break(()));
+            }
+            roots.insert(Path::new(OsStr::from_bytes(name)), moved.ino);
+        }
+    }
+    let mut previous_root = None;
+    for (root, ino) in roots {
+        // Path order groups a moved directory with all its descendants.
+        if previous_root.is_some_and(|parent: &Path| root.starts_with(parent)) {
             continue;
         }
-        let start = events.len();
-        let result = crate::btrfs::visit_snapshot_descendants(snapshot, root, |path, ino| {
+        previous_root = Some(root);
+        let mut append_path = |path: &Path, ino: u64| {
             // An ancestor rename changes the path of an otherwise unchanged inode.
             let change = manifest.objects.get(&ino).copied().unwrap_or(ObjectChange {
                 ino,
@@ -190,18 +227,20 @@ fn append_moved_descendants(
                 (None, Some(path))
             };
             events.push(event(change, kind.clone(), old, new));
-        });
+        };
+        append_path(root, ino);
+        let result = crate::btrfs::visit_snapshot_descendants(snapshot, root, budget, append_path);
         // Other consumers can rescan a prefix even if the manager lacks
         // read permission. Never publish a partial list as an exact move.
-        if let Err(error) = result {
-            if error.kind() != io::ErrorKind::PermissionDenied {
-                return Err(error);
+        match result {
+            Ok(ControlFlow::Continue(())) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Ok(ControlFlow::Break(()));
             }
-            events.truncate(start);
-            events.push((*moved).clone());
+            other => return other,
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 fn event(
@@ -244,7 +283,7 @@ mod tests {
     use crate::manifest::{CHANGE_FILE_DATA, Reference};
     use std::fs::{self, File};
     use std::os::fd::AsFd;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     fn object(ino: u64, mode: u32) -> Object {
         Object {
@@ -334,6 +373,79 @@ mod tests {
                 raw.as_bytes(),
             ]
         );
+    }
+
+    #[test]
+    fn move_limits_cover_all_roots_and_both_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = File::open(dir.path()).unwrap();
+        let change = ObjectChange {
+            ino: 300,
+            old_generation: Some(400),
+            new_generation: Some(400),
+            change_mask: CHANGE_REF,
+        };
+        let other = ObjectChange { ino: 301, ..change };
+        let manifest = ChangedObjectsManifest {
+            objects: [(300, change), (301, other)].into(),
+            ref_adds: BTreeSet::new(),
+            ref_deletes: BTreeSet::new(),
+            raw_ref_adds: 0,
+            raw_ref_deletes: 0,
+        };
+        let mut moves = Vec::new();
+        for (inode, old, new) in [(change, "p/a", "p/c"), (other, "p/b", "p/d")] {
+            for path in [old, new] {
+                let path = dir.path().join(path);
+                fs::create_dir_all(&path).unwrap();
+                fs::write(path.join("f"), []).unwrap();
+            }
+            moves.push(event(
+                inode,
+                EventKind::SubtreeMoved,
+                Some(old.as_bytes().to_vec()),
+                Some(new.as_bytes().to_vec()),
+            ));
+        }
+        let ordinary = event(
+            change,
+            EventKind::PathAdded,
+            None,
+            Some(b"unrelated".to_vec()),
+        );
+        let expand = |steps_left, path_bytes_left| {
+            let mut events = vec![ordinary.clone()];
+            expand_directory_moves(
+                &mut events,
+                moves.clone(),
+                &manifest,
+                root.as_fd(),
+                root.as_fd(),
+                MoveWalkBudget {
+                    steps_left,
+                    path_bytes_left,
+                },
+            )
+            .unwrap();
+            events
+        };
+        // Each of the four roots costs four steps (root, two opens, leaf)
+        // and eight path bytes ("p/a" and "p/a/f").
+        let exact = project_events(&expand(16, 32));
+        assert!(exact.prefixes.is_empty());
+        assert_eq!(exact.paths.len(), 9);
+        let compact = [vec![ordinary.clone()], moves.clone()].concat();
+        assert_eq!(expand(15, 32), compact);
+        assert_eq!(expand(16, 31), compact);
+
+        let last_root = dir.path().join("p/d");
+        let permissions = fs::metadata(&last_root).unwrap().permissions();
+        fs::set_permissions(&last_root, fs::Permissions::from_mode(0)).unwrap();
+        // A privileged test process can still read this directory.
+        if fs::read_dir(&last_root).is_err_and(|e| e.kind() == io::ErrorKind::PermissionDenied) {
+            assert_eq!(expand(16, 32), compact);
+        }
+        fs::set_permissions(last_root, permissions).unwrap();
     }
 
     #[test]

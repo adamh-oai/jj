@@ -378,13 +378,19 @@ The semantic event kinds are `PathAdded`, `PathRemoved`, `PathChanged`,
 moves are inputs to conservative endpoint projection. When a directory moves,
 AWACS walks it in each immutable endpoint before saving the cut. It records
 the old names as removals and the new names as additions, including the
-directories themselves. Symlinks contribute their own names. Older cuts and
-moves that the manager cannot read can contain only the directory names.
-Those cuts can serve consumers that accept prefixes. Git requires the child
-paths to refresh its untracked cache and needs a baseline rebuild if its
-cursor crosses such a cut. A direct scan reads the
-opened immutable snapshot, so live mutations after Begin cannot change the
-tree being traversed.
+directories themselves. Symlinks contribute their own names.
+
+Each comparison allows 32,768 steps and 4 MiB of pathnames across all moves
+in both snapshots. Checking a move root, opening a directory component, and
+visiting a child each cost one step. If either limit prevents another step,
+AWACS discards the partially expanded moves and saves their directory names.
+It does the same if it lacks permission to read a moved directory. It keeps
+ordinary file changes in both cases. Older cuts can also contain only the
+directory names. Consumers that accept prefixes can replay these cuts. Git
+needs a baseline rebuild if its cursor crosses one.
+
+A direct scan reads the opened immutable snapshot, so live mutations after
+Begin cannot change the tree being traversed.
 
 The Git hook returns a cursor and changed paths. Git then reads the live
 worktree; it does not traverse the immutable snapshot supplied to Jujutsu.
