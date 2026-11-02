@@ -12,7 +12,9 @@ use std::os::fd::FromRawFd;
 use std::os::fd::IntoRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::DirEntryExt;
 use std::os::unix::fs::MetadataExt;
+use std::path::Component;
 use std::path::Path;
 use std::time::Instant;
 
@@ -1050,6 +1052,46 @@ fn open_directory_at(parent: BorrowedFd<'_>, name: &OsStr) -> io::Result<File> {
     } else {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
+}
+
+/// Visits children of a directory in an immutable snapshot. Keep the walk
+/// relative to open directories so symlinks, mount points, and long paths
+/// cannot redirect it to another tree.
+pub(crate) fn visit_snapshot_descendants(
+    snapshot: BorrowedFd<'_>,
+    path: &Path,
+    mut visit: impl FnMut(&Path, u64),
+) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::other(
+            "cannot expand a move of the snapshot root",
+        ));
+    }
+    let snapshot_mount = mount_id(snapshot)?;
+    // Queue directory names so the number of open descriptors stays constant
+    // as the tree grows deeper or wider.
+    let mut pending = vec![path.to_owned()];
+    while let Some(path) = pending.pop() {
+        let mut dir = File::from(snapshot.try_clone_to_owned()?);
+        for component in path.components() {
+            let Component::Normal(name) = component else {
+                return Err(io::Error::other("invalid directory path in snapshot"));
+            };
+            dir = open_directory_at(dir.as_fd(), name)?;
+        }
+        if mount_id(dir.as_fd())? != snapshot_mount {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+            let entry = entry?;
+            let child = path.join(entry.file_name());
+            visit(&child, entry.ino());
+            if entry.file_type()?.is_dir() {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn directory_stat(directory: BorrowedFd<'_>) -> io::Result<libc::stat> {

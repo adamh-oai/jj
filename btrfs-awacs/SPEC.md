@@ -375,7 +375,14 @@ sentinel path when a narrowed scan cannot be proven safe.
 
 The semantic event kinds are `PathAdded`, `PathRemoved`, `PathChanged`,
 `SubtreeMoved`, and `DirectoryDirtyWitness`. Directory witnesses and subtree
-moves are inputs to conservative endpoint projection. A direct scan reads the
+moves are inputs to conservative endpoint projection. When a directory moves,
+AWACS walks it in each immutable endpoint before saving the cut. It records
+the old names as removals and the new names as additions, including the
+directories themselves. Symlinks contribute their own names. Older cuts and
+moves that the manager cannot read can contain only the directory names.
+Those cuts can serve consumers that accept prefixes. Git requires the child
+paths to refresh its untracked cache and needs a baseline rebuild if its
+cursor crosses such a cut. A direct scan reads the
 opened immutable snapshot, so live mutations after Begin cannot change the
 tree being traversed.
 

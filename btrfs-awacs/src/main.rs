@@ -2039,12 +2039,14 @@ fn git_fsmonitor_invalidations(
         Invalidation::Full => Err("AWACS cannot replay this Git cursor incrementally; use an \
                                    explicit baseline rebuild"
             .to_owned()),
-        // Git's hook protocol has no first-class prefix result. Until the
-        // Git adapter proves directory-prefix semantics, fail the hook rather
-        // than widening an exact AWACS answer to a whole-tree invalidation.
-        Invalidation::Prefixes(_) => {
-            Err("AWACS cannot represent prefix invalidations in the Git fsmonitor hook".to_owned())
-        }
+        // Older cuts and unreadable directories can have only the directory
+        // names. Git needs child paths to refresh its untracked cache.
+        Invalidation::Prefixes(_) => Err(
+            "AWACS has only directory names for this Git cursor. To rebuild its baseline, run \
+             `git --no-optional-locks -c core.fsmonitorHookFallback=true update-index --no-fsmonitor` \
+             and then `git status`."
+                .to_owned(),
+        ),
     }
 }
 
@@ -3501,6 +3503,14 @@ mod tests {
             git_fsmonitor_invalidations(true, &btrfs_awacs::scan::Invalidation::Full).unwrap(),
             [b"/".to_vec()]
         );
+    }
+
+    #[test]
+    fn git_fsmonitor_refuses_directory_names_without_children() {
+        let prefixes =
+            btrfs_awacs::scan::Invalidation::Prefixes(vec![b"old".to_vec(), b"new".to_vec()]);
+        let error = git_fsmonitor_invalidations(false, &prefixes).unwrap_err();
+        assert!(error.contains("rebuild its baseline"), "{error}");
     }
 
     #[test]

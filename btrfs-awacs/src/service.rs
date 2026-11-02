@@ -1633,9 +1633,10 @@ impl Service {
             let events = derive_events_from_endpoint_paths(
                 &parsed.manifest,
                 &target_objects,
-                &base_paths,
-                &target_paths,
-            );
+                (source, &base_paths),
+                (target, &target_paths),
+            )
+            .map_err(|error| ServiceError::context("expand moved snapshot directories", error))?;
             Ok((parsed.manifest, events))
         })();
         let _ = fs::remove_file(spool_path);
@@ -1873,9 +1874,10 @@ impl Service {
             let replay_events = derive_events_from_endpoint_paths(
                 &parsed.manifest,
                 &target_objects,
-                &base_paths,
-                &target_paths,
-            );
+                (base.as_fd(), &base_paths),
+                (target_fd.as_fd(), &target_paths),
+            )
+            .map_err(|error| ServiceError::context("expand moved snapshot directories", error))?;
             incremental_phase = "append-replay-spool";
             let replay_payload_hash = append_replay_spool_payload(&spool_path, &replay_events)
                 .map_err(|error| ServiceError::context("append replay spool", error))?;
