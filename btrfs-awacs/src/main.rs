@@ -2115,16 +2115,18 @@ fn git_fsmonitor_invalidations(
 ) -> Result<Vec<Vec<u8>>, String> {
     match invalidation {
         _ if is_bootstrap => Ok(vec![b"/".to_vec()]),
-        Invalidation::ExactPaths(paths) => Ok(paths.clone()),
+        Invalidation::Paths { exact, prefixes } if prefixes.is_empty() => Ok(exact.clone()),
         Invalidation::Full => Err("AWACS cannot replay this Git cursor incrementally; use an \
                                    explicit baseline rebuild"
             .to_owned()),
-        // Git's hook protocol has no first-class prefix result. Until the
-        // Git adapter proves directory-prefix semantics, fail the hook rather
-        // than widening an exact AWACS answer to a whole-tree invalidation.
-        Invalidation::Prefixes(_) => {
-            Err("AWACS cannot represent prefix invalidations in the Git fsmonitor hook".to_owned())
-        }
+        // Compact moves have only the directory names. Git needs child
+        // paths to refresh its untracked cache.
+        Invalidation::Paths { .. } => Err("AWACS lacks child paths for a directory move in this \
+                                           Git cursor. To rebuild its baseline, run `git \
+                                           --no-optional-locks -c \
+                                           core.fsmonitorHookFallback=true update-index \
+                                           --no-fsmonitor` and then `git status`."
+            .to_owned()),
     }
 }
 
@@ -3549,7 +3551,10 @@ mod tests {
             assert!(previous.is_none());
             let paths = git_fsmonitor_invalidations(
                 previous.is_none(),
-                &btrfs_awacs::scan::Invalidation::ExactPaths(Vec::new()),
+                &btrfs_awacs::scan::Invalidation::Paths {
+                    exact: Vec::new(),
+                    prefixes: Vec::new(),
+                },
             )
             .unwrap();
             assert_eq!(
@@ -3581,6 +3586,16 @@ mod tests {
             git_fsmonitor_invalidations(true, &btrfs_awacs::scan::Invalidation::Full).unwrap(),
             [b"/".to_vec()]
         );
+    }
+
+    #[test]
+    fn git_fsmonitor_refuses_directory_names_without_children() {
+        let mixed = btrfs_awacs::scan::Invalidation::Paths {
+            exact: vec![b"file".to_vec()],
+            prefixes: vec![b"old".to_vec(), b"new".to_vec()],
+        };
+        let error = git_fsmonitor_invalidations(false, &mixed).unwrap_err();
+        assert!(error.contains("rebuild its baseline"), "{error}");
     }
 
     #[test]

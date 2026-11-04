@@ -148,6 +148,7 @@ impl btrfs_awacs::scan::ScanSession for FakeAwacsSession {
 #[cfg(all(feature = "awacs", unix))]
 struct FakeAwacsClient {
     scan_root: PathBuf,
+    invalidation: btrfs_awacs::scan::Invalidation,
     outcomes: Arc<Mutex<Vec<btrfs_awacs::scan::ScanOutcome>>>,
     requests: Arc<Mutex<Vec<Option<btrfs_awacs::scan::SnapshotBaseline>>>>,
     valid_scan_root: bool,
@@ -173,7 +174,7 @@ impl btrfs_awacs::scan::ScanClient for FakeAwacsClient {
                 continuity_token: b"baseline".to_vec(),
                 retention_token: request.baseline_owner_id.to_vec(),
             },
-            btrfs_awacs::scan::Invalidation::Prefixes(vec![b"dir".to_vec()]),
+            self.invalidation.clone(),
             u64::MAX,
             File::open(&self.scan_root).unwrap(),
             Box::new(FakeAwacsSession {
@@ -3959,6 +3960,7 @@ fn test_subvolume_mode_recovers_pending_materialization_incrementally(marker: &s
         &base_settings,
     )?;
 
+    seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
     let old_tree = create_tree(repo, &[(repo_path("old/file"), "old\n")]);
     let intended_tree = create_tree(repo, &[(repo_path("new/file"), "new\n")]);
     let mut journal = read_compact_working_copy_state(&state_path)?;
@@ -3972,14 +3974,7 @@ fn test_subvolume_mode_recovers_pending_materialization_incrementally(marker: &s
         .map(|id| id.to_bytes())
         .collect();
     journal.pending_conflict_labels = intended_tree.labels().as_slice().to_owned();
-    journal.pending_baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
-        filesystem_uuid: vec![1; 16],
-        subvolume_uuid: vec![2; 16],
-        continuity_token: b"baseline-a".to_vec(),
-        interpretation_input_fingerprint: vec![3; 32],
-        ..Default::default()
-    });
-    journal.untracked_scan_complete = true;
+    journal.pending_baseline = journal.baseline.take();
     journal.mutation_kind = "checkout".to_owned();
     write_compact_working_copy_state(&state_path, &journal)?;
     std::fs::write(state_path.join("subvolume_mode"), format!("{marker}\n"))?;
@@ -4909,8 +4904,10 @@ fn test_test_awacs_exact_delta_reconciles_reported_symlink_ancestor() -> TestRes
 
 #[test]
 #[cfg(all(feature = "awacs", unix))]
-fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_snapshot()
--> TestResult {
+fn test_awacs_library_client_snapshots_a_directory_move_and_an_exact_edit() -> TestResult {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
     let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
     let workspace_root = test_repo.env.root().join("workspace");
@@ -4928,17 +4925,35 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
         &tree_state_settings,
     )?;
 
-    let path = repo_path("dir/file");
-    let untouched_path = repo_path("untouched");
-    testutils::write_working_copy_file(&workspace_root, path, "live\n");
-    testutils::write_working_copy_file(&scan_root, path, "leased\n");
-    testutils::write_working_copy_file(&scan_root, untouched_path, "untouched\n");
+    let source = repo_path("personal/tool/src/main");
+    let destination = repo_path("project/tool/src/main");
+    let source_sibling = repo_path("personal/unrelated/file");
+    let destination_sibling = repo_path("project/unrelated/file");
+    let config = repo_path("config");
+    let baseline = [
+        (source, "leased\n"),
+        (source_sibling, "keep source\n"),
+        (destination_sibling, "keep destination\n"),
+        (config, "old config\n"),
+    ];
+    testutils::write_working_copy_file(&workspace_root, source, "live\n");
+    for (path, contents) in baseline {
+        testutils::write_working_copy_file(&scan_root, path, contents);
+    }
     let outcomes = Arc::new(Mutex::new(Vec::new()));
     let requests = Arc::new(Mutex::new(Vec::new()));
     let settings = TreeStateSettings {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root: scan_root.clone(),
+                invalidation: btrfs_awacs::scan::Invalidation::Paths {
+                    exact: vec![
+                        b"personal".to_vec(),
+                        b"project".to_vec(),
+                        b"config".to_vec(),
+                    ],
+                    prefixes: vec![b"personal/tool".to_vec(), b"project/tool".to_vec()],
+                },
                 outcomes: outcomes.clone(),
                 requests: requests.clone(),
                 valid_scan_root: true,
@@ -4961,9 +4976,8 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
         .block_on()?;
     tree_state.save()?;
 
-    // No durable A is paired with X yet, so the first Prefixes response must
-    // be widened to a full scan despite the synthetic backend's hint.
-    let expected_tree = create_tree(repo, &[(path, "leased\n"), (untouched_path, "untouched\n")]);
+    // The first scan reads the entire leased snapshot to establish the baseline.
+    let expected_tree = create_tree(repo, &baseline);
     assert_tree_eq!(*tree_state.current_tree(), expected_tree);
     assert_eq!(
         outcomes.lock().unwrap().as_slice(),
@@ -4971,10 +4985,7 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
     );
     assert_eq!(requests.lock().unwrap().as_slice(), &[None]);
 
-    // Seed the clean A binding a locked working-copy finish would publish,
-    // then prove the next production adapter scan accepts only the returned
-    // prefix. Removing an unchanged sibling from B must not delete its X
-    // value.
+    // A locked working-copy finish would record this baseline for the next scan.
     let mut journal = read_compact_working_copy_state(&state_path)?;
     journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
     journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
@@ -4987,19 +4998,41 @@ fn test_awacs_library_client_uses_full_then_retained_prefix_and_aborts_direct_sn
     });
     journal.untracked_scan_complete = true;
     write_compact_working_copy_state(&state_path, &journal)?;
-    testutils::write_working_copy_file(&scan_root, path, "leased again\n");
-    std::fs::remove_file(untouched_path.to_fs_path_unchecked(&scan_root))?;
+    std::fs::rename(
+        scan_root.join("personal/tool"),
+        scan_root.join("project/tool"),
+    )?;
+    testutils::write_working_copy_file(&scan_root, config, "new config\n");
 
-    // A direct TreeState caller still aborts B after scanning, but it may use
-    // an already-published A binding for this one directed scan.
+    // An unreported deletion must keep its stored value.
+    std::fs::remove_file(source_sibling.to_fs_path_unchecked(&scan_root))?;
+    // Reading either parent directory would encounter a name JJ cannot decode.
+    // The two recursive paths suffice to discover every moved file.
+    for parent in ["personal", "project"] {
+        std::fs::write(scan_root.join(parent).join(OsStr::from_bytes(b"\xff")), b"")?;
+    }
+    let visited = Mutex::new(Vec::new());
+    let progress = |path: &RepoPath| visited.lock().unwrap().push(path.to_owned());
+    let options = SnapshotOptions {
+        progress: Some(&progress),
+        ..options
+    };
     let mut reloaded_tree_state =
         TreeState::load(repo.store().clone(), workspace_root, state_path, &settings)?;
     reloaded_tree_state.snapshot(&options).block_on()?;
     let expected_tree = create_tree(
         repo,
-        &[(path, "leased again\n"), (untouched_path, "untouched\n")],
+        &[
+            (destination, "leased\n"),
+            (source_sibling, "keep source\n"),
+            (destination_sibling, "keep destination\n"),
+            (config, "new config\n"),
+        ],
     );
     assert_tree_eq!(*reloaded_tree_state.current_tree(), expected_tree);
+    let mut visited = visited.into_inner().unwrap();
+    visited.sort();
+    assert_eq!(visited, [config.to_owned(), destination.to_owned()]);
     assert_eq!(
         requests.lock().unwrap().as_slice(),
         &[
@@ -5048,6 +5081,7 @@ fn test_awacs_rejected_scan_root_aborts_accepted_lease() -> TestResult {
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root,
+                invalidation: btrfs_awacs::scan::Invalidation::Full,
                 outcomes: outcomes.clone(),
                 requests: Arc::new(Mutex::new(Vec::new())),
                 valid_scan_root: false,
@@ -5094,16 +5128,8 @@ fn test_awacs_baseline_input_mismatch_requires_explicit_rebuild() -> TestResult 
         &tree_state_settings,
     )?;
     tree_state.save()?;
-    let mut journal = read_compact_working_copy_state(&state_path)?;
-    journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
-    journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
-        filesystem_uuid: vec![1; 16],
-        subvolume_uuid: vec![2; 16],
-        continuity_token: b"stale-baseline".to_vec(),
-        retention_token: Vec::new(),
-        interpretation_input_fingerprint: vec![9; 32],
-    });
-    write_compact_working_copy_state(&state_path, &journal)?;
+    seed_test_awacs_baseline(&state_path, b"stale-baseline", [9; 32])?;
+    let journal = read_compact_working_copy_state(&state_path)?;
     std::fs::write(state_path.join("subvolume_mode"), b"snapshot-backed\n")?;
 
     let outcomes = Arc::new(Mutex::new(Vec::new()));
@@ -5112,6 +5138,7 @@ fn test_awacs_baseline_input_mismatch_requires_explicit_rebuild() -> TestResult 
         fsmonitor_settings: FsmonitorSettings::Awacs(AwacsConfig {
             client: Some(Arc::new(Mutex::new(Box::new(FakeAwacsClient {
                 scan_root,
+                invalidation: btrfs_awacs::scan::Invalidation::Full,
                 outcomes,
                 requests: requests.clone(),
                 valid_scan_root: true,
@@ -5130,6 +5157,10 @@ fn test_awacs_baseline_input_mismatch_requires_explicit_rebuild() -> TestResult 
         ..empty_snapshot_options()
     };
     let error = tree_state.snapshot(&options).block_on().unwrap_err();
+    assert!(
+        format!("{error:?}").contains("baseline no longer matches the working-copy inputs"),
+        "{error:?}"
+    );
     assert!(
         format!("{error:?}").contains("jj util subvolume enable --rebuild-baseline"),
         "{error:?}"

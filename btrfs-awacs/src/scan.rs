@@ -37,8 +37,12 @@ pub struct BeginScanRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Invalidation {
     Full,
-    ExactPaths(Vec<Vec<u8>>),
-    Prefixes(Vec<Vec<u8>>),
+    Paths {
+        /// Changes to the named paths.
+        exact: Vec<Vec<u8>>,
+        /// Changes to these paths and their descendants.
+        prefixes: Vec<Vec<u8>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

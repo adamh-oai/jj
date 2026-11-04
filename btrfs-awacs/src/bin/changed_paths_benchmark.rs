@@ -1,6 +1,6 @@
 use btrfs_awacs::broker::{
-    ChangedObjectsExecution, ExpectedSubvolume, INODE_PATH_OUTPUT_HEADER_SIZE,
-    INODE_PATH_OUTPUT_MAGIC, INODE_PATH_OUTPUT_VERSION, InodePathsExecution, SeqPacket,
+    ChangedObjectsExecution, ExpectedSubvolume, InodePathsExecution, SeqPacket,
+    read_inode_path_output,
 };
 use btrfs_awacs::broker_protocol::{BrokerClient, BrokerDispatcher};
 use btrfs_awacs::btrfs::{OpenedSubvolume, ROOT_INODE, inode_paths};
@@ -224,7 +224,9 @@ fn run_fixture(
                 )
                 .map_err(|error| format!("reverse lookup for {count} files: {error}"))?;
             let reverse_lookup_us = reverse_started.elapsed().as_micros();
-            let reverse_paths = parse_reverse_output(&read_file(&reverse_file)?)?;
+            let reverse_paths =
+                read_inode_path_output(&reverse_file, &reverse, reverse_request.inode_count)
+                    .map_err(|error| format!("read reverse lookup for {count} files: {error}"))?;
             if reverse_paths.len() != inodes.len()
                 || inodes.iter().any(|ino| !reverse_paths.contains_key(ino))
             {
@@ -573,54 +575,6 @@ fn read_file(file: &File) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn parse_reverse_output(bytes: &[u8]) -> Result<BTreeMap<u64, Vec<Vec<u8>>>, String> {
-    let header_len = usize::from(INODE_PATH_OUTPUT_HEADER_SIZE);
-    if bytes.len() < header_len || bytes.get(..4) != Some(INODE_PATH_OUTPUT_MAGIC.as_slice()) {
-        return Err("reverse output has invalid header".to_owned());
-    }
-    if take_u16(bytes, 4)? != INODE_PATH_OUTPUT_VERSION
-        || usize::from(take_u16(bytes, 6)?) != header_len
-    {
-        return Err("reverse output has unsupported version or header length".to_owned());
-    }
-    let inode_count = usize::try_from(take_u64(bytes, 8)?)
-        .map_err(|_| "reverse inode count exceeds usize".to_owned())?;
-    let expected_paths = take_u64(bytes, 16)?;
-    let mut cursor = header_len;
-    let mut paths = BTreeMap::new();
-    let mut actual_paths = 0_u64;
-    for _ in 0..inode_count {
-        let ino = take_u64(bytes, cursor)?;
-        cursor += 8;
-        let count = usize::try_from(take_u32(bytes, cursor)?)
-            .map_err(|_| "reverse path count exceeds usize".to_owned())?;
-        cursor += 4;
-        let mut inode_paths = Vec::with_capacity(count);
-        for _ in 0..count {
-            let length = usize::try_from(take_u32(bytes, cursor)?)
-                .map_err(|_| "reverse path length exceeds usize".to_owned())?;
-            cursor += 4;
-            let end = cursor
-                .checked_add(length)
-                .ok_or_else(|| "reverse path range overflow".to_owned())?;
-            let path = bytes
-                .get(cursor..end)
-                .ok_or_else(|| "reverse output has truncated path".to_owned())?
-                .to_vec();
-            cursor = end;
-            inode_paths.push(path);
-            actual_paths += 1;
-        }
-        if paths.insert(ino, inode_paths).is_some() {
-            return Err("reverse output contains duplicate inode".to_owned());
-        }
-    }
-    if cursor != bytes.len() || actual_paths != expected_paths {
-        return Err("reverse output has trailing bytes or mismatched path count".to_owned());
-    }
-    Ok(paths)
-}
-
 fn parse_manifest(bytes: &[u8]) -> Result<ChangedObjectsManifest, String> {
     if bytes.starts_with(CHANGED_OBJECTS_V2_MAGIC) {
         parse_changed_objects_v2(bytes)
@@ -629,27 +583,6 @@ fn parse_manifest(bytes: &[u8]) -> Result<ChangedObjectsManifest, String> {
     } else {
         parse_changed_objects(bytes).map_err(|error| error.to_string())
     }
-}
-
-fn take_u16(bytes: &[u8], offset: usize) -> Result<u16, String> {
-    let value = bytes
-        .get(offset..offset + 2)
-        .ok_or_else(|| "reverse output is truncated".to_owned())?;
-    Ok(u16::from_be_bytes(value.try_into().expect("fixed slice")))
-}
-
-fn take_u32(bytes: &[u8], offset: usize) -> Result<u32, String> {
-    let value = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| "reverse output is truncated".to_owned())?;
-    Ok(u32::from_be_bytes(value.try_into().expect("fixed slice")))
-}
-
-fn take_u64(bytes: &[u8], offset: usize) -> Result<u64, String> {
-    let value = bytes
-        .get(offset..offset + 8)
-        .ok_or_else(|| "reverse output is truncated".to_owned())?;
-    Ok(u64::from_be_bytes(value.try_into().expect("fixed slice")))
 }
 
 fn print_header() {

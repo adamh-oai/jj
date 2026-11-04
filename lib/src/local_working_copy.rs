@@ -1956,11 +1956,12 @@ impl TreeState {
     /// current scan and all inspected paths are read from the scan root.
     async fn rebuild_ephemeral_tracked_paths(
         &mut self,
-        scope: &ScanScope,
-        explicit_tracking_matcher: &dyn Matcher,
+        matcher: &dyn Matcher,
     ) -> Result<(), SnapshotError> {
         let mut entries = Vec::new();
-        let mut push_value = |path: RepoPathBuf, value: MergedTreeValue| {
+        let mut stream = self.tree.entries_stream_matching(matcher);
+        while let Some((path, value)) = stream.next().await {
+            let value = value?;
             if !value.is_tree() && !value.is_absent() {
                 let kind = if matches!(value.as_normal(), Some(TreeValue::GitSubmodule(_))) {
                     TrackedKind::GitSubmodule
@@ -1968,38 +1969,6 @@ impl TreeState {
                     TrackedKind::FileLike
                 };
                 entries.push(TrackedPathEntry { path, kind });
-            }
-        };
-        match scope {
-            ScanScope::Full => {
-                let sparse_matcher = self.sparse_matcher();
-                let mut stream = self.tree.entries_stream_matching(sparse_matcher.as_ref());
-                while let Some((path, result)) = stream.next().await {
-                    push_value(path, result?);
-                }
-            }
-            ScanScope::Changed { exact, prefixes } => {
-                // An exact delta can replace or remove a semantic directory,
-                // so include descendants of every exact path as well as the
-                // explicit recursive prefixes. Walk the semantic tree once
-                // instead of restarting it for each changed path.
-                let mut roots = exact.iter().chain(prefixes).collect_vec();
-                roots.sort_unstable();
-                let mut minimal_roots: Vec<&RepoPathBuf> = Vec::new();
-                for root in roots {
-                    if minimal_roots
-                        .last()
-                        .is_none_or(|ancestor| !root.starts_with(*ancestor))
-                    {
-                        minimal_roots.push(root);
-                    }
-                }
-                let changed_matcher = PrefixMatcher::new(minimal_roots);
-                let matcher = UnionMatcher::new(&changed_matcher, explicit_tracking_matcher);
-                let mut stream = self.tree.entries_stream_matching(&matcher);
-                while let Some((path, result)) = stream.next().await {
-                    push_value(path, result?);
-                }
             }
         }
         entries.sort_unstable_by(|entry1, entry2| entry1.path.cmp(&entry2.path));
@@ -2752,6 +2721,12 @@ impl TreeState {
         }
         let sparse_matcher = self.sparse_matcher();
         let external_sparse_matcher = external_sparse_patterns.as_ref().map(PrefixMatcher::new);
+        let external_sparse_matcher: &dyn Matcher = external_sparse_matcher
+            .as_ref()
+            .map(|matcher| matcher as &dyn Matcher)
+            .unwrap_or(&EverythingMatcher);
+        let materialized_matcher =
+            IntersectionMatcher::new(sparse_matcher.as_ref(), external_sparse_matcher);
 
         // Only authoritative immutable backends publish a durable baseline
         // token. Mutable Test/Watchman scans intentionally leave NoBaseline,
@@ -2831,8 +2806,14 @@ impl TreeState {
         let directed_root_ignores = match &scan_scope {
             ScanScope::Full => None,
             ScanScope::Changed { .. } => Some(
-                scan_root_base_ignores
-                    .chain_with_file(RepoPath::root(), scan_root.join(".gitignore"))?,
+                chain_directory_gitignore(
+                    scan_root_base_ignores.clone(),
+                    RepoPath::root(),
+                    &scan_root,
+                    &self.tree,
+                    &materialized_matcher,
+                )
+                .await?,
             ),
         };
         let ignored_path_count = if let Some(root_ignores) = &directed_root_ignores {
@@ -2883,14 +2864,14 @@ impl TreeState {
         let requested_matcher =
             UnionMatcher::new(explicit_tracking_matcher, force_tracking_matcher);
         let scan_matcher = UnionMatcher::new(fsmonitor_matcher.as_ref(), &requested_matcher);
-        let sparse_scan_matcher = IntersectionMatcher::new(sparse_matcher.as_ref(), scan_matcher);
-        let external_sparse_matcher: &dyn Matcher = external_sparse_matcher
-            .as_ref()
-            .map(|matcher| matcher as &dyn Matcher)
-            .unwrap_or(&EverythingMatcher);
-        let matcher = IntersectionMatcher::new(external_sparse_matcher, sparse_scan_matcher);
-        self.rebuild_ephemeral_tracked_paths(&scan_scope, explicit_tracking_matcher)
-            .await?;
+        // Keep tracked submodules visible at directory boundaries, even if the
+        // external sparse patterns select only paths inside them.
+        let tracked_matcher: &dyn Matcher = match &scan_scope {
+            ScanScope::Full => sparse_matcher.as_ref(),
+            ScanScope::Changed { .. } => &scan_matcher,
+        };
+        self.rebuild_ephemeral_tracked_paths(tracked_matcher).await?;
+        let matcher = IntersectionMatcher::new(&materialized_matcher, scan_matcher);
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             if baseline.is_some() {
@@ -2920,7 +2901,7 @@ impl TreeState {
                     current_tree: &self.tree,
                     changed_matcher: fsmonitor_matcher.as_ref(),
                     matcher: &matcher,
-                    sparse_matcher: sparse_matcher.as_ref(),
+                    sparse_matcher: &materialized_matcher,
                     start_tracking_matcher,
                     force_tracking_matcher,
                     // Move tx sides so they'll be dropped at the end of the scope.
@@ -3235,28 +3216,17 @@ impl TreeState {
                                 "AWACS returned a full invalidation for a committed baseline",
                             ));
                         }
-                        btrfs_awacs::scan::Invalidation::ExactPaths(paths) => (
-                            Some(
-                                paths
+                        btrfs_awacs::scan::Invalidation::Paths { exact, prefixes } => {
+                            let paths = |names: &[Vec<u8>]| {
+                                names
                                     .iter()
-                                    .map(|path| {
-                                        PathBuf::from(std::ffi::OsString::from_vec(path.clone()))
+                                    .map(|name| {
+                                        PathBuf::from(std::ffi::OsString::from_vec(name.clone()))
                                     })
-                                    .collect(),
-                            ),
-                            Some(Vec::new()),
-                        ),
-                        btrfs_awacs::scan::Invalidation::Prefixes(paths) => (
-                            Some(Vec::new()),
-                            Some(
-                                paths
-                                    .iter()
-                                    .map(|path| {
-                                        PathBuf::from(std::ffi::OsString::from_vec(path.clone()))
-                                    })
-                                    .collect(),
-                            ),
-                        ),
+                                    .collect()
+                            };
+                            (Some(paths(exact)), Some(paths(prefixes)))
+                        }
                     }
                 };
                 let baseline = crate::protos::local_working_copy::AwacsSnapshotBaseline {
@@ -3435,6 +3405,64 @@ struct DirectoryIgnoreContext {
 // authoritative structural boundary, never an unreported boundary.
 type DirectoryIgnoreCache = HashMap<RepoPathBuf, Option<DirectoryIgnoreContext>>;
 
+/// Adds the rules from a directory's regular `.gitignore` file. If sparse
+/// checkout omitted that file, use the tracked version from the current tree.
+pub(crate) async fn chain_directory_gitignore(
+    parent: Arc<GitIgnoreFile>,
+    dir: &RepoPath,
+    disk_dir: &Path,
+    tree: &MergedTree,
+    sparse_matcher: &dyn Matcher,
+) -> Result<Arc<GitIgnoreFile>, SnapshotError> {
+    let name = RepoPathComponent::new(".gitignore").expect("static string");
+    let disk_path = disk_dir.join(name.as_internal_str());
+    let contents = match disk_path.symlink_metadata() {
+        Ok(metadata) if metadata.is_file() => {
+            fs::read(&disk_path).map_err(|err| SnapshotError::Other {
+                message: format!(
+                    "Failed to read ignore patterns from file {}",
+                    disk_path.display()
+                ),
+                err: err.into(),
+            })?
+        }
+        Ok(_) => return Ok(parent),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let path = dir.join(name);
+            if sparse_matcher.matches(&path) {
+                // A materialized file that is absent on disk has been deleted.
+                return Ok(parent);
+            }
+            let value = tree.path_value(&path).await?;
+            let Some(TreeValue::File { id, .. }) = value.as_normal() else {
+                return Ok(parent);
+            };
+            let mut contents = Vec::new();
+            tree.store()
+                .read_file(&path, id)
+                .await?
+                .read_to_end(&mut contents)
+                .await
+                .map_err(|err| BackendError::ReadFile {
+                    path,
+                    id: id.clone(),
+                    source: err.into(),
+                })?;
+            contents
+        }
+        Err(err) => {
+            return Err(SnapshotError::Other {
+                message: format!(
+                    "Error accessing ignore patterns file {}",
+                    disk_path.display()
+                ),
+                err: err.into(),
+            });
+        }
+    };
+    Ok(parent.chain(dir, &disk_path, &contents)?)
+}
+
 /// Helper to scan local-disk directories and files in parallel.
 struct FileSnapshotter<'a> {
     tree_state: &'a TreeState,
@@ -3483,8 +3511,7 @@ impl FileSnapshotter<'_> {
     }
 
     /// Visits authoritative exact/prefix deltas without walking root siblings.
-    /// The roots are disjoint, but traversal still uses the original matcher:
-    /// an exact directory does not make its unchanged descendants eligible.
+    /// Inspect exact entries individually. Only a recursive root covers its descendants.
     fn visit_changed_paths<'scope>(
         &'scope self,
         exact: &[RepoPathBuf],
@@ -3526,8 +3553,9 @@ impl FileSnapshotter<'_> {
                             .symlink_metadata()
                             .is_ok_and(|metadata| metadata.is_dir());
                     if can_visit_root {
-                        self.visit_prefix_root(
+                        self.visit_changed_path(
                             &root,
+                            true,
                             base_ignores.clone(),
                             &mut ignore_contexts,
                             scope,
@@ -3537,11 +3565,18 @@ impl FileSnapshotter<'_> {
                     }
                 }
             }
-            self.visit_prefix_root(path, base_ignores.clone(), &mut ignore_contexts, scope)?;
-            // A directory schedules every matched descendant. Missing paths
-            // and file replacements likewise account for tracked descendants
-            // without following a now-invalid directory boundary.
-            previous_root = Some(path.clone());
+            let recursive = prefixes.binary_search(path).is_ok()
+                || !self.force_tracking_matcher.visit(path).is_nothing();
+            self.visit_changed_path(
+                path,
+                recursive,
+                base_ignores.clone(),
+                &mut ignore_contexts,
+                scope,
+            )?;
+            if recursive {
+                previous_root = Some(path.clone());
+            }
         }
         Ok(())
     }
@@ -3579,6 +3614,15 @@ impl FileSnapshotter<'_> {
                 };
                 context = cached.clone();
                 continue;
+            }
+            // A submodule can contain files even before it has a .git marker.
+            // A reported child may be the only path selected inside it.
+            if matches!(
+                self.current_tree.path_value(&current).block_on()?.as_normal(),
+                Some(TreeValue::GitSubmodule(_))
+            ) {
+                cache.insert(current, None);
+                return Ok(None);
             }
             if !context.ancestor_ignored && context.git_ignore.matches_dir(&current) {
                 context.ancestor_ignored = true;
@@ -3638,9 +3682,14 @@ impl FileSnapshotter<'_> {
                 });
             }
             if !context.ancestor_ignored {
-                context.git_ignore = context
-                    .git_ignore
-                    .chain_with_file(&current, disk_dir.join(".gitignore"))?;
+                context.git_ignore = chain_directory_gitignore(
+                    context.git_ignore,
+                    &current,
+                    &disk_dir,
+                    self.current_tree,
+                    self.sparse_matcher,
+                )
+                .block_on()?;
             }
             cache.insert(current.clone(), Some(context.clone()));
         }
@@ -3709,24 +3758,28 @@ impl FileSnapshotter<'_> {
         }
     }
 
-    fn visit_prefix_root<'scope>(
+    fn visit_changed_path<'scope>(
         &'scope self,
-        prefix: &RepoPath,
+        path: &RepoPath,
+        recursive: bool,
         base_ignores: Arc<GitIgnoreFile>,
         ignore_contexts: &mut DirectoryIgnoreCache,
         scope: &rayon::Scope<'scope>,
     ) -> Result<(), SnapshotError> {
-        if Self::path_has_reserved_component(prefix)
-            || (!self.matcher.matches(prefix) && self.matcher.visit(prefix).is_nothing())
+        if Self::path_has_reserved_component(path)
+            || (!self.matcher.matches(path) && self.matcher.visit(path).is_nothing())
         {
             return Ok(());
         }
-        let tracked_paths = self.tree_state.tracked_paths.all().prefixed(prefix);
-        let parent = prefix.parent().unwrap_or(RepoPath::root());
+        let tracked_paths = self.tree_state.tracked_paths.all().prefixed(path);
+        if tracked_paths.get(path) == Some(TrackedKind::GitSubmodule) {
+            return Ok(());
+        }
+        let parent = path.parent().unwrap_or(RepoPath::root());
         let Some(DirectoryIgnoreContext {
             git_ignore: parent_ignores,
             ancestor_ignored,
-        }) = (if prefix.is_root() {
+        }) = (if path.is_root() {
             Some(DirectoryIgnoreContext {
                 git_ignore: base_ignores,
                 ancestor_ignored: false,
@@ -3738,7 +3791,7 @@ impl FileSnapshotter<'_> {
             self.emit_deleted_tracked_paths(tracked_paths, None);
             return Ok(());
         };
-        let disk_path = prefix.to_fs_path(self.scan_root)?;
+        let disk_path = path.to_fs_path(self.scan_root)?;
         let metadata = match disk_path.symlink_metadata() {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -3760,12 +3813,22 @@ impl FileSnapshotter<'_> {
                 self.emit_deleted_tracked_paths(tracked_paths, None);
                 return Ok(());
             }
-            let directory_ignored = ancestor_ignored || parent_ignores.matches_dir(prefix);
-            if directory_ignored && self.force_tracking_matcher.visit(prefix).is_nothing() {
+            if !recursive {
+                // A directory has no tracked value of its own. Handle a file that became
+                // a directory here. The other exact paths and prefixes cover its children.
+                if tracked_paths.get(path) == Some(TrackedKind::FileLike)
+                    && self.matcher.matches(path)
+                {
+                    self.deleted_files_tx.send(path.to_owned()).ok();
+                }
+                return Ok(());
+            }
+            let directory_ignored = ancestor_ignored || parent_ignores.matches_dir(path);
+            if directory_ignored && self.force_tracking_matcher.visit(path).is_nothing() {
                 return self.visit_tracked_files(tracked_paths).block_on();
             }
             let directory_to_visit = DirectoryToVisit {
-                dir: prefix.to_owned(),
+                dir: path.to_owned(),
                 disk_dir: disk_path,
                 git_ignore: parent_ignores,
                 ancestor_ignored: directory_ignored,
@@ -3776,22 +3839,22 @@ impl FileSnapshotter<'_> {
             // Even if a sparse matcher excludes the replacement itself, it
             // can include children of the former directory. Account for those
             // deletions before suppressing their now-covered exact paths.
-            self.emit_deleted_tracked_paths(tracked_paths, Some(prefix));
-            if !self.matcher.matches(prefix) {
+            self.emit_deleted_tracked_paths(tracked_paths, Some(path));
+            if !self.matcher.matches(path) {
                 return Ok(());
             }
             let present = self
                 .inspect_present_path(
-                    prefix.to_owned(),
+                    path.to_owned(),
                     &disk_path,
                     &parent_ignores,
                     ancestor_ignored,
-                    tracked_paths.get(prefix),
+                    tracked_paths.get(path),
                     &metadata,
                 )
                 .block_on()?;
-            if !present && tracked_paths.get(prefix).is_some() {
-                self.deleted_files_tx.send(prefix.to_owned()).ok();
+            if !present && tracked_paths.get(path).is_some() {
+                self.deleted_files_tx.send(path.to_owned()).ok();
             };
             Ok(())
         }
@@ -3819,14 +3882,14 @@ impl FileSnapshotter<'_> {
         }
 
         if !ancestor_ignored {
-            let git_ignore_file_name = RepoPathComponent::new(".gitignore").expect("static string");
-            if let Some(git_ignore_contents) = self
-                .read_gitignore(&disk_dir, &dir, git_ignore_file_name)
-                .block_on()?
-            {
-                let git_ignore_disk_path = disk_dir.join(git_ignore_file_name.as_internal_str());
-                git_ignore = git_ignore.chain(&dir, &git_ignore_disk_path, &git_ignore_contents)?;
-            }
+            git_ignore = chain_directory_gitignore(
+                git_ignore,
+                &dir,
+                &disk_dir,
+                self.current_tree,
+                self.sparse_matcher,
+            )
+            .block_on()?;
         }
         let dir_entries: Vec<_> = disk_dir
             .read_dir()
@@ -3861,93 +3924,6 @@ impl FileSnapshotter<'_> {
         let present_entries = PresentDirEntries { dirs, files };
         self.emit_deleted_files(&dir, tracked_paths, &present_entries);
         Ok(())
-    }
-
-    /// Loads the ignore file named `file_name` and returns its contents if it
-    /// exists, supports sparse working copies.
-    ///
-    /// * `disk_dir` is the directory on disk containing the ignore file
-    /// * `repo_dir` is the corresponding repo directory used to acquire the
-    ///   fallback ignore file if it is excluded by the sparse patterns.
-    /// * `file_name` is the name of the ignore file (e.g. `.gitignore`)
-    ///
-    /// If the file isn't materialized on disk because it is excluded by the sparse
-    /// patterns, it is read from the repository directory instead to make sure
-    /// that ignored files are not tracked.
-    ///
-    /// Function also applies special handling for symlinks, `.gitignore` files are only
-    /// processed if they are regular files, symlinks and other filesystem entities are
-    /// explicitly ignored.
-    async fn read_gitignore(
-        &self,
-        disk_dir: &Path,
-        repo_dir: &RepoPath,
-        file_name: &RepoPathComponent,
-    ) -> Result<Option<Vec<u8>>, SnapshotError> {
-        let ignore_disk_path = disk_dir.join(file_name.as_internal_str());
-        match ignore_disk_path.symlink_metadata() {
-            Ok(symlink_metadata) => {
-                // TODO: If the path is excluded by the sparse patterns, the potential on-disk .gitignore file
-                // in that dir will never be snapshotted. Should we prefer the tree version in that case?
-                // Currently we match Git, which prefers on-disk content.
-                return symlink_metadata
-                    .is_file()
-                    .then(|| {
-                        fs::read(&ignore_disk_path).map_err(|err| SnapshotError::Other {
-                            message: format!(
-                                "Failed to read ignore patterns from file {}",
-                                ignore_disk_path.display()
-                            ),
-                            err: Box::new(err),
-                        })
-                    })
-                    .transpose();
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                // File doesn't exist, try to read from the repo dir.
-            }
-            Err(err) => {
-                return Err(SnapshotError::Other {
-                    message: format!(
-                        "Error accessing ignore patterns file {}",
-                        ignore_disk_path.display()
-                    ),
-                    err: Box::new(err),
-                });
-            }
-        }
-
-        let ignore_fallback_repo_path = repo_dir.join(file_name);
-        if self.sparse_matcher.matches(&ignore_fallback_repo_path) {
-            // The file should have been materialized, so its absence means it was deleted from the working copy.
-            return Ok(None);
-        }
-
-        let tree_values = self
-            .current_tree
-            .path_value(&ignore_fallback_repo_path)
-            .await?;
-        let file_id = match tree_values.as_normal() {
-            Some(TreeValue::File { id, .. }) => id,
-            None
-            | Some(TreeValue::Symlink(_) | TreeValue::GitSubmodule(_) | TreeValue::Tree(_)) => {
-                return Ok(None);
-            }
-        };
-        let mut buf = vec![];
-        let mut reader = self
-            .store()
-            .read_file(&ignore_fallback_repo_path, file_id)
-            .await?;
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|err| BackendError::ReadFile {
-                path: ignore_fallback_repo_path,
-                id: file_id.clone(),
-                source: err.into(),
-            })?;
-        Ok(Some(buf))
     }
 
     async fn process_dir_entry<'scope>(

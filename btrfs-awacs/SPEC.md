@@ -355,7 +355,7 @@ The direct AWACS backend instead selects an immutable cut and returns:
 
 - one open read-only snapshot directory fd;
 - an opaque cursor for that exact logical cut;
-- Full, ExactPaths, or Prefixes invalidation; and
+- either a full invalidation or separate lists of exact paths and recursive prefixes, and
 - filesystem/subvolume identity for the opened snapshot.
 
 Jujutsu must read relative to the retained descriptor and
@@ -451,9 +451,22 @@ sentinel path when a narrowed scan cannot be proven safe.
 
 The semantic event kinds are `PathAdded`, `PathRemoved`, `PathChanged`,
 `SubtreeMoved`, and `DirectoryDirtyWitness`. Directory witnesses and subtree
-moves are inputs to conservative endpoint projection. A direct scan reads the
-opened immutable snapshot, so live mutations after Begin cannot change the
-tree being traversed.
+moves are inputs to conservative endpoint projection. When a directory moves,
+AWACS walks it in each immutable endpoint before saving the cut. It records
+the old names as removals and the new names as additions, including the
+directories themselves. Symlinks contribute their own names.
+
+Each comparison allows 32,768 steps and 4 MiB of pathnames across all moves
+in both snapshots. Checking a move root, opening a directory component, and
+visiting a child each cost one step. If either limit prevents another step,
+AWACS discards the partially expanded moves and saves their directory names.
+It does the same if it lacks permission to read a moved directory. It keeps
+ordinary file changes in both cases. Older cuts can also contain only the
+directory names. Consumers that accept prefixes can replay these cuts. Git
+needs a baseline rebuild if its cursor crosses one.
+
+A direct scan reads the opened immutable snapshot, so live mutations after
+Begin cannot change the tree being traversed.
 
 The Git hook returns a cursor and changed paths. Git then reads the live
 worktree; it does not traverse the immutable snapshot supplied to Jujutsu.
