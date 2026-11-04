@@ -28,9 +28,9 @@ pub fn invalidate_fsmonitor_bitmap(
     let mut dirty = decode_bitmap(inherited_bitmap, layout.entries)?;
     match invalidation {
         Invalidation::Full => dirty.fill(u64::MAX),
-        Invalidation::ExactPaths(paths) | Invalidation::Prefixes(paths) => {
-            let mut prefixes = BTreeSet::new();
-            for path in paths {
+        Invalidation::Paths { exact, prefixes } => {
+            let mut dirty_paths = BTreeSet::new();
+            for path in exact.iter().chain(prefixes) {
                 // The root is a conservative full invalidation. A trailing
                 // slash is how directory events may be represented.
                 let path = path.strip_suffix(b"/").unwrap_or(path);
@@ -39,20 +39,20 @@ pub fn invalidate_fsmonitor_bitmap(
                     return encode_bitmap(layout.entries, &dirty);
                 }
                 validate_path(path)?;
-                prefixes.insert(path);
+                dirty_paths.insert(path);
             }
-            if prefixes.is_empty() {
+            if dirty_paths.is_empty() {
                 return Ok(inherited_bitmap.to_vec());
             }
             visit_git_index_paths(index_bytes, hash_len, |entry, path| {
                 validate_path(path)?;
                 // Treat exact directory events conservatively too. A rename
                 // may invalidate a directory and all indexed descendants.
-                if prefixes.contains(path)
+                if dirty_paths.contains(path)
                     || path
                         .iter()
                         .enumerate()
-                        .any(|(end, byte)| *byte == b'/' && prefixes.contains(&path[..end]))
+                        .any(|(end, byte)| *byte == b'/' && dirty_paths.contains(&path[..end]))
                 {
                     dirty[entry as usize / 64] |= 1 << (entry % 64);
                 }
@@ -259,7 +259,10 @@ mod tests {
             &index(2, 20, &paths),
             20,
             &inherited,
-            &Invalidation::ExactPaths(vec![b"file000".to_vec(), b"file254".to_vec()]),
+            &Invalidation::Paths {
+                exact: vec![b"file000".to_vec(), b"file254".to_vec()],
+                prefixes: Vec::new(),
+            },
         )
         .unwrap();
         let expected = [0, 64, 65]
@@ -285,16 +288,18 @@ mod tests {
         for hash_len in [20, 32] {
             for version in [2, 3, 4] {
                 for invalidation in [
-                    Invalidation::ExactPaths(vec![
-                        b"new".to_vec(),
-                        b"old/".to_vec(),
-                        b"raw\xff".to_vec(),
-                    ]),
-                    Invalidation::Prefixes(vec![
-                        b"new".to_vec(),
-                        b"old/".to_vec(),
-                        b"raw\xff".to_vec(),
-                    ]),
+                    Invalidation::Paths {
+                        exact: vec![b"new".to_vec(), b"old/".to_vec(), b"raw\xff".to_vec()],
+                        prefixes: Vec::new(),
+                    },
+                    Invalidation::Paths {
+                        exact: Vec::new(),
+                        prefixes: vec![b"new".to_vec(), b"old/".to_vec(), b"raw\xff".to_vec()],
+                    },
+                    Invalidation::Paths {
+                        exact: vec![b"raw\xff".to_vec()],
+                        prefixes: vec![b"new".to_vec(), b"old/".to_vec()],
+                    },
                 ] {
                     let output = invalidate_fsmonitor_bitmap(
                         &index(version, hash_len, &paths),
@@ -317,14 +322,28 @@ mod tests {
         let bytes = index(2, 20, &paths);
         let inherited = raw_bitmap(0, &[0], 0);
         assert_eq!(
-            invalidate_fsmonitor_bitmap(&bytes, 20, &inherited, &Invalidation::ExactPaths(vec![]))
-                .unwrap(),
+            invalidate_fsmonitor_bitmap(
+                &bytes,
+                20,
+                &inherited,
+                &Invalidation::Paths {
+                    exact: vec![],
+                    prefixes: Vec::new()
+                }
+            )
+            .unwrap(),
             inherited
         );
         for invalidation in [
             Invalidation::Full,
-            Invalidation::Prefixes(vec![vec![]]),
-            Invalidation::ExactPaths(vec![b"/".to_vec()]),
+            Invalidation::Paths {
+                exact: Vec::new(),
+                prefixes: vec![vec![]],
+            },
+            Invalidation::Paths {
+                exact: vec![b"/".to_vec()],
+                prefixes: Vec::new(),
+            },
         ] {
             let output =
                 invalidate_fsmonitor_bitmap(&bytes, 20, &inherited, &invalidation).unwrap();
@@ -352,7 +371,10 @@ mod tests {
             &index(4, 20, &paths),
             20,
             &raw_bitmap(0, &[0], 0),
-            &Invalidation::ExactPaths(vec![b"b/other".to_vec()]),
+            &Invalidation::Paths {
+                exact: vec![b"b/other".to_vec()],
+                prefixes: Vec::new(),
+            },
         )
         .unwrap();
         assert_eq!(dirty_positions(&output, 3), [2]);
@@ -377,7 +399,10 @@ mod tests {
             &bytes,
             20,
             &raw_bitmap(0, &[0], 0),
-            &Invalidation::ExactPaths(vec![b"conflict".to_vec()]),
+            &Invalidation::Paths {
+                exact: vec![b"conflict".to_vec()],
+                prefixes: Vec::new(),
+            },
         )
         .unwrap();
         assert_eq!(dirty_positions(&output, 3), [0, 1, 2]);
@@ -425,8 +450,16 @@ mod tests {
         malformed.extend((0..valid.len()).map(|end| valid[..end].to_vec()));
         for bitmap in malformed {
             assert!(
-                invalidate_fsmonitor_bitmap(&bytes, 20, &bitmap, &Invalidation::ExactPaths(vec![]))
-                    .is_err(),
+                invalidate_fsmonitor_bitmap(
+                    &bytes,
+                    20,
+                    &bitmap,
+                    &Invalidation::Paths {
+                        exact: vec![],
+                        prefixes: Vec::new()
+                    }
+                )
+                .is_err(),
                 "accepted malformed bitmap: {bitmap:?}"
             );
         }
@@ -434,7 +467,10 @@ mod tests {
 
     #[test]
     fn malformed_paths_and_v4_prefixes_are_rejected() {
-        let invalidation = Invalidation::ExactPaths(vec![b"file".to_vec()]);
+        let invalidation = Invalidation::Paths {
+            exact: vec![b"file".to_vec()],
+            prefixes: Vec::new(),
+        };
         for version in [2, 3, 4] {
             for path in [
                 b"../file".as_slice(),
@@ -485,7 +521,10 @@ mod tests {
                     &bytes,
                     20,
                     &raw_bitmap(0, &[0], 0),
-                    &Invalidation::ExactPaths(vec![path.to_vec()])
+                    &Invalidation::Paths {
+                        exact: vec![path.to_vec()],
+                        prefixes: Vec::new()
+                    }
                 )
                 .is_err()
             );

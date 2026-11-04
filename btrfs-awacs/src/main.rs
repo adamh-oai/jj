@@ -2035,18 +2035,18 @@ fn git_fsmonitor_invalidations(
 ) -> Result<Vec<Vec<u8>>, String> {
     match invalidation {
         _ if is_bootstrap => Ok(vec![b"/".to_vec()]),
-        Invalidation::ExactPaths(paths) => Ok(paths.clone()),
+        Invalidation::Paths { exact, prefixes } if prefixes.is_empty() => Ok(exact.clone()),
         Invalidation::Full => Err("AWACS cannot replay this Git cursor incrementally; use an \
                                    explicit baseline rebuild"
             .to_owned()),
         // Compact moves have only the directory names. Git needs child
         // paths to refresh its untracked cache.
-        Invalidation::Prefixes(_) => Err(
-            "AWACS has only directory names for this Git cursor. To rebuild its baseline, run \
-             `git --no-optional-locks -c core.fsmonitorHookFallback=true update-index --no-fsmonitor` \
-             and then `git status`."
-                .to_owned(),
-        ),
+        Invalidation::Paths { .. } => Err("AWACS lacks child paths for a directory move in this \
+                                           Git cursor. To rebuild its baseline, run `git \
+                                           --no-optional-locks -c \
+                                           core.fsmonitorHookFallback=true update-index \
+                                           --no-fsmonitor` and then `git status`."
+            .to_owned()),
     }
 }
 
@@ -3471,7 +3471,10 @@ mod tests {
             assert!(previous.is_none());
             let paths = git_fsmonitor_invalidations(
                 previous.is_none(),
-                &btrfs_awacs::scan::Invalidation::ExactPaths(Vec::new()),
+                &btrfs_awacs::scan::Invalidation::Paths {
+                    exact: Vec::new(),
+                    prefixes: Vec::new(),
+                },
             )
             .unwrap();
             assert_eq!(
@@ -3507,9 +3510,11 @@ mod tests {
 
     #[test]
     fn git_fsmonitor_refuses_directory_names_without_children() {
-        let prefixes =
-            btrfs_awacs::scan::Invalidation::Prefixes(vec![b"old".to_vec(), b"new".to_vec()]);
-        let error = git_fsmonitor_invalidations(false, &prefixes).unwrap_err();
+        let mixed = btrfs_awacs::scan::Invalidation::Paths {
+            exact: vec![b"file".to_vec()],
+            prefixes: vec![b"old".to_vec(), b"new".to_vec()],
+        };
+        let error = git_fsmonitor_invalidations(false, &mixed).unwrap_err();
         assert!(error.contains("rebuild its baseline"), "{error}");
     }
 

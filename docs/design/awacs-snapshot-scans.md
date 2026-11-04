@@ -137,7 +137,7 @@ SnapshotIdentity {
 
 SnapshotLease {
   next_baseline: SnapshotBaseline,
-  invalidation: Full | ExactPaths(Vec<Vec<u8>>) | Prefixes(Vec<Vec<u8>>),
+  invalidation: Full | Paths { exact: Vec<Vec<u8>>, prefixes: Vec<Vec<u8>> },
   expires_boottime_ns: u64,
   scan_root: File,
   session: ScanSession,
@@ -176,10 +176,11 @@ through all of JJ's traversal remains a future change.
 
 ### Complete invalidation
 
-`ExactPaths` and `Prefixes` contain repository-relative byte strings. JJ
-validates and normalizes the paths before using them. A prefix selects a whole
-subtree. It allows JJ to find deletions by comparing paths under that prefix
-in tree X with paths present in B.
+A single scan can contain both exact paths and recursive prefixes. JJ validates
+each repository-relative path before using it. When AWACS reports a move by
+its two roots, JJ checks the old and new subtrees. The parent directories also
+have changed entries. Their exact paths let JJ check the parents without
+reading files in sibling subtrees.
 
 The invalidation must cover all physical differences relevant to JJ.
 

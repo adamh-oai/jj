@@ -217,8 +217,14 @@ impl GitIndexHandoff {
         Ok(merge_git_invalidations([
             source_lease.invalidation.clone(),
             bridge,
-            Invalidation::Prefixes(self.nested_paths.clone()),
-            Invalidation::Prefixes(child_paths),
+            Invalidation::Paths {
+                exact: Vec::new(),
+                prefixes: self.nested_paths.clone(),
+            },
+            Invalidation::Paths {
+                exact: Vec::new(),
+                prefixes: child_paths,
+            },
         ]))
     }
 }
@@ -240,8 +246,9 @@ fn merge_git_invalidations(invalidations: impl IntoIterator<Item = Invalidation>
     for invalidation in invalidations {
         match invalidation {
             Invalidation::Full => return Invalidation::Full,
-            Invalidation::ExactPaths(mut changed) | Invalidation::Prefixes(mut changed) => {
-                paths.append(&mut changed);
+            Invalidation::Paths { exact, prefixes } => {
+                paths.extend(exact);
+                paths.extend(prefixes);
             }
         }
     }
@@ -250,7 +257,10 @@ fn merge_git_invalidations(invalidations: impl IntoIterator<Item = Invalidation>
     paths.retain(|path| !matches!(path.split(|byte| *byte == b'/').next(), Some(b".git")));
     paths.sort_unstable();
     paths.dedup();
-    Invalidation::Prefixes(paths)
+    Invalidation::Paths {
+        exact: Vec::new(),
+        prefixes: paths,
+    }
 }
 
 /// Records enclosing wall time, including failures, without logging command
@@ -382,7 +392,7 @@ fn rewrite_git_fsmonitor_index(
         None => None,
     };
     let unchanged = match invalidation {
-        Invalidation::ExactPaths(paths) | Invalidation::Prefixes(paths) => paths.is_empty(),
+        Invalidation::Paths { exact, prefixes } => exact.is_empty() && prefixes.is_empty(),
         Invalidation::Full => false,
     };
     let dirty_bitmap = inherited_bitmap
@@ -1013,7 +1023,10 @@ mod tests {
                         &worktree,
                         hash_len,
                         &baseline,
-                        &crate::scan::Invalidation::ExactPaths(Vec::new()),
+                        &crate::scan::Invalidation::Paths {
+                            exact: Vec::new(),
+                            prefixes: Vec::new(),
+                        },
                     )
                     .unwrap();
                     assert_eq!(
@@ -1129,10 +1142,19 @@ mod tests {
         use crate::scan::Invalidation;
         assert_eq!(
             super::merge_git_invalidations([
-                Invalidation::ExactPaths(vec![b".git/index".to_vec(), b".jj/tracked".to_vec()]),
-                Invalidation::Prefixes(vec![b"directory".to_vec()]),
+                Invalidation::Paths {
+                    exact: vec![b".git/index".to_vec(), b".jj/tracked".to_vec()],
+                    prefixes: Vec::new()
+                },
+                Invalidation::Paths {
+                    exact: Vec::new(),
+                    prefixes: vec![b"directory".to_vec()]
+                },
             ]),
-            Invalidation::Prefixes(vec![b".jj/tracked".to_vec(), b"directory".to_vec()]),
+            Invalidation::Paths {
+                exact: Vec::new(),
+                prefixes: vec![b".jj/tracked".to_vec(), b"directory".to_vec()]
+            },
         );
     }
 
@@ -1250,7 +1272,10 @@ mod tests {
             &destination,
             20,
             &destination_baseline,
-            &crate::scan::Invalidation::ExactPaths(Vec::new()),
+            &crate::scan::Invalidation::Paths {
+                exact: Vec::new(),
+                prefixes: Vec::new(),
+            },
         )
         .unwrap();
 
@@ -1340,7 +1365,10 @@ mod tests {
             &root.path,
             20,
             &destination_baseline,
-            &crate::scan::Invalidation::ExactPaths(Vec::new()),
+            &crate::scan::Invalidation::Paths {
+                exact: Vec::new(),
+                prefixes: Vec::new(),
+            },
         )
         .unwrap();
         assert_eq!(
@@ -1549,7 +1577,10 @@ mod tests {
             &destination,
             20,
             &baseline,
-            &crate::scan::Invalidation::ExactPaths(Vec::new()),
+            &crate::scan::Invalidation::Paths {
+                exact: Vec::new(),
+                prefixes: Vec::new(),
+            },
         )
         .unwrap();
 
@@ -1637,7 +1668,10 @@ mod tests {
                 &root.path,
                 20,
                 &initial_baseline,
-                &crate::scan::Invalidation::ExactPaths(Vec::new())
+                &crate::scan::Invalidation::Paths {
+                    exact: Vec::new(),
+                    prefixes: Vec::new()
+                }
             )
             .unwrap_err()
             .contains("established continuity")

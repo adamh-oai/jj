@@ -1492,13 +1492,10 @@ fn reuse_snapshot_git_index(
         // JJ reserves this directory, but Git can still expose it as
         // untracked. Its replacement is irrelevant to UNTR only if Git
         // excludes the directory in both worktrees.
-        match &mut invalidation {
-            Invalidation::ExactPaths(paths) | Invalidation::Prefixes(paths)
-                if ignored_jj_metadata =>
-            {
+        if ignored_jj_metadata && let Invalidation::Paths { exact, prefixes } = &mut invalidation {
+            for paths in [exact, prefixes] {
                 paths.retain(|path| path != b".jj" && !path.starts_with(b".jj/"));
             }
-            _ => {}
         }
         seed_git_fsmonitor_index(
             &index_path,
@@ -1536,27 +1533,25 @@ fn snapshot_git_invalidation_matcher(invalidation: &Invalidation) -> Box<dyn Mat
     use jj_lib::matchers::EverythingMatcher;
     use jj_lib::matchers::FilesMatcher;
     use jj_lib::matchers::PrefixMatcher;
+    use jj_lib::matchers::UnionMatcher;
     use jj_lib::repo_path::RepoPathBuf;
 
-    let paths = match invalidation {
-        Invalidation::Full => return Box::new(EverythingMatcher),
-        Invalidation::ExactPaths(paths) | Invalidation::Prefixes(paths) => paths,
-    };
-    let Some(paths) = paths
-        .iter()
-        .map(|path| {
-            let path = std::str::from_utf8(path).ok()?;
-            RepoPathBuf::from_internal_string(path).ok()
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        // Unsupported path representations cannot authorize a clean entry.
+    let Invalidation::Paths { exact, prefixes } = invalidation else {
         return Box::new(EverythingMatcher);
     };
-    match invalidation {
-        Invalidation::ExactPaths(_) => Box::new(FilesMatcher::new(paths)),
-        Invalidation::Prefixes(_) => Box::new(PrefixMatcher::new(paths)),
-        Invalidation::Full => unreachable!(),
+    let repo_paths = |paths: &[Vec<u8>]| {
+        paths
+            .iter()
+            .map(|path| RepoPathBuf::from_internal_string(std::str::from_utf8(path).ok()?).ok())
+            .collect::<Option<Vec<_>>>()
+    };
+    match (repo_paths(exact), repo_paths(prefixes)) {
+        (Some(exact), Some(prefixes)) => Box::new(UnionMatcher::new(
+            FilesMatcher::new(exact),
+            PrefixMatcher::new(prefixes),
+        )),
+        // Unsupported path representations cannot authorize a clean entry.
+        _ => Box::new(EverythingMatcher),
     }
 }
 
@@ -2243,18 +2238,17 @@ mod tests {
                 &EverythingMatcher,
             )
         };
-        let exact = snapshot_git_invalidation_matcher(&Invalidation::ExactPaths(vec![
-            b"dir/file".to_vec(),
-        ]));
-        assert!(dirty(b"dir/file", exact.as_ref()));
-        assert!(!dirty(b"dir/file/child", exact.as_ref()));
-        assert!(!dirty(b"dir/file-other", exact.as_ref()));
-        let prefix =
-            snapshot_git_invalidation_matcher(&Invalidation::Prefixes(vec![b"dir".to_vec()]));
-        assert!(dirty(b"dir", prefix.as_ref()));
-        assert!(dirty(b"dir/file", prefix.as_ref()));
-        assert!(!dirty(b"directory/file", prefix.as_ref()));
-        assert!(!dirty(b"other/dir/file", prefix.as_ref()));
+        let changed = snapshot_git_invalidation_matcher(&Invalidation::Paths {
+            exact: vec![b"dir/file".to_vec()],
+            prefixes: vec![b"moved".to_vec()],
+        });
+        assert!(dirty(b"dir/file", changed.as_ref()));
+        assert!(!dirty(b"dir/file/child", changed.as_ref()));
+        assert!(!dirty(b"dir/file-other", changed.as_ref()));
+        assert!(dirty(b"moved", changed.as_ref()));
+        assert!(dirty(b"moved/file", changed.as_ref()));
+        assert!(!dirty(b"moved-other/file", changed.as_ref()));
+        assert!(!dirty(b"other/moved/file", changed.as_ref()));
         assert!(dirty(
             b"unchanged",
             snapshot_git_invalidation_matcher(&Invalidation::Full).as_ref(),
@@ -2269,7 +2263,10 @@ mod tests {
         use jj_lib::matchers::PrefixMatcher;
         use jj_lib::repo_path::RepoPathBuf;
 
-        let unchanged = snapshot_git_invalidation_matcher(&Invalidation::ExactPaths(vec![]));
+        let unchanged = snapshot_git_invalidation_matcher(&Invalidation::Paths {
+            exact: vec![],
+            prefixes: vec![],
+        });
         let materialized =
             PrefixMatcher::new([RepoPathBuf::from_internal_string("visible").unwrap()]);
         let dirty = |path: &[u8], mode, stage| {
@@ -2291,9 +2288,10 @@ mod tests {
             assert!(dirty(b"visible/file", Mode::FILE, stage));
         }
         assert!(dirty(b"visible/\xff", Mode::FILE, Stage::Unconflicted));
-        let unsupported = snapshot_git_invalidation_matcher(&Invalidation::ExactPaths(vec![
-            b"invalid/\xff".to_vec(),
-        ]));
+        let unsupported = snapshot_git_invalidation_matcher(&Invalidation::Paths {
+            exact: vec![b"invalid/\xff".to_vec()],
+            prefixes: vec![],
+        });
         assert!(snapshot_git_entry_is_dirty(
             b"visible/file",
             Mode::FILE,

@@ -99,6 +99,23 @@ fn snapshot_options() -> SnapshotOptions<'static> {
 }
 
 #[test]
+fn exact_directory_skips_unrelated_stored_subtrees() -> TestResult {
+    let fixture = ExactSnapshot::new(TestRepoBackend::Test)?;
+    let store = fixture.test_repo.repo.store();
+    let mut builder = MergedTreeBuilder::new(store.empty_merged_tree());
+    // The test backend returns ObjectNotFound if the scanner reads this subtree.
+    builder.set_or_remove(
+        repo_path_buf("project/unrelated"),
+        Merge::normal(TreeValue::Tree(TreeId::new(vec![0xff; 32]))),
+    );
+    let baseline = builder.write_tree().block_on()?;
+    std::fs::create_dir(fixture.scan_root.join("project"))?;
+    let actual = fixture.snapshot(&baseline, &[repo_path("project")], &snapshot_options())?;
+    assert_eq!(actual.tree_ids(), baseline.tree_ids());
+    Ok(())
+}
+
+#[test]
 fn exact_directories_visit_each_file_once() -> TestResult {
     let fixture = ExactSnapshot::new(TestRepoBackend::Test)?;
     let repo = &fixture.test_repo.repo;
@@ -125,6 +142,20 @@ fn exact_directories_visit_each_file_once() -> TestResult {
     // Neither the missing tracked sibling nor this new sibling is in the
     // delta. Covering directory roots must not widen the exact matcher.
     testutils::write_working_copy_file(&fixture.scan_root, repo_path("dir/unreported"), "new\n");
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // Enumerating this exact directory would fail on its unrelated filename.
+        std::fs::write(
+            fixture
+                .scan_root
+                .join("dir")
+                .join(OsStr::from_bytes(b"\xff")),
+            b"",
+        )?;
+    }
     let paths = [
         "dir",
         "dir/a",
@@ -165,6 +196,37 @@ fn exact_directories_visit_each_file_once() -> TestResult {
             .map(|(path, _)| (path.to_owned(), 1))
             .collect()
     );
+    Ok(())
+}
+
+#[test_case(false ; "exact parents and child")]
+#[test_case(true ; "sparse child only")]
+fn exact_changes_inside_a_submodule_keep_its_gitlink(sparse: bool) -> TestResult {
+    let fixture = ExactSnapshot::new(TestRepoBackend::Git)?;
+    let repo = &fixture.test_repo.repo;
+    let module = repo_path("sub/module");
+    let child = repo_path("sub/module/added");
+    let sibling = repo_path("sub/config");
+    let commit = commit_with_tree(repo.store(), repo.store().empty_merged_tree());
+    let tree = |contents: &str| {
+        create_tree_with(repo, |builder| {
+            builder.submodule(module, commit.id().clone());
+            builder.file(sibling, contents);
+        })
+    };
+    // An uninitialized submodule can contain files without a .git marker.
+    testutils::write_working_copy_file(&fixture.scan_root, child, "private to submodule\n");
+    testutils::write_working_copy_file(&fixture.scan_root, sibling, "new config\n");
+    let options = SnapshotOptions {
+        external_sparse_patterns: sparse.then(|| vec![child.to_owned(), sibling.to_owned()]),
+        ..snapshot_options()
+    };
+    let actual = fixture.snapshot(
+        &tree("old config\n"),
+        &[repo_path("sub"), module, child, sibling],
+        &options,
+    )?;
+    assert_tree_eq!(actual, tree("new config\n"));
     Ok(())
 }
 

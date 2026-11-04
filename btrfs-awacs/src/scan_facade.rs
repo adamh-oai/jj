@@ -1019,47 +1019,27 @@ fn direct_invalidation(
             ))
         };
     }
-    let normalize = |path: &[u8]| {
-        // Index events are already repository-relative. Accept the old
-        // slash-prefixed representation as a compatibility input, but do not
-        // turn a valid relative delta into a full invalidation.
-        let path = path.strip_prefix(b"/").unwrap_or(path);
-        if path.is_empty() {
-            None
-        } else {
-            Some(path.to_vec())
-        }
+    // Older events can use a leading slash. Both lists use names relative
+    // to the repository, and a root entry requires a whole-tree scan.
+    let normalize = |paths: &[Vec<u8>]| -> Option<Vec<Vec<u8>>> {
+        paths
+            .iter()
+            .map(|path| {
+                let path = path.strip_prefix(b"/").unwrap_or(path);
+                (!path.is_empty()).then(|| path.to_vec())
+            })
+            .collect()
     };
-    if !projection.prefixes.is_empty() {
-        let mut prefixes = Vec::with_capacity(projection.paths.len() + projection.prefixes.len());
-        for path in projection.prefixes.iter().chain(&projection.paths) {
-            let Some(path) = normalize(path) else {
-                return if allow_full_invalidation {
-                    Ok(Invalidation::Full)
-                } else {
-                    Err(full_scan_required(
-                        "AWACS delta contains a repository-root prefix",
-                    ))
-                };
-            };
-            prefixes.push(path);
-        }
-        return Ok(Invalidation::Prefixes(prefixes));
+    match (
+        normalize(&projection.paths),
+        normalize(&projection.prefixes),
+    ) {
+        (Some(exact), Some(prefixes)) => Ok(Invalidation::Paths { exact, prefixes }),
+        _ if allow_full_invalidation => Ok(Invalidation::Full),
+        _ => Err(full_scan_required(
+            "AWACS delta contains a repository-root path",
+        )),
     }
-    let mut paths = Vec::with_capacity(projection.paths.len());
-    for path in &projection.paths {
-        let Some(path) = normalize(path) else {
-            return if allow_full_invalidation {
-                Ok(Invalidation::Full)
-            } else {
-                Err(full_scan_required(
-                    "AWACS delta contains a repository-root path",
-                ))
-            };
-        };
-        paths.push(path);
-    }
-    Ok(Invalidation::ExactPaths(paths))
 }
 
 fn scan_identity(scan_root: &File) -> Result<SnapshotIdentity, ScanError> {
@@ -1222,7 +1202,10 @@ mod tests {
         };
         assert_eq!(
             direct_invalidation(&projection, false).unwrap(),
-            Invalidation::ExactPaths(vec![b"dir/file".to_vec(), b"name".to_vec()])
+            Invalidation::Paths {
+                exact: vec![b"dir/file".to_vec(), b"name".to_vec()],
+                prefixes: Vec::new()
+            }
         );
         assert_eq!(
             direct_invalidation(
@@ -1234,7 +1217,10 @@ mod tests {
                 false
             )
             .unwrap(),
-            Invalidation::ExactPaths(vec![b"compat".to_vec()])
+            Invalidation::Paths {
+                exact: vec![b"compat".to_vec()],
+                prefixes: Vec::new()
+            }
         );
         let error = direct_invalidation(
             &crate::compat::Projection {
@@ -1258,17 +1244,38 @@ mod tests {
             .unwrap(),
             Invalidation::Full
         );
+    }
+
+    #[test]
+    fn direct_invalidation_keeps_move_parents_exact() {
+        let projection = crate::compat::Projection {
+            fresh_instance: false,
+            paths: vec![b"source".to_vec(), b"destination".to_vec()],
+            prefixes: vec![b"source/old".to_vec(), b"destination/new".to_vec()],
+        };
         assert_eq!(
-            direct_invalidation(
-                &crate::compat::Projection {
-                    fresh_instance: false,
-                    paths: vec![b"exact".to_vec()],
-                    prefixes: vec![b"moved".to_vec()],
-                },
-                false
-            )
-            .unwrap(),
-            Invalidation::Prefixes(vec![b"moved".to_vec(), b"exact".to_vec()])
+            direct_invalidation(&projection, false).unwrap(),
+            Invalidation::Paths {
+                exact: projection.paths,
+                prefixes: projection.prefixes,
+            }
+        );
+    }
+
+    #[test]
+    fn direct_invalidation_requires_permission_for_a_root_prefix() {
+        let projection = crate::compat::Projection {
+            fresh_instance: false,
+            paths: vec![b"file".to_vec()],
+            prefixes: vec![b"/".to_vec()],
+        };
+        assert_eq!(
+            direct_invalidation(&projection, false).unwrap_err().kind(),
+            ScanErrorKind::FullScanRequired
+        );
+        assert_eq!(
+            direct_invalidation(&projection, true).unwrap(),
+            Invalidation::Full
         );
     }
 

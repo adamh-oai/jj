@@ -279,7 +279,7 @@ The direct AWACS backend instead selects an immutable cut and returns:
 
 - one open read-only snapshot directory fd;
 - an opaque cursor for that exact logical cut;
-- Full, ExactPaths, or Prefixes invalidation; and
+- either a full invalidation or separate lists of exact paths and recursive prefixes, and
 - filesystem/subvolume identity for the opened snapshot.
 
 Jujutsu must read relative to the retained descriptor and
