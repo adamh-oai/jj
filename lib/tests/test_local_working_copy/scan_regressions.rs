@@ -98,6 +98,46 @@ fn snapshot_options() -> SnapshotOptions<'static> {
     }
 }
 
+#[test_case(false ; "absent ignore files use stored rules")]
+#[test_case(true ; "symlinked ignore files supply no rules")]
+fn exact_scan_uses_sparse_directory_ignores(symlink: bool) -> TestResult {
+    if symlink && !check_symlink_support()? {
+        return Ok(());
+    }
+    let fixture = ExactSnapshot::new(TestRepoBackend::Test)?;
+    let repo = &fixture.test_repo.repo;
+    let ignore_files = [
+        (repo_path(".gitignore"), "root-ignored\n"),
+        (repo_path("dir/.gitignore"), "nested-ignored\n"),
+    ];
+    let baseline = create_tree(repo, &ignore_files);
+    let files = [
+        repo_path("dir/selected/root-ignored"),
+        repo_path("dir/selected/nested-ignored"),
+        repo_path("dir/selected/visible"),
+    ];
+    for path in files {
+        testutils::write_working_copy_file(&fixture.scan_root, path, "new\n");
+    }
+    if symlink {
+        let target = fixture.test_repo.env.root().join("external-rules");
+        std::fs::write(&target, "visible\n")?;
+        for (path, _) in ignore_files {
+            symlink_file(&target, path.to_fs_path_unchecked(&fixture.scan_root))?;
+        }
+    }
+    let options = SnapshotOptions {
+        external_sparse_patterns: Some(vec![repo_path_buf("dir/selected")]),
+        ..snapshot_options()
+    };
+    let actual = fixture.snapshot(&baseline, &files, &options)?;
+    let mut expected_files = ignore_files.to_vec();
+    let visible = if symlink { &files[..] } else { &files[2..] };
+    expected_files.extend(visible.iter().map(|&path| (path, "new\n")));
+    assert_tree_eq!(actual, create_tree(repo, &expected_files));
+    Ok(())
+}
+
 #[test]
 fn exact_directory_skips_unrelated_stored_subtrees() -> TestResult {
     let fixture = ExactSnapshot::new(TestRepoBackend::Test)?;

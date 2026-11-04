@@ -94,6 +94,7 @@ use crate::fsmonitor::WatchmanConfig;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::watchman;
 use crate::gitignore::GitIgnoreFile;
+use crate::local_working_copy::chain_directory_gitignore;
 use crate::lock::FileLock;
 use crate::matchers::DifferenceMatcher;
 use crate::matchers::EverythingMatcher;
@@ -1414,13 +1415,14 @@ impl TreeState {
         };
 
         let external_sparse_matcher = external_sparse_patterns.as_ref().map(PrefixMatcher::new);
-        let scan_matcher = UnionMatcher::new(fsmonitor_matcher, force_tracking_matcher);
-        let sparse_scan_matcher = IntersectionMatcher::new(sparse_matcher.as_ref(), scan_matcher);
         let external_sparse_matcher: &dyn Matcher = external_sparse_matcher
             .as_ref()
             .map(|matcher| matcher as &dyn Matcher)
             .unwrap_or(&EverythingMatcher);
-        let matcher = IntersectionMatcher::new(external_sparse_matcher, sparse_scan_matcher);
+        let materialized_matcher =
+            IntersectionMatcher::new(sparse_matcher.as_ref(), external_sparse_matcher);
+        let scan_matcher = UnionMatcher::new(fsmonitor_matcher, force_tracking_matcher);
+        let matcher = IntersectionMatcher::new(&materialized_matcher, scan_matcher);
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to load the current tree, set up channels, etc.
             if should_update_watchman_clock {
@@ -1441,6 +1443,7 @@ impl TreeState {
                 tree_state: self,
                 current_tree: &self.tree,
                 matcher: &matcher,
+                sparse_matcher: &materialized_matcher,
                 start_tracking_matcher,
                 force_tracking_matcher,
                 // Move tx sides so they'll be dropped at the end of the scope.
@@ -1654,6 +1657,7 @@ struct FileSnapshotter<'a> {
     tree_state: &'a TreeState,
     current_tree: &'a MergedTree,
     matcher: &'a dyn Matcher,
+    sparse_matcher: &'a dyn Matcher,
     start_tracking_matcher: &'a dyn Matcher,
     force_tracking_matcher: &'a dyn Matcher,
     tree_entries_tx: Sender<(RepoPathBuf, MergedTreeValue)>,
@@ -1704,7 +1708,14 @@ impl FileSnapshotter<'_> {
             file_states,
         } = directory_to_visit;
 
-        let git_ignore = git_ignore.chain_with_file(&dir, disk_dir.join(".gitignore"))?;
+        let git_ignore = chain_directory_gitignore(
+            git_ignore,
+            &dir,
+            &disk_dir,
+            self.current_tree,
+            self.sparse_matcher,
+        )
+        .block_on()?;
         let dir_entries: Vec<_> = disk_dir
             .read_dir()
             .and_then(|entries| entries.try_collect())
