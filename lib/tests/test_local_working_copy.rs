@@ -3877,6 +3877,7 @@ fn test_subvolume_mode_recovers_pending_materialization_incrementally(marker: &s
         &base_settings,
     )?;
 
+    seed_test_awacs_baseline(&state_path, b"baseline-a", [3; 32])?;
     let old_tree = create_tree(repo, &[(repo_path("old/file"), "old\n")]);
     let intended_tree = create_tree(repo, &[(repo_path("new/file"), "new\n")]);
     let mut journal = read_compact_working_copy_state(&state_path)?;
@@ -3890,13 +3891,7 @@ fn test_subvolume_mode_recovers_pending_materialization_incrementally(marker: &s
         .map(|id| id.to_bytes())
         .collect();
     journal.pending_conflict_labels = intended_tree.labels().as_slice().to_owned();
-    journal.pending_baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
-        filesystem_uuid: vec![1; 16],
-        subvolume_uuid: vec![2; 16],
-        continuity_token: b"baseline-a".to_vec(),
-        interpretation_input_fingerprint: vec![3; 32],
-        ..Default::default()
-    });
+    journal.pending_baseline = journal.baseline.take();
     journal.mutation_kind = "checkout".to_owned();
     write_compact_working_copy_state(&state_path, &journal)?;
     std::fs::write(state_path.join("subvolume_mode"), format!("{marker}\n"))?;
@@ -5038,16 +5033,8 @@ fn test_awacs_baseline_input_mismatch_requires_explicit_rebuild() -> TestResult 
         &tree_state_settings,
     )?;
     tree_state.save()?;
-    let mut journal = read_compact_working_copy_state(&state_path)?;
-    journal.phase = jj_lib::protos::local_working_copy::WorkingCopyStatePhase::CleanBaseline as i32;
-    journal.baseline = Some(jj_lib::protos::local_working_copy::AwacsSnapshotBaseline {
-        filesystem_uuid: vec![1; 16],
-        subvolume_uuid: vec![2; 16],
-        continuity_token: b"stale-baseline".to_vec(),
-        retention_token: Vec::new(),
-        interpretation_input_fingerprint: vec![9; 32],
-    });
-    write_compact_working_copy_state(&state_path, &journal)?;
+    seed_test_awacs_baseline(&state_path, b"stale-baseline", [9; 32])?;
+    let journal = read_compact_working_copy_state(&state_path)?;
     std::fs::write(state_path.join("subvolume_mode"), b"snapshot-backed\n")?;
 
     let outcomes = Arc::new(Mutex::new(Vec::new()));
@@ -5075,6 +5062,10 @@ fn test_awacs_baseline_input_mismatch_requires_explicit_rebuild() -> TestResult 
         ..empty_snapshot_options()
     };
     let error = tree_state.snapshot(&options).block_on().unwrap_err();
+    assert!(
+        format!("{error:?}").contains("baseline no longer matches the working-copy inputs"),
+        "{error:?}"
+    );
     assert!(
         format!("{error:?}").contains("jj util subvolume enable --rebuild-baseline"),
         "{error:?}"
