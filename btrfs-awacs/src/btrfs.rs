@@ -19,6 +19,10 @@ use std::path::Component;
 use std::path::Path;
 use std::time::Instant;
 
+mod inode_path_search;
+
+pub(crate) use inode_path_search::visit_inode_paths_from_tree;
+
 pub const ROOT_INODE: u64 = 256;
 pub const TOP_LEVEL_ROOT_ID: u64 = 5;
 const ROOT_TREE_OBJECT_ID: u64 = 1;
@@ -158,6 +162,7 @@ struct BtrfsIoctlSearchArgsV2 {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct BtrfsIoctlSearchKey {
     tree_id: u64,
     min_objectid: u64,
@@ -196,7 +201,6 @@ struct BtrfsIoctlInoPathArgs {
     fspath: u64,
 }
 
-const INO_PATH_BUFFER_START: usize = 4 * 1024;
 // The kernel clamps BTRFS_IOC_INO_PATHS to one 4 KiB data container.
 const INO_PATH_BUFFER_MAX: usize = 4 * 1024;
 const DATA_CONTAINER_HEADER_SIZE: usize = 16;
@@ -505,50 +509,43 @@ pub fn has_nested_subvolumes(fd: BorrowedFd<'_>, root_id: u64) -> Result<bool, B
 /// Btrfs returns paths relative to that root. The root inode itself has the
 /// single empty relative path. Hard links may return more than one path.
 pub fn inode_paths(fd: BorrowedFd<'_>, ino: u64) -> Result<Vec<Vec<u8>>, BtrfsError> {
+    try_inode_paths(fd, ino)?.ok_or_else(|| {
+        BtrfsError::new(format!(
+            "inode-path result exceeds {INO_PATH_BUFFER_MAX} bytes"
+        ))
+    })
+}
+
+/// Returns None if the kernel reports that the result is incomplete.
+pub(crate) fn try_inode_paths(
+    fd: BorrowedFd<'_>,
+    ino: u64,
+) -> Result<Option<Vec<Vec<u8>>>, BtrfsError> {
     if ino == 0 {
         return Err(BtrfsError::new("inode path lookup inode must not be zero"));
     }
     if ino == ROOT_INODE {
-        return Ok(vec![Vec::new()]);
+        return Ok(Some(vec![Vec::new()]));
     }
-    let mut size = INO_PATH_BUFFER_START;
-    loop {
-        // u64 backing keeps the flexible data-container payload aligned for
-        // the kernel while the parser below stays byte-oriented and bounds
-        // checks every returned offset.
-        let word_count = size.div_ceil(size_of::<u64>());
-        let mut buffer = vec![0_u64; word_count];
-        let mut args = BtrfsIoctlInoPathArgs {
-            inum: ino,
-            size: u64::try_from(size).expect("bounded inode-path buffer fits u64"),
-            reserved: [0; 4],
-            fspath: buffer.as_mut_ptr() as usize as u64,
-        };
-        ioctl(fd, BTRFS_IOC_INO_PATHS, &mut args, "BTRFS_IOC_INO_PATHS")?;
-        if args.reserved != [0; 4] {
-            return Err(BtrfsError::new(
-                "BTRFS_IOC_INO_PATHS returned nonzero reserved fields",
-            ));
-        }
-        // SAFETY: buffer owns word_count initialized u64s, so viewing exactly
-        // size bytes from its aligned storage is valid for this parse.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), size) };
-        let (paths, bytes_missing, elem_missed) = parse_inode_paths_container(bytes)?;
-        if bytes_missing == 0 && elem_missed == 0 {
-            return Ok(paths);
-        }
-        let missing = usize::try_from(bytes_missing)
-            .map_err(|_| BtrfsError::new("inode-path missing byte count exceeds usize"))?;
-        let next = size
-            .checked_add(missing.max(size))
-            .ok_or_else(|| BtrfsError::new("inode-path buffer size overflow"))?;
-        if next > INO_PATH_BUFFER_MAX {
-            return Err(BtrfsError::new(format!(
-                "inode-path result exceeds {INO_PATH_BUFFER_MAX} bytes"
-            )));
-        }
-        size = next;
+    // u64 backing aligns the flexible data container for the kernel.
+    let mut buffer = [0_u64; INO_PATH_BUFFER_MAX / size_of::<u64>()];
+    let mut args = BtrfsIoctlInoPathArgs {
+        inum: ino,
+        size: INO_PATH_BUFFER_MAX as u64,
+        reserved: [0; 4],
+        fspath: buffer.as_mut_ptr() as usize as u64,
+    };
+    ioctl(fd, BTRFS_IOC_INO_PATHS, &mut args, "BTRFS_IOC_INO_PATHS")?;
+    if args.reserved != [0; 4] {
+        return Err(BtrfsError::new(
+            "BTRFS_IOC_INO_PATHS returned nonzero reserved fields",
+        ));
     }
+    // SAFETY: the slice covers exactly the initialized u64 array.
+    let bytes =
+        unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), INO_PATH_BUFFER_MAX) };
+    let (paths, bytes_missing, elem_missed) = parse_inode_paths_container(bytes)?;
+    Ok((bytes_missing == 0 && elem_missed == 0).then_some(paths))
 }
 
 fn parse_inode_paths_container(bytes: &[u8]) -> Result<(Vec<Vec<u8>>, u32, u32), BtrfsError> {
