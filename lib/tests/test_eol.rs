@@ -761,14 +761,14 @@ fn test_git_attributes_checkout_uses_target_tree() -> TestResult {
     let mut test_workspace =
         TestWorkspace::init_with_backend_and_settings(TestRepoBackend::Git, &settings);
     for (attributes, stored, checked_out) in [
-        ("*.cmd text eol=lf\n", "first\n", b"first\n".as_slice()),
+        ("*.cmd text eol=crlf\n", "first\n", b"first\r\n".as_slice()),
+        ("*.cmd text eol=lf\n", "second\n", b"second\n".as_slice()),
+        // Only the attributes change here. The file still needs new line endings.
         (
             "*.cmd text eol=crlf\n",
             "second\n",
             b"second\r\n".as_slice(),
         ),
-        // Only the attributes change here. The file still needs new line endings.
-        ("*.cmd text eol=lf\n", "second\n", b"second\n".as_slice()),
     ] {
         let tree = testutils::create_tree(
             &test_workspace.repo,

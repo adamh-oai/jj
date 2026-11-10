@@ -2289,18 +2289,19 @@ impl TreeState {
             message: "Failed to read Git line-ending attributes".to_owned(),
             err: err.into(),
         })?;
-        // Attribute-only edits can change a file's on-disk representation even
-        // when its stored bytes did not change. Compare rules only below changed
-        // attribute files, and write only paths whose conversion rules differ.
-        let attribute_glob = globset::Glob::new("**/.gitattributes").unwrap();
-        let mut attribute_matcher = GlobsMatcher::builder();
-        attribute_matcher.add(RepoPath::root(), &attribute_glob);
-        let attribute_matcher = attribute_matcher.build();
-        let mut attribute_diff = old_tree.diff_stream(new_tree, &attribute_matcher);
         let mut attribute_prefixes = Vec::new();
-        while let Some(TreeDiffEntry { path, values }) = attribute_diff.next().await {
-            values?;
-            attribute_prefixes.push(path.parent().unwrap().to_owned());
+        // The regular diff writes every selected file when the old tree is empty.
+        // Otherwise, attribute-only edits can also require rewriting existing files.
+        if old_tree.tree_ids().as_resolved() != Some(self.store.empty_tree_id()) {
+            let attribute_glob = globset::Glob::new("**/.gitattributes").unwrap();
+            let mut attribute_matcher = GlobsMatcher::builder();
+            attribute_matcher.add(RepoPath::root(), &attribute_glob);
+            let attribute_matcher = attribute_matcher.build();
+            let mut attribute_diff = old_tree.diff_stream(new_tree, &attribute_matcher);
+            while let Some(TreeDiffEntry { path, values }) = attribute_diff.next().await {
+                values?;
+                attribute_prefixes.push(path.parent().unwrap().to_owned());
+            }
         }
         let mut attributes_to_rematerialize = HashMap::new();
         if !attribute_prefixes.is_empty() {
