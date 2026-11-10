@@ -2357,9 +2357,8 @@ async fn reset_index(
     );
     result?;
     debug_assert!(index.verify_entries().is_ok());
-    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
     let started = Instant::now();
-    let result = git_index_cache::write_preserving_cache(&index, &mut writer);
+    let result = git_index_cache::write_preserving_cache(git_repo, &index, index_lock);
     tracing::debug!(
         phase = "git_index_write_preserving_cache",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -2367,28 +2366,7 @@ async fn reset_index(
         entry_count,
         "Git index phase completed"
     );
-    result.map_err(GitResetHeadError::from_git)?;
-    let started = Instant::now();
-    let result = writer.into_inner();
-    tracing::debug!(
-        phase = "git_index_flush",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    let index_lock = result.map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
-    let started = Instant::now();
-    let result = index_lock.commit();
-    tracing::debug!(
-        phase = "git_index_commit",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    result.map_err(GitResetHeadError::from_git)?;
-    Ok(())
+    result.map_err(GitResetHeadError::from_git)
 }
 
 /// Build a cold Git index for a working-copy commit, without reading an existing index.
@@ -2591,14 +2569,8 @@ pub async fn update_intent_to_add(
         return Ok(());
     }
     debug_assert!(index.verify_entries().is_ok());
-    let mut writer = std::io::BufWriter::with_capacity(64 * 1024, index_lock);
-    git_index_cache::write_preserving_cache(index, &mut writer)
-        .map_err(GitResetHeadError::from_git)?;
-    let index_lock = writer
-        .into_inner()
-        .map_err(|err| GitResetHeadError::from_git(err.into_error()))?;
-    index_lock.commit().map_err(GitResetHeadError::from_git)?;
-    Ok(())
+    git_index_cache::write_preserving_cache(&git_repo, index, index_lock)
+        .map_err(GitResetHeadError::from_git)
 }
 
 async fn update_intent_to_add_impl(

@@ -26,6 +26,23 @@ use std::path::Path;
 use std::time::Instant;
 use std::time::SystemTime;
 
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::scan::BeginScanRequest;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::scan::Invalidation;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::scan::ScanClient as _;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::scan::ScanOutcome;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::scan::SnapshotLease;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::scan_facade::DirectScanClient;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::status::decode_git_fsmonitor_token;
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+use btrfs_awacs::status::encode_git_fsmonitor_token;
+
 /// An index encoding or I/O error.
 pub type ErrorBox = Box<dyn Error + Send + Sync>;
 
@@ -200,14 +217,14 @@ pub fn index_from_tree(
     Ok(gix::index::File::from_state(state, index.path()))
 }
 
-/// Write an index, preserving its old worktree-specific caches where possible.
+/// Replace the index under the caller's lock and keep its worktree caches valid.
 ///
-/// The caller must hold the index lock, and `out` must write to that lock, not
-/// the live index. Dirty bits are remapped by path, stage, object and mode;
-/// new or modified entries are dirty. Missing caches stay missing.
-pub fn write_preserving_cache(
+/// Remap dirty bits by path, stage, object and mode. If the old index has an
+/// AWACS cursor, apply the pending invalidations before saving a newer cursor.
+pub(crate) fn write_preserving_cache(
+    repo: &gix::Repository,
     index: &gix::index::File,
-    mut out: impl Write,
+    index_lock: gix::lock::File,
 ) -> Result<(), ErrorBox> {
     let entry_count = index.entries().len();
     let started = Instant::now();
@@ -232,8 +249,21 @@ pub fn write_preserving_cache(
     );
     let previous = result?;
     let started = Instant::now();
-    if let Some(previous) = previous {
-        rebuilt.inherit_fs_monitor_from(&previous);
+    if let Some(previous) = &previous {
+        rebuilt.inherit_fs_monitor_from(previous);
+    }
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    let mut update = previous
+        .as_ref()
+        .and_then(|previous| GitMonitorUpdate::prepare(repo, previous, &mut rebuilt));
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    let keep_untracked = update.as_ref().is_none_or(|update| update.keep_untracked);
+    #[cfg(not(all(target_os = "linux", feature = "awacs")))]
+    let keep_untracked = {
+        let _ = repo;
+        true
+    };
+    if let Some(previous) = previous.filter(|_| keep_untracked) {
         rebuilt.inherit_untracked_from(&previous);
     }
     tracing::debug!(
@@ -242,17 +272,198 @@ pub fn write_preserving_cache(
         entry_count,
         "Git index phase completed"
     );
-    let started = Instant::now();
-    let result = rebuilt.write_to(&mut out, gix_index_cache::write::Options::default());
-    tracing::debug!(
-        phase = "git_index_cache_encode_and_write",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    result?;
-    Ok(())
+    let result = (|| {
+        let mut writer = io::BufWriter::with_capacity(64 * 1024, index_lock);
+        let started = Instant::now();
+        let result = rebuilt.write_to(&mut writer, gix_index_cache::write::Options::default());
+        tracing::debug!(
+            phase = "git_index_cache_encode_and_write",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            entry_count,
+            "Git index phase completed"
+        );
+        result?;
+        let started = Instant::now();
+        let result = writer.into_inner();
+        tracing::debug!(
+            phase = "git_index_flush",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            entry_count,
+            "Git index phase completed"
+        );
+        let index_lock = result.map_err(|err| err.into_error())?;
+        let started = Instant::now();
+        let result = index_lock.commit();
+        tracing::debug!(
+            phase = "git_index_commit",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            succeeded = result.is_ok(),
+            entry_count,
+            "Git index phase completed"
+        );
+        result?;
+        Ok(())
+    })();
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    if let Some(update) = &mut update {
+        update.finish(result.is_ok());
+    }
+    result
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+struct GitMonitorUpdate<'a> {
+    client: DirectScanClient,
+    lease: SnapshotLease,
+    root: &'a Path,
+    keep_untracked: bool,
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+impl<'a> GitMonitorUpdate<'a> {
+    fn prepare(
+        repo: &'a gix::Repository,
+        previous: &gix_index_cache::File,
+        rebuilt: &mut gix_index_cache::File,
+    ) -> Option<Self> {
+        let root = repo.workdir()?;
+        let baseline = decode_git_fsmonitor_token(previous.fs_monitor()?.token()?)?;
+        let owner = baseline.retention_token.as_slice().try_into().ok()?;
+        if previous.is_sparse()
+            || rebuilt.is_sparse()
+            || repo.config_snapshot().boolean("core.ignoreCase") == Some(true)
+        {
+            return None;
+        }
+        let result = (|| {
+            let mut client = DirectScanClient::for_git_index_write(root, rebuilt.path())?;
+            let mut lease = client.begin_scan(&BeginScanRequest {
+                live_root: root.to_owned(),
+                baseline_owner_id: owner,
+                previous_baseline: Some(baseline),
+                allow_full_invalidation: false,
+            })?;
+            let applied = (|| {
+                client.validate_scan_root(&lease)?;
+                let token =
+                    encode_git_fsmonitor_token(&lease.next_baseline).map_err(io::Error::other)?;
+                apply_git_invalidations(rebuilt, &token, &lease.invalidation)
+            })();
+            let has_changes = match applied {
+                Ok(has_changes) => has_changes,
+                Err(err) => {
+                    drop(lease.finish(ScanOutcome::Aborted));
+                    return Err(err);
+                }
+            };
+            // UNTR also depends on which paths are in the index, even if the
+            // worktree itself did not change.
+            let keep_untracked = !has_changes
+                && previous.untracked().is_some()
+                && previous.entries().len() == rebuilt.entries().len()
+                && previous
+                    .entries()
+                    .iter()
+                    .zip(rebuilt.entries())
+                    .all(|(old, new)| {
+                        old.path(previous) == new.path(rebuilt)
+                            && old.mode.is_submodule() == new.mode.is_submodule()
+                    });
+            Ok::<_, ErrorBox>(Self {
+                client,
+                lease,
+                root,
+                keep_untracked,
+            })
+        })();
+        match result {
+            Ok(update) => Some(update),
+            Err(err) => {
+                tracing::debug!(%err, "keeping the previous Git fsmonitor cursor");
+                None
+            }
+        }
+    }
+
+    fn finish(&mut self, index_written: bool) {
+        if index_written {
+            // A concurrent Git writer may already have replaced our index.
+            // Keep the response pin until process exit and let retention
+            // read the current index in that case.
+            if let Err(err) = self
+                .client
+                .observe_persisted_git_index(self.root, &self.lease.next_baseline)
+            {
+                tracing::debug!(%err, "could not observe the new Git fsmonitor cursor");
+            }
+        }
+        let outcome = if index_written {
+            ScanOutcome::Committed
+        } else {
+            ScanOutcome::Aborted
+        };
+        if let Err(err) = self.lease.finish(outcome) {
+            tracing::debug!(%err, "could not finish the Git index scan");
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+fn apply_git_invalidations(
+    index: &mut gix_index_cache::File,
+    token: &str,
+    invalidation: &Invalidation,
+) -> Result<bool, ErrorBox> {
+    let Invalidation::Paths { exact, prefixes } = invalidation else {
+        return Err(io::Error::other("Git fsmonitor requires an incremental AWACS delta").into());
+    };
+    let mut dirty = vec![false; index.entries().len()];
+    if index
+        .fs_monitor()
+        .and_then(|monitor| {
+            monitor.for_each_dirty_entry(|position| {
+                *dirty.get_mut(position)? = true;
+                Some(())
+            })
+        })
+        .is_none()
+    {
+        return Err(io::Error::other("invalid Git fsmonitor dirty bitmap").into());
+    }
+    let mut directory = Vec::new();
+    let mut has_worktree_changes = false;
+    for path in exact.iter().chain(prefixes) {
+        let path = path.strip_suffix(b"/").unwrap_or(path);
+        if path.contains(&0)
+            || path
+                .split(|byte| *byte == b'/')
+                .any(|component| matches!(component, b"" | b"." | b".."))
+        {
+            return Err(io::Error::other("invalid path in AWACS Git delta").into());
+        }
+        // Git's own index and lock updates do not change untracked paths.
+        if path == b".git" || path.starts_with(b".git/") {
+            continue;
+        }
+        has_worktree_changes = true;
+        if let Some(range) = index.entry_range(bstr::BStr::new(path)) {
+            dirty[range].fill(true);
+        }
+        // AWACS can report a directory as an exact path too. The slash
+        // makes the prefix match only entries in that directory.
+        directory.clear();
+        directory.extend_from_slice(path);
+        directory.push(b'/');
+        if let Some(range) = index.prefixed_entries_range(bstr::BStr::new(&directory)) {
+            dirty[range].fill(true);
+        }
+    }
+    let monitor = gix_index_cache::extension::FsMonitor::from_token(token, &dirty)
+        .ok_or_else(|| io::Error::other("invalid AWACS Git cursor or dirty bitmap"))?;
+    index.set_fs_monitor(monitor);
+    Ok(has_worktree_changes)
 }
 
 /// Write an index with the supplied filesystem-monitor token and dirty bits.
@@ -528,9 +739,20 @@ mod tests {
         .0
     }
 
+    fn rewrite_index(repo: &gix::Repository, index: &gix::index::File) -> Result<(), ErrorBox> {
+        let lock = gix::lock::File::acquire_to_update_resource(
+            index.path(),
+            gix::lock::acquire::Fail::Immediately,
+            None,
+            0,
+        )?;
+        write_preserving_cache(repo, index, lock)
+    }
+
     fn preserves_monitor(kind: gix::hash::Kind) {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index");
+        let repo = init_repo(temp.path(), kind, true, &[]);
+        let path = repo.index_path();
         let original = make_index(&path, kind, &[("a", 1), ("b", 2), ("c", 3), ("e", 5)]);
         let mut bytes = Vec::new();
         write_with_monitor(
@@ -547,8 +769,8 @@ mod tests {
             kind,
             &[("a", 1), ("b", 9), ("c", 3), ("d", 4), ("e", 5)],
         );
-        let mut bytes = Vec::new();
-        write_preserving_cache(&next, &mut bytes).unwrap();
+        rewrite_index(&repo, &next).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
         let parsed = read_bytes(&bytes, cache_hash(kind).unwrap());
         let monitor = parsed.fs_monitor().expect("fsmonitor survives the rewrite");
         assert_eq!(monitor.token().unwrap(), "test-cursor");
@@ -584,7 +806,8 @@ mod tests {
     #[test]
     fn preserves_untracked_extension() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index");
+        let repo = init_repo(temp.path(), gix::hash::Kind::Sha1, true, &[]);
+        let path = repo.index_path();
         std::fs::write(
             &path,
             include_bytes!("../tests/fixtures/untracked-cache.index"),
@@ -595,8 +818,8 @@ mod tests {
             .unwrap();
         let before = format!("{:?}", previous.untracked().expect("fixture has UNTR"));
         let next = make_index(&path, gix::hash::Kind::Sha1, &[("new", 1)]);
-        let mut bytes = Vec::new();
-        write_preserving_cache(&next, &mut bytes).unwrap();
+        rewrite_index(&repo, &next).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
         let parsed = read_bytes(&bytes, gix_hash_cache::Kind::Sha1);
         assert_eq!(
             before,
@@ -607,10 +830,63 @@ mod tests {
     #[test]
     fn rejects_truncated_source_and_invalid_bitmap() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("index");
+        let repo = init_repo(temp.path(), gix::hash::Kind::Sha1, true, &[]);
+        let path = repo.index_path();
         let index = make_index(&path, gix::hash::Kind::Sha1, &[("a", 1)]);
         assert!(write_with_monitor(&index, "token", &[], None, Vec::new()).is_err());
         std::fs::write(&path, b"DIRC").unwrap();
-        assert!(write_preserving_cache(&index, Vec::new()).is_err());
+        assert!(rewrite_index(&repo, &index).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"DIRC");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "awacs"))]
+    #[test]
+    fn advancing_monitor_keeps_dirty_bits_and_applies_directory_moves() {
+        let index = make_index(
+            Path::new("index"),
+            gix::hash::Kind::Sha1,
+            &[
+                ("a", 1),
+                ("dir-sibling/a", 2),
+                ("dir/a", 3),
+                ("dir/b", 4),
+                ("file", 5),
+            ],
+        );
+        let mut index = cache_index(&index).unwrap();
+        index.set_fs_monitor(
+            gix_index_cache::extension::FsMonitor::from_token(
+                "old",
+                &[true, false, false, false, false],
+            )
+            .unwrap(),
+        );
+        let paths = Invalidation::Paths {
+            exact: vec![b"file".to_vec()],
+            prefixes: vec![b"dir/".to_vec()],
+        };
+        assert!(apply_git_invalidations(&mut index, "new", &paths).unwrap());
+        let monitor = index.fs_monitor().unwrap();
+        assert_eq!(monitor.token().unwrap(), "new");
+        let mut dirty = Vec::new();
+        monitor
+            .for_each_dirty_entry(|position| {
+                dirty.push(position);
+                Some(())
+            })
+            .unwrap();
+        assert_eq!(dirty, [0, 2, 3, 4]);
+
+        let git_metadata = Invalidation::Paths {
+            exact: vec![b".git/index".to_vec(), b".git/index.lock".to_vec()],
+            prefixes: vec![],
+        };
+        assert!(!apply_git_invalidations(&mut index, "metadata", &git_metadata).unwrap());
+        let malformed = Invalidation::Paths {
+            exact: vec![b".".to_vec()],
+            prefixes: vec![],
+        };
+        assert!(apply_git_invalidations(&mut index, "bad", &malformed).is_err());
+        assert_eq!(index.fs_monitor().unwrap().token().unwrap(), "metadata");
     }
 }

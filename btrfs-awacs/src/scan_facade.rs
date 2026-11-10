@@ -136,6 +136,38 @@ impl DirectScanClient {
         Ok(client)
     }
 
+    /// Opens a client for a writer holding this worktree's Git index lock.
+    /// The writer can publish a cursor even if its scan lease expires, so
+    /// retain the cursor for the life of the writer as for a Git hook response.
+    pub fn for_git_index_write(live_root: &Path, index_path: &Path) -> Result<Self, ScanError> {
+        let git_dir = git_admin_directory(live_root)
+            .map_err(|err| unavailable(format!("resolve Git index: {err}")))?
+            .ok_or_else(|| unavailable("AWACS root has no Git administrative directory"))?;
+        let canonical_directory = |path: &Path| {
+            path.canonicalize()
+                .map_err(|err| unavailable(format!("resolve Git index directory: {err}")))
+        };
+        let git_dir = canonical_directory(&git_dir)?;
+        let expected_index = git_dir.join("index");
+        let index_parent = index_path
+            .parent()
+            .ok_or_else(|| unavailable("Git index has no parent directory"))?;
+        // Gitoxide replaces the index path itself, even if it is a symlink.
+        if index_path.file_name() != expected_index.file_name()
+            || canonical_directory(index_parent)? != git_dir
+            || !std::fs::symlink_metadata(&expected_index).is_ok_and(|meta| meta.is_file())
+        {
+            return Err(unavailable(
+                "Git index is outside the AWACS watch's Git lane",
+            ));
+        }
+        let publisher = GitPublisher::current_process(expected_index)
+            .ok_or_else(|| unavailable("cannot identify the Git index writer"))?;
+        let mut client = Self::for_root(live_root)?;
+        client.git_publisher = Some(publisher);
+        Ok(client)
+    }
+
     fn lock_root(&self) -> Result<RootLockGuard<'_>, ScanError> {
         RootLockGuard::acquire(&self.root_lock, &self.root_lock_path)
     }
@@ -646,7 +678,7 @@ impl DirectScanHandler {
     fn begin_scan(
         &mut self,
         request: BeginScanRequest,
-        git_hook: bool,
+        git_publisher: bool,
     ) -> Result<PreparedScanLease, ScanError> {
         let begin_started = Instant::now();
         let now_ns = unix_time_ns()?;
@@ -675,6 +707,12 @@ impl DirectScanHandler {
         );
         let baseline_reconcile_started = Instant::now();
         let logical_git_consumer = request.baseline_owner_id == watch_id;
+        if git_publisher && !logical_git_consumer {
+            return Err(ScanError::new(
+                ScanErrorKind::InvalidPreviousBaseline,
+                "AWACS Git cursor belongs to a different watch",
+            ));
+        }
         let previous_baseline = if logical_git_consumer
             && request
                 .previous_baseline
@@ -685,13 +723,10 @@ impl DirectScanHandler {
                 .previous_baseline
                 .as_ref()
                 .expect("checked Git logical baseline");
-            // Hook input proves a cursor was persisted even when full
-            // invalidation is forbidden. Internal index seeding does not;
-            // writers separately verify their published index before
-            // recording an observation; issuing this response proves nothing.
-            // Record it before issuing the next cut, whose output may never
-            // be committed to the index (e.g. GIT_OPTIONAL_LOCKS=0).
-            let retained = if git_hook || request.allow_full_invalidation {
+            // A hook input or a token read under the Git index lock proves
+            // the cursor was persisted. Record it before issuing the next
+            // cut, whose token may never reach the index.
+            let retained = if git_publisher || request.allow_full_invalidation {
                 facade.observe_logical_git_baseline(watch_id, baseline, unix_time_ns()?)
             } else {
                 facade.validate_logical_git_baseline(watch_id, baseline)

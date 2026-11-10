@@ -171,6 +171,24 @@ fn normalize_index_path(path: &Path) -> PathBuf {
 }
 
 impl GitPublisher {
+    pub(crate) fn current_process(index_path: PathBuf) -> Option<Self> {
+        let stat = fs::read_to_string("/proc/self/stat").ok()?;
+        Some(Self {
+            boot_id: *Uuid::parse_str(
+                fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .ok()?
+                    .trim(),
+            )
+            .ok()?
+            .as_bytes(),
+            pid: std::process::id(),
+            start_time: parse_process_stat(&stat)?.start_time,
+            pid_namespace: current_pid_namespace()?,
+            mount_namespace: current_mount_namespace()?,
+            index_path: Some(index_path),
+        })
+    }
+
     fn reason(&self) -> String {
         format!(
             "{RESPONSE_REASON_PREFIX}{}:{}:{}:{}:{}:{}:{}:{}",
@@ -230,6 +248,12 @@ impl GitPublisher {
 }
 
 fn current_pid_namespace() -> Option<(u64, u64)> {
+    // With an inherited procfs mount, /proc may use a different PID view
+    // from getpid(). Do not use it to identify an exited publisher.
+    let proc_pid = fs::read_link("/proc/self").ok()?;
+    if proc_pid.to_str()?.parse::<u32>().ok()? != std::process::id() {
+        return None;
+    }
     namespace_identity("pid")
 }
 

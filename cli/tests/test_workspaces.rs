@@ -415,6 +415,13 @@ fn test_awacs_retains_idle_git_index_before_next_git_query() -> TestResult {
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 #[test]
 #[ignore = "requires patched Git, JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
+fn test_awacs_advances_git_index_on_intent_to_add() -> TestResult {
+    git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::ColocatedJjIntentToAdd)
+}
+
+#[cfg(all(target_os = "linux", feature = "awacs"))]
+#[test]
+#[ignore = "requires patched Git, JJ_TEST_BTRFS_ROOT, BTRFS_AWACS_COMMAND, and matching broker"]
 fn test_workspace_add_falls_back_for_staged_git_index() -> TestResult {
     git_snapshot_worktree_handoff(GitSnapshotHandoffScenario::ColocatedJjStagedIndex)
 }
@@ -453,6 +460,7 @@ enum GitSnapshotHandoffScenario {
     RetainedCursor,
     ColocatedJjReuse,
     ColocatedJjIdleIndex,
+    ColocatedJjIntentToAdd,
     ColocatedJjExternalIndex,
     ColocatedJjStagedIndex,
     ColocatedJjEmptySparse,
@@ -557,12 +565,14 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         scenario,
         GitSnapshotHandoffScenario::ColocatedJjReuse
             | GitSnapshotHandoffScenario::ColocatedJjIdleIndex
+            | GitSnapshotHandoffScenario::ColocatedJjIntentToAdd
             | GitSnapshotHandoffScenario::ColocatedJjExternalIndex
             | GitSnapshotHandoffScenario::ColocatedJjStagedIndex
             | GitSnapshotHandoffScenario::ColocatedJjEmptySparse
             | GitSnapshotHandoffScenario::ColocatedJjFilter
     );
     let external_index = scenario == GitSnapshotHandoffScenario::ColocatedJjExternalIndex;
+    let intent_to_add = scenario == GitSnapshotHandoffScenario::ColocatedJjIntentToAdd;
     let empty_sparse = scenario == GitSnapshotHandoffScenario::ColocatedJjEmptySparse;
     let custom_filter = scenario == GitSnapshotHandoffScenario::ColocatedJjFilter;
     // Git-only scenarios intentionally have no JJ consumer, which would pin
@@ -584,6 +594,12 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         std::fs::write(root.join(name), contents)?;
     }
     run(git_command(&root).args(["add", "one", "two"]))?;
+    if intent_to_add {
+        std::fs::create_dir_all(root.join("old/nested"))?;
+        std::fs::write(root.join("old/nested/tracked"), "tracked before the move\n")?;
+        std::fs::write(root.join("untouched"), "unchanged\n")?;
+        run(git_command(&root).args(["add", "old", "untouched"]))?;
+    }
     run(git_command(&root).args([
         "-c",
         "user.name=Test User",
@@ -806,7 +822,7 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
             "advancing JJ must leave the retained Git cursor unchanged"
         );
     }
-    if scenario == GitSnapshotHandoffScenario::ColocatedJjStagedIndex {
+    if intent_to_add || scenario == GitSnapshotHandoffScenario::ColocatedJjStagedIndex {
         // The live files and JJ's semantic tree stay unchanged, while Git's
         // cached root TREE now describes a different staged blob. Matching
         // physical snapshots alone cannot authorize inheritance of this tree.
@@ -826,6 +842,100 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         );
         original_index = std::fs::read(&index_path)?;
         assert_eq!(std::fs::read_to_string(root.join("one"))?, "first\n");
+    }
+
+    if intent_to_add {
+        assert!(
+            git_index_layout(&original_index, 20)
+                .map_err(std::io::Error::other)?
+                .extension_data_range(b"UNTR")
+                .is_some(),
+            "the Git index must have a warm untracked cache before the move"
+        );
+        let staged = run(git_command(&root).args(["ls-files", "--stage", "--", "one"]))?.stdout;
+        assert!(!staged.is_empty());
+        let dirty_paths = || -> TestResult<Vec<String>> {
+            let index = gix_index_cache::File::at(
+                &index_path,
+                gix_index_cache::hash::Kind::Sha1,
+                false,
+                gix_index_cache::decode::Options::default(),
+            )?;
+            let mut paths = Vec::new();
+            index
+                .fs_monitor()
+                .expect("the index must have an FSMN extension")
+                .for_each_dirty_entry(|position| {
+                    paths.push(index.entries()[position].path(&index).to_string());
+                    Some(())
+                })
+                .expect("the FSMN bitmap must be valid");
+            Ok(paths)
+        };
+        assert_eq!(dirty_paths()?, ["one"], "staging leaves one dirty entry");
+        let GitFsmonitorStatus::Baseline(before) = inspect_git_index(&index_path)?.fsmonitor else {
+            panic!("the staged index must have an AWACS cursor");
+        };
+        let before_sequence = RootStatus::open(&root)?
+            .inspect_baseline(&before)
+            .sequence
+            .unwrap();
+
+        std::fs::rename(root.join("old"), root.join("moved"))?;
+        std::fs::write(root.join("moved/nested/git-only"), "untracked by JJ\n")?;
+        std::fs::write(root.join("two"), "unstaged edit\n")?;
+        jj_command(&root)
+            .args([
+                "--config=snapshot.auto-track='glob:moved/nested/tracked'",
+                "status",
+            ])
+            .assert()
+            .success();
+
+        let GitFsmonitorStatus::Baseline(after) = inspect_git_index(&index_path)?.fsmonitor else {
+            panic!("intent-to-add must publish an AWACS cursor");
+        };
+        let after_status = RootStatus::open(&root)?.inspect_baseline(&after);
+        assert!(after_status.issues.is_empty(), "{:?}", after_status.issues);
+        assert!(after_status.sequence.unwrap() > before_sequence);
+        assert_eq!(
+            dirty_paths()?,
+            ["moved/nested/tracked", "old/nested/tracked", "one", "two"]
+        );
+        assert_eq!(
+            run(git_command(&root).args(["ls-files", "--stage", "--", "one"]))?.stdout,
+            staged,
+            "intent-to-add must preserve the staged blob and mode"
+        );
+
+        let trace_path = runtime.join("intent-to-add-status.jsonl");
+        let status = run(git_command(&root)
+            .env("GIT_TRACE2_EVENT", &trace_path)
+            .args([
+                "-c",
+                "core.fsmonitorHookFallback=false",
+                "status",
+                "--porcelain=v1",
+                "--no-renames",
+            ]))?;
+        let stdout = String::from_utf8(status.stdout)?;
+        let mut paths = stdout.lines().collect::<Vec<_>>();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                " A moved/nested/tracked",
+                " D old/nested/tracked",
+                " M two",
+                "?? moved/nested/git-only",
+                "MM one",
+            ]
+        );
+        let trace = std::fs::read_to_string(trace_path)?;
+        assert!(trace.contains("apply_count"), "{trace}");
+        assert!(!trace.contains("query/trivial-response"), "{trace}");
+        cleanup.cleanup()?;
+        return Ok(());
     }
 
     if scenario == GitSnapshotHandoffScenario::MissingCursor {
