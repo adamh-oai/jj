@@ -72,6 +72,7 @@ use jj_lib::working_copy::WorkingCopyFreshness;
 
 use crate::cleanup_guard::CleanupGuard;
 use crate::cli_util::CommandHelper;
+use crate::cli_util::GitImportExportLock;
 use crate::cli_util::shell_quote;
 use crate::command_error::CommandError;
 use crate::command_error::internal_error;
@@ -329,22 +330,31 @@ async fn rebuild_snapshot_baseline(
     let workspace_root = workspace_command.workspace_root().to_owned();
     let repo = workspace_command.repo().clone();
     let workspace_name = workspace_command.workspace_name().to_owned();
-    let operation_id = repo.op_id().clone();
-    // Match ordinary snapshot lock ordering and keep the journal unchanged
-    // while validating its operation and semantic tree.
-    let git_import_export_lock = workspace_command.lock_git_import_export()?;
-    let (mut locked_workspace, commit) = workspace_command
+    let locks = workspace_command.lock_git_worktree_for_baseline_rebuild()?;
+    #[cfg(feature = "git")]
+    if colocated
+        && let Some(needs_recovery) = workspace_command
+            .resume_rebuild_git_sync(ui, &locks)
+            .await?
+    {
+        set_subvolume_mode(&workspace_root, true)?;
+        finalize_subvolume_root(ui, &workspace_root, !needs_recovery)?;
+        writeln!(ui.status(), "awacs: rebuilt committed snapshot baseline.")?;
+        return Ok(());
+    }
+    let (mut locked_workspace, _) = workspace_command
         .unchecked_start_working_copy_mutation()
         .await?;
-    // The helper was loaded before waiting for these locks. Refuse to reset a
-    // journal against an operation that another workspace has already changed.
-    let published_operation = command.resolve_operation(ui, repo.loader(), &workspace_name)?;
-    if published_operation.id() != repo.op_id() {
-        return Err(user_error(
-            "The repository changed while preparing the AWACS baseline rebuild. Retry `jj util \
-             subvolume enable --rebuild-baseline`.",
-        ));
-    }
+    // Use the latest target after waiting for this worktree's journal.
+    let published_operation =
+        command.resolve_current_operation(ui, repo.loader(), &workspace_name)?;
+    let repo = repo.loader().load_at(&published_operation).await?;
+    let operation_id = repo.op_id().clone();
+    let commit_id = repo
+        .view()
+        .get_wc_commit_id(&workspace_name)
+        .ok_or_else(|| user_error("Nothing checked out in this workspace"))?;
+    let commit = repo.store().get_commit_async(commit_id).await?;
     let locked_wc = locked_workspace.locked_wc();
     let freshness = WorkingCopyFreshness::check_stale(locked_wc, &commit, &repo).await?;
     let same_tree =
@@ -431,40 +441,19 @@ async fn rebuild_snapshot_baseline(
     } else {
         operation_id.clone()
     };
-    locked_workspace.finish(journal_operation_id).await?;
+    locked_workspace
+        .finish(journal_operation_id.clone())
+        .await?;
     // The compact journal is intentionally baseline-less between the reset
     // above and the replacement immutable scan below. Temporarily use the
     // transition marker so helper reloads can enter that state, then restore
     // strict mode whether reseeding succeeds or fails.
     begin_subvolume_mode(&workspace_root)?;
-    let baseline_result = if recover_stale {
-        match command
-            .snapshot_stale_working_copy_for_subvolume_rebuild(
-                ui,
-                &git_import_export_lock,
-                &operation_id,
-                old_operation.id(),
-            )
-            .await
-        {
-            Ok((recovered, stats)) => {
-                *workspace_command = recovered;
-                crate::cli_util::print_snapshot_stats(
-                    ui,
-                    &stats,
-                    workspace_command.env().path_converter(),
-                )
-                .map_err(CommandError::from)
-                .and_then(|()| verify_committed_snapshot_baseline(workspace_command))
-            }
-            Err(err) => Err(err),
-        }
-    } else {
-        drop(git_import_export_lock);
-        establish_initial_snapshot_baseline(ui, workspace_command, Some(&operation_id)).await
-    };
+    let baseline_result =
+        establish_snapshot_baseline(ui, workspace_command, Some((&locks, &journal_operation_id)))
+            .await;
     let marker_result = set_subvolume_mode(&workspace_root, true);
-    baseline_result.map_err(|err| {
+    let needs_recovery = baseline_result.map_err(|err| {
         if recover_stale {
             err.hinted(
                 "The working copy was not reconciled. Keep its files and inspect any saved \
@@ -477,7 +466,7 @@ async fn rebuild_snapshot_baseline(
     marker_result?;
     // Rebind the manager path for both cases, but do not rewrite the Git index
     // in an unreconciled stale checkout.
-    finalize_subvolume_root(ui, &workspace_root, colocated && !recover_stale)?;
+    finalize_subvolume_root(ui, &workspace_root, colocated && !needs_recovery)?;
     writeln!(ui.status(), "awacs: rebuilt committed snapshot baseline.")?;
     Ok(())
 }
@@ -771,7 +760,7 @@ async fn init_subvolume_at_inner(
     tracing::info!("seeding snapshot-backed working-copy tree");
     seed_snapshot_working_copy_tree(&mut destination_command).await?;
     writeln!(ui.status(), "awacs: creating initial snapshot baseline...")?;
-    establish_initial_snapshot_baseline(ui, &mut destination_command, None).await?;
+    establish_snapshot_baseline(ui, &mut destination_command, None).await?;
     set_subvolume_mode(&destination, true)?;
     writeln!(
         ui.status(),
@@ -1864,11 +1853,11 @@ async fn reset_local_working_copy_state(
     Ok(())
 }
 
-async fn establish_initial_snapshot_baseline(
+async fn establish_snapshot_baseline(
     ui: &Ui,
     workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
-    expected_published_operation: Option<&OperationId>,
-) -> Result<(), CommandError> {
+    rebuild: Option<(&GitImportExportLock, &OperationId)>,
+) -> Result<bool, CommandError> {
     let phase = Arc::new(Mutex::new("starting the JJ working-copy transaction"));
     let report_phase = {
         let phase = phase.clone();
@@ -1881,23 +1870,30 @@ async fn establish_initial_snapshot_baseline(
             Ok(())
         }
     };
-    let mut snapshot = Box::pin(workspace_command.snapshot_for_subvolume_enable(
-        ui,
-        &report_phase,
-        expected_published_operation,
-    ));
-    loop {
+    let mut snapshot = Box::pin(async {
+        if let Some((locks, journal_operation)) = rebuild {
+            workspace_command
+                .snapshot_for_subvolume_rebuild(ui, locks, journal_operation, &report_phase)
+                .await
+        } else {
+            workspace_command
+                .snapshot_for_subvolume_enable(ui, &report_phase)
+                .await?;
+            Ok(false)
+        }
+    });
+    let needs_recovery = loop {
         let heartbeat = Box::pin(heartbeat_delay(Duration::from_secs(10)));
         match select(snapshot, heartbeat).await {
             Either::Left((result, _heartbeat)) => {
-                result.inspect_err(|err| {
+                let needs_recovery = result.inspect_err(|err| {
                     let current_phase = phase
                         .lock()
                         .map(|current_phase| *current_phase)
                         .unwrap_or("running the JJ working-copy transaction");
                     tracing::warn!(phase = current_phase, error_kind = ?err.kind, "subvolume baseline initialization failed");
                 })?;
-                break;
+                break needs_recovery;
             }
             Either::Right(((), pending_snapshot)) => {
                 snapshot = pending_snapshot;
@@ -1911,7 +1907,7 @@ async fn establish_initial_snapshot_baseline(
                 )?;
             }
         }
-    }
+    };
     tracing::info!(
         phase = "verifying committed baseline",
         "establishing subvolume baseline"
@@ -1921,7 +1917,7 @@ async fn establish_initial_snapshot_baseline(
         tracing::warn!(phase = "verifying committed baseline", error_kind = ?err.kind, "subvolume baseline initialization failed");
     })?;
     tracing::info!("verified committed subvolume baseline");
-    Ok(())
+    Ok(needs_recovery)
 }
 
 fn verify_committed_snapshot_baseline(

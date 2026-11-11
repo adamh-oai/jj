@@ -7022,7 +7022,7 @@ fn test_stale_rebuild_preserves_files(fail_lease: bool, immutable: bool) -> Test
 
 #[cfg(all(unix, feature = "awacs", debug_assertions))]
 #[test]
-fn test_stale_rebuild_preserves_files_when_operation_changes_during_scan() -> TestResult {
+fn test_stale_rebuild_saves_recovery_after_workspace_changes_during_scan() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env.run_jj_in(".", ["git", "init", "main"]).success();
     let main_dir = test_env.work_dir("main");
@@ -7070,27 +7070,69 @@ fn test_stale_rebuild_preserves_files_when_operation_changes_during_scan() -> Te
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(signal.exists(), "rebuild did not enter its scan");
+    // Rewrite the target workspace's base again while its stale scan is in progress.
+    secondary_dir.write_file("file", "second change in secondary\n");
     secondary_dir
-        .run_jj([
-            "--ignore-working-copy",
-            "describe",
-            "-r",
-            "@",
-            "-m",
-            "concurrent",
-        ])
+        .run_jj_with(|cmd| {
+            cmd.timeout(std::time::Duration::from_secs(10))
+                .arg("squash")
+        })
         .success();
     let published_operation = main_dir.current_operation_id();
     std::fs::remove_file(&signal)?;
     let output = child.wait_with_output()?;
     let stderr = String::from_utf8(output.stderr)?;
-    assert!(!output.status.success(), "{stderr}");
+    assert!(output.status.success(), "{stderr}");
     assert!(
-        stderr.contains("repository changed during AWACS baseline rebuilding"),
+        stderr.contains("stale working copy has not been reconciled"),
         "{stderr}"
     );
-    assert_eq!(main_dir.current_operation_id(), published_operation);
+    let saved_operation = stderr
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("jj --at-operation ")?
+                .split_once(' ')
+                .map(|(id, _)| id)
+        })
+        .expect("missing recovery operation in rebuild output");
+    for (operation, contents) in [
+        (saved_operation, "unsnapshotted local edit\n"),
+        (&published_operation, "second change in secondary\n"),
+    ] {
+        let saved = secondary_dir
+            .run_jj([
+                "--at-operation",
+                operation,
+                "file",
+                "show",
+                "-r",
+                "default@",
+                "file",
+            ])
+            .success();
+        assert_eq!(saved.stdout.raw(), contents);
+    }
+    assert_eq!(
+        secondary_dir
+            .run_jj([
+                "--ignore-working-copy",
+                "file",
+                "show",
+                "-r",
+                "default@",
+                "file",
+            ])
+            .success()
+            .stdout
+            .raw(),
+        "second change in secondary\n"
+    );
     assert_eq!(main_dir.read_file("file"), "unsnapshotted local edit\n");
+    assert_eq!(
+        secondary_dir.read_file("file"),
+        "second change in secondary\n"
+    );
     Ok(())
 }
 
