@@ -437,7 +437,7 @@ pub async fn cmd_workspace_adopt(
             // establish a complete baseline by scanning their test root.
             adoption_try!(
                 workspace_command
-                    .snapshot_for_subvolume_enable(ui, &|_| Ok(()), None)
+                    .snapshot_for_subvolume_enable(ui, &|_| Ok(()))
                     .await
             );
         } else {

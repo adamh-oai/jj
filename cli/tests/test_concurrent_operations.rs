@@ -363,7 +363,6 @@ fn test_git_head_race_condition() -> TestResult {
 #[test]
 fn test_snapshot_workspace_index_seeding_only_blocks_its_worktree() -> TestResult {
     use std::process::Command;
-    use std::time::Duration;
 
     let test_env = TestEnvironment::default();
     test_env
@@ -398,8 +397,10 @@ exit 1
     })
     .success();
 
-    let pause = test_env.env_root().join("pause-index-seeding");
-    std::fs::create_dir(&pause)?;
+    let source_pause = test_env.env_root().join("pause-workspace-source");
+    let index_pause = test_env.env_root().join("pause-index-seeding");
+    std::fs::create_dir(&source_pause)?;
+    std::fs::create_dir(&index_pause)?;
     let spawn = |work_dir: &TestWorkDir, label: &str, args: &[&str], paused: bool| {
         let template = test_env.new_jj_cmd();
         let stdout_path = test_env.env_root().join(format!("{label}.stdout"));
@@ -420,7 +421,9 @@ exit 1
             .stdout(std::fs::File::create(&stdout_path)?)
             .stderr(std::fs::File::create(&stderr_path)?);
         if paused {
-            command.env("JJ_TEST_SNAPSHOT_SEED_GIT_INDEX_PAUSE_DIR", &pause);
+            command
+                .env("JJ_TEST_SNAPSHOT_WORKSPACE_SOURCE_PAUSE_DIR", &source_pause)
+                .env("JJ_TEST_SNAPSHOT_SEED_GIT_INDEX_PAUSE_DIR", &index_pause);
         }
         Ok::<_, std::io::Error>(TestChild {
             child: command.spawn()?,
@@ -434,31 +437,33 @@ exit 1
         &["workspace", "add", "--colocate", "../child"],
         true,
     )?;
-    wait_for_child_event(&mut creator, || pause.join("ready").exists());
+    wait_for_child_event(&mut creator, || source_pause.join("ready").exists());
 
-    // The new workspace is visible, but index seeding holds its worktree
-    // gate. Wait for an actual lock-wait message, not just a process start.
-    let mut waiter = spawn(&child, "snapshot-workspace-waiter", &["status"], false)?;
-    let waiter_stderr = waiter.stderr_path.clone();
-    wait_for_child_event(&mut waiter, || {
-        std::fs::read_to_string(&waiter_stderr).is_ok_and(|log| {
+    let waiting_for_gate = |label: &str| {
+        let stderr_path = test_env.env_root().join(format!("{label}.stderr"));
+        std::fs::read_to_string(stderr_path).is_ok_and(|log| {
             log.lines()
                 .any(|line| line.contains("Waiting for lock") && line.contains("git-worktree-"))
         })
-    });
+    };
 
-    // A status in the source worktree must complete while both the creator
-    // and the child-worktree waiter are still blocked at the barrier.
-    main.run_jj_with(|cmd| {
-        cmd.timeout(Duration::from_secs(10))
-            .env("PATH", &path)
-            .env("JJ_TEST_AWACS_SCAN_ROOT", main.root())
-            .arg("status")
-    })
-    .success();
+    // A source command must wait at the source gate without taking the shared
+    // Git lock that the creator will need.
+    let source_label = "snapshot-workspace-source-waiter";
+    let mut source_waiter = spawn(&main, source_label, &["status"], false)?;
+    wait_for_child_event(&mut source_waiter, || waiting_for_gate(source_label));
+    std::fs::write(source_pause.join("release"), b"release\n")?;
+    wait_for_child_event(&mut creator, || index_pause.join("ready").exists());
+
+    // Index seeding now holds the child's gate. The source command can
+    // complete even while a command in the child is blocked.
+    let child_label = "snapshot-workspace-waiter";
+    let mut waiter = spawn(&child, child_label, &["status"], false)?;
+    wait_for_child_event(&mut waiter, || waiting_for_gate(child_label));
+    source_waiter.assert_success();
     assert!(creator.child.try_wait()?.is_none());
     assert!(waiter.child.try_wait()?.is_none());
-    std::fs::write(pause.join("release"), b"release\n")?;
+    std::fs::write(index_pause.join("release"), b"release\n")?;
     creator.assert_success();
     waiter.assert_success();
     Ok(())
@@ -1185,45 +1190,6 @@ fn test_snapshot_finish_retries_after_sparse_patterns_change() -> TestResult {
 
 #[cfg(feature = "test-fakes")]
 #[test]
-fn test_snapshot_finish_reacquires_after_older_process() -> TestResult {
-    let test_env = TestEnvironment::default();
-    test_env
-        .run_jj_in(".", ["git", "init", "--colocate", "main"])
-        .success();
-    let main = test_env.work_dir("main");
-    main.write_file("edited", "edited\n");
-
-    let pause_dir = test_env.env_root().join("pause-finish");
-    std::fs::create_dir(&pause_dir)?;
-    let mut scanner = spawn_traced_jj(
-        &test_env,
-        &main,
-        "scanner",
-        &["status"],
-        Some(("JJ_TEST_SNAPSHOT_FINISH_PAUSE_DIR", &pause_dir)),
-    )?;
-    wait_for_child_event(&mut scanner, || pause_dir.join("ready").exists());
-    let helper_dir = test_env.env_root().join("old-lock-helper");
-    std::fs::create_dir(&helper_dir)?;
-    let mut old_holder = spawn_old_lock_holder(&test_env, &main, &helper_dir)?;
-    wait_for_child_event(&mut old_holder, || helper_dir.join("waiting").exists());
-    assert!(!helper_dir.join("acquired").exists());
-    std::fs::write(pause_dir.join("release"), b"release\n")?;
-    old_holder.assert_success();
-    scanner.assert_success();
-    assert!(helper_dir.join("acquired").exists());
-    assert_eq!(
-        main.run_jj(["--ignore-working-copy", "file", "show", "edited"])
-            .success()
-            .stdout
-            .raw(),
-        "edited\n"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "test-fakes")]
-#[test]
 fn test_snapshot_finish_releases_lock_for_untracked_reports() -> TestResult {
     for (config, file, contents) in [
         ("snapshot.auto-track='none()'", "excluded", "file\n"),
@@ -1561,6 +1527,209 @@ fn test_waiting_for_working_copy_does_not_block_other_worktrees() -> TestResult 
             .raw(),
         "main contents\n"
     );
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "awacs", feature = "test-fakes", debug_assertions))]
+#[test]
+fn test_awacs_rebuild_reuses_scan_after_sibling_worktree_saves() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base contents\n");
+    main.run_jj(["commit", "-m", "base"]).success();
+    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
+        .success();
+
+    let scan_root = main.root().to_owned();
+    test_env.add_env_var("JJ_TEST_AWACS_SCAN_ROOT", &scan_root);
+    let main = test_env.work_dir("main");
+    let secondary = test_env.work_dir("secondary");
+    main.write_file(".jj/working_copy/subvolume_mode", "enabling\n");
+    main.write_file("from-main", "main contents\n");
+    secondary.write_file("from-secondary", "secondary contents\n");
+    let before_scan = main.current_operation_id();
+
+    let signal = test_env.env_root().join("awacs-scan-paused");
+    let mut rebuild = spawn_traced_jj(
+        &test_env,
+        &main,
+        "rebuild",
+        &["util", "subvolume", "enable", "--rebuild-baseline"],
+        Some(("JJ_TEST_AWACS_REBUILD_PAUSE", &signal)),
+    )?;
+    wait_for_child_event(&mut rebuild, || signal.exists());
+    let journal = main.root().join(".jj/working_copy/working_copy.lock");
+    assert!(jj_lib::lock::FileLock::try_lock(journal)?.is_none());
+
+    // The sibling needs the shared Git lock to snapshot its edit.
+    secondary
+        .run_jj_with(|cmd| {
+            cmd.env_remove("JJ_TEST_AWACS_SCAN_ROOT")
+                .timeout(std::time::Duration::from_secs(10))
+                .arg("status")
+        })
+        .success();
+    let sibling_operation = main.current_operation_id();
+    assert_ne!(sibling_operation, before_scan);
+
+    // A second full scan would recreate the signal and wait for another release.
+    std::fs::remove_file(&signal)?;
+    rebuild.assert_success();
+    assert_ne!(main.current_operation_id(), sibling_operation);
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+            .success()
+            .stdout
+            .raw(),
+        "main contents\n"
+    );
+    assert_eq!(
+        main.run_jj([
+            "--ignore-working-copy",
+            "file",
+            "show",
+            "-r",
+            "secondary@",
+            "from-secondary",
+        ])
+        .success()
+        .stdout
+        .raw(),
+        "secondary contents\n"
+    );
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "awacs", feature = "test-fakes", debug_assertions))]
+#[test]
+fn test_awacs_rebuild_retries_git_sync_without_rescanning() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base contents\n");
+    main.run_jj(["commit", "-m", "base"]).success();
+    let scan_root = main.root().to_owned();
+    test_env.add_env_var("JJ_TEST_AWACS_SCAN_ROOT", &scan_root);
+    let main = test_env.work_dir("main");
+    main.write_file(".jj/working_copy/subvolume_mode", "enabling\n");
+    main.write_file("from-rebuild", "new contents\n");
+    let index_lock = main.root().join(".git/index.lock");
+    std::fs::write(&index_lock, "")?;
+
+    let rebuild_args = ["util", "subvolume", "enable", "--rebuild-baseline"];
+    let failed = main.run_jj(rebuild_args);
+    assert!(!failed.status.success(), "{failed}");
+    assert!(
+        failed
+            .stderr
+            .raw()
+            .contains("The Jujutsu baseline is saved.")
+    );
+    assert_eq!(
+        main.run_jj(["--ignore-working-copy", "file", "show", "from-rebuild"])
+            .success()
+            .stdout
+            .raw(),
+        "new contents\n"
+    );
+
+    std::fs::remove_file(index_lock)?;
+    let signal = test_env.env_root().join("awacs-scan-paused");
+    main.run_jj_with(|cmd| {
+        cmd.env("JJ_TEST_AWACS_REBUILD_PAUSE", &signal)
+            .timeout(std::time::Duration::from_secs(10))
+            .args(rebuild_args)
+    })
+    .success();
+    assert!(!signal.exists());
+    let output = std::process::Command::new("git")
+        .current_dir(main.root())
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["ls-files", "--", "from-rebuild"])
+        .output()?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"from-rebuild\n");
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "awacs", feature = "test-fakes", debug_assertions))]
+#[test]
+fn test_awacs_rebuild_preserves_git_branch_switch_at_same_commit() -> TestResult {
+    let mut test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "main"])
+        .success();
+    let main = test_env.work_dir("main");
+    main.write_file("base", "base contents\n");
+    main.run_jj(["commit", "-m", "base"]).success();
+    let repo_root = main.root().to_owned();
+    let run_git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .current_dir(&repo_root)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(args)
+            .output()
+    };
+    let output = run_git(&["branch", "other", "HEAD"])?;
+    assert!(output.status.success(), "{output:?}");
+    let before = run_git(&["rev-parse", "HEAD"])?;
+    assert!(before.status.success(), "{before:?}");
+
+    let scan_root = main.root().to_owned();
+    test_env.add_env_var("JJ_TEST_AWACS_SCAN_ROOT", &scan_root);
+    let main = test_env.work_dir("main");
+    main.write_file(".jj/working_copy/subvolume_mode", "enabling\n");
+    main.write_file("local-edit", "local contents\n");
+    let before_scan = main.current_operation_id();
+    let signal = test_env.env_root().join("awacs-scan-paused");
+    let mut rebuild = spawn_traced_jj(
+        &test_env,
+        &main,
+        "rebuild",
+        &["util", "subvolume", "enable", "--rebuild-baseline"],
+        Some(("JJ_TEST_AWACS_REBUILD_PAUSE", &signal)),
+    )?;
+    wait_for_child_event(&mut rebuild, || signal.exists());
+    let output = run_git(&["symbolic-ref", "HEAD", "refs/heads/other"])?;
+    assert!(output.status.success(), "{output:?}");
+    std::fs::remove_file(&signal)?;
+    rebuild.assert_success();
+
+    let after = run_git(&["rev-parse", "HEAD"])?;
+    assert!(after.status.success(), "{after:?}");
+    assert_eq!(before.stdout, after.stdout);
+    let output = run_git(&["symbolic-ref", "HEAD"])?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"refs/heads/other\n");
+    let output = run_git(&["ls-files", "--", "local-edit"])?;
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty());
+
+    let after_scan = main.current_operation_id();
+    assert_ne!(after_scan, before_scan);
+    assert_eq!(
+        main.run_jj([
+            "--at-op",
+            &after_scan,
+            "op",
+            "log",
+            "-n",
+            "1",
+            "--no-graph",
+            "-T",
+            "description ++ \"\\n\"",
+        ])
+        .success()
+        .stdout
+        .raw(),
+        "retain AWACS baseline recovery\n"
+    );
+    assert_eq!(main.read_file("local-edit"), "local contents\n");
     Ok(())
 }
 
@@ -2045,100 +2214,6 @@ fn check_git_head_import_wait(publish_other: bool) -> TestResult {
 
 #[cfg(feature = "test-fakes")]
 #[test]
-fn test_git_head_import_retries_when_older_process_holds_shared_lock() -> TestResult {
-    let test_env = TestEnvironment::default();
-    test_env
-        .run_jj_in(".", ["git", "init", "--colocate", "main"])
-        .success();
-    let main = test_env.work_dir("main");
-    main.write_file("checkout-file", "old\n");
-    main.run_jj(["commit", "-m", "old"]).success();
-    main.write_file("checkout-file", "new\n");
-    main.run_jj(["commit", "-m", "new"]).success();
-    let old_commit = main
-        .run_jj([
-            "--ignore-working-copy",
-            "log",
-            "--no-graph",
-            "-r",
-            "@--",
-            "-T",
-            "commit_id",
-        ])
-        .success()
-        .stdout
-        .into_raw()
-        .trim()
-        .to_owned();
-    main.write_file("from-main", "main contents\n");
-    let template = test_env.new_jj_cmd();
-    let mut git = std::process::Command::new("git");
-    git.env_clear();
-    for (key, value) in template.get_envs() {
-        if let Some(value) = value {
-            git.env(key, value);
-        }
-    }
-    let output = git
-        .current_dir(main.root())
-        .args(["checkout", "--detach", "--quiet", &old_commit])
-        .output()?;
-    assert!(
-        output.status.success(),
-        "git checkout failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let pause_dir = test_env.env_root().join("pause-import-head");
-    std::fs::create_dir(&pause_dir)?;
-    let mut importer = spawn_traced_jj(
-        &test_env,
-        &main,
-        "head-importer",
-        &["status"],
-        Some(("JJ_TEST_IMPORT_HEAD_PAUSE_DIR", &pause_dir)),
-    )?;
-    wait_for_child_event(&mut importer, || pause_dir.join("ready").exists());
-    let helper_dir = test_env.env_root().join("old-lock-helper");
-    std::fs::create_dir(&helper_dir)?;
-    let mut old_holder = spawn_old_lock_holder(&test_env, &main, &helper_dir)?;
-    wait_for_child_event(&mut old_holder, || helper_dir.join("waiting").exists());
-    assert!(!helper_dir.join("acquired").exists());
-
-    // The older process holds the shared lock while waiting for A's journal.
-    // A must release the journal before waiting for the shared lock and retry.
-    std::fs::write(pause_dir.join("release"), b"release\n")?;
-    old_holder.assert_success();
-    assert!(helper_dir.join("acquired").exists());
-    importer.assert_success();
-    assert_eq!(
-        main.run_jj([
-            "--ignore-working-copy",
-            "log",
-            "--no-graph",
-            "-r",
-            "@-",
-            "-T",
-            "commit_id",
-        ])
-        .success()
-        .stdout
-        .raw()
-        .trim(),
-        old_commit
-    );
-    assert_eq!(
-        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
-            .success()
-            .stdout
-            .raw(),
-        "main contents\n"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "test-fakes")]
-#[test]
 fn test_slow_checkout_does_not_block_other_worktrees() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
@@ -2168,7 +2243,7 @@ fn test_slow_checkout_does_not_block_other_worktrees() -> TestResult {
     let journal_path = main.root().join(".jj/working_copy/working_copy.lock");
     assert!(
         jj_lib::lock::FileLock::try_lock(journal_path)?.is_none(),
-        "checkout must exclude older processes that do not take the worktree gate"
+        "checkout must keep its working-copy journal locked"
     );
 
     // A same-worktree command waits on the gate while checkout is paused;
@@ -2314,32 +2389,13 @@ fn test_scan_retries_after_external_git_checkout() -> TestResult {
 
 #[cfg(feature = "test-fakes")]
 #[test]
-fn test_scan_retries_when_older_process_holds_shared_lock() -> TestResult {
-    if let Some(helper_dir) = std::env::var_os("JJ_TEST_OLD_LOCK_HELPER") {
-        // Re-run this test in a separate process to model an older jj which
-        // takes the shared lock before waiting for the working-copy lock.
-        let helper_dir = std::path::PathBuf::from(helper_dir);
-        let shared_path = std::path::PathBuf::from(
-            std::env::var_os("JJ_TEST_OLD_SHARED_LOCK").expect("shared lock path"),
-        );
-        let journal_path = std::path::PathBuf::from(
-            std::env::var_os("JJ_TEST_OLD_JOURNAL_LOCK").expect("journal lock path"),
-        );
-        let _shared = jj_lib::lock::FileLock::lock(shared_path)?;
-        std::fs::write(helper_dir.join("waiting"), b"waiting\n")?;
-        let _journal = jj_lib::lock::FileLock::lock(journal_path)?;
-        std::fs::write(helper_dir.join("acquired"), b"acquired\n")?;
-        return Ok(());
-    }
-
+fn test_snapshot_reuses_scan_after_waiting_for_git_lock() -> TestResult {
     let test_env = TestEnvironment::default();
     test_env
         .run_jj_in(".", ["git", "init", "--colocate", "main"])
         .success();
     let main = test_env.work_dir("main");
-    main.write_file("base", "base contents\n");
-    main.run_jj(["commit", "-m", "base"]).success();
-    main.write_file("from-main", "main contents\n");
+    main.write_file("edited", "edited contents\n");
 
     let pause_dir = test_env.env_root().join("pause-snapshot");
     std::fs::create_dir(&pause_dir)?;
@@ -2352,116 +2408,35 @@ fn test_scan_retries_when_older_process_holds_shared_lock() -> TestResult {
     )?;
     wait_for_child_event(&mut scanner, || pause_dir.join("ready").exists());
 
-    let helper_dir = test_env.env_root().join("old-lock-helper");
-    std::fs::create_dir(&helper_dir)?;
-    let mut old_holder = spawn_old_lock_holder(&test_env, &main, &helper_dir)?;
-    wait_for_child_event(&mut old_holder, || helper_dir.join("waiting").exists());
-    assert!(!helper_dir.join("acquired").exists());
-
-    // The scanner cannot wait for the shared lock while keeping its journal
-    // lock. It must drop that lock, let the old process finish, and retry.
+    // Let the scan finish while another operation holds the shared Git lock.
+    let git_lock =
+        jj_lib::lock::FileLock::lock(main.root().join(".jj/repo/git_import_export.lock"))?;
     std::fs::write(pause_dir.join("release"), b"release\n")?;
-    old_holder.assert_success();
-    assert!(helper_dir.join("acquired").exists());
+    let stderr_path = scanner.stderr_path.clone();
+    wait_for_child_event(&mut scanner, || {
+        std::fs::read_to_string(&stderr_path).is_ok_and(|log| {
+            log.lines().any(|line| {
+                line.contains("Waiting for lock") && line.contains("git_import_export.lock")
+            })
+        })
+    });
+    let journal_path = main.root().join(".jj/working_copy/working_copy.lock");
+    assert!(
+        jj_lib::lock::FileLock::try_lock(journal_path)?.is_none(),
+        "the waiting scanner must keep its journal locked"
+    );
+
+    // A second scan would fail when it tries to write the barrier's ready file.
+    std::fs::remove_dir_all(&pause_dir)?;
+    drop(git_lock);
     scanner.assert_success();
     assert_eq!(
-        main.run_jj(["--ignore-working-copy", "file", "show", "from-main"])
+        main.run_jj(["--ignore-working-copy", "file", "show", "edited"])
             .success()
             .stdout
             .raw(),
-        "main contents\n"
+        "edited contents\n"
     );
-    Ok(())
-}
-
-#[cfg(feature = "test-fakes")]
-#[test]
-fn test_conflicting_worktree_scans_take_turns_retrying() -> TestResult {
-    let test_env = TestEnvironment::default();
-    test_env
-        .run_jj_in(".", ["git", "init", "--colocate", "main"])
-        .success();
-    let main = test_env.work_dir("main");
-    main.write_file("base", "base contents\n");
-    main.run_jj(["commit", "-m", "base"]).success();
-    main.run_jj(["workspace", "add", "--colocate", "../secondary"])
-        .success();
-    main.run_jj(["workspace", "add", "--colocate", "../unrelated"])
-        .success();
-    let secondary = test_env.work_dir("secondary");
-    let unrelated = test_env.work_dir("unrelated");
-    main.write_file("from-main", "main contents\n");
-    secondary.write_file("from-secondary", "secondary contents\n");
-
-    let main_pause = test_env.env_root().join("pause-main-scan");
-    let secondary_pause = test_env.env_root().join("pause-secondary-scan");
-    let retry_pause = test_env.env_root().join("pause-retry");
-    for dir in [&main_pause, &secondary_pause, &retry_pause] {
-        std::fs::create_dir(dir)?;
-    }
-    let mut first = spawn_traced_jj_with_pauses(
-        &test_env,
-        &main,
-        "first-scan",
-        &["status"],
-        &[
-            ("JJ_TEST_SNAPSHOT_PAUSE_DIR", &main_pause),
-            ("JJ_TEST_SNAPSHOT_RETRY_PAUSE_DIR", &retry_pause),
-        ],
-    )?;
-    wait_for_child_event(&mut first, || main_pause.join("ready").exists());
-    let mut second = spawn_traced_jj(
-        &test_env,
-        &secondary,
-        "second-scan",
-        &["status"],
-        Some(("JJ_TEST_SNAPSHOT_PAUSE_DIR", &secondary_pause)),
-    )?;
-    wait_for_child_event(&mut second, || secondary_pause.join("ready").exists());
-
-    // Force both scans to fail their nonblocking shared-lock acquisition.
-    // The first scanner keeps the retry gate while the second waits, but
-    // neither can wait for it while holding its working-copy lock.
-    let shared = jj_lib::lock::FileLock::lock(main.root().join(".jj/repo/git_import_export.lock"))?;
-    std::fs::write(main_pause.join("release"), b"release\n")?;
-    wait_for_child_event(&mut first, || retry_pause.join("ready").exists());
-    std::fs::write(secondary_pause.join("release"), b"release\n")?;
-    wait_for_child_event(&mut second, || {
-        waiter_log_mentions(&test_env, "second-scan", "git_import_export_retry.lock")
-    });
-    assert!(
-        jj_lib::lock::FileLock::try_lock(
-            secondary.root().join(".jj/working_copy/working_copy.lock")
-        )?
-        .is_some(),
-        "the waiting scanner must release its journal"
-    );
-
-    // A scan that does not encounter contention can still proceed while a
-    // retry is in progress in other worktrees.
-    drop(shared);
-    unrelated
-        .run_jj_with(|cmd| {
-            cmd.timeout(std::time::Duration::from_secs(10))
-                .arg("status")
-        })
-        .success();
-    std::fs::write(retry_pause.join("release"), b"release\n")?;
-    first.assert_success();
-    second.assert_success();
-    for (work_dir, file, contents) in [
-        (&main, "from-main", "main contents\n"),
-        (&secondary, "from-secondary", "secondary contents\n"),
-    ] {
-        assert_eq!(
-            work_dir
-                .run_jj(["--ignore-working-copy", "file", "show", file])
-                .success()
-                .stdout
-                .raw(),
-            contents
-        );
-    }
     Ok(())
 }
 
@@ -2529,18 +2504,6 @@ fn spawn_traced_jj(
     args: &[&str],
     pause: Option<(&str, &std::path::Path)>,
 ) -> std::io::Result<TestChild> {
-    let pauses = pause.into_iter().collect::<Vec<_>>();
-    spawn_traced_jj_with_pauses(test_env, work_dir, label, args, &pauses)
-}
-
-#[cfg(feature = "test-fakes")]
-fn spawn_traced_jj_with_pauses(
-    test_env: &TestEnvironment,
-    work_dir: &TestWorkDir,
-    label: &str,
-    args: &[&str],
-    pauses: &[(&str, &std::path::Path)],
-) -> std::io::Result<TestChild> {
     // Use the same isolated configuration and binary as run_jj(), but keep
     // the child handle so the test can observe and clean up blocked processes.
     let template = test_env.new_jj_cmd();
@@ -2559,41 +2522,9 @@ fn spawn_traced_jj_with_pauses(
         .args(args)
         .stdout(std::fs::File::create(&stdout_path)?)
         .stderr(std::fs::File::create(&stderr_path)?);
-    for (env_name, pause_dir) in pauses {
+    if let Some((env_name, pause_dir)) = pause {
         command.env(env_name, pause_dir);
     }
-    Ok(TestChild {
-        child: command.spawn()?,
-        stdout_path,
-        stderr_path,
-    })
-}
-
-#[cfg(feature = "test-fakes")]
-fn spawn_old_lock_holder(
-    test_env: &TestEnvironment,
-    work_dir: &TestWorkDir,
-    helper_dir: &std::path::Path,
-) -> std::io::Result<TestChild> {
-    let stdout_path = test_env.env_root().join("old-holder.stdout");
-    let stderr_path = test_env.env_root().join("old-holder.stderr");
-    let mut command = std::process::Command::new(std::env::current_exe()?);
-    command
-        .args([
-            "--exact",
-            "test_concurrent_operations::test_scan_retries_when_older_process_holds_shared_lock",
-        ])
-        .env("JJ_TEST_OLD_LOCK_HELPER", helper_dir)
-        .env(
-            "JJ_TEST_OLD_SHARED_LOCK",
-            work_dir.root().join(".jj/repo/git_import_export.lock"),
-        )
-        .env(
-            "JJ_TEST_OLD_JOURNAL_LOCK",
-            work_dir.root().join(".jj/working_copy/working_copy.lock"),
-        )
-        .stdout(std::fs::File::create(&stdout_path)?)
-        .stderr(std::fs::File::create(&stderr_path)?);
     Ok(TestChild {
         child: command.spawn()?,
         stdout_path,

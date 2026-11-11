@@ -27,6 +27,7 @@ use crate::op_heads_store::OpHeadsStore;
 use crate::op_heads_store::OpHeadsStoreError;
 use crate::op_store;
 use crate::op_store::OpStoreError;
+use crate::op_store::OperationId;
 use crate::op_store::OperationMetadata;
 use crate::op_store::TimestampRange;
 use crate::operation::Operation;
@@ -111,6 +112,13 @@ impl Transaction {
         let other_repo = repo_loader.load_at(other_op).await?;
         self.parent_ops.push(other_op.clone());
         self.repo_mut().merge(&base_op_repo, &other_repo).await?;
+        Ok(())
+    }
+
+    /// Retains a recovery operation in the log without applying its view.
+    pub fn retain_recovery_operation(&mut self, recovery: &ReadonlyRepo) -> Result<(), IndexError> {
+        self.mut_repo.merge_index(recovery)?;
+        self.parent_ops.push(recovery.operation().clone());
         Ok(())
     }
 
@@ -259,6 +267,24 @@ impl UnpublishedOperation {
     }
 
     pub async fn publish(self) -> Result<Arc<ReadonlyRepo>, TransactionCommitError> {
+        Ok(self
+            .publish_inner(None)
+            .await?
+            .expect("unconditional publication always updates the operation heads"))
+    }
+
+    /// Publishes only if the expected operation is still the sole head.
+    pub async fn publish_if_current(
+        self,
+        expected: &OperationId,
+    ) -> Result<Option<Arc<ReadonlyRepo>>, TransactionCommitError> {
+        self.publish_inner(Some(expected)).await
+    }
+
+    async fn publish_inner(
+        self,
+        expected: Option<&OperationId>,
+    ) -> Result<Option<Arc<ReadonlyRepo>>, TransactionCommitError> {
         let started = Instant::now();
         let result = self.op_heads_store.lock().await;
         tracing::debug!(
@@ -268,6 +294,12 @@ impl UnpublishedOperation {
             "transaction phase completed"
         );
         let _lock = result?;
+        if let Some(expected) = expected
+            && self.op_heads_store.get_op_heads().await?.as_slice()
+                != std::slice::from_ref(expected)
+        {
+            return Ok(None);
+        }
         let started = Instant::now();
         let result = self
             .op_heads_store
@@ -280,7 +312,7 @@ impl UnpublishedOperation {
             "transaction phase completed"
         );
         result?;
-        Ok(self.repo)
+        Ok(Some(self.repo))
     }
 
     pub fn leave_unpublished(self) -> Arc<ReadonlyRepo> {

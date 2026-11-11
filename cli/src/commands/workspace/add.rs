@@ -287,6 +287,8 @@ async fn cmd_workspace_add_impl(
         allow(unused_variables)
     )]
     let mut snapshot_preparation = None;
+    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+    let mut source_worktree_gate = None;
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     let mut snapshot_source = None;
     #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
@@ -307,6 +309,14 @@ async fn cmd_workspace_add_impl(
                 .unwrap_or_else(|| repo.store().root_commit_id().clone());
             let source_commit = repo.store().get_commit_async(&source_commit_id).await?;
             #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+            if git_worktree_plan.is_some() {
+                // Keep the source gate from before we lock its journal until
+                // after we create the linked worktree under the shared Git lock.
+                // A command that holds shared Git while waiting for this journal
+                // must take the same gate first.
+                source_worktree_gate = old_workspace_command.lock_git_worktree_gate()?;
+            }
+            #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
             if let Some(plan) = &git_worktree_plan
                 && std::env::var_os("JJ_TEST_AWACS_SCAN_ROOT").is_none()
                 && snapshot_git_handoff_environment_is_safe()
@@ -322,7 +332,6 @@ async fn cmd_workspace_add_impl(
                 // descriptor and immutable copy survive Git's atomic index
                 // replacement, while the gate keeps this worktree's JJ
                 // operations from racing the capture.
-                let _worktree_gate = old_workspace_command.lock_git_worktree_gate()?;
                 if let Some(source_git) =
                     snapshot_git_handoff_worktree(old_workspace_command.workspace_root())?
                     && let Some(index_file) = open_snapshot_git_index(&source_git.index_path())?
@@ -362,6 +371,8 @@ async fn cmd_workspace_add_impl(
             {
                 snapshot_source =
                     prepare_snapshot_source(&old_workspace_command, &source_commit).await?;
+                #[cfg(feature = "test-fakes")]
+                crate::cli_util::pause_for_test("JJ_TEST_SNAPSHOT_WORKSPACE_SOURCE_PAUSE_DIR");
                 if let Some(source) = &snapshot_source {
                     snapshot_source_sparse_patterns = Some(source.sparse_patterns.clone());
                 }
@@ -464,6 +475,8 @@ async fn cmd_workspace_add_impl(
         .map(|source| source.untracked.clone());
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     drop(snapshot_source);
+    #[cfg(all(target_os = "linux", feature = "awacs", feature = "git"))]
+    drop(source_worktree_gate);
     if let Err(mut error) = workspace_setup_result {
         if snapshot
             && let Err(cleanup_error) = cleanup_failed_snapshot_workspace(
@@ -1795,7 +1808,7 @@ async fn establish_snapshot_workspace_baseline(
     workspace_command: &mut crate::cli_util::WorkspaceCommandHelper,
 ) -> Result<(), CommandError> {
     workspace_command
-        .snapshot_for_subvolume_enable(ui, &|_| Ok(()), None)
+        .snapshot_for_subvolume_enable(ui, &|_| Ok(()))
         .await
 }
 
