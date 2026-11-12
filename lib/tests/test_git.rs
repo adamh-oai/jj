@@ -8075,12 +8075,12 @@ fn set_test_index_monitor(index: &gix::index::File, token: &str, dirty: &[bool])
     lock.commit().unwrap();
 }
 
-fn read_test_cache_index(path: &Path) -> gix_index_cache::File {
-    gix_index_cache::File::at(
+fn read_test_cache_index(path: &Path) -> gix::index::File {
+    gix::index::File::at(
         path,
-        gix_hash_cache::Kind::Sha1,
+        gix::hash::Kind::Sha1,
         false,
-        gix_index_cache::decode::Options::default(),
+        gix::index::decode::Options::default(),
     )
     .unwrap()
 }
