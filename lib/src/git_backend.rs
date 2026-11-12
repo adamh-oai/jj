@@ -40,7 +40,6 @@ use futures::io::Cursor;
 use futures::stream::BoxStream;
 use gix::bstr::BString;
 use gix::objs::CommitRefIter;
-use gix::objs::Exists as _;
 use gix::objs::Write as _;
 use gix::objs::WriteTo as _;
 use gix::objs::commit::signature_field_name;
@@ -590,19 +589,14 @@ impl GitBackend {
             source: err.into(),
         })?;
 
-        let locked_repo = self.lock_git_repo();
-        if !locked_repo.objects.exists(&oid) {
-            // reuse the precomputed hash, since Gitoxide provides an API for it (otherwise
-            // Gitoxide recomputes it).
-            let write_oid = locked_repo
-                .objects
-                .write_buf_with_known_id(gix::objs::Kind::Blob, bytes, oid)
-                .map_err(|err| BackendError::WriteObject {
-                    object_type,
-                    source: err.into(),
-                })?;
-            assert!(oid == write_oid);
-        }
+        let write_oid = self
+            .lock_git_repo()
+            .write_buf_with_known_id(gix::objs::Kind::Blob, bytes, oid)
+            .map_err(|err| BackendError::WriteObject {
+                object_type,
+                source: err.into(),
+            })?;
+        assert_eq!(oid, write_oid);
         Ok(oid)
     }
 }
@@ -1721,6 +1715,30 @@ mod tests {
         )
         .unwrap()
         .to_thread_local()
+    }
+
+    #[test_case(gix::hash::Kind::Sha1 ; "sha1")]
+    #[test_case(gix::hash::Kind::Sha256; "sha256")]
+    fn writing_files_and_symlinks_reuses_known_packs(object_hash: gix::hash::Kind) -> TestResult {
+        let temp_dir = new_temp_dir();
+        let backend = GitBackend::init_internal(&user_settings(), temp_dir.path(), object_hash)?;
+        let repo = backend.git_repo();
+        let store = repo.objects.store_ref();
+        let path = RepoPath::from_internal_string("file")?;
+        let link = RepoPath::from_internal_string("link")?;
+
+        backend
+            .write_file(path, &mut b"initial".as_slice())
+            .block_on()?;
+        let refreshes = store.metrics().num_refreshes;
+        let file_id = backend
+            .write_file(path, &mut b"updated".as_slice())
+            .block_on()?;
+        let link_id = backend.write_symlink(link, "file").block_on()?;
+        assert_eq!(store.metrics().num_refreshes, refreshes);
+        assert_eq!(backend.read_file_sync(&file_id)?, b"updated");
+        assert_eq!(backend.read_symlink(link, &link_id).block_on()?, "file");
+        Ok(())
     }
 
     #[test]
