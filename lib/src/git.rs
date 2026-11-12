@@ -2358,7 +2358,7 @@ async fn reset_index(
     result?;
     debug_assert!(index.verify_entries().is_ok());
     let started = Instant::now();
-    let result = git_index_cache::write_preserving_cache(git_repo, &index, index_lock);
+    let result = git_index_cache::write_preserving_cache(git_repo, &mut index, index_lock);
     tracing::debug!(
         phase = "git_index_write_preserving_cache",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,

@@ -855,11 +855,11 @@ fn git_snapshot_worktree_handoff(scenario: GitSnapshotHandoffScenario) -> TestRe
         let staged = run(git_command(&root).args(["ls-files", "--stage", "--", "one"]))?.stdout;
         assert!(!staged.is_empty());
         let dirty_paths = || -> TestResult<Vec<String>> {
-            let index = gix_index_cache::File::at(
+            let index = gix::index::File::at(
                 &index_path,
-                gix_index_cache::hash::Kind::Sha1,
+                gix::hash::Kind::Sha1,
                 false,
-                gix_index_cache::decode::Options::default(),
+                gix::index::decode::Options::default(),
             )?;
             let mut paths = Vec::new();
             index
@@ -1529,11 +1529,11 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
     std::fs::rename(&real_hook, &hook)?;
     let index_path = root.join(".git/index");
     let dirty_entries = || -> TestResult<usize> {
-        let index = gix_index_cache::File::at(
+        let index = gix::index::File::at(
             &index_path,
-            gix_index_cache::hash::Kind::Sha1,
+            gix::hash::Kind::Sha1,
             false,
-            gix_index_cache::decode::Options::default(),
+            gix::index::decode::Options::default(),
         )?;
         let mut dirty = 0;
         index
@@ -1784,16 +1784,8 @@ fn test_workspace_add_seeds_first_git_status_without_full_refresh() -> TestResul
         } else {
             false
         };
-        // The pinned codec exposes the FSMN bitmap on this upstream gix
-        // version, which can otherwise read but not inspect individual bits.
-        let codec_index = gix_index_cache::File::at(
-            child_repo.git_dir().join("index"),
-            gix_index_cache::hash::Kind::Sha1,
-            false,
-            gix_index_cache::decode::Options::default(),
-        )?;
         let mut dirty_entries = 0;
-        if let Some(monitor) = codec_index.fs_monitor() {
+        if let Some(monitor) = initial_index.fs_monitor() {
             monitor
                 .for_each_dirty_entry(|_| {
                     dirty_entries += 1;

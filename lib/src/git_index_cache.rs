@@ -12,12 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Preserve Git index extensions through the upstream index writer.
+//! Preserve Git index extensions when rebuilding a worktree's index.
 //!
-//! Upstream gitoxide can read FSMN and UNTR but cannot write them yet. Use the
-//! pinned cache codec only at this byte boundary, so all repository operations
-//! continue using upstream gitoxide. The caller must hold the index lock from
-//! before reading the old index through publishing the new one.
+//! Hold the index lock from the read of the previous index through the final write.
 
 use std::error::Error;
 use std::io;
@@ -46,49 +43,10 @@ use btrfs_awacs::status::encode_git_fsmonitor_token;
 /// An index encoding or I/O error.
 pub type ErrorBox = Box<dyn Error + Send + Sync>;
 
-fn cache_hash(kind: gix::hash::Kind) -> Result<gix_hash_cache::Kind, ErrorBox> {
-    match kind {
-        gix::hash::Kind::Sha1 => Ok(gix_hash_cache::Kind::Sha1),
-        gix::hash::Kind::Sha256 => Ok(gix_hash_cache::Kind::Sha256),
-        _ => Err(io::Error::other("unsupported Git index hash kind").into()),
-    }
-}
-
-fn cache_index(index: &gix::index::File) -> Result<gix_index_cache::File, ErrorBox> {
-    let mut bytes = Vec::new();
-    let started = Instant::now();
-    let result = index.write_to(&mut bytes, gix::index::write::Options::default());
-    tracing::debug!(
-        phase = "git_index_cache_conversion_encode",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count = index.entries().len(),
-        "Git index phase completed"
-    );
-    result?;
-    let kind = cache_hash(index.object_hash())?;
-    let started = Instant::now();
-    let result = gix_index_cache::State::from_bytes(
-        &bytes,
-        filetime::FileTime::from_system_time(SystemTime::UNIX_EPOCH),
-        kind,
-        gix_index_cache::decode::Options::default(),
-    );
-    tracing::debug!(
-        phase = "git_index_cache_conversion_decode",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count = index.entries().len(),
-        "Git index phase completed"
-    );
-    let (state, _) = result?;
-    Ok(gix_index_cache::File::from_state(state, index.path()))
-}
-
 fn read_cache_index(
     path: &Path,
-    kind: gix_hash_cache::Kind,
-) -> Result<Option<gix_index_cache::File>, ErrorBox> {
+    kind: gix::hash::Kind,
+) -> Result<Option<gix::index::File>, ErrorBox> {
     // The codec hashes by slicing the trailer, so reject short/truncated input
     // before opening it. The lock prevents cooperating writers changing it.
     match std::fs::metadata(path) {
@@ -99,43 +57,12 @@ fn read_cache_index(
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     }
-    Ok(Some(gix_index_cache::File::at(
+    Ok(Some(gix::index::File::at(
         path,
         kind,
         false,
-        gix_index_cache::decode::Options::default(),
+        gix::index::decode::Options::default(),
     )?))
-}
-
-// The index codec uses a different gitoxide version. Bridge object lookup by
-// object ID and raw object bytes, keeping all repository operations on the
-// upstream version.
-struct TreeObjects<'a>(&'a gix::Repository);
-
-impl gix_object_cache::Find for TreeObjects<'_> {
-    fn try_find<'a>(
-        &self,
-        id: &gix_hash_cache::oid,
-        buffer: &'a mut Vec<u8>,
-    ) -> Result<Option<gix_object_cache::Data<'a>>, gix_object_cache::find::Error> {
-        let id = gix::ObjectId::from_bytes_or_panic(id.as_bytes());
-        let Some(object) = self.0.try_find_object(id)? else {
-            return Ok(None);
-        };
-        let kind = match object.kind {
-            gix::object::Kind::Tree => gix_object_cache::Kind::Tree,
-            gix::object::Kind::Blob => gix_object_cache::Kind::Blob,
-            gix::object::Kind::Commit => gix_object_cache::Kind::Commit,
-            gix::object::Kind::Tag => gix_object_cache::Kind::Tag,
-        };
-        buffer.clear();
-        buffer.extend_from_slice(&object.data);
-        Ok(Some(gix_object_cache::Data {
-            kind,
-            object_hash: cache_hash(self.0.object_hash())?,
-            data: buffer,
-        }))
-    }
 }
 
 /// Create a verified index and a TREE cache for a resolved Git tree.
@@ -146,28 +73,8 @@ pub fn index_from_tree(
     repo: &gix::Repository,
     tree: &gix::hash::oid,
 ) -> Result<gix::index::File, ErrorBox> {
-    let config = repo.config_snapshot();
-    let protect_windows = config.try_boolean("gitoxide.core.protectWindows");
-    let protect_hfs = config.try_boolean("core.protectHFS");
-    let protect_ntfs = config.try_boolean("core.protectNTFS");
-    if protect_windows.is_err() || protect_hfs.is_err() || protect_ntfs.is_err() {
-        // Upstream doesn't expose its config leniency policy. Let it reject
-        // malformed protection settings in strict repositories, or validate
-        // with their defaults in lenient repositories, before using defaults
-        // here. Valid configurations only need the single traversal below.
-        repo.index_from_tree(tree)?;
-    }
-    let options = gix_validate_cache::path::component::Options {
-        protect_windows: protect_windows.ok().flatten().unwrap_or(cfg!(windows)),
-        protect_hfs: protect_hfs
-            .ok()
-            .flatten()
-            .unwrap_or(cfg!(target_os = "macos")),
-        protect_ntfs: protect_ntfs.ok().flatten().unwrap_or(true),
-    };
-    let tree = gix_hash_cache::ObjectId::from_bytes_or_panic(tree.as_bytes());
     let started = Instant::now();
-    let result = gix_index_cache::State::from_tree(&tree, TreeObjects(repo), options);
+    let result = repo.index_from_tree(tree);
     tracing::debug!(
         phase = "git_index_from_tree_traversal",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -175,46 +82,7 @@ pub fn index_from_tree(
         entry_count = result.as_ref().map_or(0, |index| index.entries().len()),
         "Git index phase completed"
     );
-    let state = match result {
-        Ok(state) => state,
-        Err(gix_index_cache::init::from_tree::Error::InvalidComponent { path, source }) => {
-            use gix::error::ErrorExt as _;
-
-            return Err(source
-                .and_raise(gix::error::message!("The path \"{path}\" is invalid").validation())
-                .into());
-        }
-        Err(err) => return Err(err.into()),
-    };
-    let index = gix_index_cache::File::from_state(state, repo.index_path());
-    let entry_count = index.entries().len();
-    let mut bytes = Vec::new();
-    let started = Instant::now();
-    let result = index.write_to(&mut bytes, gix_index_cache::write::Options::default());
-    tracing::debug!(
-        phase = "git_index_tree_conversion_encode",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    result?;
-    let started = Instant::now();
-    let result = gix::index::State::from_bytes(
-        &bytes,
-        filetime::FileTime::from_system_time(SystemTime::UNIX_EPOCH),
-        repo.object_hash(),
-        gix::index::decode::Options::default(),
-    );
-    tracing::debug!(
-        phase = "git_index_tree_conversion_decode",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    let (state, _) = result?;
-    Ok(gix::index::File::from_state(state, index.path()))
+    Ok(result?)
 }
 
 /// Replace the index under the caller's lock and keep its worktree caches valid.
@@ -223,23 +91,12 @@ pub fn index_from_tree(
 /// AWACS cursor, apply the pending invalidations before saving a newer cursor.
 pub(crate) fn write_preserving_cache(
     repo: &gix::Repository,
-    index: &gix::index::File,
+    index: &mut gix::index::File,
     index_lock: gix::lock::File,
 ) -> Result<(), ErrorBox> {
     let entry_count = index.entries().len();
     let started = Instant::now();
-    let result = cache_index(index);
-    tracing::debug!(
-        phase = "git_index_cache_write_conversion",
-        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-        succeeded = result.is_ok(),
-        entry_count,
-        "Git index phase completed"
-    );
-    let mut rebuilt = result?;
-    let kind = cache_hash(index.object_hash())?;
-    let started = Instant::now();
-    let result = read_cache_index(index.path(), kind);
+    let result = read_cache_index(index.path(), index.object_hash());
     tracing::debug!(
         phase = "git_index_cache_read_previous",
         elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -249,13 +106,14 @@ pub(crate) fn write_preserving_cache(
     );
     let previous = result?;
     let started = Instant::now();
+    index.clear_worktree_cache_extensions();
     if let Some(previous) = &previous {
-        rebuilt.inherit_fs_monitor_from(previous);
+        index.inherit_fs_monitor_from(previous);
     }
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     let mut update = previous
         .as_ref()
-        .and_then(|previous| GitMonitorUpdate::prepare(repo, previous, &mut rebuilt));
+        .and_then(|previous| GitMonitorUpdate::prepare(repo, previous, index));
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     let keep_untracked = update.as_ref().is_none_or(|update| update.keep_untracked);
     #[cfg(not(all(target_os = "linux", feature = "awacs")))]
@@ -264,7 +122,7 @@ pub(crate) fn write_preserving_cache(
         true
     };
     if let Some(previous) = previous.filter(|_| keep_untracked) {
-        rebuilt.inherit_untracked_from(&previous);
+        index.inherit_untracked_from(&previous);
     }
     tracing::debug!(
         phase = "git_index_cache_inherit",
@@ -275,7 +133,7 @@ pub(crate) fn write_preserving_cache(
     let result = (|| {
         let mut writer = io::BufWriter::with_capacity(64 * 1024, index_lock);
         let started = Instant::now();
-        let result = rebuilt.write_to(&mut writer, gix_index_cache::write::Options::default());
+        let result = index.write_to(&mut writer, gix::index::write::Options::default());
         tracing::debug!(
             phase = "git_index_cache_encode_and_write",
             elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
@@ -325,8 +183,8 @@ struct GitMonitorUpdate<'a> {
 impl<'a> GitMonitorUpdate<'a> {
     fn prepare(
         repo: &'a gix::Repository,
-        previous: &gix_index_cache::File,
-        rebuilt: &mut gix_index_cache::File,
+        previous: &gix::index::File,
+        rebuilt: &mut gix::index::File,
     ) -> Option<Self> {
         let root = repo.workdir()?;
         let baseline = decode_git_fsmonitor_token(previous.fs_monitor()?.token()?)?;
@@ -412,7 +270,7 @@ impl<'a> GitMonitorUpdate<'a> {
 
 #[cfg(all(target_os = "linux", feature = "awacs"))]
 fn apply_git_invalidations(
-    index: &mut gix_index_cache::File,
+    index: &mut gix::index::File,
     token: &str,
     invalidation: &Invalidation,
 ) -> Result<bool, ErrorBox> {
@@ -460,7 +318,7 @@ fn apply_git_invalidations(
             dirty[range].fill(true);
         }
     }
-    let monitor = gix_index_cache::extension::FsMonitor::from_token(token, &dirty)
+    let monitor = gix::index::extension::FsMonitor::from_token(token, &dirty)
         .ok_or_else(|| io::Error::other("invalid AWACS Git cursor or dirty bitmap"))?;
     index.set_fs_monitor(monitor);
     Ok(has_worktree_changes)
@@ -486,25 +344,25 @@ pub fn write_with_monitor(
         )
         .into());
     }
-    let mut rebuilt = cache_index(index)?;
+    let mut rebuilt = index.clone();
+    rebuilt.clear_worktree_cache_extensions();
     if let Some(previous_index) = previous_index {
-        let (previous, _) = gix_index_cache::State::from_bytes(
+        let (previous, _) = gix::index::State::from_bytes(
             previous_index,
             SystemTime::UNIX_EPOCH.into(),
-            cache_hash(index.object_hash())?,
-            gix_index_cache::decode::Options::default(),
+            index.object_hash(),
+            gix::index::decode::Options::default(),
         )?;
         rebuilt.inherit_untracked_from(&previous);
     }
-    let monitor =
-        gix_index_cache::extension::FsMonitor::from_token(token, dirty).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid Git fsmonitor cursor or bitmap",
-            )
-        })?;
+    let monitor = gix::index::extension::FsMonitor::from_token(token, dirty).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Git fsmonitor cursor or bitmap",
+        )
+    })?;
     rebuilt.set_fs_monitor(monitor);
-    rebuilt.write_to(&mut out, gix_index_cache::write::Options::default())?;
+    rebuilt.write_to(&mut out, gix::index::write::Options::default())?;
     Ok(())
 }
 
@@ -553,6 +411,7 @@ mod tests {
 
     #[test]
     fn index_from_tree_preserves_entries_and_cache_tree() {
+        use gix::index::entry::Mode;
         use gix::objs::tree::EntryKind::Blob;
         use gix::objs::tree::EntryKind::BlobExecutable;
         use gix::objs::tree::EntryKind::Commit;
@@ -583,22 +442,31 @@ mod tests {
                 ],
             );
             for tree in [root, empty] {
-                let expected = repo.index_from_tree(&tree).unwrap();
                 let actual = index_from_tree(&repo, &tree).unwrap();
                 assert_eq!(actual.path(), repo.index_path());
                 assert_eq!(actual.object_hash(), kind);
-                assert_eq!(actual.version(), expected.version());
-                assert_eq!(actual.entries().len(), expected.entries().len());
-                for (actual_entry, expected_entry) in
-                    actual.entries().iter().zip(expected.entries())
-                {
-                    assert_eq!(actual_entry.path(&actual), expected_entry.path(&expected));
-                    assert_eq!(actual_entry.id, expected_entry.id);
-                    assert_eq!(actual_entry.mode, expected_entry.mode);
-                    assert_eq!(actual_entry.flags, expected_entry.flags);
-                    assert_eq!(actual_entry.stage(), expected_entry.stage());
-                    assert_eq!(actual_entry.stat, expected_entry.stat);
-                }
+                assert_eq!(actual.version(), gix::index::Version::V2);
+                let entries: Vec<_> = actual
+                    .entries()
+                    .iter()
+                    .map(|entry| {
+                        let path = std::str::from_utf8(entry.path(&actual)).unwrap();
+                        (path, entry.mode, entry.id)
+                    })
+                    .collect();
+                let expected = if tree == root {
+                    vec![
+                        ("a.c", Mode::FILE, blob),
+                        ("a/file", Mode::FILE, blob),
+                        ("a/run", Mode::FILE_EXECUTABLE, blob),
+                        ("a/symlink", Mode::SYMLINK, blob),
+                        ("a/vendor", Mode::COMMIT, gix::ObjectId::null(kind)),
+                        ("z", Mode::FILE, blob),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(entries, expected);
                 assert!(actual.fs_monitor().is_none());
                 assert!(actual.untracked().is_none());
                 let cache = actual.tree().expect("new index has a TREE cache");
@@ -617,6 +485,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn valid_component(
+        repo: &gix::Repository,
+        name: &str,
+        mode: gix::objs::tree::EntryKind,
+    ) -> bool {
+        let config = repo.config_snapshot();
+        let flag = |key: &str, default| config.try_boolean(key).ok().flatten().unwrap_or(default);
+        gix::validate::path::component(
+            name.as_bytes().into(),
+            (mode == gix::objs::tree::EntryKind::Link)
+                .then_some(gix::validate::path::component::Mode::Symlink),
+            gix::validate::path::component::Options {
+                protect_windows: flag("gitoxide.core.protectWindows", cfg!(windows)),
+                protect_hfs: flag("core.protectHFS", cfg!(target_os = "macos")),
+                protect_ntfs: flag("core.protectNTFS", true),
+            },
+        )
+        .is_ok()
     }
 
     #[test]
@@ -651,11 +539,11 @@ mod tests {
                 for mode in [Blob, Link, Tree] {
                     let oid = if mode == Tree { child } else { blob };
                     let tree = write_tree(&repo, &[(name, mode, oid)]);
-                    let expected = repo.index_from_tree(&tree);
+                    let expected = valid_component(&repo, name, mode);
                     let actual = index_from_tree(&repo, &tree);
                     assert_eq!(
                         actual.is_ok(),
-                        expected.is_ok(),
+                        expected,
                         "config={config:?}, name={name:?}, mode={mode:?}"
                     );
                     if let Err(err) = actual {
@@ -696,16 +584,13 @@ mod tests {
                     let blob = repo.write_blob(b"contents").unwrap().detach();
                     for name in ["ordinary", "git~1", ".g\u{200c}it", "CON", "a\\b"] {
                         let tree = write_tree(&repo, &[(name, Blob, blob)]);
-                        let expected = repo.index_from_tree(&tree);
+                        let expected = !strict && valid_component(&repo, name, Blob);
                         let actual = index_from_tree(&repo, &tree);
                         assert_eq!(
                             actual.is_ok(),
-                            expected.is_ok(),
+                            expected,
                             "strict={strict}, config={config:?}, name={name:?}"
                         );
-                        if strict || name == "ordinary" {
-                            assert_eq!(actual.is_ok(), !strict);
-                        }
                     }
                 }
             }
@@ -728,18 +613,18 @@ mod tests {
         index
     }
 
-    fn read_bytes(bytes: &[u8], kind: gix_hash_cache::Kind) -> gix_index_cache::State {
-        gix_index_cache::State::from_bytes(
+    fn read_bytes(bytes: &[u8], kind: gix::hash::Kind) -> gix::index::State {
+        gix::index::State::from_bytes(
             bytes,
-            filetime::FileTime::from_system_time(SystemTime::UNIX_EPOCH),
+            SystemTime::UNIX_EPOCH.into(),
             kind,
-            gix_index_cache::decode::Options::default(),
+            gix::index::decode::Options::default(),
         )
         .unwrap()
         .0
     }
 
-    fn rewrite_index(repo: &gix::Repository, index: &gix::index::File) -> Result<(), ErrorBox> {
+    fn rewrite_index(repo: &gix::Repository, index: &mut gix::index::File) -> Result<(), ErrorBox> {
         let lock = gix::lock::File::acquire_to_update_resource(
             index.path(),
             gix::lock::acquire::Fail::Immediately,
@@ -764,14 +649,14 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&path, bytes).unwrap();
-        let next = make_index(
+        let mut next = make_index(
             &path,
             kind,
             &[("a", 1), ("b", 9), ("c", 3), ("d", 4), ("e", 5)],
         );
-        rewrite_index(&repo, &next).unwrap();
+        rewrite_index(&repo, &mut next).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let parsed = read_bytes(&bytes, cache_hash(kind).unwrap());
+        let parsed = read_bytes(&bytes, kind);
         let monitor = parsed.fs_monitor().expect("fsmonitor survives the rewrite");
         assert_eq!(monitor.token().unwrap(), "test-cursor");
         let mut dirty = Vec::new();
@@ -782,15 +667,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(dirty, [1, 3, 4]);
-        let (new_index, _) = gix::index::State::from_bytes(
-            &bytes,
-            filetime::FileTime::from_system_time(SystemTime::UNIX_EPOCH),
-            kind,
-            gix::index::decode::Options::default(),
-        )
-        .unwrap();
-        assert_eq!(new_index.entries().len(), 5);
-        assert!(new_index.fs_monitor().is_some());
+        assert_eq!(parsed.entries().len(), 5);
     }
 
     #[test]
@@ -813,14 +690,14 @@ mod tests {
             include_bytes!("../tests/fixtures/untracked-cache.index"),
         )
         .unwrap();
-        let previous = read_cache_index(&path, gix_hash_cache::Kind::Sha1)
+        let previous = read_cache_index(&path, gix::hash::Kind::Sha1)
             .unwrap()
             .unwrap();
         let before = format!("{:?}", previous.untracked().expect("fixture has UNTR"));
-        let next = make_index(&path, gix::hash::Kind::Sha1, &[("new", 1)]);
-        rewrite_index(&repo, &next).unwrap();
+        let mut next = make_index(&path, gix::hash::Kind::Sha1, &[("new", 1)]);
+        rewrite_index(&repo, &mut next).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let parsed = read_bytes(&bytes, gix_hash_cache::Kind::Sha1);
+        let parsed = read_bytes(&bytes, gix::hash::Kind::Sha1);
         assert_eq!(
             before,
             format!("{:?}", parsed.untracked().expect("UNTR survives"))
@@ -828,21 +705,49 @@ mod tests {
     }
 
     #[test]
+    fn reused_index_does_not_copy_caches_from_another_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let kind = gix::hash::Kind::Sha1;
+        let repo = init_repo(temp.path(), kind, true, &[]);
+        let state = read_bytes(
+            include_bytes!("../tests/fixtures/untracked-cache.index"),
+            kind,
+        );
+        let mut index = gix::index::File::from_state(state, repo.index_path());
+        assert!(index.untracked().is_some());
+        let dirty = vec![false; index.entries().len()];
+        index.set_fs_monitor(
+            gix::index::extension::FsMonitor::from_token("source", &dirty).unwrap(),
+        );
+
+        let mut bytes = Vec::new();
+        write_with_monitor(&index, "destination", &dirty, None, &mut bytes).unwrap();
+        let saved = read_bytes(&bytes, kind);
+        assert!(saved.untracked().is_none());
+        assert_eq!(saved.fs_monitor().unwrap().token().unwrap(), "destination");
+
+        rewrite_index(&repo, &mut index).unwrap();
+        let saved = read_bytes(&std::fs::read(repo.index_path()).unwrap(), kind);
+        assert!(saved.untracked().is_none());
+        assert!(saved.fs_monitor().is_none());
+    }
+
+    #[test]
     fn rejects_truncated_source_and_invalid_bitmap() {
         let temp = tempfile::tempdir().unwrap();
         let repo = init_repo(temp.path(), gix::hash::Kind::Sha1, true, &[]);
         let path = repo.index_path();
-        let index = make_index(&path, gix::hash::Kind::Sha1, &[("a", 1)]);
+        let mut index = make_index(&path, gix::hash::Kind::Sha1, &[("a", 1)]);
         assert!(write_with_monitor(&index, "token", &[], None, Vec::new()).is_err());
         std::fs::write(&path, b"DIRC").unwrap();
-        assert!(rewrite_index(&repo, &index).is_err());
+        assert!(rewrite_index(&repo, &mut index).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"DIRC");
     }
 
     #[cfg(all(target_os = "linux", feature = "awacs"))]
     #[test]
     fn advancing_monitor_keeps_dirty_bits_and_applies_directory_moves() {
-        let index = make_index(
+        let mut index = make_index(
             Path::new("index"),
             gix::hash::Kind::Sha1,
             &[
@@ -853,9 +758,8 @@ mod tests {
                 ("file", 5),
             ],
         );
-        let mut index = cache_index(&index).unwrap();
         index.set_fs_monitor(
-            gix_index_cache::extension::FsMonitor::from_token(
+            gix::index::extension::FsMonitor::from_token(
                 "old",
                 &[true, false, false, false, false],
             )
